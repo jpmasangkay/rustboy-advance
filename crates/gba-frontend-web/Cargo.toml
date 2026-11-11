@@ -1,0 +1,10 @@
+[package]
+name = "gba-frontend-web"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+gba-core = { path = "../gba-core" }
+log.workspace = true
+

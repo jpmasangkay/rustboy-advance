@@ -1,0 +1,32 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/gba-core",
+    "crates/gba-debugger",
+    "crates/gba-frontend-desktop",
+    "crates/gba-frontend-web",
+    "crates/gba-libretro",
+]
+
+[workspace.package]
+edition = "2024"
+license = "MPL-2.0"
+version = "0.1.0"
+
+[workspace.dependencies]
+bitflags = "2.6"
+serde = { version = "1.0", default-features = false, features = ["derive", "alloc"] }
+postcard = { version = "1.0", default-features = false, features = ["alloc"] }
+log = "0.4"
+
+[profile.release]
+opt-level = 3
+lto = "fat"
+codegen-units = 1
+panic = "abort"
+strip = "symbols"
+
+[profile.bench]
+inherits = "release"
+debug = true
+

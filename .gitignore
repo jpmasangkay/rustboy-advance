@@ -1,0 +1,36 @@
+# Rust build artifacts
+/target/
+**/*.rs.bk
+Cargo.lock.bak
+
+# IDE and editor files
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+*.iml
+
+# Operating system files
+Thumbs.db
+[Dd]esktop.ini
+.DS_Store
+
+# Commercial ROMs, BIOS dumps, and game saves (keep repository clean and legal)
+*.gba
+*.bin
+*.sav
+*.srm
+*.dsv
+*.state*
+*.ips
+*.ups
+*.bps
+
+# Temporary logs, image dumps, and scratch files
+*.ppm
+*.log
+frame_*.png
+test_output/
+.gemini/
+.antigravity/

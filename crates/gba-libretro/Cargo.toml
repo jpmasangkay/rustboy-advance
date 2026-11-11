@@ -1,0 +1,13 @@
+[package]
+name = "gba-libretro"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[lib]
+crate-type = ["rlib", "cdylib"]
+
+[dependencies]
+gba-core = { path = "../gba-core" }
+log.workspace = true
+

@@ -209,12 +209,91 @@ impl SaveOverrideChoice {
     }
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize, Default)]
+pub enum ColorProfileChoice {
+    Linear,
+    #[default]
+    Agb001,
+    Ags101,
+    Ags001,
+}
+
+impl ColorProfileChoice {
+    pub const ALL: [ColorProfileChoice; 4] = [
+        Self::Agb001,
+        Self::Ags101,
+        Self::Ags001,
+        Self::Linear,
+    ];
+
+    pub const fn label(self) -> &'static str {
+        match self {
+            Self::Agb001 => "AGB-001 (Reflective sRGB)",
+            Self::Ags101 => "AGS-101 (Backlit Vibrant)",
+            Self::Ags001 => "AGS-001 (Frontlit Pastel)",
+            Self::Linear => "Raw Unfiltered",
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize, Default)]
+pub enum BezelStyle {
+    #[default]
+    None,
+    ClassicIndigo,
+    OnyxStealth,
+    PlatinumSp,
+}
+
+impl BezelStyle {
+    pub const ALL: [BezelStyle; 4] = [
+        Self::None,
+        Self::ClassicIndigo,
+        Self::OnyxStealth,
+        Self::PlatinumSp,
+    ];
+
+    pub const fn label(self) -> &'static str {
+        match self {
+            Self::None => "None (Black Screen)",
+            Self::ClassicIndigo => "Classic Indigo GBA",
+            Self::OnyxStealth => "Onyx Stealth Bezel",
+            Self::PlatinumSp => "Platinum SP Frame",
+        }
+    }
+}
+
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+pub struct RomPlaytime {
+    pub total_seconds: u64,
+    pub last_played_timestamp: u64,
+    pub launch_count: u32,
+}
+
+impl RomPlaytime {
+    pub fn formatted_playtime(&self) -> String {
+        let mins = self.total_seconds / 60;
+        let hours = mins / 60;
+        let rem_mins = mins % 60;
+        if hours > 0 {
+            format!("{hours}h {rem_mins}m")
+        } else if mins > 0 {
+            format!("{mins}m")
+        } else if self.total_seconds > 0 {
+            format!("{}s", self.total_seconds)
+        } else {
+            "-".to_string()
+        }
+    }
+}
+
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
 pub struct RomSpecificSettings {
     pub save_override: Option<SaveOverrideChoice>,
     pub rtc_override: Option<bool>,
     pub solar_lux: Option<u8>,
     pub cheats: Vec<CheatEntry>,
+    pub custom_color_profile: Option<ColorProfileChoice>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -225,6 +304,8 @@ pub struct AppConfig {
     pub window_scale: u8,
     pub integer_scaling: bool,
     pub color_correction: bool,
+    pub color_profile: ColorProfileChoice,
+    pub bezel_style: BezelStyle,
     pub lcd_ghosting: bool,
     pub scanline_grid: bool,
     pub dot_accurate_ppu: bool,
@@ -238,6 +319,12 @@ pub struct AppConfig {
     pub rom_folders: Vec<String>,
     pub favorites: Vec<String>,
     pub library_view_mode: String,
+    pub show_toolbar: bool,
+    pub show_status_bar: bool,
+    pub show_menu_bar: bool,
+    pub rumble_enabled: bool,
+    pub pause_overlay_enabled: bool,
+    pub playtimes: BTreeMap<String, RomPlaytime>,
 }
 
 impl Default for AppConfig {
@@ -248,6 +335,8 @@ impl Default for AppConfig {
             window_scale: 3,
             integer_scaling: false,
             color_correction: true,
+            color_profile: ColorProfileChoice::Agb001,
+            bezel_style: BezelStyle::None,
             lcd_ghosting: false,
             scanline_grid: false,
             dot_accurate_ppu: false,
@@ -261,6 +350,12 @@ impl Default for AppConfig {
             rom_folders: Vec::new(),
             favorites: Vec::new(),
             library_view_mode: "Table".to_string(),
+            show_toolbar: true,
+            show_status_bar: true,
+            show_menu_bar: true,
+            rumble_enabled: true,
+            pause_overlay_enabled: true,
+            playtimes: BTreeMap::new(),
         }
     }
 }

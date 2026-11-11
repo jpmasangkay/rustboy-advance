@@ -146,14 +146,23 @@ cargo run --release -p gba-frontend-desktop -- "game.gba" --bios "path/to/gba_bi
 | Action | Shortcut |
 |--------|----------|
 | **Rewind Gameplay** | Hold `R` |
-| **Fast Forward (2x/4x)** | Hold `Space` / `Tab` |
-| **Pause / Resume** | `P` |
-| **Step Single Frame** | `F` |
-| **Stop Emulation** | `Esc` / `Ctrl+W` |
-| **Quick Save (Slot 1)** | `F5` |
-| **Quick Load (Slot 1)** | `F9` |
+| **Fast Forward (4x / Turbo)** | Hold `Tab` / Toggle `Space` |
+| **Pause / Resume** | `P` / `Space` |
+| **In-Game Pause Overlay Menu** | `Esc` (Windowed) |
+| **Toggle Fullscreen** | `F11` / Double-Click Viewport |
+| **Exit Fullscreen** | `Esc` / `F11` |
+| **Stop to ROM Library** | `Ctrl+W` |
+| **Visual Save State Manager** | `F6` |
+| **Quick Save State (Slots 1–5)** | `F1` – `F5` |
+| **Quick Load State (Slots 1–5)** | `Shift+F1` – `Shift+F5` |
+| **Undo Last Save / Load Action** | `Ctrl+Z` |
+| **Toggle Action Toolbar** | `Ctrl+T` |
+| **Toggle Telemetry Status Bar** | `Ctrl+S` |
+| **Boktai Solar Sunlight Sensor** | `[` (Dimmer) / `]` (Brighter) |
 | **Take Screenshot** | `F12` |
-| **Toggle Fullscreen** | `F11` / `Alt+Enter` |
+| **Advance Single Frame** | `Ctrl+N` |
+| **Hard Reset** | `Ctrl+R` |
+| **Mute / Unmute Audio** | `Ctrl+M` |
 
 ---
 

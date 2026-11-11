@@ -1,14 +1,16 @@
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::OnceLock;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use egui::ColorImage;
 use gba_core::{LCD_HEIGHT, LCD_WIDTH};
 
-use crate::config::AppConfig;
+use crate::config::{AppConfig, ColorProfileChoice};
 
 static LINEAR_LUT: OnceLock<Box<[[u8; 4]; 32_768]>> = OnceLock::new();
 static AGB_LUT: OnceLock<Box<[[u8; 4]; 32_768]>> = OnceLock::new();
+static AGS101_LUT: OnceLock<Box<[[u8; 4]; 32_768]>> = OnceLock::new();
+static AGS001_LUT: OnceLock<Box<[[u8; 4]; 32_768]>> = OnceLock::new();
 
 #[inline]
 pub fn linear_lut() -> &'static [[u8; 4]; 32_768] {
@@ -56,6 +58,46 @@ pub fn agb_srgb_lut() -> &'static [[u8; 4]; 32_768] {
     })
 }
 
+#[inline]
+pub fn ags_101_lut() -> &'static [[u8; 4]; 32_768] {
+    AGS101_LUT.get_or_init(|| {
+        // AGS-101 backlit vibrant TFT curve (deeper contrast, vivid primary colors)
+        let mut table = vec![[0u8; 4]; 32_768].into_boxed_slice();
+        for c in 0..32_768usize {
+            let r = ((c & 0x1F) as f32) / 31.0;
+            let g = (((c >> 5) & 0x1F) as f32) / 31.0;
+            let b = (((c >> 10) & 0x1F) as f32) / 31.0;
+
+            let out_r = (255.0 * (r * 0.94 + g * 0.04 + b * 0.02).powf(1.15)).clamp(0.0, 255.0);
+            let out_g = (255.0 * (r * 0.03 + g * 0.92 + b * 0.05).powf(1.15)).clamp(0.0, 255.0);
+            let out_b = (255.0 * (r * 0.01 + g * 0.07 + b * 0.92).powf(1.15)).clamp(0.0, 255.0);
+
+            table[c] = [out_r as u8, out_g as u8, out_b as u8, 255];
+        }
+        table.try_into().expect("32768-entry LUT")
+    })
+}
+
+#[inline]
+pub fn ags_001_lut() -> &'static [[u8; 4]; 32_768] {
+    AGS001_LUT.get_or_init(|| {
+        // AGS-001 frontlit soft pastel curve (slight blue shift, gentle desaturation)
+        let mut table = vec![[0u8; 4]; 32_768].into_boxed_slice();
+        for c in 0..32_768usize {
+            let r = ((c & 0x1F) as f32) / 31.0;
+            let g = (((c >> 5) & 0x1F) as f32) / 31.0;
+            let b = (((c >> 10) & 0x1F) as f32) / 31.0;
+
+            let out_r = (255.0 * (0.04 + 0.82 * (r * 0.84 + g * 0.12 + b * 0.04))).clamp(0.0, 255.0);
+            let out_g = (255.0 * (0.05 + 0.82 * (r * 0.06 + g * 0.82 + b * 0.12))).clamp(0.0, 255.0);
+            let out_b = (255.0 * (0.08 + 0.84 * (r * 0.04 + g * 0.10 + b * 0.86))).clamp(0.0, 255.0);
+
+            table[c] = [out_r as u8, out_g as u8, out_b as u8, 255];
+        }
+        table.try_into().expect("32768-entry LUT")
+    })
+}
+
 pub struct VideoPostProcessor {
     pub prev_rgba: Vec<u8>,
     pub curr_rgba: Vec<u8>,
@@ -75,13 +117,19 @@ impl VideoPostProcessor {
         &mut self,
         fb_bgr555: &[u16; LCD_WIDTH * LCD_HEIGHT],
         color_correction: bool,
+        profile: ColorProfileChoice,
         lcd_ghosting: bool,
         scanline_grid: bool,
     ) -> ColorImage {
-        let lut = if color_correction {
-            agb_srgb_lut()
-        } else {
+        let lut = if !color_correction || profile == ColorProfileChoice::Linear {
             linear_lut()
+        } else {
+            match profile {
+                ColorProfileChoice::Agb001 => agb_srgb_lut(),
+                ColorProfileChoice::Ags101 => ags_101_lut(),
+                ColorProfileChoice::Ags001 => ags_001_lut(),
+                ColorProfileChoice::Linear => linear_lut(),
+            }
         };
 
         for (idx, &px) in fb_bgr555.iter().enumerate() {
@@ -133,6 +181,21 @@ impl VideoPostProcessor {
             }
         }
         ColorImage::from_rgba_unmultiplied([dst_w, dst_h], &self.grid_rgba)
+    }
+
+    pub fn save_thumbnail_png(&self, path: &Path) -> Result<(), String> {
+        if let Some(parent) = path.parent() {
+            let _ = std::fs::create_dir_all(parent);
+        }
+        image::save_buffer_with_format(
+            path,
+            &self.curr_rgba,
+            LCD_WIDTH as u32,
+            LCD_HEIGHT as u32,
+            image::ColorType::Rgba8,
+            image::ImageFormat::Png,
+        )
+        .map_err(|e| format!("PNG thumbnail encode failed: {e}"))
     }
 
     #[allow(dead_code)]

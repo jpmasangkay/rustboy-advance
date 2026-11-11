@@ -12,15 +12,17 @@ use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
 use egui::{
-    self, Align, Color32, CornerRadius, Key, Layout, RichText, Sense, Stroke, TextureHandle,
-    TextureOptions, Vec2,
+    self, Align, Align2, Color32, ColorImage, CornerRadius, Key, Layout, RichText, Sense, Stroke,
+    TextureHandle, TextureOptions, Vec2,
 };
 use gba_core::{encode_keyinput, GbaCore, HostFrontend, LCD_HEIGHT, LCD_WIDTH};
 use gilrs::{Axis, Button, Gilrs};
 
 use crate::audio::AudioOutput;
 use crate::cheats::{apply_cheats_to_core, CheatEntry};
-use crate::config::{AppConfig, GbaButton, RomSpecificSettings, SaveOverrideChoice};
+use crate::config::{
+    AppConfig, BezelStyle, ColorProfileChoice, GbaButton, RomSpecificSettings, SaveOverrideChoice,
+};
 use crate::debugger_ui::{DebugAction, DebuggerWindows};
 use crate::filters::VideoPostProcessor;
 use crate::headless::CliConfig;
@@ -136,6 +138,15 @@ struct RustboyApp {
     toast: Option<ToastMessage>,
     title_dirty: bool,
     pub(crate) quit_requested: bool,
+
+    // Immersive Controls, Overlays & States
+    last_mouse_activity: Instant,
+    show_pause_overlay: bool,
+    show_state_manager: bool,
+    undo_state_buffer: Option<Vec<u8>>,
+    slot_thumbnails: [Option<TextureHandle>; 5],
+    playtime_timer: Instant,
+    rumble_in_progress: bool,
 }
 
 impl RustboyApp {
@@ -187,6 +198,13 @@ impl RustboyApp {
             toast: None,
             title_dirty: true,
             quit_requested: false,
+            last_mouse_activity: Instant::now(),
+            show_pause_overlay: false,
+            show_state_manager: false,
+            undo_state_buffer: None,
+            slot_thumbnails: [None, None, None, None, None],
+            playtime_timer: Instant::now(),
+            rumble_in_progress: false,
         };
 
         app.load_persistent_config();
@@ -505,6 +523,9 @@ impl RustboyApp {
             if let Some(lux) = ov.solar_lux {
                 core.bus.cart.solar_lux = lux;
             }
+            if let Some(cp) = ov.custom_color_profile {
+                self.config.color_profile = cp;
+            }
             self.active_cheats = ov.cheats;
         } else {
             self.active_cheats.clear();
@@ -516,6 +537,8 @@ impl RustboyApp {
         self.rom_title = title.clone();
         self.rom_code = code.clone();
         self.paused = false;
+        self.show_pause_overlay = false;
+        self.show_state_manager = false;
         self.rewind_buffer.clear();
         self.frame_counter = 0;
         self.rewinding = false;
@@ -525,6 +548,17 @@ impl RustboyApp {
         self.postproc.prev_rgba.fill(0);
         self.sink.framebuffer.fill(0);
         self.sink.frame_dirty = true;
+        self.slot_thumbnails = [None, None, None, None, None];
+        self.playtime_timer = Instant::now();
+
+        // Track per-game launch count and last played timestamp
+        let now_ts = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs();
+        let pt = self.config.playtimes.entry(code.clone()).or_default();
+        pt.launch_count += 1;
+        pt.last_played_timestamp = now_ts;
 
         self.config.push_recent(rom_path, title.clone(), code.clone());
         self.title_dirty = true;
@@ -547,6 +581,8 @@ impl RustboyApp {
         self.rom_code.clear();
         self.active_cheats.clear();
         self.paused = false;
+        self.show_pause_overlay = false;
+        self.show_state_manager = false;
         self.rewind_buffer.clear();
         self.frame_counter = 0;
         self.rewinding = false;
@@ -569,6 +605,7 @@ impl RustboyApp {
             rtc_override: core.bus.cart.rtc_override,
             solar_lux: Some(core.bus.cart.solar_lux),
             cheats: self.active_cheats.clone(),
+            custom_color_profile: Some(self.config.color_profile),
         };
         self.config.per_rom.insert(key, ov);
         self.config.save();
@@ -625,16 +662,34 @@ impl RustboyApp {
         Some(rom_path.with_file_name(format!("{stem}.slot{slot}.state")))
     }
 
+    fn slot_thumb_path(&self, slot: usize) -> Option<PathBuf> {
+        let rom_path = self.rom_path.as_ref()?;
+        let stem = rom_path.file_stem()?.to_string_lossy();
+        Some(rom_path.with_file_name(format!("{stem}.slot{slot}.png")))
+    }
+
     fn quick_save(&mut self, slot: usize) {
         let (Some(core), Some(path)) = (&self.core, self.slot_path(slot)) else {
             return;
         };
+        // Backup existing state for undo
+        if let Ok(old_bytes) = fs::read(&path) {
+            self.undo_state_buffer = Some(old_bytes);
+        }
         let res = core
             .save_state()
             .map_err(|e| format!("{e}"))
             .and_then(|bytes| fs::write(&path, bytes).map_err(|e| format!("{e}")));
         match res {
-            Ok(()) => self.notify(&format!("Saved State Slot {slot}")),
+            Ok(()) => {
+                if let Some(tp) = self.slot_thumb_path(slot) {
+                    let _ = self.postproc.save_thumbnail_png(&tp);
+                    if slot >= 1 && slot <= 5 {
+                        self.slot_thumbnails[slot - 1] = None;
+                    }
+                }
+                self.notify(&format!("Saved State Slot {slot}"));
+            }
             Err(e) => self.notify(&format!("Save State failed: {e}")),
         }
     }
@@ -643,7 +698,30 @@ impl RustboyApp {
         let Some(path) = self.slot_path(slot) else {
             return;
         };
+        // Backup current core state before loading for instant undo
+        if let Some(core) = &self.core {
+            if let Ok(cur_bytes) = core.save_state() {
+                self.undo_state_buffer = Some(cur_bytes);
+            }
+        }
         self.load_state_from_path(&path, &format!("Loaded State Slot {slot}"));
+    }
+
+    fn undo_last_state_action(&mut self) {
+        let (Some(core), Some(prev_bytes)) = (&mut self.core, self.undo_state_buffer.take()) else {
+            self.notify("No save/load action to undo");
+            return;
+        };
+        let cur = core.save_state().ok();
+        match core.load_state(&prev_bytes) {
+            Ok(()) => {
+                self.sink.framebuffer.copy_from_slice(&*core.bus.ppu.framebuffer);
+                self.sink.frame_dirty = true;
+                self.undo_state_buffer = cur;
+                self.notify("Undo: Reverted state to previous checkpoint");
+            }
+            Err(e) => self.notify(&format!("Undo state load failed: {e}")),
+        }
     }
 
     fn save_state_to_file(&mut self) {
@@ -872,10 +950,24 @@ impl RustboyApp {
             return;
         }
 
-        // Escape or Ctrl+W returns to library when a game is running
-        let stop_game = ctx.input(|i| {
-            (i.modifiers.ctrl && i.key_pressed(Key::W)) || i.key_pressed(Key::Escape)
-        });
+        // Smart Escape key handling:
+        // In Fullscreen: Escape always exits Fullscreen back to Windowed mode.
+        // In Windowed mode: Escape toggles the in-game Pause Overlay Menu!
+        if ctx.input(|i| !i.modifiers.any() && i.key_pressed(Key::Escape)) {
+            if self.is_fullscreen {
+                self.is_fullscreen = false;
+                ctx.send_viewport_cmd(egui::ViewportCommand::Fullscreen(false));
+                self.notify("Exited Fullscreen");
+                return;
+            } else if self.core.is_some() {
+                self.show_pause_overlay = !self.show_pause_overlay;
+                self.paused = self.show_pause_overlay;
+                return;
+            }
+        }
+
+        // Ctrl+W returns to library when a game is running
+        let stop_game = ctx.input(|i| i.modifiers.ctrl && i.key_pressed(Key::W));
         if stop_game && self.core.is_some() {
             self.close_rom(ctx);
             return;
@@ -892,6 +984,10 @@ impl RustboyApp {
         let toggle_pause = ctx.input(|i| !i.modifiers.any() && i.key_pressed(Key::Space));
         let screenshot = ctx.input(|i| !i.modifiers.any() && i.key_pressed(Key::F12));
         let fullscreen = ctx.input(|i| !i.modifiers.any() && i.key_pressed(Key::F11));
+        let toggle_toolbar = ctx.input(|i| i.modifiers.ctrl && i.key_pressed(Key::T));
+        let toggle_status_bar = ctx.input(|i| i.modifiers.ctrl && i.key_pressed(Key::S));
+        let undo_state = ctx.input(|i| i.modifiers.ctrl && i.key_pressed(Key::Z));
+        let toggle_state_manager = ctx.input(|i| !i.modifiers.any() && i.key_pressed(Key::F6));
 
         let fn_slot = ctx.input(|i| {
             let keys = [Key::F1, Key::F2, Key::F3, Key::F4, Key::F5];
@@ -899,6 +995,52 @@ impl RustboyApp {
                 .position(|&k| i.key_pressed(k))
                 .map(|idx| (idx + 1, i.modifiers.shift))
         });
+
+        // Boktai Solar Sensor hotkeys: '[' / ']'
+        let solar_delta = if let Some(core) = &self.core {
+            if core.bus.cart.solar_enabled {
+                if ctx.input(|i| i.key_pressed(Key::OpenBracket)) {
+                    Some(-25i16)
+                } else if ctx.input(|i| i.key_pressed(Key::CloseBracket)) {
+                    Some(25i16)
+                } else {
+                    None
+                }
+            } else {
+                None
+            }
+        } else {
+            None
+        };
+
+        if let Some(delta) = solar_delta {
+            if let Some(core) = &mut self.core {
+                if delta < 0 {
+                    core.bus.cart.solar_lux = core.bus.cart.solar_lux.saturating_sub(25);
+                } else {
+                    core.bus.cart.solar_lux = core.bus.cart.solar_lux.saturating_add(25);
+                }
+                let lvl = ((core.bus.cart.solar_lux as f32 / 255.0) * 10.0).round() as u8;
+                self.notify(&format!("☀️ Solar Sunlight: Level {lvl}/10"));
+            }
+        }
+
+        if toggle_toolbar {
+            self.config.show_toolbar = !self.config.show_toolbar;
+            self.config.save();
+            self.notify(if self.config.show_toolbar { "Toolbar Shown (Ctrl+T)" } else { "Toolbar Hidden (Ctrl+T)" });
+        }
+        if toggle_status_bar {
+            self.config.show_status_bar = !self.config.show_status_bar;
+            self.config.save();
+            self.notify(if self.config.show_status_bar { "Status Bar Shown (Ctrl+S)" } else { "Status Bar Hidden (Ctrl+S)" });
+        }
+        if undo_state {
+            self.undo_last_state_action();
+        }
+        if toggle_state_manager {
+            self.show_state_manager = !self.show_state_manager;
+        }
 
         if open_rom {
             self.trigger_open_rom_dialog(ctx);
@@ -927,6 +1069,7 @@ impl RustboyApp {
         if fullscreen {
             self.is_fullscreen = !self.is_fullscreen;
             ctx.send_viewport_cmd(egui::ViewportCommand::Fullscreen(self.is_fullscreen));
+            self.notify(if self.is_fullscreen { "Entered Fullscreen" } else { "Exited Fullscreen" });
         }
         if let Some((slot, is_load)) = fn_slot {
             if is_load {
@@ -1139,6 +1282,23 @@ impl RustboyApp {
             self.last_save_flush = Instant::now();
         }
 
+        // Track per-game active gameplay time
+        if self.core.is_some() && !self.paused {
+            if self.playtime_timer.elapsed() >= Duration::from_secs(1) {
+                if !self.rom_code.is_empty() {
+                    let entry = self.config.playtimes.entry(self.rom_code.clone()).or_default();
+                    entry.total_seconds += self.playtime_timer.elapsed().as_secs();
+                }
+                self.playtime_timer = Instant::now();
+            }
+        }
+
+        if self.config.rumble_enabled {
+            if let Some(core) = &self.core {
+                self.rumble_in_progress = core.bus.cart.rumble_active;
+            }
+        }
+
         if !self.paused {
             if turbo {
                 ctx.request_repaint();
@@ -1225,6 +1385,15 @@ impl RustboyApp {
                                     }
                                 }
                                 ui.separator();
+                                if ui.button("🖼️ Save State Manager... (F6)").clicked() {
+                                    ui.close_menu();
+                                    self.show_state_manager = true;
+                                }
+                                if ui.button("↩ Undo State Action (Ctrl+Z)").clicked() {
+                                    ui.close_menu();
+                                    self.undo_last_state_action();
+                                }
+                                ui.separator();
                                 if ui.button("Save State to File...").clicked() {
                                     ui.close_menu();
                                     self.save_state_to_file();
@@ -1242,6 +1411,11 @@ impl RustboyApp {
                                         ui.close_menu();
                                         self.quick_load(s);
                                     }
+                                }
+                                ui.separator();
+                                if ui.button("🖼️ Save State Manager... (F6)").clicked() {
+                                    ui.close_menu();
+                                    self.show_state_manager = true;
                                 }
                                 ui.separator();
                                 if ui.button("Load State from File...").clicked() {
@@ -1387,13 +1561,46 @@ impl RustboyApp {
                             }
                         });
                         ui.menu_button("Display Filters", |ui| {
-                            if ui.checkbox(&mut self.config.color_correction, "AGB-001 sRGB Color Correction").changed() {
+                            if ui.checkbox(&mut self.config.color_correction, "Enable Color Correction").changed() {
                                 self.config.save();
+                                self.sink.frame_dirty = true;
                             }
+                            ui.menu_button("Color Profile Preset", |ui| {
+                                for p in ColorProfileChoice::ALL {
+                                    if ui.selectable_label(self.config.color_profile == p, p.label()).clicked() {
+                                        self.config.color_profile = p;
+                                        self.config.color_correction = p != ColorProfileChoice::Linear;
+                                        self.config.save();
+                                        self.sink.frame_dirty = true;
+                                        ui.close_menu();
+                                    }
+                                }
+                            });
+                            ui.separator();
                             if ui.checkbox(&mut self.config.lcd_ghosting, "LCD Interframe Ghosting").changed() {
                                 self.config.save();
                             }
                             if ui.checkbox(&mut self.config.scanline_grid, "Subpixel Scanline Grid").changed() {
+                                self.config.save();
+                            }
+                        });
+                        ui.menu_button("GBA Screen Bezel", |ui| {
+                            for b in BezelStyle::ALL {
+                                if ui.selectable_label(self.config.bezel_style == b, b.label()).clicked() {
+                                    self.config.bezel_style = b;
+                                    self.config.save();
+                                    ui.close_menu();
+                                }
+                            }
+                        });
+                        ui.menu_button("UI Panels & Chrome", |ui| {
+                            if ui.checkbox(&mut self.config.show_toolbar, "Show Action Toolbar (Ctrl+T)").changed() {
+                                self.config.save();
+                            }
+                            if ui.checkbox(&mut self.config.show_status_bar, "Show Status Bar (Ctrl+S)").changed() {
+                                self.config.save();
+                            }
+                            if ui.checkbox(&mut self.config.show_menu_bar, "Show Menu Bar in Window").changed() {
                                 self.config.save();
                             }
                         });
@@ -1456,6 +1663,15 @@ impl RustboyApp {
                     });
 
                     ui.menu_button("Tools", |ui| {
+                        if ui.button("🖼️ Save State Manager... (F6)").clicked() {
+                            self.show_state_manager = true;
+                            ui.close_menu();
+                        }
+                        if ui.button("↩ Undo State Action (Ctrl+Z)").clicked() {
+                            self.undo_last_state_action();
+                            ui.close_menu();
+                        }
+                        ui.separator();
                         if ui.add_enabled(has_rom, egui::Button::new("Game Overrides & Sensors...")).clicked() {
                             self.debugger.show_overrides = true;
                             ui.close_menu();
@@ -1467,6 +1683,10 @@ impl RustboyApp {
                         if ui.button("Controls & Keybindings...").clicked() {
                             self.debugger.show_controls = true;
                             ui.close_menu();
+                        }
+                        ui.separator();
+                        if ui.checkbox(&mut self.config.rumble_enabled, "Gamepad Haptic Rumble").changed() {
+                            self.config.save();
                         }
                         ui.separator();
                         if ui.button("Open Screenshots Folder").clicked() {
@@ -1617,6 +1837,29 @@ impl RustboyApp {
                         }
                         if ui.button(RichText::new("📂 Load 1").small()).clicked() {
                             self.quick_load(1);
+                        }
+                        if ui
+                            .button(RichText::new("🖼️ States").small())
+                            .on_hover_text("Open Visual Save State Manager (F6)")
+                            .clicked()
+                        {
+                            self.show_state_manager = true;
+                        }
+                        if self.undo_state_buffer.is_some() {
+                            if ui
+                                .button(RichText::new("↩ Undo").small())
+                                .on_hover_text("Undo Last Save/Load (Ctrl+Z)")
+                                .clicked()
+                            {
+                                self.undo_last_state_action();
+                            }
+                        }
+                        if let Some(core) = &self.core {
+                            if core.bus.cart.solar_enabled {
+                                let lvl = ((core.bus.cart.solar_lux as f32 / 255.0) * 10.0).round() as u8;
+                                ui.label(RichText::new(format!("☀️ {lvl}/10")).small().color(ACCENT_TEAL))
+                                    .on_hover_text("Boktai Solar Sensor Intensity (Hotkey: [ / ])");
+                            }
                         }
                         if ui
                             .button(RichText::new("📷 Shot").small())
@@ -1955,6 +2198,7 @@ impl RustboyApp {
                                 ui.strong("Game ID");
                                 ui.strong("Region");
                                 ui.strong("Size");
+                                ui.strong("Playtime");
                                 ui.strong("Save File");
                                 ui.strong("Action");
                                 ui.end_row();
@@ -2046,6 +2290,14 @@ impl RustboyApp {
                                         _ => TEXT_MUTED,
                                     }));
                                     ui.monospace(format!("{:.1} MB", entry.size_mb));
+
+                                    let pt_str = self
+                                        .config
+                                        .playtimes
+                                        .get(&entry.game_code)
+                                        .map(|p| p.formatted_playtime())
+                                        .unwrap_or_else(|| "-".to_string());
+                                    ui.monospace(RichText::new(pt_str).color(TEXT_MUTED));
 
                                     if entry.has_battery_sav {
                                         ui.label(
@@ -2150,6 +2402,16 @@ impl RustboyApp {
                                                 .color(TEXT_MUTED),
                                         );
 
+                                        let pt_str = self
+                                            .config
+                                            .playtimes
+                                            .get(&entry.game_code)
+                                            .map(|p| p.formatted_playtime())
+                                            .unwrap_or_else(|| "-".to_string());
+                                        if pt_str != "-" {
+                                            ui.label(RichText::new(format!("⏱ {pt_str}")).small().color(ACCENT_TEAL));
+                                        }
+
                                         ui.add_space(6.0);
                                         ui.horizontal(|ui| {
                                             if entry.has_battery_sav {
@@ -2241,11 +2503,398 @@ impl RustboyApp {
         }
     }
 
+    fn draw_bezel_frame(&self, ui: &mut egui::Ui, screen_rect: egui::Rect, avail: Vec2) {
+        let (chassis_color, bezel_label, badge_color) = match self.config.bezel_style {
+            BezelStyle::None => return,
+            BezelStyle::ClassicIndigo => (
+                Color32::from_rgb(44, 48, 86),
+                "GAME BOY ADVANCE",
+                Color32::from_rgb(180, 185, 210),
+            ),
+            BezelStyle::OnyxStealth => (
+                Color32::from_rgb(22, 24, 30),
+                "GAME BOY ADVANCE",
+                Color32::from_rgb(140, 145, 160),
+            ),
+            BezelStyle::PlatinumSp => (
+                Color32::from_rgb(175, 180, 190),
+                "GAME BOY ADVANCE SP",
+                Color32::from_rgb(40, 45, 55),
+            ),
+        };
+
+        let pad_x = ((avail.x - screen_rect.width()) * 0.45).clamp(24.0, 90.0);
+        let pad_y = ((avail.y - screen_rect.height()) * 0.45).clamp(20.0, 50.0);
+        let bezel_rect = screen_rect.expand2(Vec2::new(pad_x, pad_y));
+
+        // Outer handheld chassis frame
+        ui.painter().rect_filled(bezel_rect, CornerRadius::same(14), chassis_color);
+        ui.painter().rect_stroke(
+            bezel_rect,
+            CornerRadius::same(14),
+            Stroke::new(1.5_f32, Color32::from_rgb(60, 65, 80)),
+            egui::StrokeKind::Outside,
+        );
+
+        // Inner dark bezel surround around LCD
+        let inner_bevel = screen_rect.expand(6.0);
+        ui.painter().rect_filled(inner_bevel, CornerRadius::same(4), Color32::from_rgb(10, 12, 16));
+        ui.painter().rect_stroke(
+            inner_bevel,
+            CornerRadius::same(4),
+            Stroke::new(1.0_f32, Color32::from_rgb(28, 32, 42)),
+            egui::StrokeKind::Outside,
+        );
+
+        // Power LED indicator
+        let led_pos = egui::Pos2::new(bezel_rect.right() - 24.0, bezel_rect.top() + 16.0);
+        let led_color = if self.rewinding {
+            Color32::from_rgb(255, 180, 0)
+        } else if self.paused {
+            Color32::from_rgb(255, 80, 80)
+        } else {
+            Color32::from_rgb(50, 220, 100)
+        };
+        ui.painter().circle_filled(led_pos, 4.0, led_color);
+        ui.painter().circle_stroke(led_pos, 4.0, Stroke::new(1.0_f32, Color32::from_black_alpha(150)));
+
+        // GBA Badge centered below screen
+        if pad_y >= 26.0 {
+            let label_pos = egui::Pos2::new(
+                screen_rect.center().x,
+                screen_rect.bottom() + (pad_y * 0.45).max(12.0),
+            );
+            ui.painter().text(
+                label_pos,
+                Align2::CENTER_CENTER,
+                bezel_label,
+                egui::FontId::monospace(13.0),
+                badge_color,
+            );
+        }
+    }
+
+    fn draw_pause_overlay(&mut self, ui: &mut egui::Ui, disp_rect: egui::Rect) {
+        if !self.show_pause_overlay {
+            return;
+        }
+        ui.painter().rect_filled(disp_rect, CornerRadius::ZERO, Color32::from_black_alpha(170));
+
+        let card_w = 280.0;
+        let card_h = 280.0;
+        let card_rect = egui::Rect::from_center_size(disp_rect.center(), Vec2::new(card_w, card_h));
+
+        ui.painter().rect_filled(card_rect, CornerRadius::same(10), BG_CARD);
+        ui.painter().rect_stroke(
+            card_rect,
+            CornerRadius::same(10),
+            Stroke::new(1.0_f32, BORDER_HAIRLINE),
+            egui::StrokeKind::Outside,
+        );
+
+        let mut resume = false;
+        let mut quick_save = false;
+        let mut quick_load = false;
+        let mut open_states = false;
+        let mut hard_reset = false;
+        let mut close_game = false;
+
+        ui.allocate_new_ui(egui::UiBuilder::new().max_rect(card_rect.shrink(16.0)), |ui| {
+            ui.vertical_centered(|ui| {
+                ui.heading(RichText::new("PAUSED").strong().color(ACCENT_TEAL).size(18.0));
+                ui.label(RichText::new(&self.rom_title).color(Color32::WHITE).strong());
+                ui.add_space(8.0);
+
+                if ui
+                    .add_sized([card_w - 40.0, 30.0], egui::Button::new("▶  Resume Emulation"))
+                    .clicked()
+                {
+                    resume = true;
+                }
+                ui.add_space(4.0);
+                if ui
+                    .add_sized([card_w - 40.0, 26.0], egui::Button::new("💾 Quick Save (Slot 1)"))
+                    .clicked()
+                {
+                    quick_save = true;
+                }
+                ui.add_space(4.0);
+                if ui
+                    .add_sized([card_w - 40.0, 26.0], egui::Button::new("📂 Quick Load (Slot 1)"))
+                    .clicked()
+                {
+                    quick_load = true;
+                }
+                ui.add_space(4.0);
+                if ui
+                    .add_sized([card_w - 40.0, 26.0], egui::Button::new("🖼️ Save State Manager (F6)"))
+                    .clicked()
+                {
+                    open_states = true;
+                }
+                ui.add_space(4.0);
+                if ui
+                    .add_sized([card_w - 40.0, 26.0], egui::Button::new("🔄 Hard Reset (Ctrl+R)"))
+                    .clicked()
+                {
+                    hard_reset = true;
+                }
+                ui.add_space(4.0);
+                if ui
+                    .add_sized(
+                        [card_w - 40.0, 26.0],
+                        egui::Button::new(RichText::new("⏹ Return to Library").color(Color32::from_rgb(255, 120, 120))),
+                    )
+                    .clicked()
+                {
+                    close_game = true;
+                }
+            });
+        });
+
+        if resume {
+            self.show_pause_overlay = false;
+            self.paused = false;
+            self.next_frame_due = Instant::now();
+        }
+        if quick_save {
+            self.quick_save(1);
+        }
+        if quick_load {
+            self.quick_load(1);
+        }
+        if open_states {
+            self.show_state_manager = true;
+        }
+        if hard_reset {
+            if let Some(core) = &mut self.core {
+                core.reset();
+                self.notify("Hard Reset");
+                self.show_pause_overlay = false;
+                self.paused = false;
+            }
+        }
+        if close_game {
+            self.show_pause_overlay = false;
+            self.close_rom(ui.ctx());
+        }
+    }
+
+    fn draw_floating_osd_toast(&self, ctx: &egui::Context) {
+        let Some(t) = &self.toast else { return };
+        if Instant::now() > t.expires_at {
+            return;
+        }
+        let pos_y = if self.is_fullscreen { 20.0 } else { 76.0 };
+        egui::Area::new(egui::Id::new("floating_osd_toast"))
+            .anchor(egui::Align2::LEFT_TOP, [20.0, pos_y])
+            .interactable(false)
+            .show(ctx, |ui| {
+                egui::Frame::new()
+                    .fill(Color32::from_black_alpha(220))
+                    .stroke(Stroke::new(1.0_f32, BORDER_HAIRLINE))
+                    .corner_radius(CornerRadius::same(6))
+                    .inner_margin(egui::Margin::symmetric(12, 7))
+                    .show(ui, |ui| {
+                        ui.horizontal(|ui| {
+                            ui.label(RichText::new("●").color(ACCENT_TEAL).small());
+                            ui.label(RichText::new(&t.text).color(Color32::WHITE).strong());
+                        });
+                    });
+            });
+    }
+
+    fn draw_visual_state_manager(&mut self, ctx: &egui::Context) {
+        if !self.show_state_manager {
+            return;
+        }
+        let mut open = self.show_state_manager;
+        let mut do_undo = false;
+        let mut save_slot: Option<usize> = None;
+        let mut load_slot: Option<usize> = None;
+        let mut delete_slot: Option<usize> = None;
+
+        egui::Window::new("🖼️ Visual Save State Manager")
+            .open(&mut open)
+            .resizable(false)
+            .collapsible(false)
+            .anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0])
+            .frame(
+                egui::Frame::window(&ctx.style())
+                    .fill(BG_CARD)
+                    .stroke(Stroke::new(1.0_f32, BORDER_HAIRLINE))
+                    .corner_radius(CornerRadius::same(8)),
+            )
+            .show(ctx, |ui| {
+                ui.horizontal(|ui| {
+                    ui.label(
+                        RichText::new(format!("Game: {} ({})", self.rom_title, self.rom_code))
+                            .color(TEXT_MUTED)
+                            .small(),
+                    );
+                    ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                        if ui.button("↩ Undo State Action (Ctrl+Z)").clicked() {
+                            do_undo = true;
+                        }
+                    });
+                });
+                ui.separator();
+
+                ui.horizontal(|ui| {
+                    for slot in 1..=5 {
+                        let state_file = self.slot_path(slot);
+                        let exists = state_file.as_ref().map_or(false, |p| p.exists());
+                        let thumb_file = self.slot_thumb_path(slot);
+
+                        ui.vertical(|ui| {
+                            ui.add_sized(
+                                [120.0, 20.0],
+                                egui::Label::new(
+                                    RichText::new(format!("Slot {slot}"))
+                                        .strong()
+                                        .color(if exists { ACCENT_TEAL } else { TEXT_MUTED }),
+                                ),
+                            );
+
+                            if exists && self.slot_thumbnails[slot - 1].is_none() {
+                                if let Some(tpath) = &thumb_file {
+                                    if let Ok(img) = image::open(tpath) {
+                                        let rgba = img.to_rgba8();
+                                        let (w, h) = rgba.dimensions();
+                                        let cimg = ColorImage::from_rgba_unmultiplied(
+                                            [w as usize, h as usize],
+                                            &rgba.into_raw(),
+                                        );
+                                        self.slot_thumbnails[slot - 1] = Some(ctx.load_texture(
+                                            format!("slot_thumb_{slot}"),
+                                            cimg,
+                                            TextureOptions::LINEAR,
+                                        ));
+                                    }
+                                }
+                            }
+
+                            let thumb_size = Vec2::new(120.0, 80.0);
+                            if let Some(tex) = &self.slot_thumbnails[slot - 1] {
+                                let (rect, _) = ui.allocate_exact_size(thumb_size, Sense::hover());
+                                ui.painter().image(
+                                    tex.id(),
+                                    rect,
+                                    egui::Rect::from_min_max(egui::Pos2::ZERO, egui::Pos2::new(1.0, 1.0)),
+                                    Color32::WHITE,
+                                );
+                                ui.painter().rect_stroke(
+                                    rect,
+                                    CornerRadius::same(4),
+                                    Stroke::new(1.0_f32, BORDER_HAIRLINE),
+                                    egui::StrokeKind::Outside,
+                                );
+                            } else {
+                                let (rect, _) = ui.allocate_exact_size(thumb_size, Sense::hover());
+                                ui.painter().rect_filled(rect, CornerRadius::same(4), BG_PANEL);
+                                ui.painter().rect_stroke(
+                                    rect,
+                                    CornerRadius::same(4),
+                                    Stroke::new(1.0_f32, BORDER_HAIRLINE),
+                                    egui::StrokeKind::Outside,
+                                );
+                                ui.painter().text(
+                                    rect.center(),
+                                    Align2::CENTER_CENTER,
+                                    if exists { "[No Thumbnail]" } else { "[Empty Slot]" },
+                                    egui::FontId::proportional(12.0),
+                                    TEXT_MUTED,
+                                );
+                            }
+
+                            let status_lbl = if exists {
+                                if let Some(sf) = &state_file {
+                                    if let Ok(meta) = sf.metadata() {
+                                        if let Ok(mod_time) = meta.modified() {
+                                            if let Ok(el) = mod_time.elapsed() {
+                                                if el.as_secs() < 60 {
+                                                    "Saved: Just now".to_string()
+                                                } else if el.as_secs() < 3600 {
+                                                    format!("Saved: {}m ago", el.as_secs() / 60)
+                                                } else {
+                                                    format!("Saved: {}h ago", el.as_secs() / 3600)
+                                                }
+                                            } else {
+                                                "Saved".to_string()
+                                            }
+                                        } else {
+                                            "Saved".to_string()
+                                        }
+                                    } else {
+                                        "Saved".to_string()
+                                    }
+                                } else {
+                                    "Saved".to_string()
+                                }
+                            } else {
+                                "Available".to_string()
+                            };
+                            ui.label(RichText::new(status_lbl).small().color(TEXT_MUTED));
+
+                            ui.horizontal(|ui| {
+                                if ui
+                                    .add_sized([55.0, 22.0], egui::Button::new(RichText::new("Save").small()))
+                                    .on_hover_text(format!("Quick Save to Slot {slot} (F{slot})"))
+                                    .clicked()
+                                {
+                                    save_slot = Some(slot);
+                                }
+                                if ui
+                                    .add_enabled(
+                                        exists,
+                                        egui::Button::new(RichText::new("Load").small()),
+                                    )
+                                    .on_hover_text(format!("Quick Load from Slot {slot} (Shift+F{slot})"))
+                                    .clicked()
+                                {
+                                    load_slot = Some(slot);
+                                }
+                            });
+
+                            if exists {
+                                if ui.button(RichText::new("🗑 Delete").small().color(Color32::from_rgb(255, 100, 100))).clicked() {
+                                    delete_slot = Some(slot);
+                                }
+                            }
+                        });
+                        ui.add_space(6.0);
+                    }
+                });
+            });
+
+        self.show_state_manager = open;
+        if do_undo {
+            self.undo_last_state_action();
+        }
+        if let Some(s) = save_slot {
+            self.quick_save(s);
+        }
+        if let Some(s) = load_slot {
+            self.quick_load(s);
+        }
+        if let Some(s) = delete_slot {
+            if let Some(sp) = self.slot_path(s) {
+                let _ = fs::remove_file(sp);
+            }
+            if let Some(tp) = self.slot_thumb_path(s) {
+                let _ = fs::remove_file(tp);
+            }
+            self.slot_thumbnails[s - 1] = None;
+            self.notify(&format!("Deleted Slot {s}"));
+        }
+    }
+
     fn draw_active_viewport(&mut self, ctx: &egui::Context, ui: &mut egui::Ui) {
         if self.sink.frame_dirty {
             let color_img = self.postproc.process_frame(
                 &self.sink.framebuffer,
                 self.config.color_correction,
+                self.config.color_profile,
                 self.config.lcd_ghosting,
                 self.config.scanline_grid,
             );
@@ -2258,6 +2907,7 @@ impl RustboyApp {
             let blank = self.postproc.process_frame(
                 &self.sink.framebuffer,
                 self.config.color_correction,
+                self.config.color_profile,
                 false,
                 false,
             );
@@ -2276,9 +2926,20 @@ impl RustboyApp {
             Vec2::new(LCD_WIDTH as f32 * scale, LCD_HEIGHT as f32 * scale)
         };
 
+        let mut toggle_fullscreen = false;
         ui.centered_and_justified(|ui| {
             if let Some(tex) = &self.lcd_tex {
-                let (rect, _) = ui.allocate_exact_size(disp_size, Sense::hover());
+                let (rect, resp) = ui.allocate_exact_size(disp_size, Sense::click());
+
+                // Double-click viewport to toggle fullscreen
+                if resp.double_clicked() {
+                    toggle_fullscreen = true;
+                }
+
+                // Render authentic GBA bezel frame if enabled
+                self.draw_bezel_frame(ui, rect, avail);
+
+                // Render GBA LCD display
                 ui.painter().image(
                     tex.id(),
                     rect,
@@ -2291,8 +2952,17 @@ impl RustboyApp {
                     Stroke::new(1.0_f32, BORDER_HAIRLINE),
                     egui::StrokeKind::Outside,
                 );
+
+                // Render in-game pause overlay
+                self.draw_pause_overlay(ui, rect);
             }
         });
+
+        if toggle_fullscreen {
+            self.is_fullscreen = !self.is_fullscreen;
+            ctx.send_viewport_cmd(egui::ViewportCommand::Fullscreen(self.is_fullscreen));
+            self.notify(if self.is_fullscreen { "Entered Fullscreen" } else { "Exited Fullscreen" });
+        }
     }
 }
 
@@ -2306,9 +2976,49 @@ impl RustboyApp {
         self.handle_global_shortcuts(ctx);
         self.advance_emulation(ctx);
 
-        self.draw_menu_bar(ctx);
-        self.draw_toolbar(ctx);
-        self.draw_status_bar(ctx);
+        // Auto-hide mouse cursor after 2.2s of inactivity during gameplay
+        let mouse_moved = ctx.input(|i| i.pointer.delta() != Vec2::ZERO);
+        let now = Instant::now();
+        if mouse_moved {
+            self.last_mouse_activity = now;
+        }
+        let pointer_y = ctx.input(|i| i.pointer.latest_pos().map(|p| p.y).unwrap_or(999.0));
+        let hover_near_top = pointer_y <= 36.0;
+
+        let cursor_should_hide = self.core.is_some()
+            && !self.paused
+            && !self.show_pause_overlay
+            && !self.show_state_manager
+            && now.duration_since(self.last_mouse_activity) > Duration::from_millis(2200);
+
+        if cursor_should_hide {
+            ctx.set_cursor_icon(egui::CursorIcon::None);
+        }
+
+        // Fullscreen Chrome Auto-Hide:
+        // In fullscreen:
+        //   - Status bar is completely hidden (telemetry rendered via floating OSD pill)
+        //   - Top menu & toolbar slide into view when cursor hovers near top edge
+        // In windowed mode:
+        //   - Toggled via Ctrl+T / Ctrl+S / Ctrl+M
+        if self.is_fullscreen {
+            if hover_near_top {
+                self.draw_menu_bar(ctx);
+                if self.config.show_toolbar {
+                    self.draw_toolbar(ctx);
+                }
+            }
+        } else {
+            if self.config.show_menu_bar {
+                self.draw_menu_bar(ctx);
+            }
+            if self.config.show_toolbar {
+                self.draw_toolbar(ctx);
+            }
+            if self.config.show_status_bar {
+                self.draw_status_bar(ctx);
+            }
+        }
 
         egui::CentralPanel::default()
             .frame(egui::Frame::new().fill(BG_APP))
@@ -2319,6 +3029,14 @@ impl RustboyApp {
                     self.draw_rom_library_browser(ctx, ui);
                 }
             });
+
+        // Always render floating OSD toast on top so feedback is never lost
+        self.draw_floating_osd_toast(ctx);
+
+        // Visual Save State Manager dialog
+        self.draw_visual_state_manager(ctx);
+
+        // Present dockable/floating Debugger & Tool windows
 
         // Present dockable/floating Debugger & Tool windows
         let pads = self.connected_gamepad_names();
@@ -2495,5 +3213,44 @@ mod tests {
         let popped = buffer.pop_back();
         assert_eq!(popped, Some(vec![79u8]));
         assert_eq!(buffer.len(), 59);
+    }
+
+    #[test]
+    fn test_playtime_and_settings() {
+        use crate::config::RomPlaytime;
+
+        let empty = RomPlaytime::default();
+        assert_eq!(empty.formatted_playtime(), "-");
+
+        let thirty_secs = RomPlaytime {
+            total_seconds: 30,
+            last_played_timestamp: 0,
+            launch_count: 1,
+        };
+        assert_eq!(thirty_secs.formatted_playtime(), "30s");
+
+        let five_mins = RomPlaytime {
+            total_seconds: 310,
+            last_played_timestamp: 0,
+            launch_count: 2,
+        };
+        assert_eq!(five_mins.formatted_playtime(), "5m");
+
+        let two_hours = RomPlaytime {
+            total_seconds: 7325,
+            last_played_timestamp: 0,
+            launch_count: 5,
+        };
+        assert_eq!(two_hours.formatted_playtime(), "2h 2m");
+
+        // Verify color profile labels
+        for profile in ColorProfileChoice::ALL {
+            assert!(!profile.label().is_empty());
+        }
+
+        // Verify bezel labels
+        for bezel in BezelStyle::ALL {
+            assert!(!bezel.label().is_empty());
+        }
     }
 }

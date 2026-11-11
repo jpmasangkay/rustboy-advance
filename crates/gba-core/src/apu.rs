@@ -12,7 +12,7 @@ const DUTY_TABLE: [[u8; 8]; 4] = [
 
 #[derive(Clone, Serialize, Deserialize)]
 pub struct DmaAudioFifo {
-    pub buffer: [u32; 7],
+    pub buffer: [u32; 16],
     pub read_idx: u8,
     pub write_idx: u8,
     pub count: u8,
@@ -24,7 +24,7 @@ pub struct DmaAudioFifo {
 impl DmaAudioFifo {
     pub fn new() -> Self {
         Self {
-            buffer: [0; 7],
+            buffer: [0; 16],
             read_idx: 0,
             write_idx: 0,
             count: 0,
@@ -35,7 +35,7 @@ impl DmaAudioFifo {
     }
 
     pub fn reset(&mut self) {
-        self.buffer = [0; 7];
+        self.buffer = [0; 16];
         self.read_idx = 0;
         self.write_idx = 0;
         self.count = 0;
@@ -45,13 +45,13 @@ impl DmaAudioFifo {
     }
 
     pub fn push_word(&mut self, val: u32) {
-        if self.count >= 7 {
+        if self.count >= 16 {
             // Overwrite oldest on hardware overflow, keep FIFO intact
-            self.read_idx = (self.read_idx + 1) % 7;
+            self.read_idx = (self.read_idx + 1) % 16;
             self.count -= 1;
         }
         self.buffer[self.write_idx as usize] = val;
-        self.write_idx = (self.write_idx + 1) % 7;
+        self.write_idx = (self.write_idx + 1) % 16;
         self.count += 1;
     }
 
@@ -73,7 +73,7 @@ impl DmaAudioFifo {
         if self.latch_bytes_left == 0 {
             if self.count > 0 {
                 self.active_latch = self.buffer[self.read_idx as usize];
-                self.read_idx = (self.read_idx + 1) % 7;
+                self.read_idx = (self.read_idx + 1) % 16;
                 self.count -= 1;
                 self.latch_bytes_left = 4;
             } else {
@@ -814,8 +814,8 @@ impl Apu {
 
         let vol_r = ((self.soundcnt_l & 0x07) as i32) + 1;
         let vol_l = (((self.soundcnt_l >> 4) & 0x07) as i32) + 1;
-        psg_r = (psg_r * vol_r) / 8;
-        psg_l = (psg_l * vol_l) / 8;
+        psg_r = (psg_r * vol_r * 4) / 8;
+        psg_l = (psg_l * vol_l * 4) / 8;
 
         match self.soundcnt_h & 0x03 {
             0 => {

@@ -422,10 +422,18 @@ impl SysBus {
         if ch <= 1 {
             let (req_a, req_b) = self.apu.on_timer_overflow(ch as u8);
             if req_a {
-                self.trigger_sound_dma(1);
+                for dma_ch in 1..=2 {
+                    if (self.hw.dma[dma_ch].dad & !3) == 0x0400_00A0 {
+                        self.trigger_sound_dma(dma_ch);
+                    }
+                }
             }
             if req_b {
-                self.trigger_sound_dma(2);
+                for dma_ch in 1..=2 {
+                    if (self.hw.dma[dma_ch].dad & !3) == 0x0400_00A4 {
+                        self.trigger_sound_dma(dma_ch);
+                    }
+                }
             }
         }
 
@@ -844,6 +852,19 @@ impl SysBus {
                                     self.scheduler.current_cycle + 2,
                                     EventType::DmaActivate(ch as u8),
                                 );
+                            } else if (ch == 1 || ch == 2) && self.hw.dma[ch].timing() == 3 {
+                                // Sound FIFO DMA refill if target FIFO needs initial data
+                                let dad = self.hw.dma[ch].dad & !3;
+                                let needs_refill = if dad == 0x0400_00A0 {
+                                    self.apu.fifo_a.count <= 4
+                                } else if dad == 0x0400_00A4 {
+                                    self.apu.fifo_b.count <= 4
+                                } else {
+                                    false
+                                };
+                                if needs_refill {
+                                    self.trigger_sound_dma(ch);
+                                }
                             }
                         } else if !now_en {
                             self.hw.dma[ch].active = false;

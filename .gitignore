@@ -30,6 +30,8 @@ Thumbs.db
 # Temporary logs, image dumps, and scratch files
 *.ppm
 *.log
+*.cfg
+*.ini
 frame_*.png
 test_output/
 .gemini/

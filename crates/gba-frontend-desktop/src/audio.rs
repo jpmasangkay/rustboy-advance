@@ -6,9 +6,9 @@ use gba_core::SAMPLE_RATE_HZ;
 use ringbuf::traits::{Consumer, Observer, Producer, Split};
 use ringbuf::{HeapCons, HeapProd, HeapRb};
 
-const RING_CAPACITY_SAMPLES: usize = 16_384; // 8,192 stereo frames (~250ms @ 32,768Hz)
+const RING_CAPACITY_SAMPLES: usize = 32_768; // 16,384 stereo frames (~500ms @ 32,768Hz)
 const TARGET_FILL_SAMPLES: usize = 2_048; // ~31ms steady-state target
-const MAX_QUEUED_SAMPLES: usize = 4_096; // Cap queued latency during fast-forward (~62ms)
+const MAX_QUEUED_SAMPLES: usize = 8_192; // Cap queued latency during fast-forward (~125ms)
 
 struct AudioConsumer {
     cons: HeapCons<i16>,
@@ -40,16 +40,18 @@ impl AudioConsumer {
         let fill = self.cons.occupied_len() as f64;
         let fill_norm = ((fill - TARGET_FILL_SAMPLES as f64) / TARGET_FILL_SAMPLES as f64)
             .clamp(-1.0, 1.0);
-        // Dynamic Rate Control (DRC): skew input step by up to +/-0.5% to keep latency locked.
-        let r_dynamic = self.base_ratio * (1.0 + 0.005 * fill_norm);
+        // Dynamic Rate Control (DRC): skew input step by up to +/-2.5% to keep latency locked.
+        let r_dynamic = self.base_ratio * (1.0 + 0.025 * fill_norm);
 
         while self.phase >= 1.0 {
             self.phase -= 1.0;
             self.cur_l = self.next_l;
             self.cur_r = self.next_r;
-            if let (Some(l), Some(r)) = (self.cons.try_pop(), self.cons.try_pop()) {
-                self.next_l = (l as f32) / 32768.0;
-                self.next_r = (r as f32) / 32768.0;
+            if self.cons.occupied_len() >= 2 {
+                if let (Some(l), Some(r)) = (self.cons.try_pop(), self.cons.try_pop()) {
+                    self.next_l = (l as f32) / 32768.0;
+                    self.next_r = (r as f32) / 32768.0;
+                }
             } else {
                 // Smooth exponential decay on underrun/pause prevents speaker pops.
                 self.next_l *= 0.96;
@@ -134,8 +136,8 @@ impl AudioOutput {
         if occ >= MAX_QUEUED_SAMPLES {
             return;
         }
-        let room = (MAX_QUEUED_SAMPLES - occ) & !1;
-        let to_push = (samples.len() & !1).min(room);
+        let vacant = self.prod.vacant_len() & !1;
+        let to_push = (samples.len() & !1).min(vacant);
         if to_push > 0 {
             let _ = self.prod.push_slice(&samples[..to_push]);
         }

@@ -230,3 +230,4 @@ Built with ❤️ by **John Paul Masangkay** ([@jpmasangkay](https://github.com/
 - **The Rust Community** — For crates like `egui`, `winit`, `glow`, and `cpal` that make modern native desktop development a delight
 
 ---
+

@@ -89,51 +89,54 @@ impl RustboyApp {
                                 self.load_patch_dialog(ctx);
                             }
                             ui.separator();
-                            ui.menu_button("Save State", |ui| {
-                                for s in 1..=5 {
-                                    if ui.button(format!("Slot {s} (F{s})")).clicked() {
-                                        ui.close_menu();
-                                        self.quick_save(s);
+                            let hardcore = self.is_ra_hardcore_active();
+                            ui.add_enabled_ui(!hardcore, |ui| {
+                                ui.menu_button("Save State", |ui| {
+                                    for s in 1..=5 {
+                                        if ui.button(format!("Slot {s} (F{s})")).clicked() {
+                                            ui.close_menu();
+                                            self.quick_save(s);
+                                        }
                                     }
-                                }
-                                ui.separator();
-                                if ui.button("🖼️ Save State Manager... (F6)").clicked() {
-                                    ui.close_menu();
-                                    self.show_state_manager = true;
-                                }
-                                if ui.button("↩ Undo State Action (Ctrl+Z)").clicked() {
-                                    ui.close_menu();
-                                    self.undo_last_state_action();
-                                }
-                                ui.separator();
-                                if ui.button("Save State to File...").clicked() {
-                                    ui.close_menu();
-                                    self.save_state_to_file();
-                                }
-                            });
-                            ui.menu_button("Load State", |ui| {
-                                for s in 1..=5 {
-                                    let exists = self.slot_path(s).is_some_and(|p| p.exists());
-                                    let lbl = if exists {
-                                        format!("Slot {s} (Shift+F{s}) [Saved]")
-                                    } else {
-                                        format!("Slot {s} (Shift+F{s})")
-                                    };
-                                    if ui.add_enabled(exists, egui::Button::new(lbl)).clicked() {
+                                    ui.separator();
+                                    if ui.button("🖼️ Save State Manager... (F6)").clicked() {
                                         ui.close_menu();
-                                        self.quick_load(s);
+                                        self.show_state_manager = true;
                                     }
-                                }
-                                ui.separator();
-                                if ui.button("🖼️ Save State Manager... (F6)").clicked() {
-                                    ui.close_menu();
-                                    self.show_state_manager = true;
-                                }
-                                ui.separator();
-                                if ui.button("Load State from File...").clicked() {
-                                    ui.close_menu();
-                                    self.load_state_from_file();
-                                }
+                                    if ui.button("↩ Undo State Action (Ctrl+Z)").clicked() {
+                                        ui.close_menu();
+                                        self.undo_last_state_action();
+                                    }
+                                    ui.separator();
+                                    if ui.button("Save State to File...").clicked() {
+                                        ui.close_menu();
+                                        self.save_state_to_file();
+                                    }
+                                });
+                                ui.menu_button("Load State", |ui| {
+                                    for s in 1..=5 {
+                                        let exists = self.slot_path(s).is_some_and(|p| p.exists());
+                                        let lbl = if exists {
+                                            format!("Slot {s} (Shift+F{s}) [Saved]")
+                                        } else {
+                                            format!("Slot {s} (Shift+F{s})")
+                                        };
+                                        if ui.add_enabled(exists, egui::Button::new(lbl)).clicked() {
+                                            ui.close_menu();
+                                            self.quick_load(s);
+                                        }
+                                    }
+                                    ui.separator();
+                                    if ui.button("🖼️ Save State Manager... (F6)").clicked() {
+                                        ui.close_menu();
+                                        self.show_state_manager = true;
+                                    }
+                                    ui.separator();
+                                    if ui.button("Load State from File...").clicked() {
+                                        ui.close_menu();
+                                        self.load_state_from_file();
+                                    }
+                                });
                             });
                             ui.separator();
                             if ui.button("Import Battery Save (.sav)...").clicked() {
@@ -167,11 +170,24 @@ impl RustboyApp {
                                 self.toggle_pause();
                                 ui.close_menu();
                             }
-                            if ui.button("Frame Advance / Step 1 Frame (Ctrl+N)").clicked() {
+                            let hardcore = self.is_ra_hardcore_active();
+                            if ui
+                                .add_enabled(
+                                    !hardcore,
+                                    egui::Button::new("Frame Advance / Step 1 Frame (Ctrl+N)"),
+                                )
+                                .clicked()
+                            {
                                 self.step_single_frame(ctx);
                                 ui.close_menu();
                             }
-                            if ui.button("⏪ Rewind Step (Hold R)").clicked() {
+                            if ui
+                                .add_enabled(
+                                    !hardcore,
+                                    egui::Button::new("⏪ Rewind Step (Hold R)"),
+                                )
+                                .clicked()
+                            {
                                 self.step_rewind_manual();
                                 ui.close_menu();
                             }
@@ -240,7 +256,13 @@ impl RustboyApp {
                                 }
                             }
                         });
-                        if ui.button("Rewind Settings...").clicked() {
+                        if ui
+                            .add_enabled(
+                                !self.is_ra_hardcore_active(),
+                                egui::Button::new("Rewind Settings..."),
+                            )
+                            .clicked()
+                        {
                             self.show_rewind_settings = true;
                             ui.close_menu();
                         }
@@ -462,11 +484,24 @@ impl RustboyApp {
                     });
 
                     ui.menu_button("Tools", |ui| {
-                        if ui.button("🖼️ Save State Manager... (F6)").clicked() {
+                        let hardcore = self.is_ra_hardcore_active();
+                        if ui
+                            .add_enabled(
+                                !hardcore,
+                                egui::Button::new("🖼️ Save State Manager... (F6)"),
+                            )
+                            .clicked()
+                        {
                             self.show_state_manager = true;
                             ui.close_menu();
                         }
-                        if ui.button("↩ Undo State Action (Ctrl+Z)").clicked() {
+                        if ui
+                            .add_enabled(
+                                !hardcore,
+                                egui::Button::new("↩ Undo State Action (Ctrl+Z)"),
+                            )
+                            .clicked()
+                        {
                             self.undo_last_state_action();
                             ui.close_menu();
                         }
@@ -485,10 +520,23 @@ impl RustboyApp {
                             self.debugger.show_overrides = true;
                             ui.close_menu();
                         }
-                        if ui.button("Cheat Code Manager...").clicked() {
+                        if ui
+                            .add_enabled(!hardcore, egui::Button::new("Cheat Code Manager..."))
+                            .clicked()
+                        {
                             self.debugger.show_cheats = true;
                             ui.close_menu();
                         }
+                        ui.separator();
+                        if ui.button("Lua Scripting Console...").clicked() {
+                            self.lua.show_console = true;
+                            ui.close_menu();
+                        }
+                        if ui.button("RetroAchievements...").clicked() {
+                            self.ra.show_window = true;
+                            ui.close_menu();
+                        }
+                        ui.separator();
                         if ui.button("Controls & Keybindings...").clicked() {
                             self.show_controls_dialog = true;
                             ui.close_menu();
@@ -597,8 +645,12 @@ impl RustboyApp {
                             self.close_rom(ctx);
                         }
 
+                        let hardcore = self.is_ra_hardcore_active();
                         if ui
-                            .button(RichText::new("⏭ Step").small())
+                            .add_enabled(
+                                !hardcore,
+                                egui::Button::new(RichText::new("⏭ Step").small()),
+                            )
                             .on_hover_text("Advance 1 Frame (Ctrl+N)")
                             .clicked()
                         {
@@ -606,7 +658,7 @@ impl RustboyApp {
                         }
 
                         let rewind_enabled =
-                            self.config.rewind_enabled && !self.rewind_buffer.is_empty();
+                            !hardcore && self.config.rewind_enabled && !self.rewind_buffer.is_empty();
                         let rew_btn = egui::Button::new(RichText::new("⏪ Rewind").small());
                         if ui
                             .add_enabled(rewind_enabled, rew_btn)

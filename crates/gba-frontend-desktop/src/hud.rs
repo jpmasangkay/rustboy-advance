@@ -8,6 +8,8 @@ use gba_core::{LCD_HEIGHT, LCD_WIDTH};
 
 use crate::app::{RustboyApp, ACCENT_TEAL, BG_CARD, BG_PANEL, BORDER_HAIRLINE, TEXT_MUTED};
 use crate::config::{BezelStyle, ShaderPreset};
+use crate::gb_bridge::{GB_VIEW_OFFSET_X, GB_VIEW_OFFSET_Y};
+use crate::rom_loader::RomPlatform;
 use crate::shaders::{
     color_profile_uniform, create_viewport_paint_callback, ShaderRenderParams,
 };
@@ -36,9 +38,24 @@ impl RustboyApp {
                         let isa = if core.cpu.is_thumb() { "THUMB" } else { "ARM" };
                         let mode = core.bus.ppu.dispcnt & 7;
                         let save_lbl = format!("{:?}", core.bus.cart.effective_save_type());
+                        let link_sfx = self
+                            .link
+                            .status_badge()
+                            .map(|b| format!(" | {b}"))
+                            .unwrap_or_default();
                         ui.label(
                             RichText::new(format!(
-                                "{isa} | Mode {mode} | Save: {save_lbl} | Esc = Stop to Library"
+                                "{isa} | Mode {mode} | Save: {save_lbl}{link_sfx} | Esc = Stop to Library"
+                            ))
+                            .small()
+                            .color(TEXT_MUTED),
+                        );
+                    } else if let Some(gb) = &self.gb {
+                        ui.label(
+                            RichText::new(format!(
+                                "{} | Cart: {} | Esc = Stop to Library",
+                                gb.platform.badge(),
+                                gb.cart_type_label
                             ))
                             .small()
                             .color(TEXT_MUTED),
@@ -59,13 +76,19 @@ impl RustboyApp {
 
                     // Right-to-left telemetry badges
                     ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                        let bios_lbl = if self.bios_bytes.is_some() {
-                            "BIOS: Custom"
+                        let bios_lbl = if let Some(gb) = &self.gb {
+                            if gb.platform == RomPlatform::Gbc {
+                                "CGB Mode".to_string()
+                            } else {
+                                format!("DMG: {}", self.config.dmg_palette.label())
+                            }
+                        } else if self.bios_bytes.is_some() {
+                            "BIOS: Custom".to_string()
                         } else {
-                            "BIOS: HLE"
+                            "BIOS: HLE".to_string()
                         };
 
-                        if let Some(_core) = &self.core {
+                        if self.has_active_game() {
                             let eff_speed = self.effective_speed_multiplier();
                             let speed_str = if self.paused {
                                 "PAUSED".to_string()
@@ -84,6 +107,10 @@ impl RustboyApp {
                                 .small(),
                             );
                             ui.separator();
+                            if let Some(link_badge) = self.link.status_badge() {
+                                ui.monospace(RichText::new(link_badge).small().color(ACCENT_TEAL));
+                                ui.separator();
+                            }
                             ui.monospace(RichText::new(bios_lbl).small().color(TEXT_MUTED));
                         } else {
                             ui.monospace(RichText::new(bios_lbl).small().color(TEXT_MUTED));
@@ -144,7 +171,7 @@ impl RustboyApp {
     }
 
     pub(crate) fn draw_bezel_frame(&self, ui: &mut egui::Ui, screen_rect: egui::Rect, avail: Vec2) {
-        let (chassis_color, bezel_label, badge_color) = match self.config.bezel_style {
+        let (chassis_color, gba_label, badge_color) = match self.config.bezel_style {
             BezelStyle::None => return,
             BezelStyle::ClassicIndigo => (
                 Color32::from_rgb(44, 48, 86),
@@ -161,6 +188,11 @@ impl RustboyApp {
                 "GAME BOY ADVANCE SP",
                 Color32::from_rgb(40, 45, 55),
             ),
+        };
+        let bezel_label = match &self.gb {
+            Some(gb) if gb.platform == RomPlatform::Gbc => "GAME BOY COLOR",
+            Some(_) => "GAME BOY",
+            None => gba_label,
         };
 
         let pad_x = ((avail.x - screen_rect.width()) * 0.45).clamp(24.0, 90.0);
@@ -379,12 +411,17 @@ impl RustboyApp {
     // GLSL/WGSL shader passes plug in alongside `self.postproc.process_frame`, and
     // RetroAchievements unlock banners / Lua script canvas overlays draw over `disp_rect`.
     pub(crate) fn draw_active_viewport(&mut self, ctx: &egui::Context, ui: &mut egui::Ui) {
+        let color_correction = self.config.color_correction;
         let color_profile = self.effective_color_profile();
         let shader_preset = self.config.effective_shader_preset();
         let frame_blending = self.config.frame_blending;
+        let lcd_ghosting = self.config.lcd_ghosting;
+        let scanline_grid = shader_preset == ShaderPreset::LcdGrid || self.config.scanline_grid;
+        let use_gl_shader = !self.is_gb_active() && !self.link.split_view_active();
         let mut gl_pipeline_arc = None;
 
-        if let Some(pipeline_arc) = &self.gl_shaders
+        if use_gl_shader
+            && let Some(pipeline_arc) = &self.gl_shaders
             && let Ok(mut pipeline) = pipeline_arc.lock()
         {
             if pipeline.is_preset_available(shader_preset) {
@@ -400,10 +437,10 @@ impl RustboyApp {
                             .has_prev_frame
                             .then_some(&self.sink.prev_framebuffer),
                         self.sink.frame_seq,
-                        self.config.color_correction,
+                        color_correction,
                         color_profile,
                         frame_blending,
-                        self.config.lcd_ghosting,
+                        lcd_ghosting,
                     );
                     self.sink.frame_dirty = false;
                 }
@@ -417,17 +454,16 @@ impl RustboyApp {
         }
 
         if gl_pipeline_arc.is_none() {
-            let scanline_grid = shader_preset == ShaderPreset::LcdGrid || self.config.scanline_grid;
             if self.sink.frame_dirty {
                 let color_img = self.postproc.process_frame_with_blending(
                     &self.sink.framebuffer,
                     self.sink
                         .has_prev_frame
                         .then_some(&self.sink.prev_framebuffer),
-                    self.config.color_correction,
+                    color_correction,
                     color_profile,
                     frame_blending,
-                    self.config.lcd_ghosting,
+                    lcd_ghosting,
                     scanline_grid,
                 );
                 let tex = self.lcd_tex.get_or_insert_with(|| {
@@ -441,7 +477,7 @@ impl RustboyApp {
                     self.sink
                         .has_prev_frame
                         .then_some(&self.sink.prev_framebuffer),
-                    self.config.color_correction,
+                    color_correction,
                     color_profile,
                     frame_blending,
                     false,
@@ -452,74 +488,177 @@ impl RustboyApp {
         }
 
         let avail = ui.available_size();
-        let disp_size = if self.config.integer_scaling {
-            let factor = ((avail.x / LCD_WIDTH as f32)
-                .floor()
-                .min((avail.y / LCD_HEIGHT as f32).floor()))
-            .max(1.0);
-            Vec2::new(LCD_WIDTH as f32 * factor, LCD_HEIGHT as f32 * factor)
-        } else {
-            let scale = (avail.x / LCD_WIDTH as f32)
-                .min(avail.y / LCD_HEIGHT as f32)
-                .max(0.5);
-            Vec2::new(LCD_WIDTH as f32 * scale, LCD_HEIGHT as f32 * scale)
-        };
-
         let mut toggle_fullscreen = false;
         let render_params = ShaderRenderParams {
             preset: shader_preset,
-            color_profile_id: color_profile_uniform(self.config.color_correction, color_profile),
+            color_profile_id: color_profile_uniform(color_correction, color_profile),
             frame_blend: if frame_blending && self.sink.has_prev_frame {
                 0.5
             } else {
                 0.0
             },
-            lcd_ghosting: if self.config.lcd_ghosting && !frame_blending {
+            lcd_ghosting: if lcd_ghosting && !frame_blending {
                 0.35
             } else {
                 0.0
             },
         };
 
-        ui.centered_and_justified(|ui| {
-            let has_surface = gl_pipeline_arc.is_some() || self.lcd_tex.is_some();
-            if has_surface {
-                let (rect, resp) = ui.allocate_exact_size(disp_size, Sense::click());
-
-                // Double-click viewport to toggle fullscreen
-                if resp.double_clicked() {
-                    toggle_fullscreen = true;
-                }
-
-                // Render authentic GBA bezel frame if enabled
-                self.draw_bezel_frame(ui, rect, avail);
-
-                // Render GBA LCD display via GLSL shader pipeline or CPU texture fallback
-                if let Some(pipeline_arc) = gl_pipeline_arc.take() {
-                    let cb = create_viewport_paint_callback(pipeline_arc, rect, render_params);
-                    ui.painter().add(egui::Shape::Callback(cb));
-                } else if let Some(tex) = &self.lcd_tex {
-                    ui.painter().image(
-                        tex.id(),
-                        rect,
-                        egui::Rect::from_min_max(egui::Pos2::ZERO, egui::Pos2::new(1.0, 1.0)),
-                        Color32::WHITE,
-                    );
-                }
-                ui.painter().rect_stroke(
-                    rect,
-                    CornerRadius::ZERO,
-                    Stroke::new(1.0_f32, BORDER_HAIRLINE),
-                    egui::StrokeKind::Outside,
+        if self.link.split_view_active() {
+            if let Some(local) = &mut self.link.local {
+                let p2_img = local.p2_postproc.process_frame_with_blending(
+                    &local.p2_framebuffer,
+                    None,
+                    color_correction,
+                    color_profile,
+                    frame_blending,
+                    lcd_ghosting,
+                    scanline_grid,
                 );
-
-                // Render in-game pause overlay
-                self.draw_pause_overlay(ui, rect);
-
-                // Subtle corner REC / PLAY / GIF / WAV indicator pill
-                self.draw_viewport_recording_pill(ui, rect);
+                let p2_tex = local.p2_lcd_tex.get_or_insert_with(|| {
+                    ctx.load_texture("gba_p2_lcd", p2_img.clone(), TextureOptions::NEAREST)
+                });
+                p2_tex.set(p2_img, TextureOptions::NEAREST);
             }
-        });
+
+            let gap = 14.0;
+            let header_h = 22.0;
+            let half_w = ((avail.x - gap - 16.0) * 0.5).max(120.0);
+            let half_h = (avail.y - header_h - 20.0).max(80.0);
+            let panel_size = if self.config.integer_scaling {
+                let factor = ((half_w / LCD_WIDTH as f32)
+                    .floor()
+                    .min((half_h / LCD_HEIGHT as f32).floor()))
+                .max(1.0);
+                Vec2::new(LCD_WIDTH as f32 * factor, LCD_HEIGHT as f32 * factor)
+            } else {
+                let scale = (half_w / LCD_WIDTH as f32)
+                    .min(half_h / LCD_HEIGHT as f32)
+                    .max(0.5);
+                Vec2::new(LCD_WIDTH as f32 * scale, LCD_HEIGHT as f32 * scale)
+            };
+            let full_uv = egui::Rect::from_min_max(egui::Pos2::ZERO, egui::Pos2::new(1.0, 1.0));
+            let total_w = panel_size.x * 2.0 + gap;
+            let total_h = panel_size.y + header_h;
+
+            let split_ids = if let (Some(tex1), Some(local)) = (&self.lcd_tex, &self.link.local) {
+                local
+                    .p2_lcd_tex
+                    .as_ref()
+                    .map(|tex2| (tex1.id(), tex2.id(), local.p2_rom_code.clone()))
+            } else {
+                None
+            };
+
+            ui.centered_and_justified(|ui| {
+                if let Some((tex1_id, tex2_id, p2_code)) = split_ids.as_ref() {
+                    let mut p1_rect = egui::Rect::NOTHING;
+                    ui.allocate_ui(Vec2::new(total_w, total_h), |ui| {
+                        ui.horizontal(|ui| {
+                            ui.spacing_mut().item_spacing.x = gap;
+
+                            ui.vertical(|ui| {
+                                ui.label(
+                                    RichText::new("P1 (Master)")
+                                        .small()
+                                        .strong()
+                                        .color(ACCENT_TEAL),
+                                );
+                                let (r1, resp1) = ui.allocate_exact_size(panel_size, Sense::click());
+                                p1_rect = r1;
+                                if resp1.double_clicked() {
+                                    toggle_fullscreen = true;
+                                }
+                                ui.painter().image(*tex1_id, r1, full_uv, Color32::WHITE);
+                                ui.painter().rect_stroke(
+                                    r1,
+                                    CornerRadius::ZERO,
+                                    Stroke::new(1.0_f32, BORDER_HAIRLINE),
+                                    egui::StrokeKind::Outside,
+                                );
+                            });
+
+                            ui.vertical(|ui| {
+                                ui.label(
+                                    RichText::new(format!("P2 (Slave) — {p2_code}"))
+                                        .small()
+                                        .strong()
+                                        .color(TEXT_MUTED),
+                                );
+                                let (r2, resp2) = ui.allocate_exact_size(panel_size, Sense::click());
+                                if resp2.double_clicked() {
+                                    toggle_fullscreen = true;
+                                }
+                                ui.painter().image(*tex2_id, r2, full_uv, Color32::WHITE);
+                                ui.painter().rect_stroke(
+                                    r2,
+                                    CornerRadius::ZERO,
+                                    Stroke::new(1.0_f32, BORDER_HAIRLINE),
+                                    egui::StrokeKind::Outside,
+                                );
+                            });
+                        });
+                    });
+                    self.draw_pause_overlay(ui, p1_rect);
+                    self.draw_viewport_recording_pill(ui, p1_rect);
+                }
+            });
+        } else {
+            let (ref_w, ref_h, uv) = if self.is_gb_active() {
+                let u0 = GB_VIEW_OFFSET_X as f32 / LCD_WIDTH as f32;
+                let v0 = GB_VIEW_OFFSET_Y as f32 / LCD_HEIGHT as f32;
+                let u1 = (GB_VIEW_OFFSET_X + gb_core::LCD_WIDTH) as f32 / LCD_WIDTH as f32;
+                let v1 = (GB_VIEW_OFFSET_Y + gb_core::LCD_HEIGHT) as f32 / LCD_HEIGHT as f32;
+                (
+                    gb_core::LCD_WIDTH as f32,
+                    gb_core::LCD_HEIGHT as f32,
+                    egui::Rect::from_min_max(egui::Pos2::new(u0, v0), egui::Pos2::new(u1, v1)),
+                )
+            } else {
+                (
+                    LCD_WIDTH as f32,
+                    LCD_HEIGHT as f32,
+                    egui::Rect::from_min_max(egui::Pos2::ZERO, egui::Pos2::new(1.0, 1.0)),
+                )
+            };
+
+            let disp_size = if self.config.integer_scaling {
+                let factor = ((avail.x / ref_w).floor().min((avail.y / ref_h).floor())).max(1.0);
+                Vec2::new(ref_w * factor, ref_h * factor)
+            } else {
+                let scale = (avail.x / ref_w).min(avail.y / ref_h).max(0.5);
+                Vec2::new(ref_w * scale, ref_h * scale)
+            };
+
+            ui.centered_and_justified(|ui| {
+                let has_surface = gl_pipeline_arc.is_some() || self.lcd_tex.is_some();
+                if has_surface {
+                    let (rect, resp) = ui.allocate_exact_size(disp_size, Sense::click());
+
+                    if resp.double_clicked() {
+                        toggle_fullscreen = true;
+                    }
+
+                    self.draw_bezel_frame(ui, rect, avail);
+
+                    if let Some(pipeline_arc) = gl_pipeline_arc.take() {
+                        let cb = create_viewport_paint_callback(pipeline_arc, rect, render_params);
+                        ui.painter().add(egui::Shape::Callback(cb));
+                    } else if let Some(tex) = &self.lcd_tex {
+                        ui.painter().image(tex.id(), rect, uv, Color32::WHITE);
+                    }
+                    ui.painter().rect_stroke(
+                        rect,
+                        CornerRadius::ZERO,
+                        Stroke::new(1.0_f32, BORDER_HAIRLINE),
+                        egui::StrokeKind::Outside,
+                    );
+
+                    self.draw_pause_overlay(ui, rect);
+                    self.draw_viewport_recording_pill(ui, rect);
+                }
+            });
+        }
 
         if toggle_fullscreen {
             self.is_fullscreen = !self.is_fullscreen;

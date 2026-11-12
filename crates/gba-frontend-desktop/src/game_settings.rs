@@ -182,7 +182,7 @@ impl RustboyApp {
     }
 
     pub(crate) fn open_game_settings_for_active_rom(&mut self) {
-        if self.core.is_none() || self.rom_code.is_empty() {
+        if !self.has_active_game() || self.rom_code.is_empty() {
             self.notify_warn("Load a ROM first to edit active game settings");
             return;
         }
@@ -234,7 +234,7 @@ impl RustboyApp {
             return;
         }
 
-        if self.game_settings_target.is_none() && self.core.is_some() && !self.rom_code.is_empty()
+        if self.game_settings_target.is_none() && self.has_active_game() && !self.rom_code.is_empty()
         {
             self.open_game_settings_for_active_rom();
         }
@@ -245,7 +245,7 @@ impl RustboyApp {
         };
 
         let mut open = self.show_game_settings;
-        let is_active_rom = self.core.is_some()
+        let is_active_rom = self.has_active_game()
             && self.rom_code == target.code
             && self.rom_crc32 == target.crc32;
 

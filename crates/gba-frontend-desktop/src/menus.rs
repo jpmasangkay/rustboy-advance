@@ -8,7 +8,9 @@ use crate::app::{
     RustboyApp, ACCENT_TEAL, ACCENT_TEAL_BG, BG_PANEL, BORDER_HAIRLINE, TEXT_MUTED,
 };
 use crate::capture::GifFpsMode;
-use crate::config::{AppConfig, BezelStyle, ColorProfileChoice, HotkeyAction, ShaderPreset};
+use crate::config::{
+    AppConfig, BezelStyle, ColorProfileChoice, DmgPaletteChoice, HotkeyAction, ShaderPreset,
+};
 
 impl RustboyApp {
     // WAVE-2 HOOK: Top menu bar — wave-2 agents should add menu entries here for
@@ -23,7 +25,7 @@ impl RustboyApp {
             )
             .show(ctx, |ui| {
                 egui::menu::bar(ui, |ui| {
-                    let has_rom = self.core.is_some();
+                    let has_rom = self.has_active_game();
 
                     ui.menu_button("File", |ui| {
                         if ui.button("Open ROM... (Ctrl+O)").clicked() {
@@ -391,6 +393,29 @@ impl RustboyApp {
                                 }
                             }
                         });
+                        ui.menu_button("DMG Color Palette", |ui| {
+                            for p in [
+                                DmgPaletteChoice::Greyscale,
+                                DmgPaletteChoice::GbaColorized,
+                                DmgPaletteChoice::ClassicGreen,
+                            ] {
+                                if ui
+                                    .selectable_label(self.config.dmg_palette == p, p.label())
+                                    .clicked()
+                                {
+                                    self.apply_dmg_palette(p);
+                                    ui.close_menu();
+                                }
+                            }
+                            if !self.is_gb_active() {
+                                ui.separator();
+                                ui.label(
+                                    RichText::new("Applies to monochrome .gb titles")
+                                        .small()
+                                        .color(TEXT_MUTED),
+                                );
+                            }
+                        });
                         ui.menu_button("UI Panels & Chrome", |ui| {
                             if ui
                                 .checkbox(
@@ -517,6 +542,10 @@ impl RustboyApp {
                             self.show_controls_dialog = true;
                             ui.close_menu();
                         }
+                        if ui.button("🔗 Link Cable / Netplay...").clicked() {
+                            self.link.show_window = true;
+                            ui.close_menu();
+                        }
                         ui.separator();
                         let movie_lbl = if self.movie.is_recording() {
                             format!("Input Movies (TAS)... [REC {}f]", self.movie.current_frame())
@@ -635,10 +664,10 @@ impl RustboyApp {
             )
             .show(ctx, |ui| {
                 ui.horizontal(|ui| {
-                    let has_rom = self.core.is_some();
+                    let has_rom = self.has_active_game();
                     if ui
                         .button(RichText::new("📂 Open ROM").small())
-                        .on_hover_text("Open GBA ROM File (Ctrl+O)")
+                        .on_hover_text("Open GBA / GB / GBC ROM File (Ctrl+O)")
                         .clicked()
                     {
                         self.trigger_open_rom_dialog(ctx);
@@ -841,6 +870,18 @@ impl RustboyApp {
                     }
                     if toggle_btn(ui, "Audio", self.debugger.show_audio).clicked() {
                         self.debugger.show_audio = !self.debugger.show_audio;
+                    }
+                    let link_on = self.link.local_is_active()
+                        || self
+                            .link
+                            .netplay
+                            .as_ref()
+                            .is_some_and(|n| n.is_active());
+                    if toggle_btn(ui, "Link", self.link.show_window || link_on)
+                        .on_hover_text("GBA Link Cable (Local 2P & TCP Netplay)")
+                        .clicked()
+                    {
+                        self.link.show_window = !self.link.show_window;
                     }
                 });
             });

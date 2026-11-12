@@ -369,10 +369,16 @@ impl RustboyApp {
             && let Some(gilrs) = &self.gilrs
         {
             let gp_cfg = &self.config.keybindings.gamepad;
+            let local_link = self.link.local_is_active();
+            let mut connected_idx = 0usize;
             for (_id, gamepad) in gilrs.gamepads() {
                 if !gamepad.is_connected() {
                     continue;
                 }
+                if local_link && connected_idx > 0 {
+                    break;
+                }
+                connected_idx += 1;
                 for btn in GbaButton::ALL {
                     if let Some(binding) = gp_cfg.get(ControlTarget::Button(btn))
                         && is_gamepad_input_active(&gamepad, binding)
@@ -453,6 +459,51 @@ impl RustboyApp {
             );
         self.last_pressed_mask = effective_mask;
         encode_keyinput(effective_mask)
+    }
+
+    pub(crate) fn poll_p2_inputs(&self, ctx: &egui::Context) -> u16 {
+        let mut kp = crate::link::p2_keyboard_mask(ctx);
+        if self.awaiting_input_bind.is_none()
+            && let Some(gilrs) = &self.gilrs
+        {
+            let gp_cfg = &self.config.keybindings.gamepad;
+            let p2_gp = gilrs
+                .gamepads()
+                .filter(|(_, gp)| gp.is_connected())
+                .nth(1);
+            if let Some((_id, gamepad)) = p2_gp {
+                let mut gp_mask = 0u16;
+                for btn in GbaButton::ALL {
+                    if let Some(binding) = gp_cfg.get(ControlTarget::Button(btn))
+                        && is_gamepad_input_active(&gamepad, binding)
+                    {
+                        gp_mask |= btn.mask();
+                    }
+                }
+                if gp_cfg.left_stick_as_dpad {
+                    let lx = gamepad
+                        .axis_data(Axis::LeftStickX)
+                        .map(|d| d.value())
+                        .unwrap_or(0.0);
+                    let ly = gamepad
+                        .axis_data(Axis::LeftStickY)
+                        .map(|d| d.value())
+                        .unwrap_or(0.0);
+                    if lx < -0.4 {
+                        gp_mask |= GbaButton::Left.mask();
+                    } else if lx > 0.4 {
+                        gp_mask |= GbaButton::Right.mask();
+                    }
+                    if ly > 0.4 {
+                        gp_mask |= GbaButton::Up.mask();
+                    } else if ly < -0.4 {
+                        gp_mask |= GbaButton::Down.mask();
+                    }
+                }
+                kp &= encode_keyinput(gp_mask);
+            }
+        }
+        kp
     }
 
     pub(crate) fn connected_gamepad_names(&self) -> Vec<String> {

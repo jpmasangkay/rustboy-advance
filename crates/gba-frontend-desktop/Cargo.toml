@@ -10,6 +10,7 @@ path = "src/main.rs"
 
 [dependencies]
 gba-core = { path = "../gba-core" }
+gb-core = { path = "../gb-core" }
 gba-debugger = { path = "../gba-debugger" }
 log.workspace = true
 serde.workspace = true

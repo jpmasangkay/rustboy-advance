@@ -386,13 +386,9 @@ impl RustboyApp {
 
     fn build_current_state_container(&mut self) -> Result<Vec<u8>, SaveStateError> {
         let thumb_png = self.current_thumbnail_png();
-        let core = self
-            .core
-            .as_ref()
-            .ok_or_else(|| SaveStateError::CoreError("No active ROM loaded".into()))?;
-        let core_bytes = core
-            .save_state()
-            .map_err(|e| SaveStateError::CoreError(format!("{e:?}")))?;
+        let core_bytes = self
+            .save_active_core_state()
+            .map_err(SaveStateError::CoreError)?;
         let ts = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .unwrap_or_default()
@@ -411,7 +407,7 @@ impl RustboyApp {
         let Some(path) = self.slot_path(slot) else {
             return;
         };
-        if self.core.is_none() {
+        if !self.has_active_game() {
             return;
         }
 
@@ -454,9 +450,7 @@ impl RustboyApp {
             return;
         };
         // Backup current core state before loading for instant undo
-        if let Some(core) = &self.core
-            && let Ok(cur_bytes) = core.save_state()
-        {
+        if let Ok(cur_bytes) = self.save_active_core_state() {
             self.undo_state_buffer = Some(cur_bytes);
             self.movie.record_undo_bookmark();
         }
@@ -464,23 +458,25 @@ impl RustboyApp {
     }
 
     pub(crate) fn undo_last_state_action(&mut self) {
-        let (Some(core), Some(prev_bytes)) = (&mut self.core, self.undo_state_buffer.take()) else {
+        if !self.has_active_game() {
+            self.notify("No save/load action to undo");
+            return;
+        }
+        let Some(prev_bytes) = self.undo_state_buffer.take() else {
             self.notify("No save/load action to undo");
             return;
         };
-        let cur = core.save_state().ok();
-        match core.load_state(&prev_bytes) {
+        let cur = self.save_active_core_state().ok();
+        match self.load_active_core_state(&prev_bytes) {
             Ok(()) => {
-                self.sink
-                    .framebuffer
-                    .copy_from_slice(&*core.bus.ppu.framebuffer);
-                self.sink.frame_dirty = true;
                 self.rewind_buffer.clear();
                 self.rewind_movie_frames.clear();
                 self.rewinding = false;
                 self.undo_state_buffer = cur;
                 self.state_manager_error = None;
-                self.movie.on_undo_state_loaded(core);
+                if let Some(core) = &self.core {
+                    self.movie.on_undo_state_loaded(core);
+                }
                 if let Some(msg) = self.movie.take_notice() {
                     self.notify(&msg);
                 } else {
@@ -488,7 +484,7 @@ impl RustboyApp {
                 }
             }
             Err(e) => {
-                let msg = format!("Undo state load failed: {e:?}");
+                let msg = format!("Undo state load failed: {e}");
                 self.state_manager_error = Some(msg.clone());
                 self.notify_error(&msg);
             }
@@ -496,7 +492,7 @@ impl RustboyApp {
     }
 
     pub(crate) fn save_state_to_file(&mut self) {
-        if self.core.is_none() {
+        if !self.has_active_game() {
             return;
         }
         if let Some(path) = rfd::FileDialog::new()
@@ -529,7 +525,9 @@ impl RustboyApp {
     }
 
     pub(crate) fn load_state_from_path(&mut self, path: &Path, success_msg: &str) {
-        let Some(core) = &mut self.core else { return };
+        if !self.has_active_game() {
+            return;
+        }
         let bytes = match fs::read(path) {
             Ok(b) => b,
             Err(e) => {
@@ -555,21 +553,16 @@ impl RustboyApp {
             }
         };
 
-        match core.load_state(&decoded.core_bytes) {
+        match self.load_active_core_state(&decoded.core_bytes) {
             Ok(()) => {
-                core.bus.ppu.dot_accurate_mode = self.config.dot_accurate_ppu;
-                core.bus.ppu.layer_enable_mask = self.config.layer_mask;
-                core.bus.apu.channel_enable_mask = self.config.audio_channel_mask;
-                core.bus.apu.master_volume_pct = self.config.master_volume;
-                self.sink
-                    .framebuffer
-                    .copy_from_slice(&*core.bus.ppu.framebuffer);
-                self.sink.frame_dirty = true;
                 self.rewind_buffer.clear();
                 self.rewind_movie_frames.clear();
                 self.rewinding = false;
+                self.show_pause_overlay = false;
                 self.state_manager_error = None;
-                self.movie.on_state_loaded_from_path(core, path);
+                if let Some(core) = &self.core {
+                    self.movie.on_state_loaded_from_path(core, path);
+                }
                 if let Some(msg) = self.movie.take_notice() {
                     self.notify(&format!("{success_msg} — {msg}"));
                 } else {
@@ -577,7 +570,7 @@ impl RustboyApp {
                 }
             }
             Err(e) => {
-                let msg = SaveStateError::CoreError(format!("{e:?}")).to_string();
+                let msg = SaveStateError::CoreError(e).to_string();
                 self.state_manager_error = Some(msg.clone());
                 self.notify_error(&msg);
             }

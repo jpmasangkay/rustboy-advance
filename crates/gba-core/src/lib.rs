@@ -732,6 +732,7 @@ impl GbaCore {
             match step {
                 InternalStep::Continue => {}
                 InternalStep::StoppedFrame(delta) => {
+                    frontend.present_frame(&self.bus.ppu.framebuffer);
                     if !self.bus.apu.output_buffer.is_empty() {
                         frontend.push_audio_samples(&self.bus.apu.output_buffer);
                         self.bus.apu.output_buffer.clear();

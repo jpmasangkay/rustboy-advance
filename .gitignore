@@ -35,6 +35,9 @@ Thumbs.db
 frame_*.png
 test_output/
 test-roms/
+fuzz/corpus/
+fuzz/artifacts/
+fuzz/target/
 .gemini/
 .antigravity/
 

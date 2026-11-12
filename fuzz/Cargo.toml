@@ -1,0 +1,36 @@
+[package]
+name = "rustboy-advance-fuzz"
+version = "0.0.0"
+publish = false
+edition = "2024"
+
+[workspace]
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+libfuzzer-sys = "0.4"
+gba-core = { path = "../crates/gba-core" }
+gba-debugger = { path = "../crates/gba-debugger" }
+
+[[bin]]
+name = "fuzz_load_state"
+path = "fuzz_targets/fuzz_load_state.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "fuzz_disasm"
+path = "fuzz_targets/fuzz_disasm.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "fuzz_rom_boot"
+path = "fuzz_targets/fuzz_rom_boot.rs"
+test = false
+doc = false
+bench = false

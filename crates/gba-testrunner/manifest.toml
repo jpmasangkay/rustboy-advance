@@ -1,0 +1,560 @@
+# Test ROM Manifest for Rustboy Advance (`gba-testrunner`)
+
+# --- jsmolka/gba-tests ---
+
+[[tests]]
+id = "jsmolka_arm"
+suite = "jsmolka"
+name = "jsmolka/arm.gba"
+rom_path = "test-roms/jsmolka/arm.gba"
+frames = 120
+criterion = "register"
+register = 12
+
+[[tests]]
+id = "jsmolka_thumb"
+suite = "jsmolka"
+name = "jsmolka/thumb.gba"
+rom_path = "test-roms/jsmolka/thumb.gba"
+frames = 120
+criterion = "register"
+register = 7
+
+[[tests]]
+id = "jsmolka_memory"
+suite = "jsmolka"
+name = "jsmolka/memory.gba"
+rom_path = "test-roms/jsmolka/memory.gba"
+frames = 120
+criterion = "register"
+register = 12
+
+[[tests]]
+id = "jsmolka_nes"
+suite = "jsmolka"
+name = "jsmolka/nes.gba"
+rom_path = "test-roms/jsmolka/nes.gba"
+frames = 120
+criterion = "register"
+register = 12
+
+[[tests]]
+id = "jsmolka_bios"
+suite = "jsmolka"
+name = "jsmolka/bios.gba"
+rom_path = "test-roms/jsmolka/bios.gba"
+frames = 120
+criterion = "register"
+register = 12
+
+[[tests]]
+id = "jsmolka_unsafe"
+suite = "jsmolka"
+name = "jsmolka/unsafe.gba"
+rom_path = "test-roms/jsmolka/unsafe.gba"
+frames = 120
+criterion = "register"
+register = 12
+
+[[tests]]
+id = "jsmolka_save_none"
+suite = "jsmolka"
+name = "jsmolka/save/none.gba"
+rom_path = "test-roms/jsmolka/save/none.gba"
+frames = 120
+criterion = "register"
+register = 12
+
+[[tests]]
+id = "jsmolka_save_sram"
+suite = "jsmolka"
+name = "jsmolka/save/sram.gba"
+rom_path = "test-roms/jsmolka/save/sram.gba"
+frames = 120
+criterion = "register"
+register = 12
+
+[[tests]]
+id = "jsmolka_save_flash64"
+suite = "jsmolka"
+name = "jsmolka/save/flash64.gba"
+rom_path = "test-roms/jsmolka/save/flash64.gba"
+frames = 180
+criterion = "register"
+register = 12
+
+[[tests]]
+id = "jsmolka_save_flash128"
+suite = "jsmolka"
+name = "jsmolka/save/flash128.gba"
+rom_path = "test-roms/jsmolka/save/flash128.gba"
+frames = 180
+criterion = "register"
+register = 12
+
+[[tests]]
+id = "jsmolka_ppu_hello"
+suite = "jsmolka"
+name = "jsmolka/ppu/hello.gba"
+rom_path = "test-roms/jsmolka/ppu/hello.gba"
+frames = 30
+criterion = "screenshot"
+
+[[tests]]
+id = "jsmolka_ppu_shades"
+suite = "jsmolka"
+name = "jsmolka/ppu/shades.gba"
+rom_path = "test-roms/jsmolka/ppu/shades.gba"
+frames = 30
+criterion = "fb_hash"
+
+[[tests]]
+id = "jsmolka_ppu_stripes"
+suite = "jsmolka"
+name = "jsmolka/ppu/stripes.gba"
+rom_path = "test-roms/jsmolka/ppu/stripes.gba"
+frames = 30
+criterion = "fb_hash"
+
+# --- DenSinH/FuzzARM ---
+
+[[tests]]
+id = "fuzzarm_all"
+suite = "fuzzarm"
+name = "fuzzarm/FuzzARM.gba"
+rom_path = "test-roms/fuzzarm/FuzzARM.gba"
+frames = 2600
+criterion = "screenshot"
+
+[[tests]]
+id = "fuzzarm_arm_any"
+suite = "fuzzarm"
+name = "fuzzarm/ARM_Any.gba"
+rom_path = "test-roms/fuzzarm/ARM_Any.gba"
+frames = 2500
+criterion = "screenshot"
+
+[[tests]]
+id = "fuzzarm_arm_dp"
+suite = "fuzzarm"
+name = "fuzzarm/ARM_DataProcessing.gba"
+rom_path = "test-roms/fuzzarm/ARM_DataProcessing.gba"
+frames = 2500
+criterion = "screenshot"
+
+[[tests]]
+id = "fuzzarm_thumb_any"
+suite = "fuzzarm"
+name = "fuzzarm/THUMB_Any.gba"
+rom_path = "test-roms/fuzzarm/THUMB_Any.gba"
+frames = 2500
+criterion = "screenshot"
+
+[[tests]]
+id = "fuzzarm_thumb_dp"
+suite = "fuzzarm"
+name = "fuzzarm/THUMB_DataProcessing.gba"
+rom_path = "test-roms/fuzzarm/THUMB_DataProcessing.gba"
+frames = 2500
+criterion = "screenshot"
+
+# --- ARMWrestler (menu-driven) ---
+
+[[tests]]
+id = "armwrestler_arm_alu"
+suite = "armwrestler"
+name = "armwrestler/arm-alu"
+rom_path = "test-roms/armwrestler/armwrestler-gba-fixed.gba"
+frames = 65
+criterion = "screenshot"
+inputs = [{ frame = 25, duration = 12, keys = ["START"] }]
+
+[[tests]]
+id = "armwrestler_arm_ldr_str"
+suite = "armwrestler"
+name = "armwrestler/arm-ldr-str"
+rom_path = "test-roms/armwrestler/armwrestler-gba-fixed.gba"
+frames = 90
+criterion = "screenshot"
+inputs = [
+    { frame = 25, duration = 12, keys = ["DOWN"] },
+    { frame = 49, duration = 12, keys = ["START"] },
+]
+
+[[tests]]
+id = "armwrestler_arm_ldm_stm"
+suite = "armwrestler"
+name = "armwrestler/arm-ldm-stm"
+rom_path = "test-roms/armwrestler/armwrestler-gba-fixed.gba"
+frames = 115
+criterion = "screenshot"
+known_failure = true
+known_bad_crc32 = "0xceba5d77"
+notes = "8/12 pass; LDMIBS!, LDMIAS!, LDMDBS!, LDMDBA! fail with BAD Rn (user-bank writeback suppressed)"
+inputs = [
+    { frame = 25, duration = 12, keys = ["DOWN"] },
+    { frame = 49, duration = 12, keys = ["DOWN"] },
+    { frame = 73, duration = 12, keys = ["START"] },
+]
+
+[[tests]]
+id = "armwrestler_thumb_alu"
+suite = "armwrestler"
+name = "armwrestler/thumb-alu"
+rom_path = "test-roms/armwrestler/armwrestler-gba-fixed.gba"
+frames = 140
+criterion = "screenshot"
+inputs = [
+    { frame = 25, duration = 12, keys = ["DOWN"] },
+    { frame = 49, duration = 12, keys = ["DOWN"] },
+    { frame = 73, duration = 12, keys = ["DOWN"] },
+    { frame = 97, duration = 12, keys = ["START"] },
+]
+
+[[tests]]
+id = "armwrestler_thumb_ldr_str"
+suite = "armwrestler"
+name = "armwrestler/thumb-ldr-str"
+rom_path = "test-roms/armwrestler/armwrestler-gba-fixed.gba"
+frames = 165
+criterion = "screenshot"
+inputs = [
+    { frame = 25, duration = 12, keys = ["DOWN"] },
+    { frame = 49, duration = 12, keys = ["DOWN"] },
+    { frame = 73, duration = 12, keys = ["DOWN"] },
+    { frame = 97, duration = 12, keys = ["DOWN"] },
+    { frame = 121, duration = 12, keys = ["START"] },
+]
+
+[[tests]]
+id = "armwrestler_thumb_ldm_stm"
+suite = "armwrestler"
+name = "armwrestler/thumb-ldm-stm"
+rom_path = "test-roms/armwrestler/armwrestler-gba-fixed.gba"
+frames = 190
+criterion = "screenshot"
+inputs = [
+    { frame = 25, duration = 12, keys = ["DOWN"] },
+    { frame = 49, duration = 12, keys = ["DOWN"] },
+    { frame = 73, duration = 12, keys = ["DOWN"] },
+    { frame = 97, duration = 12, keys = ["DOWN"] },
+    { frame = 121, duration = 12, keys = ["DOWN"] },
+    { frame = 145, duration = 12, keys = ["START"] },
+]
+
+# --- NanoBoyAdvance hw-test ---
+
+[[tests]]
+id = "nba_bus_128kb_boundary"
+suite = "nba-hw-test"
+name = "nba-hw-test/bus/128kb-boundary.gba"
+rom_path = "test-roms/nba-hw-test/bus/128kb-boundary/128kb-boundary.gba"
+frames = 60
+criterion = "screenshot"
+known_failure = true
+known_bad_crc32 = "0xef43f2c5"
+notes = "13/16 pass; DMA DEC 07FFFFF8 (68 vs 63) & 0801FFF0/0803FFF0 (68 vs 70) fail"
+
+[[tests]]
+id = "nba_dma_burst_into_tears"
+suite = "nba-hw-test"
+name = "nba-hw-test/dma/burst-into-tears.gba"
+rom_path = "test-roms/nba-hw-test/dma/burst-into-tears/burst-into-tears.gba"
+frames = 60
+criterion = "screenshot"
+known_failure = true
+known_bad_crc32 = "0x53e7d0fe"
+notes = "0/3 pass (1ST: 0x2e vs 0xea00, 2ND: 0xea00 vs 0xff24, DMA TIME: 43 vs 41)"
+
+[[tests]]
+id = "nba_dma_force_nseq_access"
+suite = "nba-hw-test"
+name = "nba-hw-test/dma/force-nseq-access.gba"
+rom_path = "test-roms/nba-hw-test/dma/force-nseq-access/force-nseq-access.gba"
+frames = 60
+criterion = "screenshot"
+known_failure = true
+known_bad_crc32 = "0x0aeb8290"
+notes = "0/2 pass (EWRAM DMA: 78 vs 88, ROM DMA: 78 vs 88)"
+
+[[tests]]
+id = "nba_dma_latch"
+suite = "nba-hw-test"
+name = "nba-hw-test/dma/latch.gba"
+rom_path = "test-roms/nba-hw-test/dma/latch/latch.gba"
+frames = 60
+criterion = "screenshot"
+known_failure = true
+known_bad_crc32 = "0xcf7649a4"
+notes = "2/4 pass (DMA LATCH 1: 0xc0de vs 0xdead, DMA LATCH 2: 0xc0de vs 0x1234)"
+
+[[tests]]
+id = "nba_dma_start_delay"
+suite = "nba-hw-test"
+name = "nba-hw-test/dma/start-delay.gba"
+rom_path = "test-roms/nba-hw-test/dma/start-delay/start-delay.gba"
+frames = 60
+criterion = "screenshot"
+known_failure = true
+known_bad_crc32 = "0xcd81f685"
+notes = "0/1 pass (IMM: 18 vs 20)"
+
+[[tests]]
+id = "nba_haltcnt"
+suite = "nba-hw-test"
+name = "nba-hw-test/haltcnt.gba"
+rom_path = "test-roms/nba-hw-test/haltcnt/haltcnt.gba"
+frames = 60
+criterion = "screenshot"
+known_failure = true
+known_bad_crc32 = "0x39cd150e"
+notes = "0/6 pass (HALTCNT DIRECT/CPUSET/POSTFLG/TIME IWRAM & ROM)"
+
+[[tests]]
+id = "nba_irq_delay"
+suite = "nba-hw-test"
+name = "nba-hw-test/irq/irq-delay.gba"
+rom_path = "test-roms/nba-hw-test/irq/irq-delay/irq-delay.gba"
+frames = 60
+criterion = "screenshot"
+known_failure = true
+known_bad_crc32 = "0x4fc84cc5"
+notes = "0/3 pass (IWRAM: 95 vs 92, EWRAM: 115 vs 112, ROM: 115 vs 120)"
+
+[[tests]]
+id = "nba_ppu_bgpd"
+suite = "nba-hw-test"
+name = "nba-hw-test/ppu/bgpd.gba"
+rom_path = "test-roms/nba-hw-test/ppu/bgpd/bgpd.gba"
+frames = 30
+criterion = "fb_hash"
+known_failure = true
+known_bad_crc32 = "0x41b13174"
+notes = "Visual mismatch vs expected.png (3 linear grey ramps instead of 2 ramps)"
+
+[[tests]]
+id = "nba_ppu_bgx"
+suite = "nba-hw-test"
+name = "nba-hw-test/ppu/bgx.gba"
+rom_path = "test-roms/nba-hw-test/ppu/bgx/bgx.gba"
+frames = 30
+criterion = "fb_hash"
+known_failure = true
+known_bad_crc32 = "0xd5370a26"
+notes = "Visual mismatch vs expected.png (solid green; missing center vertical white line)"
+
+[[tests]]
+id = "nba_ppu_dispcnt_latch"
+suite = "nba-hw-test"
+name = "nba-hw-test/ppu/dispcnt-latch.gba"
+rom_path = "test-roms/nba-hw-test/ppu/dispcnt-latch/dispcnt-latch.gba"
+frames = 30
+criterion = "fb_hash"
+known_failure = true
+known_bad_crc32 = "0x7ccd9bca"
+notes = "Visual mismatch vs expected.png (full-height BCDEF/DEFGH; missing scanline latch delay)"
+
+[[tests]]
+id = "nba_ppu_greenswap"
+suite = "nba-hw-test"
+name = "nba-hw-test/ppu/greenswap.gba"
+rom_path = "test-roms/nba-hw-test/ppu/greenswap/greenswap.gba"
+frames = 30
+criterion = "fb_hash"
+known_failure = true
+known_bad_crc32 = "0x9a420c77"
+notes = "Visual mismatch vs expected.png (uniform RGB stripes; GREENSWAP swap unimplemented)"
+
+[[tests]]
+id = "nba_ppu_ram_access_timing"
+suite = "nba-hw-test"
+name = "nba-hw-test/ppu/ram-access-timing.gba"
+rom_path = "test-roms/nba-hw-test/ppu/ram-access-timing/ram-access-timing.gba"
+frames = 60
+criterion = "screenshot"
+interactive = true
+notes = "Interactive mode-selection hardware test (no automated pass/fail screen)"
+
+[[tests]]
+id = "nba_ppu_sprite_hmosaic"
+suite = "nba-hw-test"
+name = "nba-hw-test/ppu/sprite-hmosaic.gba"
+rom_path = "test-roms/nba-hw-test/ppu/sprite-hmosaic/sprite-hmosaic.gba"
+frames = 30
+criterion = "fb_hash"
+known_failure = true
+known_bad_crc32 = "0x99822121"
+notes = "Visual mismatch vs expected.png (rows 9-14 horizontal mosaic stretch differs)"
+
+[[tests]]
+id = "nba_ppu_status_irq_dma"
+suite = "nba-hw-test"
+name = "nba-hw-test/ppu/status-irq-dma.gba"
+rom_path = "test-roms/nba-hw-test/ppu/status-irq-dma/status-irq-dma.gba"
+frames = 60
+criterion = "screenshot"
+interactive = true
+notes = "Interactive raster/menu hardware test (no automated pass/fail screen)"
+
+[[tests]]
+id = "nba_ppu_vram_mirror"
+suite = "nba-hw-test"
+name = "nba-hw-test/ppu/vram-mirror.gba"
+rom_path = "test-roms/nba-hw-test/ppu/vram-mirror/vram-mirror.gba"
+frames = 180
+criterion = "screenshot"
+known_failure = true
+known_bad_crc32 = "0x2b146cf1"
+notes = "7/10 pass; Mode 3 0x06018000 mirror leaks into 0x06010000 and fails to return 0"
+
+[[tests]]
+id = "nba_timer_reload"
+suite = "nba-hw-test"
+name = "nba-hw-test/timer/reload.gba"
+rom_path = "test-roms/nba-hw-test/timer/reload/reload.gba"
+frames = 60
+criterion = "screenshot"
+known_failure = true
+known_bad_crc32 = "0x56386c33"
+notes = "4/7 pass (FFF8 32 7: 0xdeae vs 0xfff9; FFFF 16/32 0: 0xdeb5 vs 0xdeb4)"
+
+[[tests]]
+id = "nba_timer_start_stop"
+suite = "nba-hw-test"
+name = "nba-hw-test/timer/start-stop.gba"
+rom_path = "test-roms/nba-hw-test/timer/start-stop/start-stop.gba"
+frames = 60
+criterion = "screenshot"
+known_failure = true
+known_bad_crc32 = "0x29380c6f"
+notes = "1/2 pass (2ND: 7 vs 8)"
+
+[[tests]]
+id = "nba_timer_tick_before_reload"
+suite = "nba-hw-test"
+name = "nba-hw-test/timer/tick-before-reload.gba"
+rom_path = "test-roms/nba-hw-test/timer/tick-before-reload/tick-before-reload.gba"
+frames = 60
+criterion = "screenshot"
+known_failure = true
+known_bad_crc32 = "0xf9bb7091"
+notes = "0/2 pass (TM1CNT_L: 0 vs 1, IF: 0 vs 8)"
+
+# --- Tonc PPU & Hardware Demos ---
+
+[[tests]]
+id = "tonc_bm_modes"
+suite = "tonc"
+name = "tonc/bm_modes.gba"
+rom_path = "test-roms/tonc/bm_modes.gba"
+frames = 30
+criterion = "fb_hash"
+
+[[tests]]
+id = "tonc_mos_demo"
+suite = "tonc"
+name = "tonc/mos_demo.gba"
+rom_path = "test-roms/tonc/mos_demo.gba"
+frames = 30
+criterion = "fb_hash"
+
+[[tests]]
+id = "tonc_win_demo"
+suite = "tonc"
+name = "tonc/win_demo.gba"
+rom_path = "test-roms/tonc/win_demo.gba"
+frames = 30
+criterion = "fb_hash"
+
+[[tests]]
+id = "tonc_bld_demo"
+suite = "tonc"
+name = "tonc/bld_demo.gba"
+rom_path = "test-roms/tonc/bld_demo.gba"
+frames = 30
+criterion = "fb_hash"
+
+[[tests]]
+id = "tonc_obj_aff"
+suite = "tonc"
+name = "tonc/obj_aff.gba"
+rom_path = "test-roms/tonc/obj_aff.gba"
+frames = 30
+criterion = "fb_hash"
+
+[[tests]]
+id = "tonc_obj_demo"
+suite = "tonc"
+name = "tonc/obj_demo.gba"
+rom_path = "test-roms/tonc/obj_demo.gba"
+frames = 30
+criterion = "fb_hash"
+
+[[tests]]
+id = "tonc_m7_demo"
+suite = "tonc"
+name = "tonc/m7_demo.gba"
+rom_path = "test-roms/tonc/m7_demo.gba"
+frames = 30
+criterion = "fb_hash"
+
+[[tests]]
+id = "tonc_prio_demo"
+suite = "tonc"
+name = "tonc/prio_demo.gba"
+rom_path = "test-roms/tonc/prio_demo.gba"
+frames = 30
+criterion = "fb_hash"
+
+[[tests]]
+id = "tonc_tte_demo"
+suite = "tonc"
+name = "tonc/tte_demo.gba"
+rom_path = "test-roms/tonc/tte_demo.gba"
+frames = 30
+criterion = "fb_hash"
+
+[[tests]]
+id = "tonc_irq_demo"
+suite = "tonc"
+name = "tonc/irq_demo.gba"
+rom_path = "test-roms/tonc/irq_demo.gba"
+frames = 60
+criterion = "fb_hash"
+
+[[tests]]
+id = "tonc_tmr_demo"
+suite = "tonc"
+name = "tonc/tmr_demo.gba"
+rom_path = "test-roms/tonc/tmr_demo.gba"
+frames = 60
+criterion = "fb_hash"
+
+[[tests]]
+id = "tonc_dma_demo"
+suite = "tonc"
+name = "tonc/dma_demo.gba"
+rom_path = "test-roms/tonc/dma_demo.gba"
+frames = 30
+criterion = "fb_hash"
+
+# --- Optional / User-Supplied Suites ---
+
+[[tests]]
+id = "mgba_suite_all"
+suite = "mgba"
+name = "mgba/suite.gba (all)"
+rom_path = "test-roms/mgba/suite.gba"
+frames = 600
+criterion = "screenshot"
+inputs = [{ frame = 20, duration = 2, keys = ["A"] }]
+notes = "Requires devkitARM-built suite.gba (see scripts/README.md)"
+
+[[tests]]
+id = "ags_aging"
+suite = "ags"
+name = "ags/ags.gba"
+rom_path = "test-roms/ags/ags.gba"
+frames = 600
+criterion = "screenshot"
+notes = "Proprietary Nintendo AGS Aging Cartridge (user-supplied)"

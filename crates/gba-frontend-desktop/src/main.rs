@@ -11,6 +11,7 @@ mod hotkeys;
 mod hud;
 mod input;
 mod library;
+mod mem_search;
 mod menus;
 mod rewind;
 mod rom_loader;

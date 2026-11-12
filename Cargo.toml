@@ -6,6 +6,7 @@ members = [
     "crates/gba-frontend-desktop",
     "crates/gba-frontend-web",
     "crates/gba-libretro",
+    "crates/gba-testrunner",
 ]
 
 [workspace.package]

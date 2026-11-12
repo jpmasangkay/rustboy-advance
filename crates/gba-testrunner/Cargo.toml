@@ -1,0 +1,15 @@
+[package]
+name = "gba-testrunner"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[[bin]]
+name = "gba-testrunner"
+path = "src/main.rs"
+
+[dependencies]
+gba-core = { path = "../gba-core" }
+image = { version = "0.25", default-features = false, features = ["png"] }
+serde = { workspace = true, features = ["std"] }
+toml = "0.8"

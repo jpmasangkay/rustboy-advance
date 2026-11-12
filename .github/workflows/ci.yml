@@ -1,0 +1,87 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  build-and-test:
+    name: Build & Test (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest, macos-latest]
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Install Linux system dependencies
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            pkg-config \
+            libasound2-dev \
+            libudev-dev \
+            libxkbcommon-dev \
+            libwayland-dev \
+            libx11-dev \
+            libxcursor-dev \
+            libxi-dev \
+            libxrandr-dev \
+            libgl-dev \
+            libgl1-mesa-dev \
+            libegl-dev
+
+      - name: Install Rust stable toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy, rustfmt
+
+      - name: Cache Cargo registry and target directory
+        uses: Swatinem/rust-cache@v2
+
+      - name: Check formatting
+        run: |
+          # Note: Workspace-wide `cargo fmt --check` currently fails on pre-existing
+          # crates on main (e.g., gba-core), so it is skipped here until formatted.
+          # Enforce strict formatting on the test runner crate:
+          cargo fmt -p gba-testrunner -- --check
+
+      - name: Run Clippy
+        run: |
+          # Existing crates on main emit clippy warnings, so run workspace clippy
+          # without -D warnings, and enforce -D warnings on gba-testrunner:
+          cargo clippy --workspace --all-targets
+          cargo clippy -p gba-testrunner --all-targets --no-deps -- -D warnings
+
+      - name: Run workspace unit & harness tests (dev profile)
+        run: cargo test --workspace
+
+      - name: Fetch freely-redistributable test ROMs (Unix)
+        if: runner.os != 'Windows'
+        shell: bash
+        run: ./scripts/fetch-test-roms.sh
+
+      - name: Fetch freely-redistributable test ROMs (Windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: ./scripts/fetch-test-roms.ps1
+
+      - name: Run GBA test ROM suite & generate TEST_RESULTS.md
+        run: cargo run -p gba-testrunner -- --report TEST_RESULTS.md --fail-on-unexpected
+
+      - name: Upload TEST_RESULTS.md and test_output artifacts
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: test-results-${{ matrix.os }}
+          path: |
+            TEST_RESULTS.md
+            test_output/
+          if-no-files-found: warn

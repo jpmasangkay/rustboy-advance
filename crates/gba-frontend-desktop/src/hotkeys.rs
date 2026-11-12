@@ -67,7 +67,7 @@ impl RustboyApp {
                 ctx.send_viewport_cmd(egui::ViewportCommand::Fullscreen(false));
                 self.notify("Exited Fullscreen");
                 return;
-            } else if self.core.is_some() {
+            } else if self.has_active_game() {
                 self.show_pause_overlay = !self.show_pause_overlay;
                 self.paused = self.show_pause_overlay;
                 return;
@@ -76,7 +76,7 @@ impl RustboyApp {
 
         // Ctrl+W returns to library when a game is running
         let stop_game = ctx.input(|i| i.modifiers.ctrl && !i.modifiers.shift && !i.modifiers.alt && i.key_pressed(Key::W));
-        if stop_game && self.core.is_some() {
+        if stop_game && self.has_active_game() {
             self.close_rom(ctx);
             return;
         }
@@ -144,7 +144,7 @@ impl RustboyApp {
 
         self.tab_fast_forward = ff_held;
 
-        if self.core.is_some() && rewind_held {
+        if self.has_active_game() && rewind_held {
             if !self.config.rewind_enabled {
                 if !was_rewinding && rewind_pressed {
                     self.notify("Rewind is disabled in Emulation -> Rewind Settings");
@@ -226,7 +226,7 @@ impl RustboyApp {
                 "Audio Unmuted"
             });
         }
-        if pause_trig && self.core.is_some() {
+        if pause_trig && self.has_active_game() {
             self.toggle_pause();
         }
         if screenshot_trig {

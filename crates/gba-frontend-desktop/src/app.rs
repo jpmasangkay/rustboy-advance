@@ -16,12 +16,15 @@ use crate::game_settings::{
     load_effective_settings, save_game_settings_entry, CartridgeHardwareDefaults,
     GameSettingsTarget,
 };
+use crate::gb_bridge::{blit_gb_to_gba_fb, crop_gb_rgba_from_240x160, GbSession};
 use crate::headless::CliConfig;
 use crate::input::{AutofireState, ControlsTab, PendingInputBind};
 use crate::library::{LibraryScanResult, LibraryViewMode, RomLibraryEntry};
+use crate::link::LinkManager;
 use crate::rewind::RewindBuffer;
 use crate::rom_loader::{
-    apply_auto_patch_if_present, apply_patch_file, is_patch_extension, load_rom_bytes,
+    apply_auto_patch_if_present, apply_patch_file, detect_rom_platform, is_patch_extension,
+    load_rom_bytes, RomPlatform,
 };
 use crate::savestates::SlotMetaEntry;
 
@@ -90,6 +93,8 @@ pub(crate) struct RustboyApp {
     // WAVE-2 HOOK: Core emulator handle (`core.bus.*` memory, PPU, APU, Link/SIO)
     // shared with Debugger, Lua scripting, RetroAchievements, and Netplay/Link Cable.
     pub(crate) core: Option<GbaCore>,
+    pub(crate) gb: Option<GbSession>,
+    pub(crate) link: LinkManager,
     pub(crate) sink: CoreSink,
     pub(crate) postproc: VideoPostProcessor,
     pub(crate) lcd_tex: Option<TextureHandle>,
@@ -174,6 +179,8 @@ impl RustboyApp {
         let mut app = Self {
             config,
             core: None,
+            gb: None,
+            link: LinkManager::new(),
             sink,
             postproc: VideoPostProcessor::new(),
             lcd_tex: None,
@@ -270,8 +277,13 @@ impl RustboyApp {
     }
 
     pub(crate) fn sync_window_title(&self, ctx: &egui::Context) {
-        let title = if self.core.is_some() {
-            format!("Rustboy Advance — {} ({})", self.rom_title, self.rom_code)
+        let title = if self.has_active_game() {
+            format!(
+                "Rustboy Advance — {} [{}] ({})",
+                self.rom_title,
+                self.active_platform_badge(),
+                self.rom_code
+            )
         } else {
             "Rustboy Advance".to_string()
         };
@@ -378,6 +390,7 @@ impl RustboyApp {
     ) -> Result<(), String> {
         self.flush_battery_save();
         self.save_rom_specific_settings();
+        self.link.disconnect_all();
 
         let mut loaded = load_rom_bytes(rom_path)?;
         let patch_applied = if let Some(patch_path) = explicit_patch {
@@ -388,12 +401,27 @@ impl RustboyApp {
         let rom_bytes = loaded.bytes;
         let archive_badge = loaded.source_kind.badge();
         let archive_inner = loaded.inner_name;
-        let rom_crc32 = crc32fast::hash(&rom_bytes);
 
         let sav_path = custom_sav
             .map(PathBuf::from)
             .unwrap_or_else(|| rom_path.with_extension("sav"));
 
+        let platform = detect_rom_platform(rom_path, archive_inner.as_deref(), &rom_bytes);
+        if matches!(platform, RomPlatform::Gb | RomPlatform::Gbc) {
+            self.open_gb_rom_loaded(
+                rom_path,
+                &sav_path,
+                rom_bytes,
+                archive_badge,
+                archive_inner,
+                patch_applied,
+                ctx,
+            );
+            return Ok(());
+        }
+
+        self.gb = None;
+        let rom_crc32 = crc32fast::hash(&rom_bytes);
         let mut core = GbaCore::new(self.bios_bytes.as_deref(), rom_bytes);
         if let Ok(sav) = fs::read(&sav_path) {
             core.bus.cart.load_save_data(&sav);
@@ -409,15 +437,47 @@ impl RustboyApp {
         };
 
         self.core = Some(core);
+        self.sink.framebuffer.fill(0);
+        self.finalize_rom_session(
+            rom_path,
+            &sav_path,
+            title.clone(),
+            code.clone(),
+            rom_crc32,
+            ctx,
+        );
+        self.apply_active_game_settings_to_core();
+
+        let patch_tag = match patch_applied {
+            Some(fmt) => format!(" ({} Patched)", fmt.label()),
+            None => String::new(),
+        };
+        let archive_tag = match (archive_badge, archive_inner.as_deref()) {
+            (Some(kind), Some(inner)) => format!(" [{kind}: {inner}]"),
+            (Some(kind), None) => format!(" [{kind}]"),
+            _ => String::new(),
+        };
+        self.notify(&format!("Playing {title} [{code}]{archive_tag}{patch_tag}"));
+        Ok(())
+    }
+
+    pub(crate) fn finalize_rom_session(
+        &mut self,
+        rom_path: &Path,
+        sav_path: &Path,
+        title: String,
+        code: String,
+        rom_crc32: u32,
+        ctx: Option<&egui::Context>,
+    ) {
         self.rom_path = Some(rom_path.to_path_buf());
-        self.sav_path = Some(sav_path);
+        self.sav_path = Some(sav_path.to_path_buf());
         self.rom_title = title.clone();
         self.rom_code = code.clone();
         self.rom_crc32 = rom_crc32;
         self.session_speed_override = None;
         self.show_game_settings = false;
         self.game_settings_target = None;
-        self.apply_active_game_settings_to_core();
         self.paused = false;
         self.show_pause_overlay = false;
         self.show_state_manager = false;
@@ -432,14 +492,12 @@ impl RustboyApp {
         self.frames_in_window = 0;
         self.last_fps_sample = Instant::now();
         self.postproc.prev_rgba.fill(0);
-        self.sink.framebuffer.fill(0);
         self.sink.frame_dirty = true;
         self.slot_thumbnails = [None, None, None, None, None];
         self.slot_meta = [None, None, None, None, None];
         self.state_manager_error = None;
         self.playtime_timer = Instant::now();
 
-        // Track per-game launch count and last played timestamp
         let now_ts = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap_or_default()
@@ -448,29 +506,21 @@ impl RustboyApp {
         pt.launch_count += 1;
         pt.last_played_timestamp = now_ts;
 
-        self.config.push_recent(rom_path, title.clone(), code.clone());
+        self.config.push_recent(rom_path, title, code);
         self.title_dirty = true;
         if let Some(c) = ctx {
             self.sync_window_title(c);
             self.title_dirty = false;
         }
-        let patch_tag = match patch_applied {
-            Some(fmt) => format!(" ({} Patched)", fmt.label()),
-            None => String::new(),
-        };
-        let archive_tag = match (archive_badge, archive_inner.as_deref()) {
-            (Some(kind), Some(inner)) => format!(" [{kind}: {inner}]"),
-            (Some(kind), None) => format!(" [{kind}]"),
-            _ => String::new(),
-        };
-        self.notify(&format!("Playing {title} [{code}]{archive_tag}{patch_tag}"));
-        Ok(())
     }
 
     pub(crate) fn close_rom(&mut self, ctx: &egui::Context) {
+        self.flush_gb_battery_save(true);
         self.flush_battery_save();
         self.save_rom_specific_settings();
+        self.link.disconnect_all();
         self.core = None;
+        self.gb = None;
         self.rom_path = None;
         self.sav_path = None;
         self.rom_title.clear();
@@ -524,6 +574,13 @@ impl RustboyApp {
     }
 
     pub(crate) fn flush_battery_save(&mut self) {
+        if let Some(local) = &mut self.link.local {
+            local.flush_p2_battery_save();
+        }
+        if self.gb.is_some() {
+            self.flush_gb_battery_save(false);
+            return;
+        }
         let (Some(core), Some(sav_path)) = (&mut self.core, &self.sav_path) else {
             return;
         };
@@ -569,6 +626,10 @@ impl RustboyApp {
     }
 
     pub(crate) fn import_battery_save(&mut self) {
+        if self.gb.is_some() {
+            self.import_gb_battery_save();
+            return;
+        }
         let Some(core) = &mut self.core else { return };
         if let Some(path) = rfd::FileDialog::new()
             .set_title("Import Battery Save (.sav)")
@@ -588,6 +649,10 @@ impl RustboyApp {
     }
 
     pub(crate) fn export_battery_save(&mut self) {
+        if self.gb.is_some() {
+            self.export_gb_battery_save();
+            return;
+        }
         let Some(core) = &self.core else { return };
         let data = core.bus.cart.export_save_data();
         if data.is_empty() {
@@ -608,9 +673,20 @@ impl RustboyApp {
     }
 
     pub(crate) fn capture_screenshot(&mut self) {
-        if self.core.is_none() {
+        if !self.has_active_game() {
             return;
         }
+        if self.sink.frame_dirty {
+            let color_profile = self.effective_color_profile();
+            let _ = self.postproc.process_frame(
+                &self.sink.framebuffer,
+                self.config.color_correction,
+                color_profile,
+                self.config.lcd_ghosting,
+                self.config.scanline_grid,
+            );
+        }
+
         let save_path = if let Some(rom_path) = &self.rom_path {
             rom_path.with_extension("png")
         } else {
@@ -623,11 +699,25 @@ impl RustboyApp {
             let _ = fs::create_dir_all(parent);
         }
 
+        let (rgba, w, h) = if self.is_gb_active() {
+            (
+                crop_gb_rgba_from_240x160(&self.postproc.curr_rgba),
+                gb_core::LCD_WIDTH as u32,
+                gb_core::LCD_HEIGHT as u32,
+            )
+        } else {
+            (
+                self.postproc.curr_rgba.to_vec(),
+                LCD_WIDTH as u32,
+                LCD_HEIGHT as u32,
+            )
+        };
+
         let res = image::save_buffer_with_format(
             &save_path,
-            &self.postproc.curr_rgba,
-            LCD_WIDTH as u32,
-            LCD_HEIGHT as u32,
+            &rgba,
+            w,
+            h,
             image::ColorType::Rgba8,
             image::ImageFormat::Png,
         );
@@ -636,8 +726,8 @@ impl RustboyApp {
             Ok(()) => self.notify(&format!("Screenshot saved: {}", save_path.display())),
             Err(e) => {
                 let ppm_path = save_path.with_extension("ppm");
-                let mut data = format!("P6\n{} {}\n255\n", LCD_WIDTH, LCD_HEIGHT).into_bytes();
-                for chunk in self.postproc.curr_rgba.as_chunks::<4>().0 {
+                let mut data = format!("P6\n{w} {h}\n255\n").into_bytes();
+                for chunk in rgba.as_chunks::<4>().0 {
                     data.push(chunk[0]);
                     data.push(chunk[1]);
                     data.push(chunk[2]);
@@ -669,12 +759,29 @@ impl RustboyApp {
             self.rewinding = false;
             self.next_frame_due = Instant::now();
             self.notify("Soft Reset");
+        } else if let Some(gb) = &mut self.gb {
+            gb.core.reset();
+            gb.core.set_dmg_palette(self.config.dmg_palette.to_core());
+            blit_gb_to_gba_fb(gb.core.framebuffer(), &mut self.sink.framebuffer);
+            self.sink.frame_dirty = true;
+            self.rewind_buffer.clear();
+            self.frame_counter = 0;
+            self.rewinding = false;
+            self.next_frame_due = Instant::now();
+            self.notify("Reset GB/GBC Core");
         }
     }
 
     pub(crate) fn hard_reset(&mut self) {
         if let Some(core) = &mut self.core {
+            let link_on = self.link.local_is_active()
+                || self
+                    .link
+                    .netplay
+                    .as_ref()
+                    .is_some_and(|n| n.is_connected());
             core.reset();
+            core.set_link_connected(link_on);
             self.rewind_buffer.clear();
             self.frame_counter = 0;
             self.rewinding = false;
@@ -683,6 +790,16 @@ impl RustboyApp {
             self.next_frame_due = Instant::now();
             self.apply_active_game_settings_to_core();
             self.notify("Hard Reset");
+        } else if let Some(gb) = &mut self.gb {
+            gb.core.reset();
+            gb.core.set_dmg_palette(self.config.dmg_palette.to_core());
+            blit_gb_to_gba_fb(gb.core.framebuffer(), &mut self.sink.framebuffer);
+            self.sink.frame_dirty = true;
+            self.rewind_buffer.clear();
+            self.frame_counter = 0;
+            self.rewinding = false;
+            self.next_frame_due = Instant::now();
+            self.notify("Hard Reset GB/GBC");
         }
     }
 
@@ -701,27 +818,43 @@ impl RustboyApp {
     }
 
     pub(crate) fn step_single_frame(&mut self, ctx: &egui::Context) {
-        if self.core.is_none() {
+        if !self.has_active_game() {
             return;
         }
         self.paused = true;
         self.show_pause_overlay = false;
         self.sink.keypad = self.poll_inputs(ctx);
+        let p2_kp = if self.link.local_is_active() {
+            self.poll_p2_inputs(ctx)
+        } else {
+            0x03FF
+        };
 
-        let Some(core) = &mut self.core else { return };
         if self.config.rewind_enabled {
             let interval = self.config.rewind_interval.clamp(1, 4) as u64;
             if self.frame_counter.is_multiple_of(interval)
-                && let Ok(state) = core.save_state()
+                && let Ok(state) = self.save_active_core_state()
             {
                 self.rewind_buffer.push(state);
             }
         }
-        apply_cheats_to_core(core, &self.active_cheats);
-        let _ = core.run_frame_with_breakpoints(&mut self.sink, &[]);
-        self.frame_counter += 1;
-        self.sink.framebuffer.copy_from_slice(&*core.bus.ppu.framebuffer);
-        self.sink.frame_dirty = true;
+
+        if let Some(core) = &mut self.core {
+            apply_cheats_to_core(core, &self.active_cheats);
+            if let Some(local) = &mut self.link.local {
+                local.step_frame(core, &mut self.sink, p2_kp);
+            } else if let Some(net) = &mut self.link.netplay {
+                net.step_frame(core, &mut self.sink);
+            } else {
+                let _ = core.run_frame_with_breakpoints(&mut self.sink, &[]);
+            }
+            self.frame_counter += 1;
+            self.sink.framebuffer.copy_from_slice(&*core.bus.ppu.framebuffer);
+            self.sink.frame_dirty = true;
+        } else if self.gb.is_some() {
+            self.step_gb_frame(self.sink.keypad, false);
+            self.frame_counter += 1;
+        }
     }
 
     pub(crate) fn step_single_instruction(&mut self) {
@@ -748,8 +881,11 @@ impl RustboyApp {
 
     pub(crate) fn trigger_open_rom_dialog(&mut self, ctx: &egui::Context) {
         if let Some(path) = rfd::FileDialog::new()
-            .set_title("Open Game Boy Advance ROM")
-            .add_filter("GBA ROMs & Archives", &["gba", "agb", "bin", "zip", "7z"])
+            .set_title("Open GBA / Game Boy ROM")
+            .add_filter(
+                "GBA / GB / GBC ROMs & Archives",
+                &["gba", "agb", "bin", "gb", "gbc", "zip", "7z"],
+            )
             .pick_file()
             && let Err(e) = self.open_rom(&path, None, Some(ctx))
         {
@@ -781,10 +917,16 @@ impl RustboyApp {
                 .unwrap_or("")
                 .to_ascii_lowercase();
             if ext == "sav" || ext == "srm" {
-                if let (Some(core), Ok(bytes)) = (&mut self.core, fs::read(&path)) {
-                    core.bus.cart.load_save_data(&bytes);
-                    core.bus.cart.save_dirty = true;
-                    self.notify("Loaded dropped .sav file");
+                if let Ok(bytes) = fs::read(&path) {
+                    if let Some(core) = &mut self.core {
+                        core.bus.cart.load_save_data(&bytes);
+                        core.bus.cart.save_dirty = true;
+                        self.notify("Loaded dropped .sav file");
+                    } else if let Some(gb) = &mut self.gb {
+                        gb.load_sav_with_rtc(&bytes);
+                        self.flush_gb_battery_save(true);
+                        self.notify("Loaded dropped GB/GBC .sav file");
+                    }
                 }
             } else if ext == "state" || ext == "gbas" {
                 self.load_state_from_path(&path, "Loaded dropped Save State");
@@ -809,7 +951,10 @@ impl RustboyApp {
     // WAVE-2 HOOK: Per-frame emulation loop — Lua `onframe`, RetroAchievements frame tick,
     // Movie frame advance, and Link Cable / SIO sync integrate inside this cadence loop.
     pub(crate) fn advance_emulation(&mut self, ctx: &egui::Context) {
-        if self.core.is_none() {
+        if let Some(net) = &mut self.link.netplay {
+            net.poll_events();
+        }
+        if !self.has_active_game() {
             return;
         }
 
@@ -830,6 +975,11 @@ impl RustboyApp {
         }
 
         self.sink.keypad = self.poll_inputs(ctx);
+        let p2_kp = if self.link.local_is_active() {
+            self.poll_p2_inputs(ctx)
+        } else {
+            0x03FF
+        };
         let speed = self.effective_speed_multiplier();
         let turbo = speed <= 0.0;
         let frame_interval = if turbo {
@@ -852,22 +1002,40 @@ impl RustboyApp {
             }
             let start_t = Instant::now();
             self.sink.keypad = self.effective_keypad_for_frame();
-            let Some(core) = &mut self.core else { break };
+            if !self.has_active_game() {
+                break;
+            }
 
             // Capture rewind snapshot before advancing frame so rewind restores exact pre-frame state
             if self.config.rewind_enabled {
                 let interval = self.config.rewind_interval.clamp(1, 4) as u64;
                 if self.frame_counter.is_multiple_of(interval)
-                    && let Ok(state) = core.save_state()
+                    && let Ok(state) = self.save_active_core_state()
                 {
                     self.rewind_buffer.push(state);
                 }
             }
 
-            self.sink.suppress_audio = (turbo || speed > 1.5) && executed > 0;
-            apply_cheats_to_core(core, &self.active_cheats);
+            let suppress_audio = (turbo || speed > 1.5) && executed > 0;
+            self.sink.suppress_audio = suppress_audio;
+            let mut bp_hit: Option<u32> = None;
 
-            let bp_hit = core.run_frame_with_breakpoints(&mut self.sink, &self.debugger.breakpoints);
+            if let Some(core) = &mut self.core {
+                apply_cheats_to_core(core, &self.active_cheats);
+                if let Some(local) = &mut self.link.local {
+                    local.step_frame(core, &mut self.sink, p2_kp);
+                } else if let Some(net) = &mut self.link.netplay {
+                    net.step_frame(core, &mut self.sink);
+                } else {
+                    bp_hit = core.run_frame_with_breakpoints(
+                        &mut self.sink,
+                        &self.debugger.breakpoints,
+                    );
+                }
+            } else if self.gb.is_some() {
+                self.step_gb_frame(self.sink.keypad, suppress_audio);
+            }
+
             self.last_core_ms = start_t.elapsed().as_secs_f32() * 1000.0;
             executed += 1;
             self.frames_in_window += 1;
@@ -904,7 +1072,7 @@ impl RustboyApp {
         }
 
         // Track per-game active gameplay time
-        if self.core.is_some()
+        if self.has_active_game()
             && !self.paused
             && self.playtime_timer.elapsed() >= Duration::from_secs(1)
         {
@@ -918,6 +1086,8 @@ impl RustboyApp {
         if self.effective_rumble_enabled() {
             if let Some(core) = &self.core {
                 self.rumble_in_progress = core.bus.cart.rumble_active;
+            } else if let Some(gb) = &self.gb {
+                self.rumble_in_progress = gb.core.is_rumble_active();
             }
         } else {
             self.rumble_in_progress = false;
@@ -958,10 +1128,11 @@ impl RustboyApp {
         let pointer_y = ctx.input(|i| i.pointer.latest_pos().map(|p| p.y).unwrap_or(999.0));
         let hover_near_top = pointer_y <= 36.0;
 
-        let cursor_should_hide = self.core.is_some()
+        let cursor_should_hide = self.has_active_game()
             && !self.paused
             && !self.show_pause_overlay
             && !self.show_state_manager
+            && !self.link.show_window
             && now.duration_since(self.last_mouse_activity) > Duration::from_millis(2200);
 
         if cursor_should_hide {
@@ -996,7 +1167,7 @@ impl RustboyApp {
         egui::CentralPanel::default()
             .frame(egui::Frame::new().fill(BG_APP))
             .show(ctx, |ui| {
-                if self.core.is_some() {
+                if self.has_active_game() {
                     self.draw_active_viewport(ctx, ui);
                 } else {
                     self.draw_rom_library_browser(ctx, ui);
@@ -1011,6 +1182,7 @@ impl RustboyApp {
         self.draw_rewind_settings_dialog(ctx);
         self.draw_controls_dialog(ctx);
         self.draw_game_settings_dialog(ctx);
+        self.draw_link_window(ctx);
 
         // Present dockable/floating Debugger & Tool windows
         let pads = self.connected_gamepad_names();
@@ -1037,14 +1209,16 @@ impl RustboyApp {
         }
 
         // Refresh LCD immediately when Color Correction / Grid / Ghosting toggles while paused
-        if self.paused && self.core.is_some() {
+        if self.paused && self.has_active_game() {
             self.sink.frame_dirty = true;
         }
     }
 
     pub fn on_exit(&mut self) {
+        self.flush_gb_battery_save(true);
         self.flush_battery_save();
         self.save_rom_specific_settings();
+        self.link.disconnect_all();
         self.save_persistent_config();
         self.config.save();
     }

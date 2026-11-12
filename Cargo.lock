@@ -552,6 +552,12 @@ dependencies = [
 ]
 
 [[package]]
+name = "color_quant"
+version = "1.1.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "3d7b894f5411737b7867f4827955924d7c254fc9f4d91a6aad6b097804b1018b"
+
+[[package]]
 name = "combine"
 version = "4.6.9"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1076,11 +1082,23 @@ dependencies = [
 ]
 
 [[package]]
+name = "gb-core"
+version = "0.1.0"
+dependencies = [
+ "bitflags 2.13.2",
+ "image",
+ "log",
+ "postcard",
+ "serde",
+]
+
+[[package]]
 name = "gba-core"
 version = "0.1.0"
 dependencies = [
  "bitflags 2.13.2",
  "log",
+ "lz4_flex",
  "postcard",
  "serde",
 ]
@@ -1104,6 +1122,7 @@ dependencies = [
  "egui_glow",
  "gba-core",
  "gba-debugger",
+ "gif",
  "gilrs",
  "glow",
  "glutin",
@@ -1126,6 +1145,7 @@ version = "0.1.0"
 dependencies = [
  "gba-core",
  "log",
+ "wasm-bindgen",
 ]
 
 [[package]]
@@ -1167,6 +1187,16 @@ dependencies = [
  "cfg-if",
  "libc",
  "r-efi 6.0.0",
+]
+
+[[package]]
+name = "gif"
+version = "0.13.3"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "4ae047235e33e2829703574b54fdec96bfbad892062d97fed2f76022287de61b"
+dependencies = [
+ "color_quant",
+ "weezl",
 ]
 
 [[package]]

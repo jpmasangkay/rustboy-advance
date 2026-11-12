@@ -25,6 +25,7 @@ rfd = "0.15"
 cpal = "0.15"
 ringbuf = "0.4"
 image = { version = "0.25", default-features = false, features = ["png"] }
+gif = "0.13"
 lz4_flex = "0.14"
 crc32fast = "1.5"
 zip = { version = "2", default-features = false, features = ["deflate"] }

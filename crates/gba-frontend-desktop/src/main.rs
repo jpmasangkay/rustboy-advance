@@ -27,6 +27,8 @@ mod shaders;
 use gba_core::{LCD_HEIGHT, LCD_WIDTH};
 
 pub(crate) use app::{configure_obsidian_style, RustboyApp};
+pub use config::DisplayFilter;
+pub use filters::FrontendBridge;
 use config::AppConfig;
 use headless::CliConfig;
 

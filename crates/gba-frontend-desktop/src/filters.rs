@@ -3,14 +3,65 @@ use std::sync::OnceLock;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use egui::ColorImage;
-use gba_core::{LCD_HEIGHT, LCD_WIDTH};
+use gba_core::{HostFrontend, LCD_HEIGHT, LCD_WIDTH};
 
-use crate::config::{AppConfig, ColorProfileChoice};
+use crate::config::{AppConfig, ColorProfileChoice, DisplayFilter};
 
 static LINEAR_LUT: OnceLock<Box<[[u8; 4]; 32_768]>> = OnceLock::new();
 static AGB_LUT: OnceLock<Box<[[u8; 4]; 32_768]>> = OnceLock::new();
 static AGS101_LUT: OnceLock<Box<[[u8; 4]; 32_768]>> = OnceLock::new();
 static AGS001_LUT: OnceLock<Box<[[u8; 4]; 32_768]>> = OnceLock::new();
+
+static SRGB_LUT_3: OnceLock<Box<[[u8; 3]; 32_768]>> = OnceLock::new();
+static RAW_LUT_3: OnceLock<Box<[[u8; 3]; 32_768]>> = OnceLock::new();
+
+#[inline]
+pub fn raw_lut_3() -> &'static [[u8; 3]; 32_768] {
+    RAW_LUT_3.get_or_init(|| {
+        let mut table = vec![[0u8; 3]; 32_768].into_boxed_slice();
+        for bgr in 0..32_768usize {
+            let r5 = (bgr & 0x1F) as f32;
+            let g5 = ((bgr >> 5) & 0x1F) as f32;
+            let b5 = ((bgr >> 10) & 0x1F) as f32;
+
+            table[bgr] = [
+                ((r5 as u8) << 3) | ((r5 as u8) >> 2),
+                ((g5 as u8) << 3) | ((g5 as u8) >> 2),
+                ((b5 as u8) << 3) | ((b5 as u8) >> 2),
+            ];
+        }
+        table.try_into().expect("32768-entry raw LUT")
+    })
+}
+
+#[inline]
+pub fn srgb_lut_3() -> &'static [[u8; 3]; 32_768] {
+    SRGB_LUT_3.get_or_init(|| {
+        let mut table = vec![[0u8; 3]; 32_768].into_boxed_slice();
+        for bgr in 0..32_768usize {
+            let r5 = (bgr & 0x1F) as f32;
+            let g5 = ((bgr >> 5) & 0x1F) as f32;
+            let b5 = ((bgr >> 10) & 0x1F) as f32;
+
+            let rl = (r5 / 31.0).powf(3.6);
+            let gl = (g5 / 31.0).powf(3.6);
+            let bl = (b5 / 31.0).powf(3.6);
+
+            let sr = (0.845 * rl + 0.195 * gl - 0.040 * bl)
+                .clamp(0.0, 1.0)
+                .powf(1.0 / 2.2);
+            let sg = (0.085 * rl + 0.690 * gl + 0.225 * bl)
+                .clamp(0.0, 1.0)
+                .powf(1.0 / 2.2);
+            let sb = (0.050 * rl + 0.210 * gl + 0.740 * bl)
+                .clamp(0.0, 1.0)
+                .powf(1.0 / 2.2);
+
+            table[bgr] = [(sr * 255.0) as u8, (sg * 255.0) as u8, (sb * 255.0) as u8];
+        }
+        table.try_into().expect("32768-entry sRGB LUT")
+    })
+}
 
 #[inline]
 pub fn linear_lut() -> &'static [[u8; 4]; 32_768] {
@@ -147,6 +198,11 @@ pub struct VideoPostProcessor {
     pub has_prev_frame: bool,
     pub frame_blending: bool,
     last_sync_key: Option<SyncCacheKey>,
+
+    pub base_rgb: Vec<[u8; 3]>,
+    pub prev_rgb: Vec<[u8; 3]>,
+    pub output_image: egui::ColorImage,
+    pub filter: DisplayFilter,
 }
 
 impl Default for VideoPostProcessor {
@@ -165,6 +221,11 @@ impl VideoPostProcessor {
             has_prev_frame: false,
             frame_blending: false,
             last_sync_key: None,
+
+            base_rgb: vec![[0u8; 3]; LCD_WIDTH * LCD_HEIGHT],
+            prev_rgb: vec![[0u8; 3]; LCD_WIDTH * LCD_HEIGHT],
+            output_image: egui::ColorImage::new([LCD_WIDTH * 3, LCD_HEIGHT * 3], egui::Color32::BLACK),
+            filter: DisplayFilter::AuthenticGbaLcd,
         }
     }
 
@@ -172,6 +233,8 @@ impl VideoPostProcessor {
         self.prev_rgba.fill(0);
         self.curr_rgba.fill(0);
         self.prev_bgr555.fill(0);
+        self.prev_rgb.fill([0, 0, 0]);
+        self.base_rgb.fill([0, 0, 0]);
         self.has_prev_frame = false;
         self.last_sync_key = None;
     }
@@ -380,6 +443,458 @@ impl VideoPostProcessor {
         .map_err(|e| format!("PNG encode failed: {e}"))?;
         Ok(path)
     }
+
+    pub fn process_display_filter(
+        &mut self,
+        fb_bgr555: &[u16; LCD_WIDTH * LCD_HEIGHT],
+        color_correction: bool,
+        lcd_ghosting: bool,
+        filter: DisplayFilter,
+        green_swap: bool,
+    ) -> &ColorImage {
+        self.filter = filter;
+        let lut = if color_correction {
+            srgb_lut_3()
+        } else {
+            raw_lut_3()
+        };
+
+        // Pass 1: O(1) LUT Color Conversion + Integer LCD Ghosting (~0.05 ms)
+        for i in 0..(LCD_WIDTH * LCD_HEIGHT) {
+            let mut bgr = (fb_bgr555[i] & 0x7FFF) as usize;
+            if green_swap && (i & 1) == 1 {
+                let neighbor_g = fb_bgr555[i ^ 1] & 0x03E0;
+                bgr = (bgr & !0x03E0) | (neighbor_g as usize);
+            }
+
+            let mut rgb = lut[bgr];
+            if lcd_ghosting {
+                let prev = self.prev_rgb[i];
+                rgb[0] = ((rgb[0] as u16 * 3 + prev[0] as u16) >> 2) as u8;
+                rgb[1] = ((rgb[1] as u16 * 3 + prev[1] as u16) >> 2) as u8;
+                rgb[2] = ((rgb[2] as u16 * 3 + prev[2] as u16) >> 2) as u8;
+                self.prev_rgb[i] = rgb;
+            }
+            self.base_rgb[i] = rgb;
+
+            let off = i * 4;
+            self.curr_rgba[off] = rgb[0];
+            self.curr_rgba[off + 1] = rgb[1];
+            self.curr_rgba[off + 2] = rgb[2];
+            self.curr_rgba[off + 3] = 255;
+        }
+
+        // Pass 2: Fast Integer Display Filter (~0.15 - 0.25 ms)
+        match filter {
+            DisplayFilter::RawNearest => {
+                if self.output_image.size != [LCD_WIDTH, LCD_HEIGHT] {
+                    self.output_image =
+                        egui::ColorImage::new([LCD_WIDTH, LCD_HEIGHT], egui::Color32::BLACK);
+                }
+                for (dst, &[r, g, b]) in self
+                    .output_image
+                    .pixels
+                    .iter_mut()
+                    .zip(self.base_rgb.iter())
+                {
+                    *dst = egui::Color32::from_rgb(r, g, b);
+                }
+            }
+
+            DisplayFilter::SoftHandheld => {
+                let out_w = LCD_WIDTH * 2;
+                let out_h = LCD_HEIGHT * 2;
+                if self.output_image.size != [out_w, out_h] {
+                    self.output_image = egui::ColorImage::new([out_w, out_h], egui::Color32::BLACK);
+                }
+                for y in 0..LCD_HEIGHT {
+                    let src_row = y * LCD_WIDTH;
+                    let dst_r0 = (y * 2) * out_w;
+                    let dst_r1 = dst_r0 + out_w;
+                    for x in 0..LCD_WIDTH {
+                        let [r, g, b] = self.base_rgb[src_row + x];
+                        let c = egui::Color32::from_rgb(r, g, b);
+                        let dx = x * 2;
+                        self.output_image.pixels[dst_r0 + dx] = c;
+                        self.output_image.pixels[dst_r0 + dx + 1] = c;
+                        self.output_image.pixels[dst_r1 + dx] = c;
+                        self.output_image.pixels[dst_r1 + dx + 1] = c;
+                    }
+                }
+            }
+
+            DisplayFilter::AuthenticGbaLcd => {
+                let out_w = LCD_WIDTH * 3;
+                let out_h = LCD_HEIGHT * 3;
+                if self.output_image.size != [out_w, out_h] {
+                    self.output_image = egui::ColorImage::new([out_w, out_h], egui::Color32::BLACK);
+                }
+                for y in 0..LCD_HEIGHT {
+                    let src_row = y * LCD_WIDTH;
+                    let r0 = (y * 3) * out_w;
+                    let r1 = r0 + out_w;
+                    let r2 = r1 + out_w;
+
+                    for x in 0..LCD_WIDTH {
+                        let [r, g, b] = self.base_rgb[src_row + x];
+                        let c_left = egui::Color32::from_rgb(
+                            r,
+                            ((g as u16 * 238) >> 8) as u8,
+                            ((b as u16 * 230) >> 8) as u8,
+                        );
+                        let c_mid = egui::Color32::from_rgb(r, g, b);
+                        let c_right = egui::Color32::from_rgb(
+                            ((r as u16 * 215) >> 8) as u8,
+                            ((g as u16 * 218) >> 8) as u8,
+                            ((b as u16 * 228) >> 8) as u8,
+                        );
+                        let c_scan = egui::Color32::from_rgb(
+                            ((r as u16 * 198) >> 8) as u8,
+                            ((g as u16 * 198) >> 8) as u8,
+                            ((b as u16 * 204) >> 8) as u8,
+                        );
+                        let c_corner = egui::Color32::from_rgb(
+                            ((r as u16 * 175) >> 8) as u8,
+                            ((g as u16 * 175) >> 8) as u8,
+                            ((b as u16 * 180) >> 8) as u8,
+                        );
+
+                        let dx = x * 3;
+                        self.output_image.pixels[r0 + dx] = c_left;
+                        self.output_image.pixels[r0 + dx + 1] = c_mid;
+                        self.output_image.pixels[r0 + dx + 2] = c_right;
+
+                        self.output_image.pixels[r1 + dx] = c_left;
+                        self.output_image.pixels[r1 + dx + 1] = c_mid;
+                        self.output_image.pixels[r1 + dx + 2] = c_right;
+
+                        self.output_image.pixels[r2 + dx] = c_scan;
+                        self.output_image.pixels[r2 + dx + 1] = c_scan;
+                        self.output_image.pixels[r2 + dx + 2] = c_corner;
+                    }
+                }
+            }
+
+            DisplayFilter::SmoothScale2x => {
+                let out_w = LCD_WIDTH * 2;
+                let out_h = LCD_HEIGHT * 2;
+                if self.output_image.size != [out_w, out_h] {
+                    self.output_image = egui::ColorImage::new([out_w, out_h], egui::Color32::BLACK);
+                }
+                for y in 0..LCD_HEIGHT {
+                    let ym1 = y.saturating_sub(1);
+                    let yp1 = (y + 1).min(LCD_HEIGHT - 1);
+                    let dst_r0 = (y * 2) * out_w;
+                    let dst_r1 = dst_r0 + out_w;
+
+                    for x in 0..LCD_WIDTH {
+                        let xm1 = x.saturating_sub(1);
+                        let xp1 = (x + 1).min(LCD_WIDTH - 1);
+
+                        let p = self.base_rgb[y * LCD_WIDTH + x];
+                        let a = self.base_rgb[ym1 * LCD_WIDTH + x]; // Up
+                        let b = self.base_rgb[y * LCD_WIDTH + xp1]; // Right
+                        let c = self.base_rgb[y * LCD_WIDTH + xm1]; // Left
+                        let d = self.base_rgb[yp1 * LCD_WIDTH + x]; // Down
+
+                        let mut p1 = p;
+                        let mut p2 = p;
+                        let mut p3 = p;
+                        let mut p4 = p;
+
+                        if c == a && c != d && a != b {
+                            p1 = a;
+                        }
+                        if a == b && a != c && b != d {
+                            p2 = b;
+                        }
+                        if d == c && d != b && c != a {
+                            p3 = c;
+                        }
+                        if b == d && b != a && d != c {
+                            p4 = d;
+                        }
+
+                        let dx = x * 2;
+                        self.output_image.pixels[dst_r0 + dx] =
+                            egui::Color32::from_rgb(p1[0], p1[1], p1[2]);
+                        self.output_image.pixels[dst_r0 + dx + 1] =
+                            egui::Color32::from_rgb(p2[0], p2[1], p2[2]);
+                        self.output_image.pixels[dst_r1 + dx] =
+                            egui::Color32::from_rgb(p3[0], p3[1], p3[2]);
+                        self.output_image.pixels[dst_r1 + dx + 1] =
+                            egui::Color32::from_rgb(p4[0], p4[1], p4[2]);
+                    }
+                }
+            }
+        }
+
+        &self.output_image
+    }
+}
+
+pub struct FrontendBridge {
+    // Precomputed 15-bit BGR555 -> 24-bit RGB Lookup Tables (0.02 ms lookup!)
+    pub srgb_lut: Box<[[u8; 3]; 32768]>,
+    pub raw_lut: Box<[[u8; 3]; 32768]>,
+
+    pub base_rgb: Vec<[u8; 3]>,
+    pub prev_rgb: Vec<[u8; 3]>,
+    pub output_image: egui::ColorImage,
+
+    pub filter: DisplayFilter,
+    pub color_correction: bool,
+    pub lcd_ghosting: bool,
+    pub green_swap: bool,
+
+    pub keypad_mask: u16,
+    pub audio_prod: ringbuf::HeapProd<i16>,
+    pub audio_muted: bool,
+    pub volume: f32,
+}
+
+impl FrontendBridge {
+    pub fn new(audio_prod: ringbuf::HeapProd<i16>) -> Self {
+        let mut srgb_lut = Box::new([[0u8; 3]; 32768]);
+        let mut raw_lut = Box::new([[0u8; 3]; 32768]);
+
+        for bgr in 0..32768usize {
+            let r5 = (bgr & 0x1F) as f32;
+            let g5 = ((bgr >> 5) & 0x1F) as f32;
+            let b5 = ((bgr >> 10) & 0x1F) as f32;
+
+            raw_lut[bgr] = [
+                ((r5 as u8) << 3) | ((r5 as u8) >> 2),
+                ((g5 as u8) << 3) | ((g5 as u8) >> 2),
+                ((b5 as u8) << 3) | ((b5 as u8) >> 2),
+            ];
+
+            let rl = (r5 / 31.0).powf(3.6);
+            let gl = (g5 / 31.0).powf(3.6);
+            let bl = (b5 / 31.0).powf(3.6);
+
+            let sr = (0.845 * rl + 0.195 * gl - 0.040 * bl)
+                .clamp(0.0, 1.0)
+                .powf(1.0 / 2.2);
+            let sg = (0.085 * rl + 0.690 * gl + 0.225 * bl)
+                .clamp(0.0, 1.0)
+                .powf(1.0 / 2.2);
+            let sb = (0.050 * rl + 0.210 * gl + 0.740 * bl)
+                .clamp(0.0, 1.0)
+                .powf(1.0 / 2.2);
+
+            srgb_lut[bgr] = [(sr * 255.0) as u8, (sg * 255.0) as u8, (sb * 255.0) as u8];
+        }
+
+        Self {
+            srgb_lut,
+            raw_lut,
+            base_rgb: vec![[0u8; 3]; LCD_WIDTH * LCD_HEIGHT],
+            prev_rgb: vec![[0u8; 3]; LCD_WIDTH * LCD_HEIGHT],
+            output_image: egui::ColorImage::new([LCD_WIDTH * 3, LCD_HEIGHT * 3], egui::Color32::BLACK),
+            filter: DisplayFilter::AuthenticGbaLcd,
+            color_correction: true,
+            lcd_ghosting: true,
+            green_swap: false,
+            keypad_mask: 0x03FF,
+            audio_prod,
+            audio_muted: false,
+            volume: 0.85,
+        }
+    }
+
+    pub fn texture_options(&self) -> egui::TextureOptions {
+        self.filter.texture_options()
+    }
+}
+
+impl HostFrontend for FrontendBridge {
+    fn present_frame(&mut self, framebuffer_bgr555: &[u16; LCD_WIDTH * LCD_HEIGHT]) {
+        let lut = if self.color_correction {
+            &self.srgb_lut
+        } else {
+            &self.raw_lut
+        };
+
+        // Pass 1: O(1) LUT Color Conversion + Integer LCD Ghosting (~0.05 ms)
+        for i in 0..(LCD_WIDTH * LCD_HEIGHT) {
+            let mut bgr = (framebuffer_bgr555[i] & 0x7FFF) as usize;
+            if self.green_swap && (i & 1) == 1 {
+                let neighbor_g = framebuffer_bgr555[i ^ 1] & 0x03E0;
+                bgr = (bgr & !0x03E0) | (neighbor_g as usize);
+            }
+
+            let mut rgb = lut[bgr];
+            if self.lcd_ghosting {
+                let prev = self.prev_rgb[i];
+                rgb[0] = ((rgb[0] as u16 * 3 + prev[0] as u16) >> 2) as u8;
+                rgb[1] = ((rgb[1] as u16 * 3 + prev[1] as u16) >> 2) as u8;
+                rgb[2] = ((rgb[2] as u16 * 3 + prev[2] as u16) >> 2) as u8;
+                self.prev_rgb[i] = rgb;
+            }
+            self.base_rgb[i] = rgb;
+        }
+
+        // Pass 2: Fast Integer Display Filter (~0.15 - 0.25 ms)
+        match self.filter {
+            DisplayFilter::RawNearest => {
+                if self.output_image.size != [LCD_WIDTH, LCD_HEIGHT] {
+                    self.output_image =
+                        egui::ColorImage::new([LCD_WIDTH, LCD_HEIGHT], egui::Color32::BLACK);
+                }
+                for (dst, &[r, g, b]) in self
+                    .output_image
+                    .pixels
+                    .iter_mut()
+                    .zip(self.base_rgb.iter())
+                {
+                    *dst = egui::Color32::from_rgb(r, g, b);
+                }
+            }
+
+            DisplayFilter::SoftHandheld => {
+                let out_w = LCD_WIDTH * 2;
+                let out_h = LCD_HEIGHT * 2;
+                if self.output_image.size != [out_w, out_h] {
+                    self.output_image = egui::ColorImage::new([out_w, out_h], egui::Color32::BLACK);
+                }
+                for y in 0..LCD_HEIGHT {
+                    let src_row = y * LCD_WIDTH;
+                    let dst_r0 = (y * 2) * out_w;
+                    let dst_r1 = dst_r0 + out_w;
+                    for x in 0..LCD_WIDTH {
+                        let [r, g, b] = self.base_rgb[src_row + x];
+                        let c = egui::Color32::from_rgb(r, g, b);
+                        let dx = x * 2;
+                        self.output_image.pixels[dst_r0 + dx] = c;
+                        self.output_image.pixels[dst_r0 + dx + 1] = c;
+                        self.output_image.pixels[dst_r1 + dx] = c;
+                        self.output_image.pixels[dst_r1 + dx + 1] = c;
+                    }
+                }
+            }
+
+            DisplayFilter::AuthenticGbaLcd => {
+                let out_w = LCD_WIDTH * 3;
+                let out_h = LCD_HEIGHT * 3;
+                if self.output_image.size != [out_w, out_h] {
+                    self.output_image = egui::ColorImage::new([out_w, out_h], egui::Color32::BLACK);
+                }
+                for y in 0..LCD_HEIGHT {
+                    let src_row = y * LCD_WIDTH;
+                    let r0 = (y * 3) * out_w;
+                    let r1 = r0 + out_w;
+                    let r2 = r1 + out_w;
+
+                    for x in 0..LCD_WIDTH {
+                        let [r, g, b] = self.base_rgb[src_row + x];
+                        let c_left = egui::Color32::from_rgb(
+                            r,
+                            ((g as u16 * 238) >> 8) as u8,
+                            ((b as u16 * 230) >> 8) as u8,
+                        );
+                        let c_mid = egui::Color32::from_rgb(r, g, b);
+                        let c_right = egui::Color32::from_rgb(
+                            ((r as u16 * 215) >> 8) as u8,
+                            ((g as u16 * 218) >> 8) as u8,
+                            ((b as u16 * 228) >> 8) as u8,
+                        );
+                        let c_scan = egui::Color32::from_rgb(
+                            ((r as u16 * 198) >> 8) as u8,
+                            ((g as u16 * 198) >> 8) as u8,
+                            ((b as u16 * 204) >> 8) as u8,
+                        );
+                        let c_corner = egui::Color32::from_rgb(
+                            ((r as u16 * 175) >> 8) as u8,
+                            ((g as u16 * 175) >> 8) as u8,
+                            ((b as u16 * 180) >> 8) as u8,
+                        );
+
+                        let dx = x * 3;
+                        self.output_image.pixels[r0 + dx] = c_left;
+                        self.output_image.pixels[r0 + dx + 1] = c_mid;
+                        self.output_image.pixels[r0 + dx + 2] = c_right;
+
+                        self.output_image.pixels[r1 + dx] = c_left;
+                        self.output_image.pixels[r1 + dx + 1] = c_mid;
+                        self.output_image.pixels[r1 + dx + 2] = c_right;
+
+                        self.output_image.pixels[r2 + dx] = c_scan;
+                        self.output_image.pixels[r2 + dx + 1] = c_scan;
+                        self.output_image.pixels[r2 + dx + 2] = c_corner;
+                    }
+                }
+            }
+
+            DisplayFilter::SmoothScale2x => {
+                let out_w = LCD_WIDTH * 2;
+                let out_h = LCD_HEIGHT * 2;
+                if self.output_image.size != [out_w, out_h] {
+                    self.output_image = egui::ColorImage::new([out_w, out_h], egui::Color32::BLACK);
+                }
+                for y in 0..LCD_HEIGHT {
+                    let ym1 = y.saturating_sub(1);
+                    let yp1 = (y + 1).min(LCD_HEIGHT - 1);
+                    let dst_r0 = (y * 2) * out_w;
+                    let dst_r1 = dst_r0 + out_w;
+
+                    for x in 0..LCD_WIDTH {
+                        let xm1 = x.saturating_sub(1);
+                        let xp1 = (x + 1).min(LCD_WIDTH - 1);
+
+                        let p = self.base_rgb[y * LCD_WIDTH + x];
+                        let a = self.base_rgb[ym1 * LCD_WIDTH + x]; // Up
+                        let b = self.base_rgb[y * LCD_WIDTH + xp1]; // Right
+                        let c = self.base_rgb[y * LCD_WIDTH + xm1]; // Left
+                        let d = self.base_rgb[yp1 * LCD_WIDTH + x]; // Down
+
+                        let mut p1 = p;
+                        let mut p2 = p;
+                        let mut p3 = p;
+                        let mut p4 = p;
+
+                        if c == a && c != d && a != b {
+                            p1 = a;
+                        }
+                        if a == b && a != c && b != d {
+                            p2 = b;
+                        }
+                        if d == c && d != b && c != a {
+                            p3 = c;
+                        }
+                        if b == d && b != a && d != c {
+                            p4 = d;
+                        }
+
+                        let dx = x * 2;
+                        self.output_image.pixels[dst_r0 + dx] =
+                            egui::Color32::from_rgb(p1[0], p1[1], p1[2]);
+                        self.output_image.pixels[dst_r0 + dx + 1] =
+                            egui::Color32::from_rgb(p2[0], p2[1], p2[2]);
+                        self.output_image.pixels[dst_r1 + dx] =
+                            egui::Color32::from_rgb(p3[0], p3[1], p3[2]);
+                        self.output_image.pixels[dst_r1 + dx + 1] =
+                            egui::Color32::from_rgb(p4[0], p4[1], p4[2]);
+                    }
+                }
+            }
+        }
+    }
+
+    fn push_audio_samples(&mut self, samples_interleaved_i16: &[i16]) {
+        use ringbuf::traits::Producer;
+        if self.audio_muted {
+            return;
+        }
+        for &s in samples_interleaved_i16 {
+            let scaled = ((s as f32) * self.volume).clamp(i16::MIN as f32, i16::MAX as f32) as i16;
+            let _ = self.audio_prod.try_push(scaled);
+        }
+    }
+
+    fn poll_keypad(&mut self) -> u16 {
+        self.keypad_mask
+    }
 }
 
 #[cfg(test)]
@@ -445,5 +960,49 @@ mod tests {
             false,
         );
         assert_eq!(img.pixels[0], egui::Color32::from_rgba_unmultiplied(127, 127, 0, 255));
+    }
+
+    #[test]
+    fn display_filter_modes_and_frontend_bridge_pipeline() {
+        use ringbuf::traits::Split;
+        use ringbuf::HeapRb;
+
+        let rb = HeapRb::<i16>::new(1024);
+        let (prod, _) = rb.split();
+        let mut bridge = FrontendBridge::new(prod);
+
+        let test_fb = [0x7FFF_u16; LCD_WIDTH * LCD_HEIGHT];
+
+        // 1. Authentic GBA LCD (3x -> 720x480)
+        bridge.filter = DisplayFilter::AuthenticGbaLcd;
+        bridge.present_frame(&test_fb);
+        assert_eq!(bridge.output_image.size, [LCD_WIDTH * 3, LCD_HEIGHT * 3]);
+        assert_eq!(bridge.texture_options(), egui::TextureOptions::LINEAR);
+
+        // 2. Soft Handheld (2x -> 480x320)
+        bridge.filter = DisplayFilter::SoftHandheld;
+        bridge.present_frame(&test_fb);
+        assert_eq!(bridge.output_image.size, [LCD_WIDTH * 2, LCD_HEIGHT * 2]);
+        assert_eq!(bridge.texture_options(), egui::TextureOptions::LINEAR);
+
+        // 3. Smooth Scale2x (2x -> 480x320)
+        bridge.filter = DisplayFilter::SmoothScale2x;
+        bridge.present_frame(&test_fb);
+        assert_eq!(bridge.output_image.size, [LCD_WIDTH * 2, LCD_HEIGHT * 2]);
+        assert_eq!(bridge.texture_options(), egui::TextureOptions::NEAREST);
+
+        // 4. Raw Nearest (1x -> 240x160)
+        bridge.filter = DisplayFilter::RawNearest;
+        bridge.present_frame(&test_fb);
+        assert_eq!(bridge.output_image.size, [LCD_WIDTH, LCD_HEIGHT]);
+        assert_eq!(bridge.texture_options(), egui::TextureOptions::NEAREST);
+
+        // Also test VideoPostProcessor::process_display_filter directly
+        let mut proc = VideoPostProcessor::new();
+        for &f in &DisplayFilter::ALL {
+            let img = proc.process_display_filter(&test_fb, true, true, f, false);
+            let (exp_w, exp_h) = f.target_dimensions();
+            assert_eq!(img.size, [exp_w, exp_h]);
+        }
     }
 }

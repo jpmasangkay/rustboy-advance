@@ -671,6 +671,68 @@ impl SaveOverrideChoice {
     }
 }
 
+#[derive(Copy, Clone, PartialEq, Eq, Debug, Serialize, Deserialize, Default)]
+pub enum DisplayFilter {
+    #[default]
+    AuthenticGbaLcd, // 3x (720x480) LCD Subpixel Dot-Matrix
+    SoftHandheld,    // 2x (480x320) Sharp-Bilinear
+    SmoothScale2x,   // 2x (480x320) EPX / Scale2x diagonal smoothing
+    RawNearest,      // 1x (240x160) Raw square pixels
+}
+
+impl DisplayFilter {
+    pub const ALL: [Self; 4] = [
+        Self::AuthenticGbaLcd,
+        Self::SoftHandheld,
+        Self::SmoothScale2x,
+        Self::RawNearest,
+    ];
+
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::AuthenticGbaLcd => "LCD Matrix",
+            Self::SoftHandheld => "Soft LCD",
+            Self::SmoothScale2x => "Scale2x",
+            Self::RawNearest => "Raw 1x",
+        }
+    }
+
+    pub fn description(self) -> &'static str {
+        match self {
+            Self::AuthenticGbaLcd => "Authentic GBA LCD (3x subpixel grid)",
+            Self::SoftHandheld => "Soft Handheld (2x sharp-bilinear)",
+            Self::SmoothScale2x => "Smooth Pixel Art (Scale2x / EPX)",
+            Self::RawNearest => "Raw Pixelated (1x nearest-neighbor)",
+        }
+    }
+
+    pub fn next(self) -> Self {
+        match self {
+            Self::AuthenticGbaLcd => Self::SoftHandheld,
+            Self::SoftHandheld => Self::SmoothScale2x,
+            Self::SmoothScale2x => Self::RawNearest,
+            Self::RawNearest => Self::AuthenticGbaLcd,
+        }
+    }
+
+    pub fn texture_options(self) -> egui::TextureOptions {
+        match self {
+            Self::AuthenticGbaLcd | Self::SoftHandheld => egui::TextureOptions::LINEAR,
+            Self::SmoothScale2x | Self::RawNearest => egui::TextureOptions::NEAREST,
+        }
+    }
+
+    pub fn target_dimensions(self) -> (usize, usize) {
+        match self {
+            Self::AuthenticGbaLcd => (gba_core::LCD_WIDTH * 3, gba_core::LCD_HEIGHT * 3),
+            Self::SoftHandheld | Self::SmoothScale2x => {
+                (gba_core::LCD_WIDTH * 2, gba_core::LCD_HEIGHT * 2)
+            }
+            Self::RawNearest => (gba_core::LCD_WIDTH, gba_core::LCD_HEIGHT),
+        }
+    }
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize, Default)]
 pub enum ShaderPreset {
     #[default]
@@ -902,6 +964,8 @@ pub struct AppConfig {
     pub lcd_ghosting: bool,
     pub scanline_grid: bool,
     #[serde(default)]
+    pub display_filter: DisplayFilter,
+    #[serde(default)]
     pub shader_preset: ShaderPreset,
     #[serde(default)]
     pub frame_blending: bool,
@@ -955,7 +1019,8 @@ impl Default for AppConfig {
             bezel_style: BezelStyle::None,
             lcd_ghosting: false,
             scanline_grid: false,
-            shader_preset: ShaderPreset::Nearest,
+            display_filter: DisplayFilter::AuthenticGbaLcd,
+            shader_preset: ShaderPreset::LcdGrid,
             frame_blending: false,
             dot_accurate_ppu: false,
             dmg_palette: DmgPaletteChoice::default(),
@@ -1013,11 +1078,21 @@ impl AppConfig {
 
     pub fn from_json_str(raw: &str) -> Self {
         let mut cfg: Self = serde_json::from_str(raw).unwrap_or_default();
-        if let Ok(val) = serde_json::from_str::<serde_json::Value>(raw)
-            && val.get("shader_preset").is_none()
-            && cfg.scanline_grid
-        {
-            cfg.shader_preset = ShaderPreset::LcdGrid;
+        if let Ok(val) = serde_json::from_str::<serde_json::Value>(raw) {
+            if val.get("display_filter").is_none() {
+                if cfg.scanline_grid || cfg.shader_preset == ShaderPreset::LcdGrid {
+                    cfg.display_filter = DisplayFilter::AuthenticGbaLcd;
+                } else if cfg.shader_preset == ShaderPreset::SharpBilinear {
+                    cfg.display_filter = DisplayFilter::SoftHandheld;
+                } else if cfg.shader_preset == ShaderPreset::ScaleEdge {
+                    cfg.display_filter = DisplayFilter::SmoothScale2x;
+                } else if cfg.shader_preset == ShaderPreset::Nearest {
+                    cfg.display_filter = DisplayFilter::RawNearest;
+                }
+            }
+            if val.get("shader_preset").is_none() && cfg.scanline_grid {
+                cfg.shader_preset = ShaderPreset::LcdGrid;
+            }
         }
         cfg
     }
@@ -1149,6 +1224,15 @@ mod tests {
 
     #[test]
     fn shader_preset_roundtrip_and_legacy_scanline_grid_migration() {
+        for filter in DisplayFilter::ALL {
+            assert!(!filter.label().is_empty());
+            assert!(!filter.description().is_empty());
+            assert_eq!(filter.next().next().next().next(), filter);
+            let json = serde_json::to_string(&filter).expect("serialize filter");
+            let back: DisplayFilter = serde_json::from_str(&json).expect("deserialize filter");
+            assert_eq!(back, filter);
+        }
+
         for preset in ShaderPreset::ALL {
             assert!(!preset.label().is_empty());
             assert!(!preset.short_label().is_empty());

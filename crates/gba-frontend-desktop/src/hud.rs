@@ -1,13 +1,13 @@
 use std::time::Instant;
 
 use egui::{
-    self, Align, Align2, Color32, CornerRadius, Layout, RichText, Sense, Stroke, TextureOptions,
+    self, Align, Align2, Color32, CornerRadius, Layout, RichText, Sense, Stroke,
     Vec2,
 };
 use gba_core::{LCD_HEIGHT, LCD_WIDTH};
 
 use crate::app::{RustboyApp, ACCENT_TEAL, BG_CARD, BG_PANEL, BORDER_HAIRLINE, TEXT_MUTED};
-use crate::config::{BezelStyle, ShaderPreset};
+use crate::config::BezelStyle;
 use crate::gb_bridge::{GB_VIEW_OFFSET_X, GB_VIEW_OFFSET_Y};
 use crate::rom_loader::RomPlatform;
 use crate::shaders::{
@@ -427,7 +427,6 @@ impl RustboyApp {
         let shader_preset = self.config.effective_shader_preset();
         let frame_blending = self.config.frame_blending;
         let lcd_ghosting = self.config.lcd_ghosting;
-        let scanline_grid = shader_preset == ShaderPreset::LcdGrid || self.config.scanline_grid;
         let use_gl_shader = !self.is_gb_active() && !self.link.split_view_active();
         let mut gl_pipeline_arc = None;
 
@@ -465,36 +464,29 @@ impl RustboyApp {
         }
 
         if gl_pipeline_arc.is_none() {
+            let tex_options = self.config.display_filter.texture_options();
             if self.sink.frame_dirty {
-                let color_img = self.postproc.process_frame_with_blending(
+                let color_img = self.postproc.process_display_filter(
                     &self.sink.framebuffer,
-                    self.sink
-                        .has_prev_frame
-                        .then_some(&self.sink.prev_framebuffer),
                     color_correction,
-                    color_profile,
-                    frame_blending,
                     lcd_ghosting,
-                    scanline_grid,
+                    self.config.display_filter,
+                    false,
                 );
                 let tex = self.lcd_tex.get_or_insert_with(|| {
-                    ctx.load_texture("gba_lcd", color_img.clone(), TextureOptions::NEAREST)
+                    ctx.load_texture("gba_lcd", color_img.clone(), tex_options)
                 });
-                tex.set(color_img, TextureOptions::NEAREST);
+                tex.set(color_img.clone(), tex_options);
                 self.sink.frame_dirty = false;
             } else if self.lcd_tex.is_none() {
-                let blank = self.postproc.process_frame_with_blending(
+                let blank = self.postproc.process_display_filter(
                     &self.sink.framebuffer,
-                    self.sink
-                        .has_prev_frame
-                        .then_some(&self.sink.prev_framebuffer),
                     color_correction,
-                    color_profile,
-                    frame_blending,
                     false,
-                    scanline_grid,
+                    self.config.display_filter,
+                    false,
                 );
-                self.lcd_tex = Some(ctx.load_texture("gba_lcd", blank, TextureOptions::NEAREST));
+                self.lcd_tex = Some(ctx.load_texture("gba_lcd", blank.clone(), tex_options));
             }
         }
 
@@ -517,19 +509,18 @@ impl RustboyApp {
 
         if self.link.split_view_active() {
             if let Some(local) = &mut self.link.local {
-                let p2_img = local.p2_postproc.process_frame_with_blending(
+                let tex_options = self.config.display_filter.texture_options();
+                let p2_img = local.p2_postproc.process_display_filter(
                     &local.p2_framebuffer,
-                    None,
                     color_correction,
-                    color_profile,
-                    frame_blending,
                     lcd_ghosting,
-                    scanline_grid,
+                    self.config.display_filter,
+                    false,
                 );
                 let p2_tex = local.p2_lcd_tex.get_or_insert_with(|| {
-                    ctx.load_texture("gba_p2_lcd", p2_img.clone(), TextureOptions::NEAREST)
+                    ctx.load_texture("gba_p2_lcd", p2_img.clone(), tex_options)
                 });
-                p2_tex.set(p2_img, TextureOptions::NEAREST);
+                p2_tex.set(p2_img.clone(), tex_options);
             }
 
             let gap = 14.0;

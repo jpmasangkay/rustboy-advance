@@ -9,7 +9,8 @@ use crate::app::{
 };
 use crate::capture::GifFpsMode;
 use crate::config::{
-    AppConfig, BezelStyle, ColorProfileChoice, DmgPaletteChoice, HotkeyAction, ShaderPreset,
+    AppConfig, BezelStyle, ColorProfileChoice, DisplayFilter, DmgPaletteChoice, HotkeyAction,
+    ShaderPreset,
 };
 
 impl RustboyApp {
@@ -353,6 +354,34 @@ impl RustboyApp {
                             },
                         );
                         ui.menu_button("Display Filters", |ui| {
+                            ui.menu_button(
+                                format!("Filter Mode ({})", self.config.display_filter.label()),
+                                |ui| {
+                                    for filter in DisplayFilter::ALL {
+                                        if ui
+                                            .selectable_label(
+                                                self.config.display_filter == filter,
+                                                filter.description(),
+                                            )
+                                            .clicked()
+                                        {
+                                            self.config.display_filter = filter;
+                                            self.config.shader_preset = match filter {
+                                                DisplayFilter::AuthenticGbaLcd => ShaderPreset::LcdGrid,
+                                                DisplayFilter::SoftHandheld => ShaderPreset::SharpBilinear,
+                                                DisplayFilter::SmoothScale2x => ShaderPreset::ScaleEdge,
+                                                DisplayFilter::RawNearest => ShaderPreset::Nearest,
+                                            };
+                                            self.config.scanline_grid = filter == DisplayFilter::AuthenticGbaLcd;
+                                            self.config.save();
+                                            self.sink.frame_dirty = true;
+                                            self.lcd_tex = None;
+                                            ui.close_menu();
+                                        }
+                                    }
+                                },
+                            );
+                            ui.separator();
                             if ui
                                 .checkbox(
                                     &mut self.config.color_correction,
@@ -896,25 +925,45 @@ impl RustboyApp {
                         self.config.save();
                         self.sink.frame_dirty = true;
                     }
-                    let grid_active =
-                        self.config.effective_shader_preset() == ShaderPreset::LcdGrid;
-                    if toggle_btn(ui, "Grid", grid_active)
-                        .on_hover_text(format!(
-                            "Toggle GBA LCD Grid Shader (Current: {})",
-                            self.config.effective_shader_preset().label()
-                        ))
-                        .clicked()
-                    {
-                        let next = if grid_active {
-                            ShaderPreset::Nearest
-                        } else {
-                            ShaderPreset::LcdGrid
+                    let filter_btn = ui.button(format!("Filter: {}", self.config.display_filter.label()));
+                    if filter_btn.clicked() {
+                        self.config.display_filter = self.config.display_filter.next();
+                        self.config.shader_preset = match self.config.display_filter {
+                            DisplayFilter::AuthenticGbaLcd => ShaderPreset::LcdGrid,
+                            DisplayFilter::SoftHandheld => ShaderPreset::SharpBilinear,
+                            DisplayFilter::SmoothScale2x => ShaderPreset::ScaleEdge,
+                            DisplayFilter::RawNearest => ShaderPreset::Nearest,
                         };
-                        self.config.shader_preset = next;
-                        self.config.scanline_grid = next == ShaderPreset::LcdGrid;
+                        self.config.scanline_grid = self.config.display_filter == DisplayFilter::AuthenticGbaLcd;
                         self.config.save();
                         self.sink.frame_dirty = true;
+                        self.lcd_tex = None;
                     }
+                    let filter_desc = self.config.display_filter.description();
+                    let filter_btn = filter_btn.on_hover_text(format!(
+                        "GBA Display Filter: {filter_desc}\n(Click to cycle, right-click for quick menu)"
+                    ));
+                    filter_btn.context_menu(|ui| {
+                        for f in DisplayFilter::ALL {
+                            if ui
+                                .selectable_label(self.config.display_filter == f, f.description())
+                                .clicked()
+                            {
+                                self.config.display_filter = f;
+                                self.config.shader_preset = match f {
+                                    DisplayFilter::AuthenticGbaLcd => ShaderPreset::LcdGrid,
+                                    DisplayFilter::SoftHandheld => ShaderPreset::SharpBilinear,
+                                    DisplayFilter::SmoothScale2x => ShaderPreset::ScaleEdge,
+                                    DisplayFilter::RawNearest => ShaderPreset::Nearest,
+                                };
+                                self.config.scanline_grid = f == DisplayFilter::AuthenticGbaLcd;
+                                self.config.save();
+                                self.sink.frame_dirty = true;
+                                self.lcd_tex = None;
+                                ui.close_menu();
+                            }
+                        }
+                    });
 
                     ui.separator();
 

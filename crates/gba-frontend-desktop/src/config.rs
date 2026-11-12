@@ -415,3 +415,45 @@ impl AppConfig {
         self.save();
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_playtime_and_settings() {
+        let empty = RomPlaytime::default();
+        assert_eq!(empty.formatted_playtime(), "-");
+
+        let thirty_secs = RomPlaytime {
+            total_seconds: 30,
+            last_played_timestamp: 0,
+            launch_count: 1,
+        };
+        assert_eq!(thirty_secs.formatted_playtime(), "30s");
+
+        let five_mins = RomPlaytime {
+            total_seconds: 310,
+            last_played_timestamp: 0,
+            launch_count: 2,
+        };
+        assert_eq!(five_mins.formatted_playtime(), "5m");
+
+        let two_hours = RomPlaytime {
+            total_seconds: 7325,
+            last_played_timestamp: 0,
+            launch_count: 5,
+        };
+        assert_eq!(two_hours.formatted_playtime(), "2h 2m");
+
+        // Verify color profile labels
+        for profile in ColorProfileChoice::ALL {
+            assert!(!profile.label().is_empty());
+        }
+
+        // Verify bezel labels
+        for bezel in BezelStyle::ALL {
+            assert!(!bezel.label().is_empty());
+        }
+    }
+}

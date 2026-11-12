@@ -491,9 +491,9 @@ fn apu_high_freq_square_wave_suppresses_aliasing() {
     while mono.len() < 2048 {
         fe.samples.clear();
         core.run_frame(&mut fe);
-        for pair in fe.samples.chunks_exact(2) {
+        for &s in fe.samples.iter().step_by(2) {
             if mono.len() < 2048 {
-                mono.push(pair[0] as f64);
+                mono.push(s as f64);
             }
         }
     }
@@ -562,8 +562,8 @@ fn apu_fifo_18khz_steady_frame_output_and_interpolation() {
             "frame {frame}: stereo pairs {pairs} drifted from expected {expected_pairs:.2}"
         );
         if frame >= 4 {
-            for pair in fe.samples.chunks_exact(2) {
-                raw_mono.push(pair[0] as f64);
+            for &s in fe.samples.iter().step_by(2) {
+                raw_mono.push(s as f64);
             }
         }
     }
@@ -581,8 +581,8 @@ fn apu_fifo_18khz_steady_frame_output_and_interpolation() {
         fe.samples.clear();
         core_interp.run_frame(&mut fe);
         if frame >= 4 {
-            for pair in fe.samples.chunks_exact(2) {
-                interp_mono.push(pair[0] as f64);
+            for &s in fe.samples.iter().step_by(2) {
+                interp_mono.push(s as f64);
             }
         }
     }

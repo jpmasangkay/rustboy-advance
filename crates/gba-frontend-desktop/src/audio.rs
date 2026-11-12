@@ -115,12 +115,12 @@ impl AudioConsumer {
     fn advance_input_sample(&mut self) {
         self.hist_l.copy_within(1..SINC_TAPS, 0);
         self.hist_r.copy_within(1..SINC_TAPS, 0);
-        if self.cons.occupied_len() >= 2 {
-            if let (Some(l), Some(r)) = (self.cons.try_pop(), self.cons.try_pop()) {
-                self.hist_l[SINC_TAPS - 1] = (l as f32) / 32768.0;
-                self.hist_r[SINC_TAPS - 1] = (r as f32) / 32768.0;
-                return;
-            }
+        if self.cons.occupied_len() >= 2
+            && let (Some(l), Some(r)) = (self.cons.try_pop(), self.cons.try_pop())
+        {
+            self.hist_l[SINC_TAPS - 1] = (l as f32) / 32768.0;
+            self.hist_r[SINC_TAPS - 1] = (r as f32) / 32768.0;
+            return;
         }
         // Smooth exponential decay on underrun/pause prevents speaker pops.
         let prev_l = self.hist_l[SINC_TAPS - 2] * 0.96;

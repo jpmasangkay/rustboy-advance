@@ -411,7 +411,7 @@ mod tests {
         }
 
         let n = 2048usize;
-        let mono: Vec<f64> = out.chunks_exact(2).take(n).map(|c| c[0] as f64).collect();
+        let mono: Vec<f64> = out.iter().step_by(2).take(n).map(|&s| s as f64).collect();
         assert_eq!(mono.len(), n);
 
         // Compute 4-term Blackman-Harris windowed DFT magnitude squared for bins 4..n/2

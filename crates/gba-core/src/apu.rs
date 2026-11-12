@@ -962,35 +962,35 @@ impl Apu {
         while self.last_cycle < target_cycle {
             let mut next_cycle = target_cycle;
 
-            if (mask & 0x01) != 0 && Self::sq_wakes_edges(&self.sq1, 0x1100, cnt_l) {
-                if let Some(dt) = self.sq1.next_step_cycles() {
-                    next_cycle = next_cycle.min(self.last_cycle + dt);
-                }
+            if (mask & 0x01) != 0
+                && Self::sq_wakes_edges(&self.sq1, 0x1100, cnt_l)
+                && let Some(dt) = self.sq1.next_step_cycles()
+            {
+                next_cycle = next_cycle.min(self.last_cycle + dt);
             }
-            if (mask & 0x02) != 0 && Self::sq_wakes_edges(&self.sq2, 0x2200, cnt_l) {
-                if let Some(dt) = self.sq2.next_step_cycles() {
-                    next_cycle = next_cycle.min(self.last_cycle + dt);
-                }
+            if (mask & 0x02) != 0
+                && Self::sq_wakes_edges(&self.sq2, 0x2200, cnt_l)
+                && let Some(dt) = self.sq2.next_step_cycles()
+            {
+                next_cycle = next_cycle.min(self.last_cycle + dt);
             }
             if (mask & 0x04) != 0
                 && self.wave.enabled
                 && self.wave.dac_enabled
                 && (self.wave.volume_code != 0 || self.wave.force_75)
                 && (cnt_l & 0x4400) != 0
+                && let Some(dt) = self.wave.next_step_cycles()
             {
-                if let Some(dt) = self.wave.next_step_cycles() {
-                    next_cycle = next_cycle.min(self.last_cycle + dt);
-                }
+                next_cycle = next_cycle.min(self.last_cycle + dt);
             }
             if (mask & 0x08) != 0
                 && self.noise.enabled
                 && self.noise.dac_enabled
                 && self.noise.current_vol > 0
                 && (cnt_l & 0x8800) != 0
+                && let Some(dt) = self.noise.next_step_cycles()
             {
-                if let Some(dt) = self.noise.next_step_cycles() {
-                    next_cycle = next_cycle.min(self.last_cycle + dt);
-                }
+                next_cycle = next_cycle.min(self.last_cycle + dt);
             }
 
             if self.fifo_interpolation

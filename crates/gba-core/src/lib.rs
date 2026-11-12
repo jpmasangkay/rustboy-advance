@@ -22,6 +22,7 @@ use serde::{Deserialize, Serialize};
 use crate::bus::SysBus;
 use crate::cartridge::SaveType;
 use crate::cpu::Arm7tdmi;
+pub use crate::hw::{SioMode, SioResponse, SioTransfer};
 
 pub const CPU_CLOCK_HZ: u32 = 16_777_216;
 pub const CYCLES_PER_SCANLINE: u64 = 1_232;
@@ -619,6 +620,38 @@ impl GbaCore {
     #[inline]
     pub fn game_code(&self) -> String {
         self.bus.cart.game_code()
+    }
+
+    /// Returns whether an external link cable is attached for SIO transfers.
+    ///
+    /// When `false` (the default), internal-clock Normal and Multiplayer transfers complete
+    /// automatically after their cycle duration; when `true`, initiated transfers are staged for
+    /// [`Self::take_pending_sio_transfer`] and completed via [`Self::complete_sio_transfer`].
+    #[inline]
+    pub fn link_connected(&self) -> bool {
+        self.bus.hw.link_connected
+    }
+
+    /// Enables or disables external link-cable mode for SIO transfers.
+    #[inline]
+    pub fn set_link_connected(&mut self, connected: bool) {
+        self.bus.hw.link_connected = connected;
+        if !connected {
+            self.bus.hw.pending_sio_transfer = None;
+        }
+    }
+
+    /// Pops a queued outgoing SIO transfer when [`Self::link_connected`] is `true`.
+    #[inline]
+    pub fn take_pending_sio_transfer(&mut self) -> Option<SioTransfer> {
+        self.bus.hw.pending_sio_transfer.take()
+    }
+
+    /// Applies peer response data from a link cable, clearing busy status and firing `IRQ_SERIAL`
+    /// if enabled in `SIOCNT`.
+    #[inline]
+    pub fn complete_sio_transfer(&mut self, response: SioResponse) {
+        self.bus.complete_sio_transfer(response);
     }
 }
 

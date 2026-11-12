@@ -118,6 +118,39 @@ impl TimerChannel {
     }
 }
 
+#[derive(Copy, Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub enum SioMode {
+    Normal8,
+    Normal32,
+    Multi,
+    Uart,
+}
+
+/// Outgoing GBA SIO transfer captured when [`HardwareControl::link_connected`] is `true`.
+///
+/// Link-cable backends poll pending transfers via [`crate::GbaCore::take_pending_sio_transfer`],
+/// perform peer exchange, and complete the transfer via [`crate::GbaCore::complete_sio_transfer`].
+/// When `link_connected` is `false`, internal-clock Normal and Multiplayer transfers
+/// auto-complete after their hardware cycle duration via [`crate::EventType::SioTransferComplete`].
+#[derive(Copy, Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SioTransfer {
+    pub mode: SioMode,
+    pub siocnt: u16,
+    pub data8_or_send: u16,
+    pub data32: u32,
+    pub duration_cycles: u64,
+}
+
+/// Incoming peer data supplied to [`crate::GbaCore::complete_sio_transfer`].
+#[derive(Copy, Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SioResponse {
+    pub data8: u8,
+    pub data32: u32,
+    pub multi: [u16; 4],
+    pub multi_id: u8,
+    pub error: bool,
+}
+
 #[derive(Clone, Serialize, Deserialize)]
 pub struct HardwareControl {
     pub dma: [DmaChannel; 4],
@@ -137,10 +170,21 @@ pub struct HardwareControl {
     pub keycnt: u16,
     pub key_irq_latch: bool,
 
+    #[serde(default = "default_rcnt")]
     pub rcnt: u16,
     pub siocnt: u16,
+    #[serde(default)]
+    pub siodata8: u16,
     pub siomulti: [u16; 4],
+    #[serde(default)]
+    pub link_connected: bool,
+    #[serde(default)]
+    pub pending_sio_transfer: Option<SioTransfer>,
     pub memcnt: u32,
+}
+
+fn default_rcnt() -> u16 {
+    0x8000
 }
 
 impl HardwareControl {
@@ -159,9 +203,12 @@ impl HardwareControl {
             keyinput: 0x03FF,
             keycnt: 0,
             key_irq_latch: false,
-            rcnt: 0x8000,
+            rcnt: default_rcnt(),
             siocnt: 0,
+            siodata8: 0,
             siomulti: [0xFFFF; 4],
+            link_connected: false,
+            pending_sio_transfer: None,
             memcnt: 0x0D00_0020,
         }
     }
@@ -210,6 +257,35 @@ impl HardwareControl {
             if t.running_non_cascade {
                 t.start_cycle = t.start_cycle.saturating_add(delta);
             }
+        }
+    }
+
+    pub fn sio_transfer_duration(siocnt: u16) -> Option<(SioMode, u64)> {
+        let mode_bits = (siocnt >> 12) & 0x03;
+        match mode_bits {
+            0 => {
+                let internal_clk = (siocnt & 0x0001) != 0;
+                if !internal_clk {
+                    return Some((SioMode::Normal8, 0));
+                }
+                let cycles_per_bit = if (siocnt & 0x0002) != 0 { 8 } else { 64 };
+                Some((SioMode::Normal8, 8 * cycles_per_bit))
+            }
+            1 => {
+                let internal_clk = (siocnt & 0x0001) != 0;
+                if !internal_clk {
+                    return Some((SioMode::Normal32, 0));
+                }
+                let cycles_per_bit = if (siocnt & 0x0002) != 0 { 8 } else { 64 };
+                Some((SioMode::Normal32, 32 * cycles_per_bit))
+            }
+            2 => {
+                const MULTI_BAUD: [u64; 4] = [9_600, 38_400, 57_600, 115_200];
+                let baud = MULTI_BAUD[(siocnt & 0x0003) as usize];
+                let duration = (16_777_216u64 * 72) / baud;
+                Some((SioMode::Multi, duration))
+            }
+            _ => Some((SioMode::Uart, 64)),
         }
     }
 
@@ -537,13 +613,14 @@ impl SysBus {
             0x0400_010C => self.hw.current_timer_counter(3, self.scheduler.current_cycle),
             0x0400_010E => self.hw.timers[3].cnt,
 
-            // Serial stub
+            // Serial I/O
             0x0400_0120 => self.hw.siomulti[0],
             0x0400_0122 => self.hw.siomulti[1],
             0x0400_0124 => self.hw.siomulti[2],
             0x0400_0126 => self.hw.siomulti[3],
             0x0400_0128 => self.hw.siocnt,
-            0x0400_0134 => self.hw.rcnt,
+            0x0400_012A => self.hw.siodata8,
+            0x0400_0134 => self.hw.rcnt & 0xC1FF,
 
             // Keypad
             0x0400_0130 => self.hw.keyinput,
@@ -693,7 +770,14 @@ impl SysBus {
             0x0400_010A => self.hw.timers[2].cnt,
             0x0400_010C => self.hw.timers[3].reload,
             0x0400_010E => self.hw.timers[3].cnt,
+            0x0400_0120 => self.hw.siomulti[0],
+            0x0400_0122 => self.hw.siomulti[1],
+            0x0400_0124 => self.hw.siomulti[2],
+            0x0400_0126 => self.hw.siomulti[3],
+            0x0400_0128 => self.hw.siocnt,
+            0x0400_012A => self.hw.siodata8,
             0x0400_0132 => self.hw.keycnt,
+            0x0400_0134 => self.hw.rcnt,
             0x0400_0200 => self.hw.ie,
             0x0400_0204 => self.hw.waitcnt,
             0x0400_0208 => self.hw.ime,
@@ -924,12 +1008,42 @@ impl SysBus {
                 self.hw.siomulti[idx] = val;
             }
             0x0400_0128 => {
-                self.hw.siocnt = val & !0x0080;
-                if (val & 0x0080) != 0 && (val & 0x4000) != 0 {
-                    self.hw.request_irq(IRQ_SERIAL);
+                let was_busy = (self.hw.siocnt & 0x0080) != 0;
+                let is_multi = (val & 0x3000) == 0x2000;
+                let cleaned = if is_multi {
+                    (val & !0x007C) | (self.hw.siocnt & 0x0070) | 0x0008
+                } else {
+                    val
+                };
+                self.hw.siocnt = cleaned;
+
+                let start_requested =
+                    !was_busy && (cleaned & 0x0080) != 0 && (self.hw.rcnt & 0x8000) == 0;
+                if start_requested {
+                    if let Some((mode, duration)) = HardwareControl::sio_transfer_duration(cleaned)
+                    {
+                        if self.hw.link_connected {
+                            self.hw.pending_sio_transfer = Some(SioTransfer {
+                                mode,
+                                siocnt: cleaned,
+                                data8_or_send: self.hw.siodata8,
+                                data32: u32::from(self.hw.siomulti[0])
+                                    | (u32::from(self.hw.siomulti[1]) << 16),
+                                duration_cycles: duration,
+                            });
+                        } else if duration > 0 {
+                            self.scheduler.schedule(
+                                self.scheduler.current_cycle + duration,
+                                EventType::SioTransferComplete,
+                            );
+                        }
+                    }
                 }
             }
-            0x0400_0134 => self.hw.rcnt = val,
+            0x0400_012A => {
+                self.hw.siodata8 = val;
+            }
+            0x0400_0134 => self.hw.rcnt = val & 0xC1FF,
 
             0x0400_0132 => {
                 self.hw.keycnt = val & 0xC3FF;
@@ -1020,6 +1134,10 @@ impl SysBus {
                 }
                 if (flags & 0x20) != 0 {
                     self.hw.siocnt = 0;
+                    self.hw.siodata8 = 0;
+                    self.hw.siomulti = [0xFFFF; 4];
+                    self.hw.pending_sio_transfer = None;
+                    self.scheduler.cancel(EventType::SioTransferComplete);
                     self.hw.rcnt = 0x8000;
                 }
                 if (flags & 0x40) != 0 {

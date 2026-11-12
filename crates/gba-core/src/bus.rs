@@ -4,7 +4,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::apu::Apu;
 use crate::cartridge::{Cartridge, SaveType};
-use crate::hw::{HardwareControl, IRQ_HBLANK, IRQ_VBLANK, IRQ_VCOUNT};
+use crate::hw::{HardwareControl, IRQ_HBLANK, IRQ_SERIAL, IRQ_VBLANK, IRQ_VCOUNT, SioResponse};
 use crate::ppu::Ppu;
 use crate::serde_helpers::{alloc_boxed_array, box_bytes};
 use crate::{APU_SAMPLE_INTERVAL, EventType, Scheduler};
@@ -355,7 +355,67 @@ impl SysBus {
                 self.scheduler
                     .schedule(ev_cycle + APU_SAMPLE_INTERVAL, EventType::ApuSampleTick);
             }
-            EventType::IrqSynchronizer | EventType::SioTransferComplete | EventType::None => {}
+            EventType::SioTransferComplete => {
+                self.complete_sio_no_cable();
+            }
+            EventType::IrqSynchronizer | EventType::None => {}
+        }
+    }
+
+    /// Auto-completes internal-clock SIO transfers when no link cable is connected.
+    pub fn complete_sio_no_cable(&mut self) {
+        if self.hw.link_connected || (self.hw.siocnt & 0x0080) == 0 {
+            return;
+        }
+        let mode_bits = (self.hw.siocnt >> 12) & 0x03;
+        match mode_bits {
+            0 => {
+                self.hw.siodata8 = 0x00FF;
+            }
+            1 => {
+                self.hw.siomulti[0] = 0xFFFF;
+                self.hw.siomulti[1] = 0xFFFF;
+            }
+            2 => {
+                self.hw.siomulti[0] = self.hw.siodata8;
+                self.hw.siomulti[1] = 0xFFFF;
+                self.hw.siomulti[2] = 0xFFFF;
+                self.hw.siomulti[3] = 0xFFFF;
+                // Parent ID = 0 (bits 5..4 = 0), Error = 0 (bit 6 = 0), SD = 1 (bit 3 = 1).
+                self.hw.siocnt = (self.hw.siocnt & !0x0074) | 0x0008;
+            }
+            _ => {}
+        }
+        self.hw.siocnt &= !0x0080;
+        if (self.hw.siocnt & 0x4000) != 0 {
+            self.hw.request_irq(IRQ_SERIAL);
+        }
+    }
+
+    /// Completes an active SIO transfer with peer data delivered by a link-cable frontend.
+    pub fn complete_sio_transfer(&mut self, resp: SioResponse) {
+        let mode_bits = (self.hw.siocnt >> 12) & 0x03;
+        match mode_bits {
+            0 => {
+                self.hw.siodata8 = u16::from(resp.data8);
+            }
+            1 => {
+                self.hw.siomulti[0] = resp.data32 as u16;
+                self.hw.siomulti[1] = (resp.data32 >> 16) as u16;
+            }
+            2 => {
+                self.hw.siomulti = resp.multi;
+                let id_bits = (u16::from(resp.multi_id) & 0x03) << 4;
+                let err_bit = if resp.error { 0x0040 } else { 0 };
+                self.hw.siocnt = (self.hw.siocnt & !0x0074) | 0x0008 | id_bits | err_bit;
+            }
+            _ => {}
+        }
+        self.hw.siocnt &= !0x0080;
+        self.hw.pending_sio_transfer = None;
+        self.scheduler.cancel(EventType::SioTransferComplete);
+        if (self.hw.siocnt & 0x4000) != 0 {
+            self.hw.request_irq(IRQ_SERIAL);
         }
     }
 
@@ -1080,9 +1140,10 @@ impl SysBus {
             0x0400_0124 => self.hw.siomulti[2],
             0x0400_0126 => self.hw.siomulti[3],
             0x0400_0128 => self.hw.siocnt,
+            0x0400_012A => self.hw.siodata8,
             0x0400_0130 => self.hw.keyinput,
             0x0400_0132 => self.hw.keycnt,
-            0x0400_0134 => self.hw.rcnt,
+            0x0400_0134 => self.hw.rcnt & 0xC1FF,
             0x0400_0200 => self.hw.ie,
             0x0400_0202 => self.hw.if_flag,
             0x0400_0204 => self.hw.waitcnt & 0x7FFF,

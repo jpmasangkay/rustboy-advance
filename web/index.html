@@ -1,0 +1,352 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0, viewport-fit=cover">
+  <meta name="color-scheme" content="dark">
+  <title>Rustboy Advance — GBA WebAssembly Emulator</title>
+  <link rel="icon" type="image/svg+xml" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Crect x='2' y='5' width='28' height='22' rx='4' fill='%2315171c' stroke='%233f4554' stroke-width='2'/%3E%3Crect x='7' y='9' width='18' height='12' rx='1.5' fill='%230d0e11' stroke='%232a2e39'/%3E%3Ccircle cx='5' cy='11' r='1.5' fill='%2310b981'/%3E%3C/svg%3E">
+  <link rel="stylesheet" href="./style.css">
+  <script type="module" src="./main.js"></script>
+</head>
+<body>
+  <div class="app-shell">
+    <header class="app-header">
+      <div class="brand">
+        <svg class="brand-mark" width="22" height="22" viewBox="0 0 24 24" aria-hidden="true">
+          <rect x="2" y="4" width="20" height="16" rx="3" fill="none" stroke="currentColor" stroke-width="1.75"/>
+          <rect x="6" y="7" width="12" height="8" rx="1" fill="none" stroke="currentColor" stroke-width="1.5"/>
+          <circle cx="4.2" cy="8.5" r="1" fill="#10b981"/>
+        </svg>
+        <h1>Rustboy Advance</h1>
+        <span class="tag-mono">WASM</span>
+      </div>
+
+      <div class="toolbar" role="toolbar" focusgroup="toolbar wrap" aria-label="Emulator controls" aria-controls="gba-canvas">
+        <div class="toolbar-group" role="group" aria-label="ROM and execution">
+          <button type="button" id="btn-load-rom" class="ctrl-btn ctrl-btn-primary" title="Open .gba ROM file">
+            <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" aria-hidden="true">
+              <path d="M3 15v4a2 2 0 0 0 2 2h14a2 2 0 0 0 2-2v-4"/>
+              <polyline points="17 8 12 3 7 8"/>
+              <line x1="12" y1="3" x2="12" y2="15"/>
+            </svg>
+            <span>Open ROM</span>
+          </button>
+          <button type="button" id="btn-pause" class="ctrl-btn" aria-pressed="false" aria-disabled="true" title="Pause or resume (P / Space)">
+            <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" aria-hidden="true">
+              <rect x="6" y="4" width="4" height="16"/>
+              <rect x="14" y="4" width="4" height="16"/>
+            </svg>
+            <span>Pause</span>
+          </button>
+          <button type="button" id="btn-reset" class="ctrl-btn" aria-disabled="true" title="Hard reset console">
+            <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" aria-hidden="true">
+              <path d="M3 12a9 9 0 1 0 3-6.7L3 8"/>
+              <polyline points="3 3 3 8 8 8"/>
+            </svg>
+            <span>Reset</span>
+          </button>
+        </div>
+
+        <span class="toolbar-sep" role="separator" aria-orientation="vertical"></span>
+
+        <div class="toolbar-group" role="group" aria-label="Speed and audio">
+          <button type="button" id="btn-fast-forward" class="ctrl-btn" aria-pressed="false" aria-disabled="true" title="Toggle fast-forward (F)">
+            <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" aria-hidden="true">
+              <polygon points="13 19 22 12 13 5 13 19"/>
+              <polygon points="2 19 11 12 2 5 2 19"/>
+            </svg>
+            <span id="speed-label">1×</span>
+          </button>
+          <button type="button" id="btn-mute" class="ctrl-btn" aria-pressed="false" title="Mute audio (M)">
+            <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" aria-hidden="true">
+              <polygon points="11 5 6 9 2 9 2 15 6 15 11 19 11 5"/>
+              <path d="M15.54 8.46a5 5 0 0 1 0 7.07"/>
+            </svg>
+            <span>Audio</span>
+          </button>
+          <button type="button" id="btn-unlock-audio" class="ctrl-btn ctrl-btn-amber" hidden title="Browser paused WebAudio until interaction">
+            <span>Enable Sound</span>
+          </button>
+        </div>
+
+        <span class="toolbar-sep" role="separator" aria-orientation="vertical"></span>
+
+        <div class="toolbar-group" role="group" aria-label="Saves and preferences">
+          <button type="button" id="btn-states" class="ctrl-btn" aria-disabled="true" title="Save &amp; load state slots">
+            <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" aria-hidden="true">
+              <path d="M19 21H5a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h11l5 5v11a2 2 0 0 1-2 2z"/>
+              <polyline points="17 21 17 13 7 13 7 21"/>
+              <polyline points="7 3 7 8 15 8"/>
+            </svg>
+            <span>States</span>
+          </button>
+          <button type="button" id="btn-settings" class="ctrl-btn" title="Display, BIOS, saves &amp; keybindings">
+            <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" aria-hidden="true">
+              <line x1="4" y1="21" x2="4" y2="14"/>
+              <line x1="4" y1="10" x2="4" y2="3"/>
+              <line x1="12" y1="21" x2="12" y2="12"/>
+              <line x1="12" y1="8" x2="12" y2="3"/>
+              <line x1="20" y1="21" x2="20" y2="16"/>
+              <line x1="20" y1="12" x2="20" y2="3"/>
+              <line x1="1" y1="14" x2="7" y2="14"/>
+              <line x1="9" y1="8" x2="15" y2="8"/>
+              <line x1="17" y1="16" x2="23" y2="16"/>
+            </svg>
+            <span>Settings</span>
+          </button>
+          <button type="button" id="btn-fullscreen" class="ctrl-btn" aria-pressed="false" title="Toggle fullscreen">
+            <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" aria-hidden="true">
+              <polyline points="15 3 21 3 21 9"/>
+              <polyline points="9 21 3 21 3 15"/>
+              <line x1="21" y1="3" x2="14" y2="10"/>
+              <line x1="3" y1="21" x2="10" y2="14"/>
+            </svg>
+            <span>Fullscreen</span>
+          </button>
+        </div>
+      </div>
+    </header>
+
+    <main class="workspace">
+      <div id="error-banner" class="alert-banner" role="alert" hidden>
+        <div class="alert-body">
+          <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" aria-hidden="true">
+            <circle cx="12" cy="12" r="10"/>
+            <line x1="12" y1="8" x2="12" y2="12"/>
+            <line x1="12" y1="16" x2="12.01" y2="16"/>
+          </svg>
+          <div>
+            <strong id="error-title">Error</strong>
+            <p id="error-message"></p>
+          </div>
+        </div>
+        <button type="button" id="btn-dismiss-error" class="ctrl-btn">Dismiss</button>
+      </div>
+
+      <section class="stage-shell" id="stage-shell" aria-label="Game Boy Advance console viewport">
+        <div class="bezel-card" id="bezel-card">
+          <div class="bezel-topbar">
+            <div class="power-indicator" id="power-indicator" data-state="idle">
+              <span class="led-dot" aria-hidden="true"></span>
+              <span id="power-label">IDLE</span>
+            </div>
+            <div class="cart-badge" id="cart-badge">NO CARTRIDGE</div>
+          </div>
+
+          <div class="screen-stage" id="screen-stage">
+            <!-- State 1: Loading / WASM Initialization Skeleton -->
+            <div id="state-loading" class="stage-state stage-loading" aria-busy="true">
+              <div class="skeleton-box" aria-hidden="true">
+                <div class="skeleton-bar skeleton-bar-lg"></div>
+                <div class="skeleton-bar skeleton-bar-md"></div>
+                <div class="skeleton-bar skeleton-bar-sm"></div>
+              </div>
+              <p class="loading-caption" id="loading-caption">Initializing WebAssembly core…</p>
+              <progress class="init-progress" aria-label="Initialization progress"></progress>
+            </div>
+
+            <!-- State 2: Empty Drop Zone (No ROM loaded) -->
+            <div id="state-empty" class="stage-state stage-empty" hidden>
+              <div class="dropzone-card">
+                <svg class="cart-icon" width="32" height="32" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" aria-hidden="true">
+                  <path d="M5 4h14a1 1 0 0 1 1 1v14a1 1 0 0 1-1 1H5a1 1 0 0 1-1-1V5a1 1 0 0 1 1-1z"/>
+                  <path d="M7 4v4h10V4"/>
+                  <rect x="7" y="11" width="10" height="6" rx="1"/>
+                </svg>
+                <h2>Drop a <code>.gba</code> ROM to boot</h2>
+                <p>Executes locally at 59.73 Hz in WebAssembly. Battery saves &amp; states stay in your browser IndexedDB.</p>
+                <div class="dropzone-actions">
+                  <button type="button" id="btn-empty-load" class="ctrl-btn ctrl-btn-primary">Choose .gba ROM</button>
+                  <button type="button" id="btn-empty-demo" class="ctrl-btn">Run Built-in Demo</button>
+                  <button type="button" id="btn-empty-bios" class="ctrl-btn ctrl-btn-ghost">Optional BIOS</button>
+                </div>
+              </div>
+            </div>
+
+            <!-- State 3: Active Pixel-Perfect GBA Canvas -->
+            <div id="state-running" class="stage-state stage-running" hidden>
+              <div class="canvas-wrap" id="canvas-wrap">
+                <canvas id="gba-canvas" width="240" height="160" tabindex="0" aria-label="Game Boy Advance screen"></canvas>
+                <div id="lcd-grid-overlay" class="lcd-grid-overlay" hidden aria-hidden="true"></div>
+                <div id="paused-scrim" class="paused-scrim" hidden>
+                  <span>PAUSED</span>
+                  <button type="button" id="btn-scrim-resume" class="ctrl-btn ctrl-btn-primary">Resume</button>
+                </div>
+              </div>
+            </div>
+
+            <!-- Drag-over Drop Overlay -->
+            <div id="drag-overlay" class="drag-overlay" hidden aria-hidden="true">
+              <div class="drag-overlay-box">
+                <span>Drop .gba ROM or .sav file</span>
+              </div>
+            </div>
+          </div>
+
+          <div class="bezel-quickstrip">
+            <div class="quick-controls" role="group" aria-label="Quick display toggles">
+              <label class="inline-field">
+                <span>Profile</span>
+                <select id="quick-color-profile" aria-label="Color profile">
+                  <option value="1">AGB-001</option>
+                  <option value="2">AGS-101</option>
+                  <option value="3">AGS-001</option>
+                  <option value="0">Linear</option>
+                </select>
+              </label>
+              <button type="button" id="btn-quick-grid" class="chip-toggle" aria-pressed="false">LCD Grid</button>
+              <button type="button" id="btn-quick-integer" class="chip-toggle" aria-pressed="true">Integer</button>
+              <button type="button" id="btn-quick-touch" class="chip-toggle" aria-pressed="false">Touch Pad</button>
+            </div>
+            <div class="quick-hint" id="quick-hint">
+              <span>Arrows · Z/X · A/S · Enter · Backspace</span>
+            </div>
+          </div>
+        </div>
+
+        <!-- Touch On-Screen Gamepad (Auto on touch devices or manually toggled) -->
+        <div id="touch-deck" class="touch-deck" hidden aria-label="On-screen touch gamepad">
+          <div class="touch-shoulders">
+            <button type="button" class="touch-btn touch-shoulder" data-key="L" aria-label="L shoulder">L</button>
+            <div class="touch-meta">
+              <button type="button" class="touch-btn touch-pill" data-key="SELECT">SELECT</button>
+              <button type="button" class="touch-btn touch-pill" data-key="START">START</button>
+            </div>
+            <button type="button" class="touch-btn touch-shoulder" data-key="R" aria-label="R shoulder">R</button>
+          </div>
+
+          <div class="touch-main-row">
+            <div id="touch-dpad" class="touch-dpad" role="group" aria-label="D-Pad">
+              <span class="dpad-arm dpad-up" aria-hidden="true">▲</span>
+              <span class="dpad-arm dpad-right" aria-hidden="true">▶</span>
+              <span class="dpad-arm dpad-down" aria-hidden="true">▼</span>
+              <span class="dpad-arm dpad-left" aria-hidden="true">◀</span>
+              <span class="dpad-center" aria-hidden="true"></span>
+            </div>
+
+            <div class="touch-face">
+              <button type="button" class="touch-btn touch-circle touch-b" data-key="B">B</button>
+              <button type="button" class="touch-btn touch-circle touch-a" data-key="A">A</button>
+            </div>
+          </div>
+        </div>
+      </section>
+    </main>
+
+    <footer class="status-bar" aria-label="Emulator telemetry">
+      <div class="telemetry-group">
+        <span class="telemetry-item"><strong>FPS</strong> <span id="stat-fps" class="mono-num">—</span></span>
+        <span class="telemetry-item"><strong>Audio</strong> <span id="stat-audio" class="mono-num">—</span></span>
+        <span class="telemetry-item"><strong>BIOS</strong> <span id="stat-bios">HLE</span></span>
+      </div>
+      <div class="telemetry-group">
+        <span class="telemetry-item"><strong>CRC32</strong> <span id="stat-crc" class="mono-num">—</span></span>
+        <span class="telemetry-item"><strong>Save</strong> <span id="stat-save">None</span></span>
+        <span class="telemetry-item"><strong>Input</strong> <span id="stat-gamepad">Keyboard</span></span>
+      </div>
+    </footer>
+
+    <p id="sr-status" class="visually-hidden" role="status" aria-live="polite"></p>
+    <div id="toast" class="toast" hidden aria-hidden="true"></div>
+
+    <!-- Save States Modal Dialog -->
+    <dialog id="states-dialog" class="modal-dialog" closedby="any" aria-labelledby="states-dialog-title">
+      <div class="dialog-head">
+        <h2 id="states-dialog-title">Save States</h2>
+        <button type="button" class="ctrl-btn" data-close-dialog="states-dialog" aria-label="Close save states">Close</button>
+      </div>
+      <div class="dialog-body">
+        <p class="dialog-sub" id="states-game-label">IndexedDB slots isolated by game code &amp; CRC32.</p>
+        <div id="slots-list" class="slots-grid"></div>
+        <div class="dialog-actions-row">
+          <button type="button" id="btn-export-state-file" class="ctrl-btn">Export .state File</button>
+          <button type="button" id="btn-import-state-file" class="ctrl-btn">Import .state File</button>
+        </div>
+      </div>
+    </dialog>
+
+    <!-- Settings, Storage & Keybindings Modal Dialog -->
+    <dialog id="settings-dialog" class="modal-dialog modal-dialog-wide" closedby="any" aria-labelledby="settings-dialog-title">
+      <div class="dialog-head">
+        <h2 id="settings-dialog-title">Settings &amp; Controls</h2>
+        <button type="button" class="ctrl-btn" data-close-dialog="settings-dialog" aria-label="Close settings">Close</button>
+      </div>
+      <div class="dialog-body settings-sections">
+        <section class="settings-panel">
+          <h3>Video &amp; Audio</h3>
+          <div class="settings-grid">
+            <label class="field-row">
+              <span>Color Profile</span>
+              <select id="set-color-profile">
+                <option value="1">AGB-001 (Original TFT)</option>
+                <option value="2">AGS-101 (Backlit Vibrant)</option>
+                <option value="3">AGS-001 (Frontlit Pastel)</option>
+                <option value="0">Linear (Uncorrected RGB)</option>
+              </select>
+            </label>
+            <label class="field-row">
+              <span>Emulation Speed</span>
+              <select id="set-speed">
+                <option value="0.5">0.5× (Slow)</option>
+                <option value="1">1.0× (Native 59.73 Hz)</option>
+                <option value="2">2.0× (Turbo)</option>
+                <option value="4">4.0× (Fast Forward)</option>
+              </select>
+            </label>
+            <label class="field-row">
+              <span>Master Volume (<span id="vol-readout" class="mono-num">100%</span>)</span>
+              <input type="range" id="set-volume" min="0" max="100" value="100">
+            </label>
+            <label class="toggle-row">
+              <span>Integer Pixel Scaling</span>
+              <input type="checkbox" id="set-integer-scale" switch checked>
+            </label>
+            <label class="toggle-row">
+              <span>LCD Pixel Grid</span>
+              <input type="checkbox" id="set-lcd-grid" switch>
+            </label>
+            <label class="toggle-row">
+              <span>LCD Frame Blending (Ghosting)</span>
+              <input type="checkbox" id="set-lcd-ghosting" switch>
+            </label>
+            <label class="toggle-row">
+              <span>Show Touch Gamepad</span>
+              <input type="checkbox" id="set-touch-controls" switch>
+            </label>
+          </div>
+        </section>
+
+        <section class="settings-panel">
+          <h3>Cartridge &amp; BIOS</h3>
+          <div class="settings-actions">
+            <button type="button" id="btn-export-sav" class="ctrl-btn">Export Battery Save (.sav)</button>
+            <button type="button" id="btn-import-sav" class="ctrl-btn">Import Battery Save (.sav)</button>
+            <button type="button" id="btn-load-bios" class="ctrl-btn">Load 16 KiB BIOS</button>
+            <button type="button" id="btn-clear-bios" class="ctrl-btn">Use Built-in HLE BIOS</button>
+          </div>
+          <p class="dialog-sub" id="bios-status-text">Active BIOS: Built-in HLE BIOS</p>
+        </section>
+
+        <section class="settings-panel">
+          <div class="panel-header-row">
+            <h3>Keyboard &amp; Gamepad</h3>
+            <button type="button" id="btn-reset-keys" class="ctrl-btn">Reset Defaults</button>
+          </div>
+          <label class="toggle-row">
+            <span>Swap Gamepad A / B (Nintendo Layout)</span>
+            <input type="checkbox" id="set-swap-ab" switch>
+          </label>
+          <div id="keybindings-grid" class="keybindings-grid"></div>
+        </section>
+      </div>
+    </dialog>
+
+    <!-- Hidden File Inputs -->
+    <input type="file" id="rom-file-input" accept=".gba,.agb,.bin" hidden>
+    <input type="file" id="bios-file-input" accept=".bin,.rom" hidden>
+    <input type="file" id="sav-file-input" accept=".sav,.srm,.eep,.fla" hidden>
+    <input type="file" id="state-file-input" accept=".state,.gbas,.bin" hidden>
+  </div>
+</body>
+</html>

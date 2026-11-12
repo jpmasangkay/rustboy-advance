@@ -176,18 +176,39 @@ impl Ppu {
     }
 
     #[inline]
-    fn read_vram_u16(&self, byte_off: usize) -> u16 {
-        let off = Self::mirror_vram(byte_off) & !1;
-        u16::from_le_bytes([self.vram[off], self.vram[off + 1]])
+    fn vram_byte(&self, addr: usize) -> u8 {
+        match Self::mirror_vram(addr, self.dispcnt) {
+            Some(o) => self.vram[o],
+            None => 0,
+        }
     }
 
     #[inline]
-    pub fn mirror_vram(byte_off: usize) -> usize {
+    fn read_vram_u16(&self, byte_off: usize) -> u16 {
+        match Self::mirror_vram(byte_off, self.dispcnt) {
+            Some(off) => {
+                let off = off & !1;
+                u16::from_le_bytes([self.vram[off], self.vram[off + 1]])
+            }
+            None => 0,
+        }
+    }
+
+    #[inline]
+    pub fn mirror_vram(byte_off: usize, dispcnt: u16) -> Option<usize> {
         let masked = byte_off & 0x1FFFF;
         if masked >= 0x18000 {
-            masked - 0x8000
+            if (dispcnt & 0x07) >= 3 {
+                if masked < 0x1C000 {
+                    None
+                } else {
+                    Some(masked - 0x8000)
+                }
+            } else {
+                Some(masked - 0x8000)
+            }
         } else {
-            masked
+            Some(masked)
         }
     }
 
@@ -356,14 +377,14 @@ impl Ppu {
 
             if is_8bpp {
                 let addr = char_base + tile_num * 64 + ty * 8 + tx;
-                let col_idx = self.vram[Self::mirror_vram(addr)] as usize;
+                let col_idx = self.vram_byte(addr) as usize;
                 if col_idx != 0 {
                     self.bg_lines[bg][x] = self.read_pram_u16(col_idx);
                     self.bg_opaque[bg][x] = true;
                 }
             } else {
                 let addr = char_base + tile_num * 32 + ty * 4 + (tx >> 1);
-                let byte = self.vram[Self::mirror_vram(addr)];
+                let byte = self.vram_byte(addr);
                 let col_idx = ((byte >> ((tx & 1) * 4)) & 0x0F) as usize;
                 if col_idx != 0 {
                     self.bg_lines[bg][x] = self.read_pram_u16(pal_bank * 16 + col_idx);
@@ -407,9 +428,9 @@ impl Ppu {
             let fine_y = (py & 7) as usize;
 
             let map_addr = screen_base + tile_y * (tiles_per_row as usize) + tile_x;
-            let tile_num = self.vram[Self::mirror_vram(map_addr)] as usize;
+            let tile_num = self.vram_byte(map_addr) as usize;
             let pixel_addr = char_base + tile_num * 64 + fine_y * 8 + fine_x;
-            let col_idx = self.vram[Self::mirror_vram(pixel_addr)] as usize;
+            let col_idx = self.vram_byte(pixel_addr) as usize;
 
             if col_idx != 0 {
                 self.bg_lines[bg][x] = self.read_pram_u16(col_idx);
@@ -800,6 +821,21 @@ impl Ppu {
             };
 
             self.framebuffer[row_start + x] = final_col;
+        }
+
+        if (self.greenswap & 1) != 0 {
+            let start = row_start + (x_start & !1);
+            let end = (row_start + x_end).min(row_start + LCD_WIDTH);
+            let mut i = start;
+            while i + 1 < end {
+                let p0 = self.framebuffer[i];
+                let p1 = self.framebuffer[i + 1];
+                let g0 = (p0 >> 5) & 0x1F;
+                let g1 = (p1 >> 5) & 0x1F;
+                self.framebuffer[i] = (p0 & !0x03E0) | (g1 << 5);
+                self.framebuffer[i + 1] = (p1 & !0x03E0) | (g0 << 5);
+                i += 2;
+            }
         }
     }
 

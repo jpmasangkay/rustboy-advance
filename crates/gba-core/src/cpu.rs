@@ -1327,8 +1327,9 @@ fn arm_block_transfer<const CFG: u8>(cpu: &mut Arm7tdmi, bus: &mut SysBus, instr
                 cpu.gpr[r] = v;
             }
         }
-        // LDM writeback does NOT happen if Rn was loaded (unless user_bank, wait: ARM7TDMI writes back only if Rn not in rlist!)
-        if writeback && !user_bank && (rlist & (1 << rn)) == 0 && rn != 15 {
+        // LDM writeback does NOT happen if Rn was loaded in rlist.
+        // On ARM7TDMI user-bank LDM/STM, base register writeback updates current mode's Rn.
+        if writeback && (rlist & (1 << rn)) == 0 && rn != 15 {
             cpu.gpr[rn] = new_base;
         }
         cyc += 1;
@@ -1356,7 +1357,7 @@ fn arm_block_transfer<const CFG: u8>(cpu: &mut Arm7tdmi, bus: &mut SysBus, instr
             cyc += bus.write_32(addr, v, acc);
             addr = addr.wrapping_add(4);
         }
-        if writeback && !user_bank && rn != 15 {
+        if writeback && rn != 15 {
             cpu.gpr[rn] = new_base;
         }
     }

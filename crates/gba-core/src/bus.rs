@@ -235,8 +235,10 @@ impl SysBus {
                 0x06 => {
                     let off = (addr as usize) & 0x1FFFF;
                     // Only first 64KB + 32KB (96KB) are contiguous, 0x18000..0x1FFFF mirrors 0x10000..0x17FFF
-                    let mir = Ppu::mirror_vram(off);
-                    if mir <= 0x14000 {
+                    let mir = Ppu::mirror_vram(off, self.ppu.dispcnt);
+                    if let Some(mir) = mir
+                        && mir <= 0x14000
+                    {
                         Some(unsafe { self.ppu.vram.as_ptr().add(mir) })
                     } else {
                         None
@@ -708,7 +710,12 @@ impl SysBus {
                 }
             }
             0x05 => (self.ppu.pram[(addr as usize) & 0x3FF], 1, true),
-            0x06 => (self.ppu.vram[Ppu::mirror_vram(addr as usize)], 1, true),
+            0x06 => {
+                let val = Ppu::mirror_vram(addr as usize, self.ppu.dispcnt)
+                    .map(|o| self.ppu.vram[o])
+                    .unwrap_or(0);
+                (val, 1, true)
+            }
             0x07 => (self.ppu.oam[(addr as usize) & 0x3FF], 1, true),
             0x08..=0x0D => {
                 self.prefetch.invalidate();
@@ -839,12 +846,16 @@ impl SysBus {
                 )
             }
             0x06 => {
-                let off = Ppu::mirror_vram(aligned as usize) & !1;
+                let off = Ppu::mirror_vram(aligned as usize, self.ppu.dispcnt);
                 self.last_access_was_dma = false;
-                (
-                    u16::from_le_bytes([self.ppu.vram[off], self.ppu.vram[off + 1]]),
-                    1,
-                )
+                let val = match off {
+                    Some(o) => {
+                        let o = o & !1;
+                        u16::from_le_bytes([self.ppu.vram[o], self.ppu.vram[o + 1]])
+                    }
+                    None => 0,
+                };
+                (val, 1)
             }
             0x07 => {
                 let off = (aligned as usize) & 0x3FE;
@@ -990,17 +1001,21 @@ impl SysBus {
                 )
             }
             0x06 => {
-                let off = Ppu::mirror_vram(aligned as usize) & !3;
+                let off = Ppu::mirror_vram(aligned as usize, self.ppu.dispcnt);
                 self.last_access_was_dma = false;
-                (
-                    u32::from_le_bytes([
-                        self.ppu.vram[off],
-                        self.ppu.vram[off + 1],
-                        self.ppu.vram[off + 2],
-                        self.ppu.vram[off + 3],
-                    ]),
-                    2,
-                )
+                let val = match off {
+                    Some(o) => {
+                        let o = o & !3;
+                        u32::from_le_bytes([
+                            self.ppu.vram[o],
+                            self.ppu.vram[o + 1],
+                            self.ppu.vram[o + 2],
+                            self.ppu.vram[o + 3],
+                        ])
+                    }
+                    None => 0,
+                };
+                (val, 2)
             }
             0x07 => {
                 let off = (aligned as usize) & 0x3FC;
@@ -1063,16 +1078,17 @@ impl SysBus {
             0x06 => {
                 // 8-bit writes to OBJ VRAM (0x06010000.. or bitmap? Actually BG VRAM only:
                 // Bitmap Modes 3-5 have OBJ VRAM starting at 0x14000, Tile Modes 0-2 at 0x10000).
-                let off = Ppu::mirror_vram(addr as usize);
-                let obj_start = if (self.ppu.dispcnt & 0x07) >= 3 {
-                    0x14000
-                } else {
-                    0x10000
-                };
-                if off < obj_start {
-                    let aligned = off & !1;
-                    self.ppu.vram[aligned] = val;
-                    self.ppu.vram[aligned + 1] = val;
+                if let Some(off) = Ppu::mirror_vram(addr as usize, self.ppu.dispcnt) {
+                    let obj_start = if (self.ppu.dispcnt & 0x07) >= 3 {
+                        0x14000
+                    } else {
+                        0x10000
+                    };
+                    if off < obj_start {
+                        let aligned = off & !1;
+                        self.ppu.vram[aligned] = val;
+                        self.ppu.vram[aligned + 1] = val;
+                    }
                 }
                 1
             }
@@ -1128,8 +1144,10 @@ impl SysBus {
                 1
             }
             0x06 => {
-                let off = Ppu::mirror_vram(aligned as usize) & !1;
-                self.ppu.vram[off..off + 2].copy_from_slice(&bytes);
+                if let Some(off) = Ppu::mirror_vram(aligned as usize, self.ppu.dispcnt) {
+                    let off = off & !1;
+                    self.ppu.vram[off..off + 2].copy_from_slice(&bytes);
+                }
                 1
             }
             0x07 => {
@@ -1200,8 +1218,10 @@ impl SysBus {
                 2
             }
             0x06 => {
-                let off = Ppu::mirror_vram(aligned as usize) & !3;
-                self.ppu.vram[off..off + 4].copy_from_slice(&bytes);
+                if let Some(off) = Ppu::mirror_vram(aligned as usize, self.ppu.dispcnt) {
+                    let off = off & !3;
+                    self.ppu.vram[off..off + 4].copy_from_slice(&bytes);
+                }
                 2
             }
             0x07 => {
@@ -1321,7 +1341,9 @@ impl SysBus {
                 ((v16 >> ((addr & 1) * 8)) & 0xFF) as u8
             }
             0x05 => self.ppu.pram[(addr as usize) & 0x3FF],
-            0x06 => self.ppu.vram[Ppu::mirror_vram(addr as usize)],
+            0x06 => Ppu::mirror_vram(addr as usize, self.ppu.dispcnt)
+                .map(|o| self.ppu.vram[o])
+                .unwrap_or(0),
             0x07 => self.ppu.oam[(addr as usize) & 0x3FF],
             0x08..=0x0D => {
                 let v16 = self.cart.read_rom_16(addr & !1);
@@ -1353,7 +1375,11 @@ impl SysBus {
             0x02 => self.ewram[(addr as usize) & 0x3FFFF] = val,
             0x03 => self.iwram[(addr as usize) & 0x7FFF] = val,
             0x05 => self.ppu.pram[(addr as usize) & 0x3FF] = val,
-            0x06 => self.ppu.vram[Ppu::mirror_vram(addr as usize)] = val,
+            0x06 => {
+                if let Some(off) = Ppu::mirror_vram(addr as usize, self.ppu.dispcnt) {
+                    self.ppu.vram[off] = val;
+                }
+            }
             0x07 => self.ppu.oam[(addr as usize) & 0x3FF] = val,
             0x08..=0x0D => {
                 let off = (addr as usize) & 0x01FF_FFFF;
@@ -1390,7 +1416,11 @@ impl SysBus {
             0x03 => self.iwram[(addr as usize) & 0x7FFF] = val,
             0x04 => self.write_io_8(addr, val),
             0x05 => self.ppu.pram[(addr as usize) & 0x3FF] = val,
-            0x06 => self.ppu.vram[Ppu::mirror_vram(addr as usize)] = val,
+            0x06 => {
+                if let Some(off) = Ppu::mirror_vram(addr as usize, self.ppu.dispcnt) {
+                    self.ppu.vram[off] = val;
+                }
+            }
             0x07 => self.ppu.oam[(addr as usize) & 0x3FF] = val,
             0x08..=0x0D => {
                 let off = (addr as usize) & 0x01FF_FFFF;

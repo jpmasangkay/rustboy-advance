@@ -534,6 +534,10 @@ impl RustboyApp {
                             self.debugger.show_overrides = true;
                             ui.close_menu();
                         }
+                        if ui.button("Memory Search / Cheat Finder...").clicked() {
+                            self.debugger.mem_search.open = true;
+                            ui.close_menu();
+                        }
                         if ui.button("Cheat Code Manager...").clicked() {
                             self.debugger.show_cheats = true;
                             ui.close_menu();
@@ -629,6 +633,9 @@ impl RustboyApp {
                     ui.menu_button("Debug / Views", |ui| {
                         ui.checkbox(&mut self.debugger.show_cpu, "ARM7TDMI CPU & Disassembler");
                         ui.checkbox(&mut self.debugger.show_hex, "Memory Hex Viewer");
+                        ui.checkbox(&mut self.debugger.show_io_regs, "I/O Register Inspector");
+                        ui.checkbox(&mut self.debugger.mem_search.open, "Memory Search / Cheat Finder...");
+                        ui.checkbox(&mut self.debugger.show_gdb, "GDB Remote Server...");
                         ui.checkbox(&mut self.debugger.show_palette, "Palette Viewer");
                         ui.checkbox(&mut self.debugger.show_vram, "VRAM Tile Viewer");
                         ui.checkbox(&mut self.debugger.show_bg, "BG Map Viewer");

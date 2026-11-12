@@ -14,6 +14,7 @@ mod hud;
 mod input;
 mod library;
 mod link;
+mod mem_search;
 mod menus;
 mod movies;
 mod rewind;

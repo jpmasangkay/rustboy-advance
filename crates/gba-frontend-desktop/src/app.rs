@@ -132,6 +132,9 @@ pub(crate) struct RustboyApp {
     pub(crate) lcd_tex: Option<TextureHandle>,
     pub(crate) gl_shaders: Option<Arc<Mutex<GlShaderPipeline>>>,
     pub(crate) debugger: DebuggerWindows,
+    pub(crate) gdb_stub: gba_debugger::GdbStub,
+    pub(crate) temp_step_bp: Option<u32>,
+    pub(crate) temp_step_target_depth: Option<usize>,
     pub(crate) gilrs: Option<Gilrs>,
 
     pub(crate) rom_path: Option<PathBuf>,
@@ -225,6 +228,9 @@ impl RustboyApp {
             lcd_tex: None,
             gl_shaders: None,
             debugger: DebuggerWindows::default(),
+            gdb_stub: gba_debugger::GdbStub::new(),
+            temp_step_bp: None,
+            temp_step_target_depth: None,
             gilrs: Gilrs::new().ok(),
             rom_path: None,
             sav_path: None,
@@ -897,11 +903,14 @@ impl RustboyApp {
     pub(crate) fn toggle_pause(&mut self) {
         self.paused = !self.paused;
         if !self.paused {
+            self.temp_step_bp = None;
+            self.temp_step_target_depth = None;
+            let ctrl = self.build_debug_control();
             // Avoid spurious immediate re-hit if currently parked on a breakpoint
             if let Some(core) = &mut self.core {
                 let pc = core.cpu.current_exec_pc();
-                if self.debugger.breakpoints.contains(&pc) {
-                    core.step_one();
+                if ctrl.breakpoints.contains(&pc) {
+                    self.debugger.call_stack.step_one_with_tracker(core, &ctrl);
                 }
             }
             self.next_frame_due = Instant::now();
@@ -964,13 +973,187 @@ impl RustboyApp {
     }
 
     pub(crate) fn step_single_instruction(&mut self) {
-        let Some(core) = &mut self.core else { return };
-        self.paused = true;
-        core.step_one();
-        if core.bus.ppu.frame_ready {
-            self.sink.push_frame(&core.bus.ppu.framebuffer);
-            core.bus.ppu.frame_ready = false;
+        self.temp_step_bp = None;
+        self.temp_step_target_depth = None;
+        let ctrl = self.build_debug_control();
+        let mut stop_hit = None;
+        if let Some(core) = &mut self.core {
+            self.paused = true;
+            stop_hit = self.debugger.call_stack.step_one_with_tracker(core, &ctrl);
+            if self.debugger.show_io_regs {
+                self.debugger.poll_io_changes(core);
+            }
+            if core.bus.ppu.frame_ready {
+                self.sink.push_frame(&core.bus.ppu.framebuffer);
+                core.bus.ppu.frame_ready = false;
+            }
         }
+        if let Some(reason) = stop_hit {
+            self.handle_stop_reason(reason);
+        }
+    }
+
+    pub(crate) fn step_over(&mut self) {
+        let Some(core) = &self.core else { return };
+        let pc = core.cpu.current_exec_pc();
+        let thumb = core.cpu.is_thumb();
+        let call_ret = gba_debugger::is_call_instruction(core, pc, thumb);
+        let Some(ret_addr) = call_ret else {
+            self.step_single_instruction();
+            return;
+        };
+
+        let base_depth = self.debugger.call_stack.frames().len();
+        let ctrl = self.build_debug_control();
+        if let Some(core) = &mut self.core {
+            // Advance past call start (and any breakpoint parked on current PC) before running to return addr.
+            self.debugger.call_stack.step_one_with_tracker(core, &ctrl);
+        }
+        self.temp_step_bp = Some(ret_addr & !1);
+        self.temp_step_target_depth = Some(base_depth);
+        self.paused = false;
+        self.next_frame_due = Instant::now();
+    }
+
+    pub(crate) fn step_out(&mut self) {
+        let Some(core) = &self.core else { return };
+        let Some(ret_addr) = gba_debugger::step_out_return_addr(core, &self.debugger.call_stack)
+        else {
+            self.notify("Step Out: no return address available");
+            return;
+        };
+
+        let target_depth = self.debugger.call_stack.frames().len().saturating_sub(1);
+        let ctrl = self.build_debug_control();
+        if let Some(core) = &mut self.core {
+            let pc = core.cpu.current_exec_pc();
+            if ctrl.breakpoints.contains(&pc) {
+                self.debugger.call_stack.step_one_with_tracker(core, &ctrl);
+            }
+        }
+        self.temp_step_bp = Some(ret_addr & !1);
+        self.temp_step_target_depth = Some(target_depth);
+        self.paused = false;
+        self.next_frame_due = Instant::now();
+    }
+
+    fn build_debug_control(&self) -> gba_core::DebugControl {
+        let base = gba_core::DebugControl {
+            breakpoints: self.debugger.breakpoints.clone(),
+            watchpoints: self.debugger.watchpoints.clone(),
+        };
+        let mut merged = gba_core::DebugControl::default();
+        self.gdb_stub.merged_debug_control(&base, &mut merged);
+        if let Some(temp_bp) = self.temp_step_bp
+            && !merged.breakpoints.contains(&temp_bp)
+        {
+            merged.breakpoints.push(temp_bp);
+        }
+        merged
+    }
+
+    fn handle_stop_reason(&mut self, reason: gba_core::StopReason) {
+        use gba_core::StopReason;
+
+        let hit_temp = matches!(
+            reason,
+            StopReason::Breakpoint(pc) if self.temp_step_bp == Some(pc & !1)
+        );
+        if hit_temp {
+            self.temp_step_bp = None;
+            if let Some(target_depth) = self.temp_step_target_depth.take() {
+                // Keep call stack aligned after running at frame speed during Step Over/Out.
+                self.debugger.call_stack.truncate(target_depth);
+            }
+        } else {
+            self.temp_step_bp = None;
+            self.temp_step_target_depth = None;
+        }
+
+        self.paused = true;
+        self.debugger.show_cpu = true;
+        if self.gdb_stub.is_client_connected() && !hit_temp {
+            self.gdb_stub.notify_stop(&reason);
+        }
+
+        match reason {
+            StopReason::Breakpoint(pc) => {
+                if hit_temp {
+                    self.notify(&format!("Stepped to 0x{pc:08X}"));
+                } else {
+                    self.notify(&format!("Paused at Breakpoint 0x{pc:08X}"));
+                }
+            }
+            StopReason::Watchpoint {
+                addr,
+                pc,
+                write,
+                value,
+            } => {
+                self.debugger.last_watchpoint_hit = Some(reason);
+                let rw = if write { "WRITE" } else { "READ" };
+                self.notify(&format!(
+                    "Watchpoint [{rw}] 0x{addr:08X} = 0x{value:X} @ 0x{pc:08X}"
+                ));
+            }
+            StopReason::FrameComplete => {}
+        }
+    }
+
+    fn poll_gdb_server(&mut self) {
+        if !self.gdb_stub.is_listening() && !self.debugger.show_gdb {
+            return;
+        }
+        let user_ctrl = gba_core::DebugControl {
+            breakpoints: self.debugger.breakpoints.clone(),
+            watchpoints: self.debugger.watchpoints.clone(),
+        };
+        let mut pending_notice: Option<String> = None;
+        let mut stop_hit = None;
+        if let Some(core) = &mut self.core {
+            let outcome = self.gdb_stub.poll_network(core, &user_ctrl);
+            if let Some(peer) = outcome.client_connected {
+                pending_notice = Some(format!("GDB client connected ({peer})"));
+            } else if outcome.client_disconnected {
+                pending_notice = Some(String::from("GDB client disconnected"));
+            }
+            if outcome.kill_requested {
+                self.paused = true;
+                pending_notice = Some(String::from("GDB target killed (paused)"));
+            } else if let Some(pause) = outcome.pause_request {
+                if pause {
+                    self.paused = true;
+                } else {
+                    // Resuming from GDB continue: step past current PC if parked on a breakpoint.
+                    let mut merged = gba_core::DebugControl::default();
+                    self.gdb_stub.merged_debug_control(&user_ctrl, &mut merged);
+                    let pc = core.cpu.current_exec_pc();
+                    if merged.breakpoints.contains(&pc) {
+                        self.debugger.call_stack.step_one_with_tracker(core, &merged);
+                    }
+                    self.paused = false;
+                    self.next_frame_due = Instant::now();
+                }
+            }
+            if let Some(reason) = outcome.stop_reason {
+                stop_hit = Some(reason);
+            }
+            if let Some(err) = outcome.last_error {
+                self.debugger.gdb_status.last_error = Some(err);
+            }
+        }
+        if let Some(msg) = pending_notice {
+            self.notify(&msg);
+        }
+        if let Some(reason) = stop_hit {
+            self.handle_stop_reason(reason);
+        }
+        let (bps, wps) = self.gdb_stub.session.breakpoint_counts();
+        self.debugger.gdb_status.listening = self.gdb_stub.is_listening();
+        self.debugger.gdb_status.port = self.gdb_stub.port();
+        self.debugger.gdb_status.client_addr = self.gdb_stub.client_addr().map(str::to_owned);
+        self.debugger.gdb_status.breakpoints = bps;
+        self.debugger.gdb_status.watchpoints = wps;
     }
 
     pub(crate) fn step_single_scanline(&mut self) {
@@ -1138,7 +1321,8 @@ impl RustboyApp {
 
             let suppress_audio = (turbo || speed > 1.5) && executed > 0;
             self.sink.suppress_audio = suppress_audio;
-            let mut bp_hit: Option<u32> = None;
+            let mut stop_reason = gba_core::StopReason::FrameComplete;
+            let ctrl = self.build_debug_control();
 
             if let Some(core) = &mut self.core {
                 apply_cheats_to_core(core, &self.active_cheats);
@@ -1147,10 +1331,10 @@ impl RustboyApp {
                 } else if let Some(net) = &mut self.link.netplay {
                     net.step_frame(core, &mut self.sink);
                 } else {
-                    bp_hit = core.run_frame_with_breakpoints(
-                        &mut self.sink,
-                        &self.debugger.breakpoints,
-                    );
+                    stop_reason = core.run_frame_debug(&mut self.sink, &ctrl);
+                    if self.debugger.show_io_regs {
+                        self.debugger.poll_io_changes(core);
+                    }
                 }
             } else if self.gb.is_some() {
                 self.step_gb_frame(self.sink.keypad, suppress_audio);
@@ -1161,12 +1345,11 @@ impl RustboyApp {
             self.frames_in_window += 1;
             self.frame_counter += 1;
 
-            self.flush_frame_captures(bp_hit.is_none(), color_corr, color_profile);
+            let frame_complete = matches!(stop_reason, gba_core::StopReason::FrameComplete);
+            self.flush_frame_captures(frame_complete, color_corr, color_profile);
 
-            if let Some(bp_pc) = bp_hit {
-                self.paused = true;
-                self.debugger.show_cpu = true;
-                self.notify(&format!("Paused at Breakpoint 0x{bp_pc:08X}"));
+            if !matches!(stop_reason, gba_core::StopReason::FrameComplete) {
+                self.handle_stop_reason(stop_reason);
                 break;
             }
 
@@ -1237,6 +1420,7 @@ impl RustboyApp {
     pub fn update(&mut self, ctx: &egui::Context) {
         self.poll_library_scan(ctx);
         self.pump_gamepad_events(ctx);
+        self.poll_gdb_server();
         if self.title_dirty {
             self.sync_window_title(ctx);
             self.title_dirty = false;
@@ -1325,12 +1509,47 @@ impl RustboyApp {
         match dbg_act {
             DebugAction::TogglePause => self.toggle_pause(),
             DebugAction::StepInstruction => self.step_single_instruction(),
+            DebugAction::StepOver => self.step_over(),
+            DebugAction::StepOut => self.step_out(),
             DebugAction::StepScanline => self.step_single_scanline(),
             DebugAction::StepFrame => self.step_single_frame(ctx),
-            DebugAction::HardReset => self.hard_reset(),
+            DebugAction::HardReset => {
+                self.temp_step_bp = None;
+                self.temp_step_target_depth = None;
+                self.debugger.call_stack.clear();
+                self.debugger.last_watchpoint_hit = None;
+                self.debugger.io_prev_snapshot.clear();
+                self.hard_reset();
+            }
             DebugAction::ConfigChanged => {
                 self.save_rom_specific_settings();
                 self.config.save();
+            }
+            DebugAction::AddCheat(entry) => {
+                let name = entry.name.clone();
+                self.active_cheats.push(entry);
+                self.notify(&format!("Added cheat: {name}"));
+            }
+            DebugAction::GdbStart(port) => match self.gdb_stub.start(port) {
+                Ok(bound) => {
+                    self.debugger.gdb_status.listening = true;
+                    self.debugger.gdb_status.port = bound;
+                    self.debugger.gdb_status.last_error = None;
+                    self.notify(&format!("GDB Server listening on 127.0.0.1:{bound}"));
+                }
+                Err(err) => {
+                    self.debugger.gdb_status.listening = false;
+                    self.debugger.gdb_status.last_error =
+                        Some(format!("Failed to bind 127.0.0.1:{port}: {err}"));
+                }
+            },
+            DebugAction::GdbStop => {
+                self.gdb_stub.stop();
+                self.debugger.gdb_status.listening = false;
+                self.debugger.gdb_status.client_addr = None;
+                self.debugger.gdb_status.breakpoints = 0;
+                self.debugger.gdb_status.watchpoints = 0;
+                self.notify("GDB Server stopped");
             }
             DebugAction::None => {}
         }

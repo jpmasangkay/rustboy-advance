@@ -11,7 +11,7 @@ path = "src/main.rs"
 [dependencies]
 gba-core = { path = "../gba-core" }
 gb-core = { path = "../gb-core" }
-gba-debugger = { path = "../gba-debugger" }
+gba-debugger = { path = "../gba-debugger", features = ["std"] }
 log.workspace = true
 serde.workspace = true
 serde_json = "1.0"

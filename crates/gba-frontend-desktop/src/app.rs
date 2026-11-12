@@ -1,10 +1,10 @@
-use std::collections::{HashSet, VecDeque};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
-use egui::{self, Color32, CornerRadius, Stroke, TextureHandle, Vec2};
+use egui::{self, TextureHandle, Vec2};
 use gba_core::{GbaCore, HostFrontend, LCD_HEIGHT, LCD_WIDTH};
 use gilrs::Gilrs;
 
@@ -34,13 +34,8 @@ use crate::shaders::GlShaderPipeline;
 
 pub(crate) const CONFIG_FILE: &str = "rustboy_library.cfg";
 pub(crate) const GBA_FRAME_SECS: f64 = 280_896.0 / 16_777_216.0; // Exact GBA refresh ~16.7427ms (~59.7275 Hz)
-pub(crate) const BG_APP: Color32 = Color32::from_rgb(13, 15, 19);
-pub(crate) const BG_PANEL: Color32 = Color32::from_rgb(20, 23, 30);
-pub(crate) const BG_CARD: Color32 = Color32::from_rgb(25, 29, 38);
-pub(crate) const BORDER_HAIRLINE: Color32 = Color32::from_rgb(42, 48, 61);
-pub(crate) const ACCENT_TEAL: Color32 = Color32::from_rgb(46, 196, 182);
-pub(crate) const ACCENT_TEAL_BG: Color32 = Color32::from_rgb(26, 62, 62);
-pub(crate) const TEXT_MUTED: Color32 = Color32::from_rgb(142, 152, 170);
+#[allow(unused_imports)]
+pub(crate) use crate::theme::*;
 
 pub(crate) struct CoreSink {
     pub(crate) audio: AudioOutput,
@@ -159,6 +154,11 @@ pub(crate) struct RustboyApp {
     pub(crate) search_query: String,
     pub(crate) filter_favorites_only: bool,
     pub(crate) library_view_mode: LibraryViewMode,
+    pub(crate) selected_rom_path: Option<PathBuf>,
+    pub(crate) table_sort_column: crate::library::TableSortColumn,
+    pub(crate) table_sort_descending: bool,
+    pub(crate) cover_textures: HashMap<PathBuf, TextureHandle>,
+    pub(crate) pending_cover_downloads: HashSet<PathBuf>,
 
     // Real-Time Rewind Buffer
     pub(crate) rewind_buffer: RewindBuffer,
@@ -257,6 +257,11 @@ impl RustboyApp {
             search_query: String::new(),
             filter_favorites_only: false,
             library_view_mode: LibraryViewMode::Table,
+            selected_rom_path: None,
+            table_sort_column: crate::library::TableSortColumn::Title,
+            table_sort_descending: false,
+            cover_textures: HashMap::new(),
+            pending_cover_downloads: HashSet::new(),
             rewind_buffer: RewindBuffer::new(rewind_budget_mb),
             frame_counter: 0,
             rewinding: false,
@@ -1809,19 +1814,5 @@ fn record_rewind_snapshot(
 }
 
 pub(crate) fn configure_obsidian_style(ctx: &egui::Context) {
-    let mut visuals = egui::Visuals::dark();
-    visuals.panel_fill = BG_PANEL;
-    visuals.window_fill = BG_PANEL;
-    visuals.extreme_bg_color = BG_APP;
-    visuals.faint_bg_color = BG_CARD;
-    visuals.window_corner_radius = CornerRadius::same(4);
-    visuals.menu_corner_radius = CornerRadius::same(4);
-    visuals.window_stroke = Stroke::new(1.0_f32, BORDER_HAIRLINE);
-    visuals.widgets.noninteractive.bg_stroke = Stroke::new(1.0_f32, BORDER_HAIRLINE);
-    visuals.widgets.inactive.bg_fill = BG_CARD;
-    visuals.widgets.inactive.bg_stroke = Stroke::new(1.0_f32, BORDER_HAIRLINE);
-    visuals.widgets.hovered.bg_stroke = Stroke::new(1.0_f32, ACCENT_TEAL);
-    visuals.selection.bg_fill = ACCENT_TEAL_BG;
-    visuals.selection.stroke = Stroke::new(1.0_f32, ACCENT_TEAL);
-    ctx.set_visuals(visuals);
+    crate::theme::configure_theme(ctx);
 }

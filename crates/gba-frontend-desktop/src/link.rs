@@ -38,6 +38,7 @@ pub struct SioStats {
 
 impl SioStats {
     /// Total completed link exchanges across all SIO modes.
+    #[allow(dead_code)]
     pub fn total(&self) -> u64 {
         self.normal8 + self.normal32 + self.multi + self.uart
     }
@@ -1246,6 +1247,7 @@ impl LinkManager {
     }
 
     /// Returns a concise status badge string for the status bar.
+    #[allow(dead_code)]
     pub fn status_badge(&self) -> Option<String> {
         if let Some(local) = &self.local {
             return Some(format!(

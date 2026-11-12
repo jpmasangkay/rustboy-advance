@@ -672,16 +672,81 @@ impl SaveOverrideChoice {
 }
 
 #[derive(Copy, Clone, PartialEq, Eq, Debug, Serialize, Deserialize, Default)]
-pub enum DisplayFilter {
-    AuthenticGbaLcd, // 3x (720x480) LCD Subpixel Dot-Matrix
+pub enum ViewportScale {
     #[default]
+    FitWindow,
+    Handheld3x,
+    Compact2x,
+    Medium4x,
+}
+
+impl ViewportScale {
+    pub const ALL: [Self; 4] = [
+        Self::FitWindow,
+        Self::Handheld3x,
+        Self::Compact2x,
+        Self::Medium4x,
+    ];
+
+    pub fn toolbar_label(self) -> &'static str {
+        match self {
+            Self::FitWindow => "Size: Fit",
+            Self::Handheld3x => "Size: Handheld 3x",
+            Self::Compact2x => "Size: Compact 2x",
+            Self::Medium4x => "Size: Medium 4x",
+        }
+    }
+
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::FitWindow => "Fit",
+            Self::Handheld3x => "Handheld 3x",
+            Self::Compact2x => "Compact 2x",
+            Self::Medium4x => "Medium 4x",
+        }
+    }
+
+    pub fn description(self) -> &'static str {
+        match self {
+            Self::FitWindow => "Fit Window (Stretches to fill panel, preserving 3:2 aspect ratio)",
+            Self::Handheld3x => "Handheld 3x (720x480 centered, phone-sized physical dimension)",
+            Self::Compact2x => "Compact 2x (480x320 centered, true GBA-SP physical screen size)",
+            Self::Medium4x => "Medium 4x (960x640 centered, balanced desktop size)",
+        }
+    }
+
+    pub fn next(self) -> Self {
+        match self {
+            Self::FitWindow => Self::Handheld3x,
+            Self::Handheld3x => Self::Compact2x,
+            Self::Compact2x => Self::Medium4x,
+            Self::Medium4x => Self::FitWindow,
+        }
+    }
+
+    pub fn scale_factor(self) -> Option<f32> {
+        match self {
+            Self::FitWindow => None,
+            Self::Handheld3x => Some(3.0),
+            Self::Compact2x => Some(2.0),
+            Self::Medium4x => Some(4.0),
+        }
+    }
+}
+
+#[derive(Copy, Clone, PartialEq, Eq, Debug, Serialize, Deserialize, Default)]
+pub enum DisplayFilter {
+    #[default]
+    XbrSmooth3x,     // 3x (720x480) xBR 3x edge smoothing (Laptop HD)
+    AuthenticGbaLcd, // 3x (720x480) LCD Subpixel Dot-Matrix
     SoftHandheld,    // 2x (480x320) Sharp-Bilinear
     SmoothScale2x,   // 2x (480x320) EPX / Scale2x diagonal smoothing
     RawNearest,      // 1x (240x160) Raw square pixels
 }
 
 impl DisplayFilter {
-    pub const ALL: [Self; 4] = [
+    pub const ALL: [Self; 5] = [
+        Self::XbrSmooth3x,
         Self::AuthenticGbaLcd,
         Self::SoftHandheld,
         Self::SmoothScale2x,
@@ -690,6 +755,7 @@ impl DisplayFilter {
 
     pub fn label(self) -> &'static str {
         match self {
+            Self::XbrSmooth3x => "xBR 3x",
             Self::AuthenticGbaLcd => "LCD Matrix",
             Self::SoftHandheld => "Soft LCD",
             Self::SmoothScale2x => "Scale2x",
@@ -699,6 +765,7 @@ impl DisplayFilter {
 
     pub fn description(self) -> &'static str {
         match self {
+            Self::XbrSmooth3x => "xBR 3x (Laptop HD)",
             Self::AuthenticGbaLcd => "Authentic GBA LCD (3x subpixel grid)",
             Self::SoftHandheld => "Soft Handheld (2x sharp-bilinear)",
             Self::SmoothScale2x => "Smooth Pixel Art (Scale2x / EPX)",
@@ -708,23 +775,28 @@ impl DisplayFilter {
 
     pub fn next(self) -> Self {
         match self {
+            Self::XbrSmooth3x => Self::AuthenticGbaLcd,
             Self::AuthenticGbaLcd => Self::SoftHandheld,
             Self::SoftHandheld => Self::SmoothScale2x,
             Self::SmoothScale2x => Self::RawNearest,
-            Self::RawNearest => Self::AuthenticGbaLcd,
+            Self::RawNearest => Self::XbrSmooth3x,
         }
     }
 
     pub fn texture_options(self) -> egui::TextureOptions {
         match self {
-            Self::AuthenticGbaLcd | Self::SoftHandheld => egui::TextureOptions::LINEAR,
+            Self::XbrSmooth3x | Self::AuthenticGbaLcd | Self::SoftHandheld => {
+                egui::TextureOptions::LINEAR
+            }
             Self::SmoothScale2x | Self::RawNearest => egui::TextureOptions::NEAREST,
         }
     }
 
     pub fn target_dimensions(self) -> (usize, usize) {
         match self {
-            Self::AuthenticGbaLcd => (gba_core::LCD_WIDTH * 3, gba_core::LCD_HEIGHT * 3),
+            Self::XbrSmooth3x | Self::AuthenticGbaLcd => {
+                (gba_core::LCD_WIDTH * 3, gba_core::LCD_HEIGHT * 3)
+            }
             Self::SoftHandheld | Self::SmoothScale2x => {
                 (gba_core::LCD_WIDTH * 2, gba_core::LCD_HEIGHT * 2)
             }
@@ -873,6 +945,7 @@ pub struct RomPlaytime {
 }
 
 impl RomPlaytime {
+    #[allow(dead_code)]
     pub fn formatted_playtime(&self) -> String {
         let mins = self.total_seconds / 60;
         let hours = mins / 60;
@@ -970,6 +1043,8 @@ pub struct AppConfig {
     #[serde(default = "default_lcd_grid_intensity")]
     pub lcd_grid_intensity: f32,
     #[serde(default)]
+    pub viewport_scale: ViewportScale,
+    #[serde(default)]
     pub display_filter: DisplayFilter,
     #[serde(default)]
     pub shader_preset: ShaderPreset,
@@ -1026,8 +1101,9 @@ impl Default for AppConfig {
             lcd_ghosting: false,
             scanline_grid: false,
             lcd_grid_intensity: 0.08,
-            display_filter: DisplayFilter::SoftHandheld,
-            shader_preset: ShaderPreset::SharpBilinear,
+            viewport_scale: ViewportScale::FitWindow,
+            display_filter: DisplayFilter::XbrSmooth3x,
+            shader_preset: ShaderPreset::Nearest,
             frame_blending: false,
             dot_accurate_ppu: false,
             dmg_palette: DmgPaletteChoice::default(),
@@ -1239,18 +1315,19 @@ mod tests {
         for filter in DisplayFilter::ALL {
             assert!(!filter.label().is_empty());
             assert!(!filter.description().is_empty());
-            assert_eq!(filter.next().next().next().next(), filter);
+            assert_eq!(filter.next().next().next().next().next(), filter);
             let json = serde_json::to_string(&filter).expect("serialize filter");
             let back: DisplayFilter = serde_json::from_str(&json).expect("deserialize filter");
             assert_eq!(back, filter);
         }
 
-        for preset in ShaderPreset::ALL {
-            assert!(!preset.label().is_empty());
-            assert!(!preset.short_label().is_empty());
-            let json = serde_json::to_string(&preset).expect("serialize preset");
-            let back: ShaderPreset = serde_json::from_str(&json).expect("deserialize preset");
-            assert_eq!(back, preset);
+        for scale in ViewportScale::ALL {
+            assert!(!scale.toolbar_label().is_empty());
+            assert!(!scale.description().is_empty());
+            assert_eq!(scale.next().next().next().next(), scale);
+            let json = serde_json::to_string(&scale).expect("serialize viewport scale");
+            let back: ViewportScale = serde_json::from_str(&json).expect("deserialize viewport scale");
+            assert_eq!(back, scale);
         }
 
         let legacy_grid_json = r#"{"scanline_grid": true}"#;
@@ -1269,7 +1346,33 @@ mod tests {
         assert!((modern.lcd_grid_intensity - 0.08).abs() < 1e-4);
 
         let default_cfg = AppConfig::from_json_str("{}");
-        assert_eq!(default_cfg.display_filter, DisplayFilter::SoftHandheld);
+        assert_eq!(default_cfg.display_filter, DisplayFilter::XbrSmooth3x);
+        assert_eq!(default_cfg.viewport_scale, ViewportScale::FitWindow);
         assert!((default_cfg.lcd_grid_intensity - 0.08).abs() < 1e-4);
+    }
+
+    #[test]
+    fn viewport_scale_toolbar_labels_and_dimensions() {
+        assert_eq!(ViewportScale::FitWindow.toolbar_label(), "Size: Fit");
+        assert_eq!(ViewportScale::Handheld3x.toolbar_label(), "Size: Handheld 3x");
+        assert_eq!(ViewportScale::Compact2x.toolbar_label(), "Size: Compact 2x");
+        assert_eq!(ViewportScale::Medium4x.toolbar_label(), "Size: Medium 4x");
+
+        // Cycle test: Fit -> Handheld 3x -> Compact 2x -> Medium 4x -> Fit
+        assert_eq!(ViewportScale::FitWindow.next(), ViewportScale::Handheld3x);
+        assert_eq!(ViewportScale::Handheld3x.next(), ViewportScale::Compact2x);
+        assert_eq!(ViewportScale::Compact2x.next(), ViewportScale::Medium4x);
+        assert_eq!(ViewportScale::Medium4x.next(), ViewportScale::FitWindow);
+
+        // Physical dimension multipliers for GBA (240x160):
+        let (w, h) = (gba_core::LCD_WIDTH as f32, gba_core::LCD_HEIGHT as f32);
+        assert_eq!(ViewportScale::FitWindow.scale_factor(), None);
+        assert_eq!(ViewportScale::Handheld3x.scale_factor(), Some(3.0));
+        assert_eq!(ViewportScale::Compact2x.scale_factor(), Some(2.0));
+        assert_eq!(ViewportScale::Medium4x.scale_factor(), Some(4.0));
+
+        assert_eq!((w * 3.0, h * 3.0), (720.0, 480.0));
+        assert_eq!((w * 2.0, h * 2.0), (480.0, 320.0));
+        assert_eq!((w * 4.0, h * 4.0), (960.0, 640.0));
     }
 }

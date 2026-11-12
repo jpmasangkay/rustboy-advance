@@ -6,8 +6,8 @@ use egui::{
 };
 use gba_core::{LCD_HEIGHT, LCD_WIDTH};
 
-use crate::app::{RustboyApp, ACCENT_TEAL, BG_CARD, BG_PANEL, BORDER_HAIRLINE, TEXT_MUTED};
-use crate::config::{BezelStyle, ShaderPreset};
+use crate::app::{RustboyApp, ACCENT_TEAL, BG_CARD, BORDER_HAIRLINE, TEXT_MUTED};
+use crate::config::{BezelStyle, ShaderPreset, ViewportScale};
 use crate::gb_bridge::{GB_VIEW_OFFSET_X, GB_VIEW_OFFSET_Y};
 use crate::rom_loader::RomPlatform;
 use crate::shaders::{
@@ -23,148 +23,49 @@ impl RustboyApp {
         }
 
         egui::TopBottomPanel::bottom("telemetry_status_bar")
+            .exact_height(24.0)
             .frame(
                 egui::Frame::new()
-                    .fill(BG_PANEL)
-                    .inner_margin(egui::Margin::symmetric(8, 4))
-                    .stroke(Stroke::new(1.0_f32, BORDER_HAIRLINE)),
+                    .fill(crate::theme::COLOR_SURFACE)
+                    .inner_margin(egui::Margin::symmetric(8, 2))
+                    .stroke(Stroke::new(1.0_f32, crate::theme::COLOR_BORDER)),
             )
             .show(ctx, |ui| {
                 ui.horizontal(|ui| {
-                    // Left: Toast / Status
-                    if let Some(t) = &self.toast {
-                        ui.label(RichText::new(&t.text).small().color(ACCENT_TEAL));
-                    } else if let Some(core) = &self.core {
-                        let isa = if core.cpu.is_thumb() { "THUMB" } else { "ARM" };
-                        let mode = core.bus.ppu.dispcnt & 7;
-                        let save_lbl = format!("{:?}", core.bus.cart.effective_save_type());
-                        let link_sfx = self
-                            .link
-                            .status_badge()
-                            .map(|b| format!(" | {b}"))
-                            .unwrap_or_default();
-                        ui.label(
-                            RichText::new(format!(
-                                "{isa} | Mode {mode} | Save: {save_lbl}{link_sfx} | Esc = Stop to Library"
-                            ))
-                            .small()
-                            .color(TEXT_MUTED),
-                        );
-                    } else if let Some(gb) = &self.gb {
-                        ui.label(
-                            RichText::new(format!(
-                                "{} | Cart: {} | Esc = Stop to Library",
-                                gb.platform.badge(),
-                                gb.cart_type_label
-                            ))
-                            .small()
-                            .color(TEXT_MUTED),
-                        );
+                    ui.set_height(20.0);
+                    // Left: "N Games | N Folders" + core name
+                    let n_games = self.library_entries.len();
+                    let n_folders = self.rom_folders.len();
+                    let left_text = if let Some(t) = &self.toast {
+                        t.text.clone()
+                    } else if n_games == 0 && n_folders == 0 {
+                        format!("{n_games} Games | {n_folders} Folders | Core: GBA-ARM7TDMI (Strict JIT)")
+                    } else if self.has_active_game() {
+                        format!("{n_games} Games | {n_folders} Folders | Core: GBA-ARM7TDMI (Strict JIT)")
                     } else {
-                        let n_games = self.library_entries.len();
-                        let n_folders = self.rom_folders.len();
-                        ui.label(
-                            RichText::new(format!(
-                                "{n_games} Game{} | {n_folders} Folder{}",
-                                if n_games == 1 { "" } else { "s" },
-                                if n_folders == 1 { "" } else { "s" }
-                            ))
-                            .small()
-                            .color(TEXT_MUTED),
-                        );
-                    }
+                        format!("{n_games} Games | {n_folders} Folders")
+                    };
+                    ui.label(RichText::new(left_text).color(crate::theme::COLOR_TEXT_SECONDARY));
 
-                    // Right-to-left telemetry badges
+                    // Right: FPS (mono) + BIOS status
                     ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                        let bios_lbl = if let Some(gb) = &self.gb {
-                            if gb.platform == RomPlatform::Gbc {
-                                "CGB Mode".to_string()
-                            } else {
-                                format!("DMG: {}", self.config.dmg_palette.label())
-                            }
-                        } else if self.bios_bytes.is_some() {
-                            "BIOS: Custom".to_string()
+                        let (bios_lbl, bios_color) = if self.bios_bytes.is_some() {
+                            ("BIOS: Official GBA (normatt)", crate::theme::ACCENT_TEAL)
                         } else {
-                            "BIOS: HLE".to_string()
+                            ("BIOS: HLE", crate::theme::COLOR_TEXT_SECONDARY)
                         };
+                        ui.label(RichText::new(bios_lbl).color(bios_color));
 
-                        if self.has_active_game() {
-                            let eff_speed = self.effective_speed_multiplier();
-                            let speed_str = if self.paused {
-                                "PAUSED".to_string()
-                            } else if eff_speed <= 0.0 {
-                                "UNLIMITED".to_string()
-                            } else {
-                                format!("{eff_speed:.1}x")
-                            };
-                            ui.monospace(RichText::new(speed_str).small().color(ACCENT_TEAL));
-                            ui.separator();
-                            ui.monospace(
-                                RichText::new(format!(
-                                    "{:.1} FPS ({:.2} ms)",
-                                    self.measured_fps, self.last_core_ms
-                                ))
-                                .small(),
-                            );
-                            ui.separator();
-                            if let Some(link_badge) = self.link.status_badge() {
-                                ui.monospace(RichText::new(link_badge).small().color(ACCENT_TEAL));
-                                ui.separator();
-                            }
-                            ui.monospace(RichText::new(bios_lbl).small().color(TEXT_MUTED));
+                        ui.add_space(16.0);
+
+                        let fps_text = if self.has_active_game() || self.measured_fps > 1.0 {
+                            format!("FPS: {:.2} (100%)", self.measured_fps)
                         } else {
-                            ui.monospace(RichText::new(bios_lbl).small().color(TEXT_MUTED));
-                        }
-
-                        if self.capture.is_wav_recording() {
-                            ui.separator();
-                            draw_status_pill(
-                                ui,
-                                &format!("WAV {:.1}s", self.capture.wav_duration_secs()),
-                                Color32::from_rgb(245, 180, 66),
-                                Color32::from_rgb(130, 88, 32),
-                                Color32::from_rgb(36, 26, 16),
-                            );
-                        }
-                        if self.capture.is_gif_recording() {
-                            ui.separator();
-                            draw_status_pill(
-                                ui,
-                                &format!("GIF {}f", self.capture.gif_frames()),
-                                Color32::from_rgb(248, 113, 113),
-                                Color32::from_rgb(138, 46, 52),
-                                Color32::from_rgb(38, 18, 22),
-                            );
-                        }
-                        if self.movie.is_recording() {
-                            ui.separator();
-                            draw_status_pill(
-                                ui,
-                                &format!(
-                                    "REC {}f (RR:{})",
-                                    self.movie.current_frame(),
-                                    self.movie.rerecord_count()
-                                ),
-                                Color32::from_rgb(248, 113, 113),
-                                Color32::from_rgb(138, 46, 52),
-                                Color32::from_rgb(38, 18, 22),
-                            );
-                        } else if self.movie.is_playing() {
-                            ui.separator();
-                            let mode = if self.movie.read_only() { "RO" } else { "RW" };
-                            draw_status_pill(
-                                ui,
-                                &format!(
-                                    "PLAY {}/{} [{}]",
-                                    self.movie.current_frame(),
-                                    self.movie.total_frames(),
-                                    mode
-                                ),
-                                ACCENT_TEAL,
-                                Color32::from_rgb(36, 108, 104),
-                                Color32::from_rgb(16, 34, 38),
-                            );
-                        }
+                            "FPS: 0.00".to_string()
+                        };
+                        ui.monospace(
+                            RichText::new(fps_text).color(crate::theme::COLOR_TEXT_SECONDARY),
+                        );
                     });
                 });
             });
@@ -543,17 +444,36 @@ impl RustboyApp {
             let header_h = 22.0;
             let half_w = ((avail.x - gap - 16.0) * 0.5).max(120.0);
             let half_h = (avail.y - header_h - 20.0).max(80.0);
-            let panel_size = if self.config.integer_scaling {
-                let factor = ((half_w / LCD_WIDTH as f32)
-                    .floor()
-                    .min((half_h / LCD_HEIGHT as f32).floor()))
-                .max(1.0);
-                Vec2::new(LCD_WIDTH as f32 * factor, LCD_HEIGHT as f32 * factor)
-            } else {
-                let scale = (half_w / LCD_WIDTH as f32)
-                    .min(half_h / LCD_HEIGHT as f32)
-                    .max(0.5);
-                Vec2::new(LCD_WIDTH as f32 * scale, LCD_HEIGHT as f32 * scale)
+            let panel_size = match self.config.viewport_scale {
+                ViewportScale::Compact2x => {
+                    let max_scale = (half_w / LCD_WIDTH as f32).min(half_h / LCD_HEIGHT as f32);
+                    let scale = 2.0_f32.min(max_scale.max(0.5));
+                    Vec2::new(LCD_WIDTH as f32 * scale, LCD_HEIGHT as f32 * scale)
+                }
+                ViewportScale::Handheld3x => {
+                    let max_scale = (half_w / LCD_WIDTH as f32).min(half_h / LCD_HEIGHT as f32);
+                    let scale = 3.0_f32.min(max_scale.max(0.5));
+                    Vec2::new(LCD_WIDTH as f32 * scale, LCD_HEIGHT as f32 * scale)
+                }
+                ViewportScale::Medium4x => {
+                    let max_scale = (half_w / LCD_WIDTH as f32).min(half_h / LCD_HEIGHT as f32);
+                    let scale = 4.0_f32.min(max_scale.max(0.5));
+                    Vec2::new(LCD_WIDTH as f32 * scale, LCD_HEIGHT as f32 * scale)
+                }
+                ViewportScale::FitWindow => {
+                    if self.config.integer_scaling {
+                        let factor = ((half_w / LCD_WIDTH as f32)
+                            .floor()
+                            .min((half_h / LCD_HEIGHT as f32).floor()))
+                        .max(1.0);
+                        Vec2::new(LCD_WIDTH as f32 * factor, LCD_HEIGHT as f32 * factor)
+                    } else {
+                        let scale = (half_w / LCD_WIDTH as f32)
+                            .min(half_h / LCD_HEIGHT as f32)
+                            .max(0.5);
+                        Vec2::new(LCD_WIDTH as f32 * scale, LCD_HEIGHT as f32 * scale)
+                    }
+                }
             };
             let full_uv = egui::Rect::from_min_max(egui::Pos2::ZERO, egui::Pos2::new(1.0, 1.0));
             let total_w = panel_size.x * 2.0 + gap;
@@ -640,12 +560,31 @@ impl RustboyApp {
                 )
             };
 
-            let disp_size = if self.config.integer_scaling {
-                let factor = ((avail.x / ref_w).floor().min((avail.y / ref_h).floor())).max(1.0);
-                Vec2::new(ref_w * factor, ref_h * factor)
-            } else {
-                let scale = (avail.x / ref_w).min(avail.y / ref_h).max(0.5);
-                Vec2::new(ref_w * scale, ref_h * scale)
+            let disp_size = match self.config.viewport_scale {
+                ViewportScale::Handheld3x => {
+                    let max_scale = (avail.x / ref_w).min(avail.y / ref_h);
+                    let scale = 3.0_f32.min(max_scale.max(0.5));
+                    Vec2::new(ref_w * scale, ref_h * scale)
+                }
+                ViewportScale::Compact2x => {
+                    let max_scale = (avail.x / ref_w).min(avail.y / ref_h);
+                    let scale = 2.0_f32.min(max_scale.max(0.5));
+                    Vec2::new(ref_w * scale, ref_h * scale)
+                }
+                ViewportScale::Medium4x => {
+                    let max_scale = (avail.x / ref_w).min(avail.y / ref_h);
+                    let scale = 4.0_f32.min(max_scale.max(0.5));
+                    Vec2::new(ref_w * scale, ref_h * scale)
+                }
+                ViewportScale::FitWindow => {
+                    if self.config.integer_scaling {
+                        let factor = ((avail.x / ref_w).floor().min((avail.y / ref_h).floor())).max(1.0);
+                        Vec2::new(ref_w * factor, ref_h * factor)
+                    } else {
+                        let scale = (avail.x / ref_w).min(avail.y / ref_h).max(0.5);
+                        Vec2::new(ref_w * scale, ref_h * scale)
+                    }
+                }
             };
 
             ui.centered_and_justified(|ui| {
@@ -828,6 +767,7 @@ impl RustboyApp {
     }
 }
 
+#[allow(dead_code)]
 fn draw_status_pill(ui: &mut egui::Ui, label: &str, fg: Color32, border: Color32, bg: Color32) {
     egui::Frame::new()
         .fill(bg)

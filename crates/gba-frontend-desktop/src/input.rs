@@ -465,6 +465,7 @@ impl RustboyApp {
         encode_keyinput(effective_mask)
     }
 
+    #[allow(dead_code)]
     pub(crate) fn effective_keypad_for_frame(&mut self) -> u16 {
         self.effective_live_keypad_for_frame()
     }

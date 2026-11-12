@@ -225,8 +225,8 @@ impl VideoPostProcessor {
 
             base_rgb: vec![[0u8; 3]; LCD_WIDTH * LCD_HEIGHT],
             prev_rgb: vec![[0u8; 3]; LCD_WIDTH * LCD_HEIGHT],
-            output_image: egui::ColorImage::new([LCD_WIDTH * 2, LCD_HEIGHT * 2], egui::Color32::BLACK),
-            filter: DisplayFilter::SoftHandheld,
+            output_image: egui::ColorImage::new([LCD_WIDTH * 3, LCD_HEIGHT * 3], egui::Color32::BLACK),
+            filter: DisplayFilter::XbrSmooth3x,
             lcd_grid_intensity: 0.08,
         }
     }
@@ -490,6 +490,9 @@ impl VideoPostProcessor {
 
         // Pass 2: Fast Integer Display Filter (~0.15 - 0.25 ms)
         match filter {
+            DisplayFilter::XbrSmooth3x => {
+                render_xbr_smooth_3x(&self.base_rgb, &mut self.output_image);
+            }
             DisplayFilter::RawNearest => {
                 if self.output_image.size != [LCD_WIDTH, LCD_HEIGHT] {
                     self.output_image =
@@ -657,6 +660,99 @@ impl VideoPostProcessor {
     }
 }
 
+#[inline(always)]
+fn color_dist(c1: [u8; 3], c2: [u8; 3]) -> u32 {
+    let dr = (c1[0] as i32 - c2[0] as i32).abs() as u32;
+    let dg = (c1[1] as i32 - c2[1] as i32).abs() as u32;
+    let db = (c1[2] as i32 - c2[2] as i32).abs() as u32;
+    dr + dg + db
+}
+
+#[inline(always)]
+fn blend_corner_xbr(
+    p: [u8; 3],
+    c1: [u8; 3],
+    c2: [u8; 3],
+    diag: [u8; 3],
+) -> egui::Color32 {
+    let d_card = color_dist(c1, c2);
+    let d_diag = color_dist(p, diag);
+    let d_p_c1 = color_dist(p, c1);
+    let d_p_c2 = color_dist(p, c2);
+
+    // Precise diagonal edge check:
+    // 1. Cardinal neighbors c1 and c2 are similar to each other (same color/ramp)
+    // 2. p differs from BOTH c1 and c2 (p is NOT connected along horizontal or vertical axis)
+    // 3. c1 and c2 contrast with the diagonal neighbor relative to p
+    if d_card < d_diag && d_card <= 40 && d_p_c1 >= 24 && d_p_c2 >= 24 {
+        let n_r = (c1[0] as u16 + c2[0] as u16) >> 1;
+        let n_g = (c1[1] as u16 + c2[1] as u16) >> 1;
+        let n_b = (c1[2] as u16 + c2[2] as u16) >> 1;
+
+        egui::Color32::from_rgb(
+            ((p[0] as u16 + n_r) >> 1) as u8,
+            ((p[1] as u16 + n_g) >> 1) as u8,
+            ((p[2] as u16 + n_b) >> 1) as u8,
+        )
+    } else {
+        egui::Color32::from_rgb(p[0], p[1], p[2])
+    }
+}
+
+pub fn render_xbr_smooth_3x(base_rgb: &[[u8; 3]], output_image: &mut egui::ColorImage) {
+    let out_w = LCD_WIDTH * 3;
+    let out_h = LCD_HEIGHT * 3;
+    if output_image.size != [out_w, out_h] {
+        *output_image = egui::ColorImage::new([out_w, out_h], egui::Color32::BLACK);
+    }
+
+    for y in 0..LCD_HEIGHT {
+        let ym1 = y.saturating_sub(1);
+        let yp1 = (y + 1).min(LCD_HEIGHT - 1);
+        let dst_r0 = (y * 3) * out_w;
+        let dst_r1 = dst_r0 + out_w;
+        let dst_r2 = dst_r1 + out_w;
+
+        for x in 0..LCD_WIDTH {
+            let xm1 = x.saturating_sub(1);
+            let xp1 = (x + 1).min(LCD_WIDTH - 1);
+
+            let p = base_rgb[y * LCD_WIDTH + x];
+            let u = base_rgb[ym1 * LCD_WIDTH + x];
+            let d = base_rgb[yp1 * LCD_WIDTH + x];
+            let l = base_rgb[y * LCD_WIDTH + xm1];
+            let r = base_rgb[y * LCD_WIDTH + xp1];
+
+            let ul = base_rgb[ym1 * LCD_WIDTH + xm1];
+            let ur = base_rgb[ym1 * LCD_WIDTH + xp1];
+            let dl = base_rgb[yp1 * LCD_WIDTH + xm1];
+            let dr = base_rgb[yp1 * LCD_WIDTH + xp1];
+
+            let c_center = egui::Color32::from_rgb(p[0], p[1], p[2]);
+            let c_tl = blend_corner_xbr(p, u, l, ul);
+            let c_tr = blend_corner_xbr(p, u, r, ur);
+            let c_bl = blend_corner_xbr(p, d, l, dl);
+            let c_br = blend_corner_xbr(p, d, r, dr);
+
+            let dx = x * 3;
+            // Row 0: [0, 0] (TL corner), [0, 1] (Top edge), [0, 2] (TR corner)
+            output_image.pixels[dst_r0 + dx] = c_tl;
+            output_image.pixels[dst_r0 + dx + 1] = c_center;
+            output_image.pixels[dst_r0 + dx + 2] = c_tr;
+
+            // Row 1: [1, 0] (Left edge), [1, 1] (Center), [1, 2] (Right edge)
+            output_image.pixels[dst_r1 + dx] = c_center;
+            output_image.pixels[dst_r1 + dx + 1] = c_center;
+            output_image.pixels[dst_r1 + dx + 2] = c_center;
+
+            // Row 2: [2, 0] (BL corner), [2, 1] (Bottom edge), [2, 2] (BR corner)
+            output_image.pixels[dst_r2 + dx] = c_bl;
+            output_image.pixels[dst_r2 + dx + 1] = c_center;
+            output_image.pixels[dst_r2 + dx + 2] = c_br;
+        }
+    }
+}
+
 pub struct FrontendBridge {
     // Precomputed 15-bit BGR555 -> 24-bit RGB Lookup Tables (0.02 ms lookup!)
     pub srgb_lut: Box<[[u8; 3]; 32768]>,
@@ -716,8 +812,8 @@ impl FrontendBridge {
             raw_lut,
             base_rgb: vec![[0u8; 3]; LCD_WIDTH * LCD_HEIGHT],
             prev_rgb: vec![[0u8; 3]; LCD_WIDTH * LCD_HEIGHT],
-            output_image: egui::ColorImage::new([LCD_WIDTH * 2, LCD_HEIGHT * 2], egui::Color32::BLACK),
-            filter: DisplayFilter::SoftHandheld,
+            output_image: egui::ColorImage::new([LCD_WIDTH * 3, LCD_HEIGHT * 3], egui::Color32::BLACK),
+            filter: DisplayFilter::XbrSmooth3x,
             lcd_grid_intensity: 0.08,
             color_correction: true,
             lcd_ghosting: true,
@@ -763,6 +859,9 @@ impl HostFrontend for FrontendBridge {
 
         // Pass 2: Fast Integer Display Filter (~0.15 - 0.25 ms)
         match self.filter {
+            DisplayFilter::XbrSmooth3x => {
+                render_xbr_smooth_3x(&self.base_rgb, &mut self.output_image);
+            }
             DisplayFilter::RawNearest => {
                 if self.output_image.size != [LCD_WIDTH, LCD_HEIGHT] {
                     self.output_image =
@@ -1015,25 +1114,31 @@ mod tests {
 
         let test_fb = [0x7FFF_u16; LCD_WIDTH * LCD_HEIGHT];
 
-        // 1. Authentic GBA LCD (3x -> 720x480)
+        // 1. xBR 3x (Laptop HD) (3x -> 720x480)
+        bridge.filter = DisplayFilter::XbrSmooth3x;
+        bridge.present_frame(&test_fb);
+        assert_eq!(bridge.output_image.size, [LCD_WIDTH * 3, LCD_HEIGHT * 3]);
+        assert_eq!(bridge.texture_options(), egui::TextureOptions::LINEAR);
+
+        // 2. Authentic GBA LCD (3x -> 720x480)
         bridge.filter = DisplayFilter::AuthenticGbaLcd;
         bridge.present_frame(&test_fb);
         assert_eq!(bridge.output_image.size, [LCD_WIDTH * 3, LCD_HEIGHT * 3]);
         assert_eq!(bridge.texture_options(), egui::TextureOptions::LINEAR);
 
-        // 2. Soft Handheld (2x -> 480x320)
+        // 3. Soft Handheld (2x -> 480x320)
         bridge.filter = DisplayFilter::SoftHandheld;
         bridge.present_frame(&test_fb);
         assert_eq!(bridge.output_image.size, [LCD_WIDTH * 2, LCD_HEIGHT * 2]);
         assert_eq!(bridge.texture_options(), egui::TextureOptions::LINEAR);
 
-        // 3. Smooth Scale2x (2x -> 480x320)
+        // 4. Smooth Scale2x (2x -> 480x320)
         bridge.filter = DisplayFilter::SmoothScale2x;
         bridge.present_frame(&test_fb);
         assert_eq!(bridge.output_image.size, [LCD_WIDTH * 2, LCD_HEIGHT * 2]);
         assert_eq!(bridge.texture_options(), egui::TextureOptions::NEAREST);
 
-        // 4. Raw Nearest (1x -> 240x160)
+        // 5. Raw Nearest (1x -> 240x160)
         bridge.filter = DisplayFilter::RawNearest;
         bridge.present_frame(&test_fb);
         assert_eq!(bridge.output_image.size, [LCD_WIDTH, LCD_HEIGHT]);
@@ -1063,5 +1168,61 @@ mod tests {
         assert_eq!(lcd_img_0pct.pixels[1], egui::Color32::from_rgb(255, 255, 255));
         assert_eq!(lcd_img_0pct.pixels[2 * out_w], egui::Color32::from_rgb(255, 255, 255));
         assert_eq!(lcd_img_0pct.pixels[2 * out_w + 2], egui::Color32::from_rgb(255, 255, 255));
+    }
+
+    #[test]
+    fn xbr_smooth_3x_edge_smoothing_and_sharp_interior() {
+        let mut proc = VideoPostProcessor::new();
+        // Create an all-white framebuffer (0x7FFF) with a black pixel (0x0000) at (0, 0), (1, 0), (0, 1)
+        // so that for pixel (1, 1) [white]:
+        //   Up (1, 0) is black
+        //   Left (0, 1) is black
+        //   Up-Left (0, 0) is black
+        //   Down, Right, and all other neighbors are white
+        let mut test_fb = [0x7FFF_u16; LCD_WIDTH * LCD_HEIGHT];
+        test_fb[0] = 0x0000; // (0, 0)
+        test_fb[1] = 0x0000; // (1, 0) - Up for (1, 1)
+        test_fb[LCD_WIDTH] = 0x0000; // (0, 1) - Left for (1, 1)
+
+        let img = proc.process_display_filter(
+            &test_fb,
+            false,
+            false,
+            DisplayFilter::XbrSmooth3x,
+            false,
+            0.08,
+        );
+        let out_w = LCD_WIDTH * 3;
+        assert_eq!(img.size, [LCD_WIDTH * 3, LCD_HEIGHT * 3]);
+
+        // Examine the 3x3 block corresponding to source pixel (1, 1):
+        // Destination rows: 3, 4, 5
+        // Destination cols: 3, 4, 5
+        let r0 = 3 * out_w;
+        let r1 = 4 * out_w;
+        let r2 = 5 * out_w;
+
+        // 1. Center [1, 1] at (4, 4) must be 100% original pixel sharpness (white: 255, 255, 255)
+        assert_eq!(img.pixels[r1 + 4], egui::Color32::from_rgb(255, 255, 255));
+
+        // 2. Orthogonal edges must also be 100% original pixel sharpness:
+        // Top edge [0, 1] at (3, 4)
+        assert_eq!(img.pixels[r0 + 4], egui::Color32::from_rgb(255, 255, 255));
+        // Left edge [1, 0] at (4, 3)
+        assert_eq!(img.pixels[r1 + 3], egui::Color32::from_rgb(255, 255, 255));
+        // Right edge [1, 2] at (4, 5)
+        assert_eq!(img.pixels[r1 + 5], egui::Color32::from_rgb(255, 255, 255));
+        // Bottom edge [2, 1] at (5, 4)
+        assert_eq!(img.pixels[r2 + 4], egui::Color32::from_rgb(255, 255, 255));
+
+        // 3. Top-Left corner [0, 0] at (3, 3):
+        // Up is black [0, 0, 0], Left is black [0, 0, 0], Up-Left is black [0, 0, 0].
+        // Cardinal neighbors are identical and similar, contrasting with white center (255, 255, 255).
+        // Blends 50/50: ((255 + 0) >> 1) = 127
+        assert_eq!(img.pixels[r0 + 3], egui::Color32::from_rgb(127, 127, 127));
+
+        // 4. Bottom-Right corner [2, 2] at (5, 5):
+        // Down is white, Right is white, center is white -> stays 100% white (255, 255, 255)
+        assert_eq!(img.pixels[r2 + 5], egui::Color32::from_rgb(255, 255, 255));
     }
 }

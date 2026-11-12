@@ -1,17 +1,43 @@
 use std::fs;
 use std::path::PathBuf;
 
-use egui::{self, Color32, RichText, Stroke};
+use egui::{self, RichText, Stroke};
 use gba_core::{LCD_HEIGHT, LCD_WIDTH};
 
-use crate::app::{
-    RustboyApp, ACCENT_TEAL, ACCENT_TEAL_BG, BG_PANEL, BORDER_HAIRLINE, TEXT_MUTED,
-};
+use crate::app::{RustboyApp, TEXT_MUTED};
 use crate::capture::GifFpsMode;
 use crate::config::{
     AppConfig, BezelStyle, ColorProfileChoice, DisplayFilter, DmgPaletteChoice, HotkeyAction,
-    ShaderPreset,
+    ShaderPreset, ViewportScale,
 };
+
+fn toolbar_btn(
+    ui: &mut egui::Ui,
+    label: &str,
+    active: bool,
+    enabled: bool,
+) -> egui::Response {
+    let text_color = if !enabled {
+        crate::theme::COLOR_TEXT_DISABLED
+    } else if active {
+        crate::theme::ACCENT_TEAL
+    } else {
+        crate::theme::COLOR_TEXT
+    };
+
+    let border_stroke = if active && enabled {
+        Stroke::new(1.0_f32, crate::theme::ACCENT_TEAL)
+    } else {
+        Stroke::new(1.0_f32, crate::theme::COLOR_BORDER)
+    };
+
+    let btn = egui::Button::new(RichText::new(label).color(text_color))
+        .fill(crate::theme::COLOR_SURFACE)
+        .stroke(border_stroke)
+        .corner_radius(crate::theme::RADIUS_DEFAULT);
+
+    ui.add_enabled(enabled, btn.min_size(egui::vec2(0.0, 26.0)))
+}
 
 impl RustboyApp {
     // WAVE-2 HOOK: Top menu bar — wave-2 agents should add menu entries here for
@@ -20,9 +46,9 @@ impl RustboyApp {
         egui::TopBottomPanel::top("top_menu_bar")
             .frame(
                 egui::Frame::new()
-                    .fill(BG_PANEL)
-                    .inner_margin(4.0)
-                    .stroke(Stroke::new(1.0_f32, BORDER_HAIRLINE)),
+                    .fill(crate::theme::COLOR_SURFACE)
+                    .inner_margin(egui::Margin::symmetric(8, 3))
+                    .stroke(Stroke::new(1.0_f32, crate::theme::COLOR_BORDER)),
             )
             .show(ctx, |ui| {
                 egui::menu::bar(ui, |ui| {
@@ -335,6 +361,24 @@ impl RustboyApp {
                                 ui.close_menu();
                             }
                         });
+                        ui.menu_button(
+                            format!("Viewport Size ({})", self.config.viewport_scale.toolbar_label()),
+                            |ui| {
+                                for scale in ViewportScale::ALL {
+                                    if ui
+                                        .selectable_label(
+                                            self.config.viewport_scale == scale,
+                                            scale.description(),
+                                        )
+                                        .clicked()
+                                    {
+                                        self.config.viewport_scale = scale;
+                                        self.config.save();
+                                        ui.close_menu();
+                                    }
+                                }
+                            },
+                        );
                         let active_shader = self.config.effective_shader_preset();
                         ui.menu_button(
                             format!("Shader Preset ({})", active_shader.short_label()),
@@ -367,6 +411,7 @@ impl RustboyApp {
                                         {
                                             self.config.display_filter = filter;
                                             self.config.shader_preset = match filter {
+                                                DisplayFilter::XbrSmooth3x => ShaderPreset::Nearest,
                                                 DisplayFilter::AuthenticGbaLcd => ShaderPreset::LcdGrid,
                                                 DisplayFilter::SoftHandheld => ShaderPreset::SharpBilinear,
                                                 DisplayFilter::SmoothScale2x => ShaderPreset::ScaleEdge,
@@ -742,195 +787,139 @@ impl RustboyApp {
     }
 
     pub(crate) fn draw_toolbar(&mut self, ctx: &egui::Context) {
-        let toggle_btn = |ui: &mut egui::Ui, label: &str, active: bool| -> egui::Response {
-            let mut btn = egui::Button::new(RichText::new(label).small());
-            if active {
-                btn = btn
-                    .fill(ACCENT_TEAL_BG)
-                    .stroke(Stroke::new(1.0_f32, ACCENT_TEAL));
-            }
-            ui.add(btn)
-        };
-
         egui::TopBottomPanel::top("quick_toolbar")
             .frame(
                 egui::Frame::new()
-                    .fill(BG_PANEL)
-                    .inner_margin(egui::Margin::symmetric(8, 5))
-                    .stroke(Stroke::new(1.0_f32, BORDER_HAIRLINE)),
+                    .fill(crate::theme::COLOR_SURFACE)
+                    .inner_margin(egui::Margin::symmetric(8, 4))
+                    .stroke(crate::theme::STROKE_BORDER),
             )
             .show(ctx, |ui| {
                 ui.horizontal(|ui| {
                     let has_rom = self.has_active_game();
-                    if ui
-                        .button(RichText::new("📂 Open ROM").small())
+
+                    // Group 1: Open, Folder, Reload
+                    if toolbar_btn(ui, "📂 Open", false, true)
                         .on_hover_text("Open GBA / GB / GBC ROM File (Ctrl+O)")
                         .clicked()
                     {
                         self.trigger_open_rom_dialog(ctx);
                     }
-                    if ui
-                        .button(RichText::new("📁 Add Folder").small())
+                    if toolbar_btn(ui, "📁 Folder", false, true)
                         .on_hover_text("Add ROM Directory to Library")
                         .clicked()
                     {
                         self.add_rom_folder_dialog();
                     }
-                    if ui
-                        .button(RichText::new("🔄 Refresh").small())
-                        .on_hover_text("Rescan configured ROM folders")
+                    if toolbar_btn(ui, "🔄 Reload", false, true)
+                        .on_hover_text("Reload current ROM or rescan folders")
                         .clicked()
                     {
-                        self.rescan_rom_folders();
+                        if let Some(path) = self.rom_path.clone() {
+                            let _ = self.open_rom(&path, None, Some(ctx));
+                        } else {
+                            self.rescan_rom_folders();
+                        }
                     }
 
                     ui.separator();
 
-                    ui.add_enabled_ui(has_rom, |ui| {
-                        let play_lbl = if self.paused {
-                            "▶ Resume"
+                    // Group 2: Pause, Stop, Step, Rewind, Reset, FF
+                    let play_lbl = if self.paused { "▶ Resume" } else { "⏸ Pause" };
+                    if toolbar_btn(ui, play_lbl, self.paused, has_rom)
+                        .on_hover_text("Pause / Resume emulation (P / Space)")
+                        .clicked()
+                    {
+                        self.toggle_pause();
+                    }
+                    if toolbar_btn(ui, "⏹ Stop", false, has_rom)
+                        .on_hover_text("Stop game and return to ROM Library (Esc / Ctrl+W)")
+                        .clicked()
+                    {
+                        self.close_rom(ctx);
+                    }
+                    let hardcore = self.is_ra_hardcore_active();
+                    if toolbar_btn(ui, "⏭ Step", false, has_rom && !hardcore)
+                        .on_hover_text("Advance 1 Frame (Ctrl+N)")
+                        .clicked()
+                    {
+                        self.step_single_frame(ctx);
+                    }
+                    let rewind_enabled =
+                        has_rom && !hardcore && self.config.rewind_enabled && !self.rewind_buffer.is_empty();
+                    if toolbar_btn(ui, "⏪ Rewind", false, rewind_enabled)
+                        .on_hover_text("Rewind ~0.5s (or hold R key in-game)")
+                        .clicked()
+                    {
+                        self.rewind_manual_with_movie_sync();
+                    }
+                    if toolbar_btn(ui, "⟲ Reset", false, has_rom)
+                        .on_hover_text("Hard Reset (Ctrl+R)")
+                        .clicked()
+                    {
+                        self.hard_reset();
+                    }
+                    let eff_speed = self.effective_speed_multiplier();
+                    let turbo_on = self.tab_fast_forward || eff_speed > 1.05 || eff_speed <= 0.0;
+                    if toolbar_btn(ui, "⏩ FF", turbo_on, has_rom)
+                        .on_hover_text("Toggle Fast-Forward (Tab / hotkey)")
+                        .clicked()
+                    {
+                        let target_speed = if eff_speed > 1.05 || eff_speed <= 0.0 {
+                            1.0
                         } else {
-                            "⏸ Pause"
+                            self.config.fast_forward_speed
                         };
-                        if toggle_btn(ui, play_lbl, self.paused).clicked() {
-                            self.toggle_pause();
-                        }
-
-                        // Prominent STOP button to exit running game back to ROM Library
-                        let stop_btn = egui::Button::new(
-                            RichText::new("⏹ Stop")
-                                .color(Color32::from_rgb(255, 120, 120))
-                                .small(),
-                        );
-                        if ui
-                            .add(stop_btn)
-                            .on_hover_text("Stop game and return to ROM Library (Esc / Ctrl+W)")
-                            .clicked()
-                        {
-                            self.close_rom(ctx);
-                        }
-
-                        let hardcore = self.is_ra_hardcore_active();
-                        if ui
-                            .add_enabled(
-                                !hardcore,
-                                egui::Button::new(RichText::new("⏭ Step").small()),
-                            )
-                            .on_hover_text("Advance 1 Frame (Ctrl+N)")
-                            .clicked()
-                        {
-                            self.step_single_frame(ctx);
-                        }
-
-                        let rewind_enabled =
-                            !hardcore && self.config.rewind_enabled && !self.rewind_buffer.is_empty();
-                        let rew_btn = egui::Button::new(RichText::new("⏪ Rewind").small());
-                        if ui
-                            .add_enabled(rewind_enabled, rew_btn)
-                            .on_hover_text("Rewind ~0.5s (or hold R key in-game)")
-                            .clicked()
-                        {
-                            self.rewind_manual_with_movie_sync();
-                        }
-
-                        if ui
-                            .button(RichText::new("Reset").small())
-                            .on_hover_text("Hard Reset (Ctrl+R)")
-                            .clicked()
-                        {
-                            self.hard_reset();
-                        }
-
-                        let eff_speed = self.effective_speed_multiplier();
-                        let turbo_on = self.tab_fast_forward || eff_speed > 1.05 || eff_speed <= 0.0;
-                        let ff_hotkey = self
-                            .config
-                            .keybindings
-                            .hotkeys
-                            .display(HotkeyAction::FastForward);
-                        let ff_label = if self.config.fast_forward_speed <= 0.0 {
-                            "Unlimited".to_string()
+                        if self.has_per_game_speed_override() {
+                            self.session_speed_override = Some(target_speed);
                         } else {
-                            format!("{:.0}x", self.config.fast_forward_speed)
-                        };
-                        if toggle_btn(ui, "FF >>", turbo_on)
-                            .on_hover_text(format!(
-                                "Toggle {ff_label} Fast-Forward (or Hold {ff_hotkey})"
-                            ))
-                            .clicked()
-                        {
-                            let target_speed = if eff_speed > 1.05 || eff_speed <= 0.0 {
-                                1.0
-                            } else {
-                                self.config.fast_forward_speed
-                            };
-                            if self.has_per_game_speed_override() {
-                                self.session_speed_override = Some(target_speed);
-                            } else {
-                                self.session_speed_override = None;
-                                self.config.speed_multiplier = target_speed;
-                                self.config.save();
-                            }
+                            self.session_speed_override = None;
+                            self.config.speed_multiplier = target_speed;
+                            self.config.save();
                         }
+                    }
 
-                        ui.separator();
+                    ui.separator();
 
-                        if ui.button(RichText::new("💾 Save 1").small()).clicked() {
-                            self.quick_save(1);
-                        }
-                        if ui.button(RichText::new("📂 Load 1").small()).clicked() {
-                            self.quick_load(1);
-                        }
-                        if ui
-                            .button(RichText::new("🖼️ States").small())
-                            .on_hover_text("Open Visual Save State Manager (F6)")
-                            .clicked()
-                        {
-                            self.show_state_manager = true;
-                        }
-                        if self.undo_state_buffer.is_some()
-                            && ui
-                                .button(RichText::new("↩ Undo").small())
-                                .on_hover_text("Undo Last Save/Load (Ctrl+Z)")
-                                .clicked()
-                        {
-                            self.undo_last_state_action();
-                        }
-                        if let Some(core) = &self.core
-                            && core.bus.cart.solar_enabled
-                        {
-                            let lvl = ((core.bus.cart.solar_lux as f32 / 255.0) * 10.0).round()
-                                as u8;
-                            ui.label(
-                                RichText::new(format!("☀️ {lvl}/10"))
-                                    .small()
-                                    .color(ACCENT_TEAL),
-                            )
-                            .on_hover_text("Boktai Solar Sensor Intensity (Hotkey: [ / ])");
-                        }
-                        if ui
-                            .button(RichText::new("📷 Shot").small())
-                            .on_hover_text("Save Screenshot alongside ROM (F12)")
-                            .clicked()
-                        {
-                            self.capture_screenshot();
-                        }
+                    // Group 3: S1, L1, States, Snap
+                    if toolbar_btn(ui, "💾 S1", false, has_rom)
+                        .on_hover_text("Quick Save Slot 1 (F5)")
+                        .clicked()
+                    {
+                        self.quick_save(1);
+                    }
+                    if toolbar_btn(ui, "📂 L1", false, has_rom)
+                        .on_hover_text("Quick Load Slot 1 (F7)")
+                        .clicked()
+                    {
+                        self.quick_load(1);
+                    }
+                    if toolbar_btn(ui, "◈ States", self.show_state_manager, true)
+                        .on_hover_text("Open Visual Save State Manager (F6)")
+                        .clicked()
+                    {
+                        self.show_state_manager = !self.show_state_manager;
+                    }
+                    if toolbar_btn(ui, "📷 Snap", false, has_rom)
+                        .on_hover_text("Save Screenshot alongside ROM (F12)")
+                        .clicked()
+                    {
+                        self.capture_screenshot();
+                    }
 
-                        ui.separator();
-                    });
+                    ui.separator();
 
-                    if toggle_btn(
-                        ui,
-                        if self.config.muted { "Muted" } else { "Audio" },
-                        self.config.muted,
-                    )
-                    .clicked()
+                    // Group 4: Audio, sRGB, Filter: LCD Matrix
+                    let audio_active = !self.config.muted;
+                    if toolbar_btn(ui, "🔊 Audio", audio_active, true)
+                        .on_hover_text("Toggle Audio Output (M)")
+                        .clicked()
                     {
                         self.config.muted = !self.config.muted;
                         self.sink.audio.set_muted(self.config.muted);
                         self.config.save();
                     }
-                    if toggle_btn(ui, "sRGB", self.config.color_correction)
+                    if toolbar_btn(ui, "🎨 sRGB", self.config.color_correction, true)
                         .on_hover_text("Color Correction")
                         .clicked()
                     {
@@ -938,25 +927,29 @@ impl RustboyApp {
                         self.config.save();
                         self.sink.frame_dirty = true;
                     }
-                    let filter_btn = ui.button(format!("Filter: {}", self.config.display_filter.label()));
-                    if filter_btn.clicked() {
+
+                    let filter_label = format!("🎛 Filter: {}", self.config.display_filter.label());
+                    let filter_resp = toolbar_btn(ui, &filter_label, false, true);
+                    if filter_resp.clicked() {
                         self.config.display_filter = self.config.display_filter.next();
                         self.config.shader_preset = match self.config.display_filter {
+                            DisplayFilter::XbrSmooth3x => ShaderPreset::Nearest,
                             DisplayFilter::AuthenticGbaLcd => ShaderPreset::LcdGrid,
                             DisplayFilter::SoftHandheld => ShaderPreset::SharpBilinear,
                             DisplayFilter::SmoothScale2x => ShaderPreset::ScaleEdge,
                             DisplayFilter::RawNearest => ShaderPreset::Nearest,
                         };
-                        self.config.scanline_grid = self.config.display_filter == DisplayFilter::AuthenticGbaLcd;
+                        self.config.scanline_grid =
+                            self.config.display_filter == DisplayFilter::AuthenticGbaLcd;
                         self.config.save();
                         self.sink.frame_dirty = true;
                         self.lcd_tex = None;
                     }
                     let filter_desc = self.config.display_filter.description();
-                    let filter_btn = filter_btn.on_hover_text(format!(
+                    let filter_resp = filter_resp.on_hover_text(format!(
                         "GBA Display Filter: {filter_desc}\n(Click to cycle, right-click for quick menu)"
                     ));
-                    filter_btn.context_menu(|ui| {
+                    filter_resp.context_menu(|ui| {
                         for f in DisplayFilter::ALL {
                             if ui
                                 .selectable_label(self.config.display_filter == f, f.description())
@@ -964,6 +957,7 @@ impl RustboyApp {
                             {
                                 self.config.display_filter = f;
                                 self.config.shader_preset = match f {
+                                    DisplayFilter::XbrSmooth3x => ShaderPreset::Nearest,
                                     DisplayFilter::AuthenticGbaLcd => ShaderPreset::LcdGrid,
                                     DisplayFilter::SoftHandheld => ShaderPreset::SharpBilinear,
                                     DisplayFilter::SmoothScale2x => ShaderPreset::ScaleEdge,
@@ -993,25 +987,22 @@ impl RustboyApp {
 
                     ui.separator();
 
-                    if toggle_btn(ui, "CPU", self.debugger.show_cpu).clicked() {
+                    // Group 5: CPU, Hex, VRAM, Audio, Link
+                    if toolbar_btn(ui, "CPU", self.debugger.show_cpu, true).clicked() {
                         self.debugger.show_cpu = !self.debugger.show_cpu;
                     }
-                    if toggle_btn(ui, "Hex", self.debugger.show_hex).clicked() {
+                    if toolbar_btn(ui, "Hex", self.debugger.show_hex, true).clicked() {
                         self.debugger.show_hex = !self.debugger.show_hex;
                     }
-                    if toggle_btn(ui, "VRAM", self.debugger.show_vram).clicked() {
+                    if toolbar_btn(ui, "VRAM", self.debugger.show_vram, true).clicked() {
                         self.debugger.show_vram = !self.debugger.show_vram;
                     }
-                    if toggle_btn(ui, "Audio", self.debugger.show_audio).clicked() {
+                    if toolbar_btn(ui, "Audio", self.debugger.show_audio, true).clicked() {
                         self.debugger.show_audio = !self.debugger.show_audio;
                     }
                     let link_on = self.link.local_is_active()
-                        || self
-                            .link
-                            .netplay
-                            .as_ref()
-                            .is_some_and(|n| n.is_active());
-                    if toggle_btn(ui, "Link", self.link.show_window || link_on)
+                        || self.link.netplay.as_ref().is_some_and(|n| n.is_active());
+                    if toolbar_btn(ui, "Link", self.link.show_window || link_on, true)
                         .on_hover_text("GBA Link Cable (Local 2P & TCP Netplay)")
                         .clicked()
                     {

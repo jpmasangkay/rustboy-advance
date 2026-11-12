@@ -362,6 +362,7 @@ impl TriggerProgram {
         })
     }
 
+    #[allow(dead_code)]
     pub fn reset(&mut self) {
         for group in &mut self.groups {
             group.paused = false;
@@ -1119,7 +1120,9 @@ pub struct RuntimeAchievement {
     pub title: String,
     pub description: String,
     pub points: u32,
+    #[allow(dead_code)]
     pub flags: u32,
+    #[allow(dead_code)]
     pub mem_addr: String,
     pub earned: bool,
     pub hardcore_earned: bool,
@@ -1132,6 +1135,7 @@ pub struct RuntimeAchievement {
 /// Slide-in HUD notification queued when an achievement unlocks.
 #[derive(Clone, Debug)]
 pub struct UnlockToast {
+    #[allow(dead_code)]
     pub id: u64,
     pub title: String,
     pub description: String,

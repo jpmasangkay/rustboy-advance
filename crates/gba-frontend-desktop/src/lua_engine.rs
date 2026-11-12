@@ -1,5 +1,7 @@
 //! mGBA-inspired Lua 5.4 scripting engine powered by pure-Rust `piccolo`.
 
+#![allow(dead_code)]
+
 use std::{
     cell::RefCell,
     collections::VecDeque,

@@ -355,7 +355,7 @@ impl SysBus {
                 self.scheduler
                     .schedule(ev_cycle + APU_SAMPLE_INTERVAL, EventType::ApuSampleTick);
             }
-            EventType::IrqSynchronizer | EventType::None => {}
+            EventType::IrqSynchronizer | EventType::SioTransferComplete | EventType::None => {}
         }
     }
 

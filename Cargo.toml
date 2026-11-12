@@ -18,6 +18,7 @@ bitflags = "2.6"
 serde = { version = "1.0", default-features = false, features = ["derive", "alloc"] }
 postcard = { version = "1.0", default-features = false, features = ["alloc"] }
 log = "0.4"
+lz4_flex = { version = "0.14", default-features = false, features = ["alloc", "safe-encode", "safe-decode", "checked-decode"] }
 
 [profile.release]
 opt-level = 3

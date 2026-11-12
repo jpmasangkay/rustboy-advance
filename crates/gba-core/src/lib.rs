@@ -68,7 +68,29 @@ pub enum EventType {
     DmaActivate(u8),
     ApuSampleTick,
     IrqSynchronizer,
+    SioTransferComplete,
 }
+
+impl EventType {
+    /// Returns the fixed scheduler slot index for this event variant, or `None` for `EventType::None`.
+    #[inline]
+    pub const fn slot_index(self) -> Option<usize> {
+        match self {
+            EventType::None => None,
+            EventType::PpuHDrawEnd => Some(0),
+            EventType::PpuHBlank => Some(1),
+            EventType::PpuDotStep => Some(2),
+            EventType::TimerOverflow(ch) if ch < 4 => Some(3 + ch as usize),
+            EventType::DmaActivate(ch) if ch < 4 => Some(7 + ch as usize),
+            EventType::ApuSampleTick => Some(11),
+            EventType::IrqSynchronizer => Some(12),
+            EventType::SioTransferComplete => Some(13),
+            EventType::TimerOverflow(_) | EventType::DmaActivate(_) => None,
+        }
+    }
+}
+
+pub const SCHEDULER_SLOTS: usize = 14;
 
 #[derive(Copy, Clone, Debug, Serialize, Deserialize)]
 pub struct ScheduledEvent {
@@ -91,7 +113,7 @@ impl ScheduledEvent {
 pub struct Scheduler {
     pub current_cycle: u64,
     pub next_event_cycle: u64,
-    pub events: [ScheduledEvent; 24],
+    pub events: [ScheduledEvent; SCHEDULER_SLOTS],
 }
 
 impl Scheduler {
@@ -99,47 +121,27 @@ impl Scheduler {
         Self {
             current_cycle: 0,
             next_event_cycle: u64::MAX,
-            events: [ScheduledEvent::empty(); 24],
+            events: [ScheduledEvent::empty(); SCHEDULER_SLOTS],
         }
     }
 
     pub fn schedule(&mut self, target_cycle: u64, kind: EventType) {
-        if kind == EventType::None {
+        let Some(idx) = kind.slot_index() else {
             return;
-        }
-        // Replace existing slot with same EventType if already queued.
-        let mut free_idx = None;
-        for (i, ev) in self.events.iter().enumerate() {
-            if ev.active && ev.kind == kind {
-                self.events[i].cycle = target_cycle;
-                self.recompute_next();
-                return;
-            }
-            if !ev.active && free_idx.is_none() {
-                free_idx = Some(i);
-            }
-        }
-        if let Some(idx) = free_idx {
-            self.events[idx] = ScheduledEvent {
-                cycle: target_cycle,
-                kind,
-                active: true,
-            };
-        } else {
-            // Fallback: replace the farthest inactive/latest slot only if out of 24 slots
-            log::warn!("Scheduler event table full; dropping {:?}", kind);
-        }
+        };
+        self.events[idx] = ScheduledEvent {
+            cycle: target_cycle,
+            kind,
+            active: true,
+        };
         self.recompute_next();
     }
 
     pub fn cancel(&mut self, kind: EventType) {
-        for ev in self.events.iter_mut() {
-            if ev.active && ev.kind == kind {
-                ev.active = false;
-                ev.cycle = u64::MAX;
-                ev.kind = EventType::None;
-            }
-        }
+        let Some(idx) = kind.slot_index() else {
+            return;
+        };
+        self.events[idx] = ScheduledEvent::empty();
         self.recompute_next();
     }
 

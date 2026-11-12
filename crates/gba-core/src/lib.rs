@@ -19,7 +19,7 @@ pub mod serde_helpers;
 use alloc::{string::String, vec::Vec};
 use serde::{Deserialize, Serialize};
 
-use crate::bus::SysBus;
+pub use crate::bus::{SysBus, Watchpoint, WatchpointHit, WatchpointKind};
 use crate::cartridge::SaveType;
 use crate::cpu::Arm7tdmi;
 pub use crate::hw::{SioMode, SioResponse, SioTransfer};
@@ -210,6 +210,43 @@ pub struct MemoryRegionSlice<'a> {
     pub data: &'a [u8],
 }
 
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub enum StopReason {
+    FrameComplete,
+    Breakpoint(u32),
+    Watchpoint {
+        addr: u32,
+        pc: u32,
+        write: bool,
+        value: u32,
+    },
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct DebugControl {
+    pub breakpoints: Vec<u32>,
+    pub watchpoints: Vec<Watchpoint>,
+}
+
+impl DebugControl {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    pub fn with_breakpoints(breakpoints: &[u32]) -> Self {
+        Self {
+            breakpoints: breakpoints.to_vec(),
+            watchpoints: Vec::new(),
+        }
+    }
+}
+
+enum InternalStep {
+    Continue,
+    StoppedFrame(u64),
+    DebugStop(StopReason),
+}
+
 #[derive(Serialize, Deserialize)]
 struct SaveStatePayload {
     cpu: Arm7tdmi,
@@ -219,13 +256,20 @@ struct SaveStatePayload {
 pub struct GbaCore {
     pub cpu: Arm7tdmi,
     pub bus: SysBus,
+    pub idle_skip_enabled: bool,
+    pending_idle_check_pc: Option<u32>,
 }
 
 impl GbaCore {
     pub fn new(bios: Option<&[u8]>, rom: Vec<u8>) -> Self {
         let mut bus = SysBus::new(bios, rom);
         let cpu = Arm7tdmi::new(&mut bus);
-        Self { cpu, bus }
+        Self {
+            cpu,
+            bus,
+            idle_skip_enabled: true,
+            pending_idle_check_pc: None,
+        }
     }
 
     pub fn reset(&mut self) {
@@ -262,8 +306,10 @@ impl GbaCore {
         let layer_mask = self.bus.ppu.layer_enable_mask;
         let chan_mask = self.bus.apu.channel_enable_mask;
         let master_vol = self.bus.apu.master_volume_pct;
+        let idle_skip_enabled = self.idle_skip_enabled;
 
         *self = Self::new(bios, rom);
+        self.idle_skip_enabled = idle_skip_enabled;
         self.bus.cart.save_type = save_type;
         self.bus.cart.set_save_type_override(save_type_override);
         self.bus.cart.set_flash_id_override(flash_id_override);
@@ -291,6 +337,7 @@ impl GbaCore {
         self.bus.iwram[0x7E00..0x8000].fill(0);
         self.cpu.halted = false;
         self.cpu.stopped = false;
+        self.pending_idle_check_pc = None;
         self.bus.hw.halt_requested = false;
         self.bus.hw.stop_requested = false;
         self.bus.hw.ime = 0;
@@ -319,6 +366,30 @@ impl GbaCore {
 
     #[inline]
     pub fn step_one(&mut self) {
+        let _ = self.step_internal(&[], None, false);
+    }
+
+    pub fn step_one_debug(&mut self, ctrl: &DebugControl) -> Option<StopReason> {
+        let has_watchpoints = !ctrl.watchpoints.is_empty();
+        if has_watchpoints {
+            self.bus.set_watchpoints(&ctrl.watchpoints);
+        }
+        let res = match self.step_internal(&ctrl.breakpoints, None, false) {
+            InternalStep::DebugStop(reason) => Some(reason),
+            InternalStep::Continue | InternalStep::StoppedFrame(_) => None,
+        };
+        if has_watchpoints {
+            self.bus.clear_watchpoints();
+        }
+        res
+    }
+
+    fn step_internal(
+        &mut self,
+        breakpoints: &[u32],
+        halt_end_cycle: Option<u64>,
+        allow_idle_skip: bool,
+    ) -> InternalStep {
         while let Some((ev_cycle, kind)) = self.bus.scheduler.pop_due() {
             self.bus.dispatch_event(ev_cycle, kind);
         }
@@ -339,30 +410,51 @@ impl GbaCore {
             if (self.bus.hw.ie & self.bus.hw.if_flag & hw::IRQ_STOP_WAKE_MASK) != 0 {
                 self.cpu.stopped = false;
             } else {
-                self.bus.scheduler.shift_by(4);
-                self.bus.hw.shift_timers_by(4);
+                let delta = halt_end_cycle
+                    .map(|end| end.saturating_sub(self.bus.scheduler.current_cycle).max(1))
+                    .unwrap_or(4);
+                self.bus.scheduler.shift_by(delta);
+                self.bus.hw.shift_timers_by(delta);
                 self.bus.ppu.framebuffer.fill(0x7FFF);
-                return;
+                if halt_end_cycle.is_some() {
+                    return InternalStep::StoppedFrame(delta);
+                }
+                return InternalStep::Continue;
             }
         }
 
         if self.bus.hw.active_dma.is_some() {
+            if self.bus.watchpoint_active {
+                self.bus.debug_pc = self.cpu.current_exec_pc();
+                self.bus.watchpoint_hit = None;
+            }
             let cycles = self.bus.step_active_dma();
             self.bus.scheduler.current_cycle += cycles.max(1);
-            return;
+            if let Some(hit) = self.bus.watchpoint_hit.take() {
+                return InternalStep::DebugStop(StopReason::Watchpoint {
+                    addr: hit.addr,
+                    pc: hit.pc,
+                    write: hit.write,
+                    value: hit.value,
+                });
+            }
+            return InternalStep::Continue;
         }
 
         if self.cpu.halted {
             if (self.bus.hw.ie & self.bus.hw.if_flag) != 0 {
                 self.cpu.halted = false;
             } else {
-                let target = self.bus.scheduler.next_event_cycle;
-                if target != u64::MAX && target > self.bus.scheduler.current_cycle {
-                    self.bus.scheduler.current_cycle = target;
+                let next = match halt_end_cycle {
+                    Some(end) => self.bus.scheduler.next_event_cycle.min(end),
+                    None => self.bus.scheduler.next_event_cycle,
+                };
+                if next != u64::MAX && next > self.bus.scheduler.current_cycle {
+                    self.bus.scheduler.current_cycle = next;
                 } else {
                     self.bus.scheduler.current_cycle += 4;
                 }
-                return;
+                return InternalStep::Continue;
             }
         }
 
@@ -371,66 +463,275 @@ impl GbaCore {
             && !self.cpu.is_irq_disabled()
             && self.bus.irq_sync_delay == 0
         {
+            self.pending_idle_check_pc = None;
             self.cpu.trigger_irq(&mut self.bus);
             self.bus.scheduler.current_cycle += 3;
-            return;
+            return InternalStep::Continue;
         }
 
         if self.bus.irq_sync_delay > 0 {
             self.bus.irq_sync_delay = self.bus.irq_sync_delay.saturating_sub(1);
         }
 
+        let exec_pc = self.cpu.current_exec_pc();
+        if !breakpoints.is_empty() && breakpoints.contains(&exec_pc) {
+            return InternalStep::DebugStop(StopReason::Breakpoint(exec_pc));
+        }
+
+        if allow_idle_skip && self.pending_idle_check_pc == Some(exec_pc) {
+            self.pending_idle_check_pc = None;
+            if self.is_safe_idle_loop(exec_pc) {
+                let target = match halt_end_cycle {
+                    Some(end) => self.bus.scheduler.next_event_cycle.min(end),
+                    None => self.bus.scheduler.next_event_cycle,
+                };
+                if target != u64::MAX && target > self.bus.scheduler.current_cycle {
+                    self.bus.scheduler.current_cycle = target;
+                    return InternalStep::Continue;
+                }
+            }
+        }
+
+        if self.bus.watchpoint_active {
+            self.bus.debug_pc = exec_pc;
+            self.bus.watchpoint_hit = None;
+        }
         let cycles = self.cpu.step(&mut self.bus);
         self.bus.scheduler.current_cycle += cycles.max(1);
+
+        if allow_idle_skip {
+            let next_pc = self.cpu.current_exec_pc();
+            if next_pc <= exec_pc && !self.cpu.halted && !self.cpu.stopped {
+                self.pending_idle_check_pc = Some(next_pc);
+            } else {
+                self.pending_idle_check_pc = None;
+            }
+        }
+
+        if let Some(hit) = self.bus.watchpoint_hit.take() {
+            return InternalStep::DebugStop(StopReason::Watchpoint {
+                addr: hit.addr,
+                pc: hit.pc,
+                write: hit.write,
+                value: hit.value,
+            });
+        }
+        InternalStep::Continue
+    }
+
+    fn is_safe_idle_loop(&self, loop_start: u32) -> bool {
+        let region = (loop_start >> 24) & 0xFF;
+        if !matches!(region, 0x02 | 0x03 | 0x08..=0x0D) {
+            return false;
+        }
+        if self.bus.cart.idle_loop_addr == Some(loop_start) {
+            return true;
+        }
+        if self.cpu.is_thumb() {
+            self.is_safe_thumb_idle_loop(loop_start)
+        } else {
+            self.is_safe_arm_idle_loop(loop_start)
+        }
+    }
+
+    fn is_safe_thumb_idle_loop(&self, loop_start: u32) -> bool {
+        let mut saw_poll_load = false;
+        let mut base_regs_mask: u16 = 0;
+        let mut written_regs_mask: u16 = 0;
+
+        for i in 0..3u32 {
+            let addr = loop_start.wrapping_add(i * 2);
+            let op = self.bus.debug_read_16(addr);
+
+            if i == 0 && op == 0xE7FE {
+                return true;
+            }
+            if (op & 0xF000) == 0xD000 && (op & 0x0F00) < 0x0E00 {
+                let imm8 = (op & 0xFF) as i8 as i32;
+                let target = addr.wrapping_add(4).wrapping_add_signed(imm8 << 1);
+                return target == loop_start
+                    && saw_poll_load
+                    && (written_regs_mask & base_regs_mask) == 0;
+            }
+            if (op & 0xF800) == 0xE000 {
+                let imm11 = ((op & 0x07FF) as i32) << 21 >> 21;
+                let target = addr.wrapping_add(4).wrapping_add_signed(imm11 << 1);
+                return target == loop_start
+                    && saw_poll_load
+                    && (written_regs_mask & base_regs_mask) == 0;
+            }
+            if i == 2 {
+                return false;
+            }
+
+            match op & 0xF800 {
+                0x6800 | 0x7800 | 0x8800 => {
+                    let scale = match op & 0xF800 {
+                        0x6800 => 4,
+                        0x8800 => 2,
+                        _ => 1,
+                    };
+                    let rn = (op >> 3) & 7;
+                    let rd = op & 7;
+                    let imm = u32::from((op >> 6) & 0x1F) * scale;
+                    let eff = self.cpu.gpr[rn as usize].wrapping_add(imm);
+                    if !is_safe_idle_poll_addr(eff) {
+                        return false;
+                    }
+                    base_regs_mask |= 1 << rn;
+                    written_regs_mask |= 1 << rd;
+                    saw_poll_load = true;
+                }
+                0x5800 => {
+                    let kind_bits = op & 0xFE00;
+                    if !matches!(kind_bits, 0x5800 | 0x5A00 | 0x5C00 | 0x5E00) {
+                        return false;
+                    }
+                    let rn = (op >> 3) & 7;
+                    let rm = (op >> 6) & 7;
+                    let rd = op & 7;
+                    let eff = self.cpu.gpr[rn as usize].wrapping_add(self.cpu.gpr[rm as usize]);
+                    if !is_safe_idle_poll_addr(eff) {
+                        return false;
+                    }
+                    base_regs_mask |= (1 << rn) | (1 << rm);
+                    written_regs_mask |= 1 << rd;
+                    saw_poll_load = true;
+                }
+                0x2800 => {} // CMP Rn, #imm8 (flags only)
+                _ => {
+                    if matches!(op & 0xFFC0, 0x4200 | 0x4280 | 0x42C0) {
+                        // TST / CMP / CMN (flags only)
+                    } else if ((op & 0xE000) == 0x0000 && (op & 0xF800) != 0x1800)
+                        || (op & 0xFC00) == 0x4000
+                    {
+                        written_regs_mask |= 1 << (op & 7);
+                    } else {
+                        return false;
+                    }
+                }
+            }
+        }
+        false
+    }
+
+    fn is_safe_arm_idle_loop(&self, loop_start: u32) -> bool {
+        let mut saw_poll_load = false;
+        let mut base_regs_mask: u16 = 0;
+        let mut written_regs_mask: u16 = 0;
+
+        for i in 0..3u32 {
+            let addr = loop_start.wrapping_add(i * 4);
+            let instr = self.bus.debug_read_32(addr);
+            if (instr >> 28) == 15 {
+                return false;
+            }
+            if i == 0 && instr == 0xEAFF_FFFE {
+                return true;
+            }
+            if ((instr >> 24) & 0x0F) == 0x0A {
+                let imm24 = ((instr as i32) << 8) >> 8;
+                let target = addr.wrapping_add(8).wrapping_add_signed(imm24 << 2);
+                return target == loop_start
+                    && saw_poll_load
+                    && (written_regs_mask & base_regs_mask) == 0;
+            }
+            if i == 2 {
+                return false;
+            }
+
+            if (instr & 0x0F30_0000) == 0x0510_0000 {
+                // LDR / LDRB [Rn, #+/-imm] with P=1, W=0, L=1
+                let rn = ((instr >> 16) & 0xF) as u16;
+                let rd = ((instr >> 12) & 0xF) as u16;
+                if rn == 15 || rd == 15 {
+                    return false;
+                }
+                let off = instr & 0xFFF;
+                let base = self.cpu.gpr[rn as usize];
+                let eff = if (instr & 0x0080_0000) != 0 {
+                    base.wrapping_add(off)
+                } else {
+                    base.wrapping_sub(off)
+                };
+                if !is_safe_idle_poll_addr(eff) {
+                    return false;
+                }
+                base_regs_mask |= 1 << rn;
+                written_regs_mask |= 1 << rd;
+                saw_poll_load = true;
+            } else if (instr & 0x0F70_0090) == 0x0150_0090 && (instr & 0x0000_0060) != 0 {
+                // LDRH / LDRSB / LDRSH [Rn, #+/-imm8] with P=1, I=1, W=0, L=1
+                let rn = ((instr >> 16) & 0xF) as u16;
+                let rd = ((instr >> 12) & 0xF) as u16;
+                if rn == 15 || rd == 15 {
+                    return false;
+                }
+                let off = ((instr >> 4) & 0xF0) | (instr & 0x0F);
+                let base = self.cpu.gpr[rn as usize];
+                let eff = if (instr & 0x0080_0000) != 0 {
+                    base.wrapping_add(off)
+                } else {
+                    base.wrapping_sub(off)
+                };
+                if !is_safe_idle_poll_addr(eff) {
+                    return false;
+                }
+                base_regs_mask |= 1 << rn;
+                written_regs_mask |= 1 << rd;
+                saw_poll_load = true;
+            } else if (instr & 0x0C00_0000) == 0
+                && ((instr & 0x0200_0000) != 0 || (instr & 0x0000_0010) == 0)
+            {
+                let opcode = (instr >> 21) & 0xF;
+                let rd = ((instr >> 12) & 0xF) as u16;
+                if (0x8..=0xB).contains(&opcode) {
+                    if (instr & 0x0010_0000) == 0 {
+                        // MRS / MSR
+                        return false;
+                    }
+                } else if rd != 15 {
+                    written_regs_mask |= 1 << rd;
+                } else {
+                    return false;
+                }
+            } else {
+                return false;
+            }
+        }
+        false
     }
 
     pub fn run_frame<F: HostFrontend + ?Sized>(&mut self, frontend: &mut F) {
-        let _ = self.run_frame_with_breakpoints(frontend, &[]);
+        let _ = self.run_frame_debug(frontend, &DebugControl::default());
     }
 
-    /// Runs a single GBA frame, stopping early if an instruction PC matches `breakpoints`.
-    /// Returns `Some(hit_pc)` when halted at a breakpoint, or `None` after completing the frame.
-    pub fn run_frame_with_breakpoints<F: HostFrontend + ?Sized>(
+    /// Runs a single GBA frame with breakpoint and memory watchpoint support.
+    pub fn run_frame_debug<F: HostFrontend + ?Sized>(
         &mut self,
         frontend: &mut F,
-        breakpoints: &[u32],
-    ) -> Option<u32> {
+        ctrl: &DebugControl,
+    ) -> StopReason {
         let keypad = frontend.poll_keypad() & 0x03FF;
         self.bus.hw.update_keypad(keypad);
 
+        let has_watchpoints = !ctrl.watchpoints.is_empty();
+        if has_watchpoints {
+            self.bus.set_watchpoints(&ctrl.watchpoints);
+        }
+        let allow_idle_skip =
+            self.idle_skip_enabled && ctrl.breakpoints.is_empty() && !has_watchpoints;
+
         let end_cycle = self.bus.scheduler.current_cycle + CYCLES_PER_FRAME;
         while self.bus.scheduler.current_cycle < end_cycle {
-            while let Some((ev_cycle, kind)) = self.bus.scheduler.pop_due() {
-                self.bus.dispatch_event(ev_cycle, kind);
-            }
-
+            let step = self.step_internal(&ctrl.breakpoints, Some(end_cycle), allow_idle_skip);
             if self.bus.ppu.frame_ready {
                 frontend.present_frame(&self.bus.ppu.framebuffer);
                 self.bus.ppu.frame_ready = false;
             }
-
-            if self.bus.hw.stop_requested {
-                self.cpu.stopped = true;
-                self.cpu.halted = false;
-                self.bus.hw.stop_requested = false;
-            }
-            if self.bus.hw.halt_requested {
-                if !self.cpu.stopped {
-                    self.cpu.halted = true;
-                }
-                self.bus.hw.halt_requested = false;
-            }
-
-            if self.cpu.stopped {
-                if (self.bus.hw.ie & self.bus.hw.if_flag & hw::IRQ_STOP_WAKE_MASK) != 0 {
-                    self.cpu.stopped = false;
-                } else {
-                    let delta = end_cycle.saturating_sub(self.bus.scheduler.current_cycle).max(1);
-                    self.bus.scheduler.shift_by(delta);
-                    self.bus.hw.shift_timers_by(delta);
-                    self.bus.ppu.framebuffer.fill(0x7FFF);
-                    self.bus.ppu.frame_ready = false;
-                    frontend.present_frame(&self.bus.ppu.framebuffer);
+            match step {
+                InternalStep::Continue => {}
+                InternalStep::StoppedFrame(delta) => {
                     if !self.bus.apu.output_buffer.is_empty() {
                         frontend.push_audio_samples(&self.bus.apu.output_buffer);
                         self.bus.apu.output_buffer.clear();
@@ -438,57 +739,22 @@ impl GbaCore {
                     let silence_samples = ((delta / APU_SAMPLE_INTERVAL).max(1) as usize) * 2;
                     let silence = alloc::vec![0i16; silence_samples];
                     frontend.push_audio_samples(&silence);
-                    return None;
-                }
-            }
-
-            if self.bus.hw.active_dma.is_some() {
-                let cycles = self.bus.step_active_dma();
-                self.bus.scheduler.current_cycle += cycles.max(1);
-                continue;
-            }
-
-            if self.cpu.halted {
-                if (self.bus.hw.ie & self.bus.hw.if_flag) != 0 {
-                    self.cpu.halted = false;
-                } else {
-                    let next = self.bus.scheduler.next_event_cycle.min(end_cycle);
-                    if next > self.bus.scheduler.current_cycle {
-                        self.bus.scheduler.current_cycle = next;
-                    } else {
-                        self.bus.scheduler.current_cycle += 1;
+                    if has_watchpoints {
+                        self.bus.clear_watchpoints();
                     }
-                    continue;
+                    return StopReason::FrameComplete;
                 }
-            }
-
-            if self.bus.hw.ime != 0
-                && (self.bus.hw.ie & self.bus.hw.if_flag) != 0
-                && !self.cpu.is_irq_disabled()
-                && self.bus.irq_sync_delay == 0
-            {
-                self.cpu.trigger_irq(&mut self.bus);
-                self.bus.scheduler.current_cycle += 3;
-                continue;
-            }
-
-            if self.bus.irq_sync_delay > 0 {
-                self.bus.irq_sync_delay = self.bus.irq_sync_delay.saturating_sub(1);
-            }
-
-            if !breakpoints.is_empty() {
-                let exec_pc = self.cpu.current_exec_pc();
-                if breakpoints.contains(&exec_pc) {
+                InternalStep::DebugStop(reason) => {
                     if !self.bus.apu.output_buffer.is_empty() {
                         frontend.push_audio_samples(&self.bus.apu.output_buffer);
                         self.bus.apu.output_buffer.clear();
                     }
-                    return Some(exec_pc);
+                    if has_watchpoints {
+                        self.bus.clear_watchpoints();
+                    }
+                    return reason;
                 }
             }
-
-            let cycles = self.cpu.step(&mut self.bus);
-            self.bus.scheduler.current_cycle += cycles.max(1);
         }
 
         while let Some((ev_cycle, kind)) = self.bus.scheduler.pop_due() {
@@ -504,7 +770,24 @@ impl GbaCore {
             frontend.push_audio_samples(&self.bus.apu.output_buffer);
             self.bus.apu.output_buffer.clear();
         }
-        None
+        if has_watchpoints {
+            self.bus.clear_watchpoints();
+        }
+        StopReason::FrameComplete
+    }
+
+    /// Runs a single GBA frame, stopping early if an instruction PC matches `breakpoints`.
+    /// Returns `Some(hit_pc)` when halted at a breakpoint, or `None` after completing the frame.
+    pub fn run_frame_with_breakpoints<F: HostFrontend + ?Sized>(
+        &mut self,
+        frontend: &mut F,
+        breakpoints: &[u32],
+    ) -> Option<u32> {
+        let ctrl = DebugControl::with_breakpoints(breakpoints);
+        match self.run_frame_debug(frontend, &ctrl) {
+            StopReason::Breakpoint(pc) => Some(pc),
+            StopReason::FrameComplete | StopReason::Watchpoint { .. } => None,
+        }
     }
 
     pub fn save_state(&self) -> Result<Vec<u8>, postcard::Error> {
@@ -525,6 +808,7 @@ impl GbaCore {
         payload.bus.rebuild_fastmem();
         self.cpu = payload.cpu;
         self.bus = payload.bus;
+        self.pending_idle_check_pc = None;
         Ok(())
     }
 
@@ -652,6 +936,23 @@ impl GbaCore {
     #[inline]
     pub fn complete_sio_transfer(&mut self, response: SioResponse) {
         self.bus.complete_sio_transfer(response);
+    }
+}
+
+#[inline]
+fn is_safe_idle_poll_addr(addr: u32) -> bool {
+    match addr >> 24 {
+        0x02 | 0x03 => true,
+        0x04 => matches!(
+            addr & 0xFFFF_FFFE,
+            0x0400_0004
+                | 0x0400_0006
+                | 0x0400_0128
+                | 0x0400_0130
+                | 0x0400_0200
+                | 0x0400_0202
+        ),
+        _ => false,
     }
 }
 

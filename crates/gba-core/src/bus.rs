@@ -9,6 +9,56 @@ use crate::ppu::Ppu;
 use crate::serde_helpers::{alloc_boxed_array, box_bytes};
 use crate::{APU_SAMPLE_INTERVAL, EventType, Scheduler};
 
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub enum WatchpointKind {
+    Read,
+    Write,
+    ReadWrite,
+}
+
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub struct Watchpoint {
+    pub start: u32,
+    pub end: u32,
+    pub kind: WatchpointKind,
+}
+
+impl Watchpoint {
+    pub const fn new(start: u32, end: u32, kind: WatchpointKind) -> Self {
+        Self { start, end, kind }
+    }
+
+    pub const fn addr(addr: u32, kind: WatchpointKind) -> Self {
+        Self {
+            start: addr,
+            end: addr,
+            kind,
+        }
+    }
+
+    #[inline]
+    pub fn matches_access(&self, access_addr: u32, size: u32, write: bool) -> bool {
+        let kind_ok = match self.kind {
+            WatchpointKind::Read => !write,
+            WatchpointKind::Write => write,
+            WatchpointKind::ReadWrite => true,
+        };
+        if !kind_ok {
+            return false;
+        }
+        let access_end = access_addr.saturating_add(size.saturating_sub(1));
+        access_addr <= self.end && access_end >= self.start
+    }
+}
+
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub struct WatchpointHit {
+    pub addr: u32,
+    pub pc: u32,
+    pub write: bool,
+    pub value: u32,
+}
+
 #[derive(Copy, Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub enum AccessType {
     NonSequential,
@@ -78,6 +128,16 @@ pub struct SysBus {
     fastmem_read: Box<[Option<NonNull<u8>>; 16384]>,
     // Track last opcode access cycles cleanly for CPU stepping.
     pub last_cycles: u64,
+
+    // Debug watchpoints (fast-path `watchpoint_active` bool avoids overhead when empty).
+    #[serde(skip)]
+    pub watchpoint_active: bool,
+    #[serde(skip)]
+    pub debug_pc: u32,
+    #[serde(skip)]
+    pub watchpoint_hit: Option<WatchpointHit>,
+    #[serde(skip)]
+    pub watchpoints: Vec<Watchpoint>,
 }
 
 fn empty_fastmem() -> Box<[Option<NonNull<u8>>; 16384]> {
@@ -124,6 +184,10 @@ impl SysBus {
             irq_sync_delay: 0,
             fastmem_read: empty_fastmem(),
             last_cycles: 0,
+            watchpoint_active: false,
+            debug_pc: 0,
+            watchpoint_hit: None,
+            watchpoints: Vec::new(),
         };
         bus.update_waitcnt(0x0000);
         bus.rebuild_fastmem();
@@ -545,7 +609,49 @@ impl SysBus {
         self.cart.read_rom_32(aligned)
     }
 
+    #[inline]
+    pub fn set_watchpoints(&mut self, wps: &[Watchpoint]) {
+        self.watchpoints.clear();
+        self.watchpoints.extend_from_slice(wps);
+        self.watchpoint_active = !self.watchpoints.is_empty();
+        self.watchpoint_hit = None;
+    }
+
+    #[inline]
+    pub fn clear_watchpoints(&mut self) {
+        self.watchpoint_active = false;
+        self.watchpoint_hit = None;
+        self.watchpoints.clear();
+    }
+
+    #[cold]
+    fn check_watchpoint(&mut self, addr: u32, size: u32, write: bool, value: u32) {
+        if self.watchpoint_hit.is_some() {
+            return;
+        }
+        for wp in &self.watchpoints {
+            if wp.matches_access(addr, size, write) {
+                self.watchpoint_hit = Some(WatchpointHit {
+                    addr,
+                    pc: self.debug_pc,
+                    write,
+                    value,
+                });
+                return;
+            }
+        }
+    }
+
+    #[inline]
     pub fn read_8(&mut self, addr: u32, access: AccessType, pc: u32, is_thumb: bool) -> u8 {
+        let val = self.read_8_inner(addr, access, pc, is_thumb);
+        if self.watchpoint_active {
+            self.check_watchpoint(addr, 1, false, val as u32);
+        }
+        val
+    }
+
+    fn read_8_inner(&mut self, addr: u32, access: AccessType, pc: u32, is_thumb: bool) -> u8 {
         self.last_cycles = 1;
         if addr < 0x1000_0000 {
             let page = (addr >> 14) as usize;
@@ -627,7 +733,16 @@ impl SysBus {
         val
     }
 
+    #[inline]
     pub fn read_16(&mut self, addr: u32, access: AccessType, pc: u32, is_thumb: bool) -> u16 {
+        let val = self.read_16_inner(addr, access, pc, is_thumb);
+        if self.watchpoint_active {
+            self.check_watchpoint(addr & !1, 2, false, val as u32);
+        }
+        val
+    }
+
+    fn read_16_inner(&mut self, addr: u32, access: AccessType, pc: u32, is_thumb: bool) -> u16 {
         let aligned = addr & !1;
         if addr < 0x1000_0000 {
             let page = (aligned >> 14) as usize;
@@ -743,7 +858,16 @@ impl SysBus {
         }
     }
 
+    #[inline]
     pub fn read_32(&mut self, addr: u32, access: AccessType, pc: u32) -> u32 {
+        let val = self.read_32_inner(addr, access, pc);
+        if self.watchpoint_active {
+            self.check_watchpoint(addr & !3, 4, false, val);
+        }
+        val
+    }
+
+    fn read_32_inner(&mut self, addr: u32, access: AccessType, pc: u32) -> u32 {
         let aligned = addr & !3;
         if addr < 0x1000_0000 {
             let page = (aligned >> 14) as usize;
@@ -905,7 +1029,16 @@ impl SysBus {
         (v, self.last_cycles)
     }
 
-    pub fn write_8(&mut self, addr: u32, val: u8, _access: AccessType) -> u64 {
+    #[inline]
+    pub fn write_8(&mut self, addr: u32, val: u8, access: AccessType) -> u64 {
+        let cyc = self.write_8_inner(addr, val, access);
+        if self.watchpoint_active {
+            self.check_watchpoint(addr, 1, true, val as u32);
+        }
+        cyc
+    }
+
+    fn write_8_inner(&mut self, addr: u32, val: u8, _access: AccessType) -> u64 {
         let region = (addr >> 24) & 0x0F;
         let cyc = match addr >> 24 {
             0x02 => {
@@ -961,7 +1094,16 @@ impl SysBus {
         cyc
     }
 
+    #[inline]
     pub fn write_16(&mut self, addr: u32, val: u16, access: AccessType) -> u64 {
+        let cyc = self.write_16_inner(addr, val, access);
+        if self.watchpoint_active {
+            self.check_watchpoint(addr & !1, 2, true, val as u32);
+        }
+        cyc
+    }
+
+    fn write_16_inner(&mut self, addr: u32, val: u16, access: AccessType) -> u64 {
         let aligned = addr & !1;
         let bytes = val.to_le_bytes();
         let region = (aligned >> 24) & 0x0F;
@@ -1016,7 +1158,16 @@ impl SysBus {
         cyc
     }
 
+    #[inline]
     pub fn write_32(&mut self, addr: u32, val: u32, access: AccessType) -> u64 {
+        let cyc = self.write_32_inner(addr, val, access);
+        if self.watchpoint_active {
+            self.check_watchpoint(addr & !3, 4, true, val);
+        }
+        cyc
+    }
+
+    fn write_32_inner(&mut self, addr: u32, val: u32, access: AccessType) -> u64 {
         let aligned = addr & !3;
         let bytes = val.to_le_bytes();
         let region = (aligned >> 24) & 0x0F;

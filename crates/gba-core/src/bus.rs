@@ -1135,6 +1135,42 @@ impl SysBus {
         ])
     }
 
+    /// Side-effect-free write for Lua/GDB/debug `poke*` APIs; ignores IO so no side effects trigger.
+    pub fn debug_write_8(&mut self, addr: u32, val: u8) {
+        match (addr >> 24) & 0xFF {
+            0x02 => self.ewram[(addr as usize) & 0x3FFFF] = val,
+            0x03 => self.iwram[(addr as usize) & 0x7FFF] = val,
+            0x05 => self.ppu.pram[(addr as usize) & 0x3FF] = val,
+            0x06 => self.ppu.vram[Ppu::mirror_vram(addr as usize)] = val,
+            0x07 => self.ppu.oam[(addr as usize) & 0x3FF] = val,
+            0x08..=0x0D => {
+                let off = (addr as usize) & 0x01FF_FFFF;
+                if off < self.cart.rom.len() {
+                    self.cart.rom[off] = val;
+                    self.rebuild_fastmem();
+                }
+            }
+            0x0E | 0x0F if addr < 0x1000_0000 => self.cart.debug_write_sram(addr, val),
+            _ => {}
+        }
+    }
+
+    pub fn debug_write_16(&mut self, addr: u32, val: u16) {
+        let a = addr & !1;
+        let bytes = val.to_le_bytes();
+        self.debug_write_8(a, bytes[0]);
+        self.debug_write_8(a.wrapping_add(1), bytes[1]);
+    }
+
+    pub fn debug_write_32(&mut self, addr: u32, val: u32) {
+        let a = addr & !3;
+        let bytes = val.to_le_bytes();
+        self.debug_write_8(a, bytes[0]);
+        self.debug_write_8(a.wrapping_add(1), bytes[1]);
+        self.debug_write_8(a.wrapping_add(2), bytes[2]);
+        self.debug_write_8(a.wrapping_add(3), bytes[3]);
+    }
+
     /// Writes a cheat value into RAM, Video RAM, or ROM memory safely.
     pub fn apply_cheat_write_8(&mut self, addr: u32, val: u8) {
         match (addr >> 24) & 0xFF {

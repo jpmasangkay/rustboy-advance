@@ -16,10 +16,11 @@ pub mod hw;
 pub mod ppu;
 pub mod serde_helpers;
 
-use alloc::vec::Vec;
+use alloc::{string::String, vec::Vec};
 use serde::{Deserialize, Serialize};
 
 use crate::bus::SysBus;
+use crate::cartridge::SaveType;
 use crate::cpu::Arm7tdmi;
 
 pub const CPU_CLOCK_HZ: u32 = 16_777_216;
@@ -175,6 +176,25 @@ impl Scheduler {
         }
         self.next_event_cycle = min_cycle;
     }
+}
+
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub enum MemoryRegionKind {
+    Ewram,
+    Iwram,
+    PaletteRam,
+    Vram,
+    Oam,
+    Sram,
+}
+
+#[derive(Copy, Clone, Debug)]
+pub struct MemoryRegionSlice<'a> {
+    pub kind: MemoryRegionKind,
+    pub name: &'static str,
+    pub base: u32,
+    pub len: usize,
+    pub data: &'a [u8],
 }
 
 #[derive(Serialize, Deserialize)]
@@ -444,6 +464,100 @@ impl GbaCore {
         self.cpu = payload.cpu;
         self.bus = payload.bus;
         Ok(())
+    }
+
+    #[inline]
+    pub fn peek8(&self, addr: u32) -> u8 {
+        self.bus.debug_read_8(addr)
+    }
+
+    #[inline]
+    pub fn peek16(&self, addr: u32) -> u16 {
+        self.bus.debug_read_16(addr)
+    }
+
+    #[inline]
+    pub fn peek32(&self, addr: u32) -> u32 {
+        self.bus.debug_read_32(addr)
+    }
+
+    #[inline]
+    pub fn poke8(&mut self, addr: u32, val: u8) {
+        self.bus.debug_write_8(addr, val);
+    }
+
+    #[inline]
+    pub fn poke16(&mut self, addr: u32, val: u16) {
+        self.bus.debug_write_16(addr, val);
+    }
+
+    #[inline]
+    pub fn poke32(&mut self, addr: u32, val: u32) {
+        self.bus.debug_write_32(addr, val);
+    }
+
+    pub fn memory_regions(&self) -> [MemoryRegionSlice<'_>; 6] {
+        let sram_slice = match self.bus.cart.effective_save_type() {
+            SaveType::Flash64K => &self.bus.cart.sram[..0x10000],
+            SaveType::Flash128K => &self.bus.cart.sram[..0x20000],
+            SaveType::Eeprom512B => &self.bus.cart.sram[..512],
+            SaveType::Eeprom8K => &self.bus.cart.sram[..0x2000],
+            SaveType::Sram32K | SaveType::None => &self.bus.cart.sram[..0x8000],
+        };
+        [
+            MemoryRegionSlice {
+                kind: MemoryRegionKind::Ewram,
+                name: "EWRAM",
+                base: 0x0200_0000,
+                len: self.bus.ewram.len(),
+                data: &self.bus.ewram[..],
+            },
+            MemoryRegionSlice {
+                kind: MemoryRegionKind::Iwram,
+                name: "IWRAM",
+                base: 0x0300_0000,
+                len: self.bus.iwram.len(),
+                data: &self.bus.iwram[..],
+            },
+            MemoryRegionSlice {
+                kind: MemoryRegionKind::PaletteRam,
+                name: "Palette RAM",
+                base: 0x0500_0000,
+                len: self.bus.ppu.pram.len(),
+                data: &self.bus.ppu.pram[..],
+            },
+            MemoryRegionSlice {
+                kind: MemoryRegionKind::Vram,
+                name: "VRAM",
+                base: 0x0600_0000,
+                len: self.bus.ppu.vram.len(),
+                data: &self.bus.ppu.vram[..],
+            },
+            MemoryRegionSlice {
+                kind: MemoryRegionKind::Oam,
+                name: "OAM",
+                base: 0x0700_0000,
+                len: self.bus.ppu.oam.len(),
+                data: &self.bus.ppu.oam[..],
+            },
+            MemoryRegionSlice {
+                kind: MemoryRegionKind::Sram,
+                name: "SRAM",
+                base: 0x0E00_0000,
+                len: sram_slice.len(),
+                data: sram_slice,
+            },
+        ]
+    }
+
+    #[inline]
+    pub fn rom_crc32(&self) -> u32 {
+        self.bus.cart.rom_crc32
+    }
+
+    #[inline]
+    pub fn game_code(&self) -> String {
+        self.bus.cart.game_code()
     }
 }
 

@@ -1000,5 +1000,23 @@ impl Cartridge {
             _ => {}
         }
     }
+
+    /// Side-effect-free SRAM/Flash backing-store write for debug `poke*` APIs.
+    pub fn debug_write_sram(&mut self, addr: u32, val: u8) {
+        let offset = (addr as usize) & 0xFFFF;
+        match self.effective_save_type() {
+            SaveType::Flash64K => {
+                self.sram[offset] = val;
+            }
+            SaveType::Flash128K => {
+                let bank_base = (self.flash.bank as usize & 1) * 0x10000;
+                self.sram[bank_base + offset] = val;
+            }
+            SaveType::Sram32K | SaveType::None => {
+                self.sram[offset & 0x7FFF] = val;
+            }
+            SaveType::Eeprom512B | SaveType::Eeprom8K => {}
+        }
+    }
 }
 

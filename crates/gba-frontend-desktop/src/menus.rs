@@ -671,26 +671,25 @@ impl RustboyApp {
                         {
                             self.show_state_manager = true;
                         }
-                        if self.undo_state_buffer.is_some() {
-                            if ui
+                        if self.undo_state_buffer.is_some()
+                            && ui
                                 .button(RichText::new("↩ Undo").small())
                                 .on_hover_text("Undo Last Save/Load (Ctrl+Z)")
                                 .clicked()
-                            {
-                                self.undo_last_state_action();
-                            }
+                        {
+                            self.undo_last_state_action();
                         }
-                        if let Some(core) = &self.core {
-                            if core.bus.cart.solar_enabled {
-                                let lvl = ((core.bus.cart.solar_lux as f32 / 255.0) * 10.0).round()
-                                    as u8;
-                                ui.label(
-                                    RichText::new(format!("☀️ {lvl}/10"))
-                                        .small()
-                                        .color(ACCENT_TEAL),
-                                )
-                                .on_hover_text("Boktai Solar Sensor Intensity (Hotkey: [ / ])");
-                            }
+                        if let Some(core) = &self.core
+                            && core.bus.cart.solar_enabled
+                        {
+                            let lvl = ((core.bus.cart.solar_lux as f32 / 255.0) * 10.0).round()
+                                as u8;
+                            ui.label(
+                                RichText::new(format!("☀️ {lvl}/10"))
+                                    .small()
+                                    .color(ACCENT_TEAL),
+                            )
+                            .on_hover_text("Boktai Solar Sensor Intensity (Hotkey: [ / ])");
                         }
                         if ui
                             .button(RichText::new("📷 Shot").small())

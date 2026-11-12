@@ -236,10 +236,10 @@ impl RustboyApp {
         app.load_persistent_config();
         app.rescan_rom_folders();
 
-        if let Some(rom_path) = cli.rom_path {
-            if let Err(e) = app.open_rom(&rom_path, cli.sav_path.as_deref(), None) {
-                app.notify_error(&format!("Failed to load CLI ROM: {e}"));
-            }
+        if let Some(rom_path) = cli.rom_path
+            && let Err(e) = app.open_rom(&rom_path, cli.sav_path.as_deref(), None)
+        {
+            app.notify_error(&format!("Failed to load CLI ROM: {e}"));
         }
         app
     }
@@ -322,11 +322,11 @@ impl RustboyApp {
                 let line = line.trim();
                 if let Some(p) = line.strip_prefix("BIOS=") {
                     let path = PathBuf::from(p);
-                    if let Ok(b) = fs::read(&path) {
-                        if b.len() >= 0x4000 {
-                            self.bios_bytes = Some(b[..0x4000].to_vec());
-                            self.config.bios_path = Some(p.to_string());
-                        }
+                    if let Ok(b) = fs::read(&path)
+                        && b.len() >= 0x4000
+                    {
+                        self.bios_bytes = Some(b[..0x4000].to_vec());
+                        self.config.bios_path = Some(p.to_string());
                     }
                 } else if let Some(f) = line.strip_prefix("FOLDER=") {
                     let path = PathBuf::from(f);
@@ -387,6 +387,7 @@ impl RustboyApp {
         };
         let rom_bytes = loaded.bytes;
         let archive_badge = loaded.source_kind.badge();
+        let archive_inner = loaded.inner_name;
         let rom_crc32 = crc32fast::hash(&rom_bytes);
 
         let sav_path = custom_sav
@@ -457,9 +458,10 @@ impl RustboyApp {
             Some(fmt) => format!(" ({} Patched)", fmt.label()),
             None => String::new(),
         };
-        let archive_tag = match archive_badge {
-            Some(kind) => format!(" [{kind}]"),
-            None => String::new(),
+        let archive_tag = match (archive_badge, archive_inner.as_deref()) {
+            (Some(kind), Some(inner)) => format!(" [{kind}: {inner}]"),
+            (Some(kind), None) => format!(" [{kind}]"),
+            _ => String::new(),
         };
         self.notify(&format!("Playing {title} [{code}]{archive_tag}{patch_tag}"));
         Ok(())
@@ -635,7 +637,7 @@ impl RustboyApp {
             Err(e) => {
                 let ppm_path = save_path.with_extension("ppm");
                 let mut data = format!("P6\n{} {}\n255\n", LCD_WIDTH, LCD_HEIGHT).into_bytes();
-                for chunk in self.postproc.curr_rgba.chunks_exact(4) {
+                for chunk in self.postproc.curr_rgba.as_chunks::<4>().0 {
                     data.push(chunk[0]);
                     data.push(chunk[1]);
                     data.push(chunk[2]);
@@ -902,14 +904,15 @@ impl RustboyApp {
         }
 
         // Track per-game active gameplay time
-        if self.core.is_some() && !self.paused {
-            if self.playtime_timer.elapsed() >= Duration::from_secs(1) {
-                if !self.rom_code.is_empty() {
-                    let entry = self.config.playtimes.entry(self.rom_code.clone()).or_default();
-                    entry.total_seconds += self.playtime_timer.elapsed().as_secs();
-                }
-                self.playtime_timer = Instant::now();
+        if self.core.is_some()
+            && !self.paused
+            && self.playtime_timer.elapsed() >= Duration::from_secs(1)
+        {
+            if !self.rom_code.is_empty() {
+                let entry = self.config.playtimes.entry(self.rom_code.clone()).or_default();
+                entry.total_seconds += self.playtime_timer.elapsed().as_secs();
             }
+            self.playtime_timer = Instant::now();
         }
 
         if self.effective_rumble_enabled() {

@@ -121,12 +121,11 @@ pub fn run_headless(cfg: &CliConfig) -> Result<(), String> {
     };
 
     let mut core = GbaCore::new(bios.as_deref(), rom);
-    if let Some(sav) = &cfg.sav_path {
-        if sav.exists() {
-            if let Ok(bytes) = fs::read(sav) {
-                core.bus.cart.load_save_data(&bytes);
-            }
-        }
+    if let Some(sav) = &cfg.sav_path
+        && sav.exists()
+        && let Ok(bytes) = fs::read(sav)
+    {
+        core.bus.cart.load_save_data(&bytes);
     }
 
     let mut frontend = NullFrontend::new();
@@ -134,10 +133,10 @@ pub fn run_headless(cfg: &CliConfig) -> Result<(), String> {
         core.run_frame(&mut frontend);
     }
 
-    if let Some(sav) = &cfg.sav_path {
-        if core.bus.cart.save_dirty {
-            let _ = fs::write(sav, core.bus.cart.export_save_data());
-        }
+    if let Some(sav) = &cfg.sav_path
+        && core.bus.cart.save_dirty
+    {
+        let _ = fs::write(sav, core.bus.cart.export_save_data());
     }
 
     println!(

@@ -717,8 +717,8 @@ mod tests {
         encode_vlq(4, &mut bps); // metadata len = 4
         bps.extend_from_slice(b"META");
 
-        // cmd 0: SourceRead len=8 -> (7 << 2) | 0
-        encode_vlq((7 << 2) | 0, &mut bps);
+        // cmd 0: SourceRead len=8 -> (7 << 2)
+        encode_vlq(7 << 2, &mut bps);
         // cmd 1: TargetRead len=4 -> (3 << 2) | 1
         encode_vlq((3 << 2) | 1, &mut bps);
         bps.extend_from_slice(&[0xAA, 0xBB, 0xCC, 0xDD]);
@@ -827,9 +827,9 @@ mod tests {
         encode_vlq(16, &mut bps);
         encode_vlq(16, &mut bps);
         encode_vlq(0, &mut bps);
-        encode_vlq((0 << 2) | 1, &mut bps); // TargetRead(1)
+        encode_vlq(1, &mut bps); // TargetRead(1)
         bps.push(0xB1);
-        encode_vlq((14 << 2) | 0, &mut bps); // SourceRead(15)
+        encode_vlq(14 << 2, &mut bps); // SourceRead(15)
         finalize_bps(&mut bps, &source, &target_bps);
         fs::write(rom_path.with_extension("bps"), &bps).unwrap();
 

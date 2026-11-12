@@ -17,16 +17,15 @@ const BUDGET_PRESETS_MB: [u32; 5] = [16, 32, 64, 128, 256];
 /// Computes `out[i] = a[i] ^ b[i]` over `max(a.len(), b.len())` with zero-extension.
 fn xor_buffers(a: &[u8], b: &[u8], out: &mut [u8]) {
     let min_len = a.len().min(b.len());
-    let chunk_bytes = min_len - (min_len % 8);
+    let (a_chunks, _) = a[..min_len].as_chunks::<8>();
+    let (b_chunks, _) = b[..min_len].as_chunks::<8>();
+    let (out_chunks, _) = out[..min_len].as_chunks_mut::<8>();
+    let chunk_bytes = a_chunks.len() * 8;
 
-    for ((ca, cb), co) in a[..chunk_bytes]
-        .chunks_exact(8)
-        .zip(b[..chunk_bytes].chunks_exact(8))
-        .zip(out[..chunk_bytes].chunks_exact_mut(8))
-    {
-        let va = u64::from_ne_bytes(ca.try_into().unwrap());
-        let vb = u64::from_ne_bytes(cb.try_into().unwrap());
-        co.copy_from_slice(&(va ^ vb).to_ne_bytes());
+    for ((ca, cb), co) in a_chunks.iter().zip(b_chunks.iter()).zip(out_chunks.iter_mut()) {
+        let va = u64::from_ne_bytes(*ca);
+        let vb = u64::from_ne_bytes(*cb);
+        *co = (va ^ vb).to_ne_bytes();
     }
 
     for i in chunk_bytes..min_len {
@@ -78,15 +77,18 @@ impl XorDelta {
 
         let mut prev = vec![0u8; self.prev_len];
         let common = self.prev_len.min(curr.len()).min(xor.len());
-        let chunk_bytes = common - (common % 8);
-        for ((cc, cx), cp) in curr[..chunk_bytes]
-            .chunks_exact(8)
-            .zip(xor[..chunk_bytes].chunks_exact(8))
-            .zip(prev[..chunk_bytes].chunks_exact_mut(8))
+        let (curr_chunks, _) = curr[..common].as_chunks::<8>();
+        let (xor_chunks, _) = xor[..common].as_chunks::<8>();
+        let (prev_chunks, _) = prev[..common].as_chunks_mut::<8>();
+        let chunk_bytes = curr_chunks.len() * 8;
+        for ((cc, cx), cp) in curr_chunks
+            .iter()
+            .zip(xor_chunks.iter())
+            .zip(prev_chunks.iter_mut())
         {
-            let vc = u64::from_ne_bytes(cc.try_into().unwrap());
-            let vx = u64::from_ne_bytes(cx.try_into().unwrap());
-            cp.copy_from_slice(&(vc ^ vx).to_ne_bytes());
+            let vc = u64::from_ne_bytes(*cc);
+            let vx = u64::from_ne_bytes(*cx);
+            *cp = (vc ^ vx).to_ne_bytes();
         }
         for i in chunk_bytes..common {
             prev[i] = curr[i] ^ xor[i];
@@ -105,6 +107,7 @@ impl XorDelta {
 enum RewindEntry {
     Keyframe {
         compressed: Vec<u8>,
+        #[allow(dead_code)]
         uncompressed_len: usize,
         back_delta: Option<XorDelta>,
     },

@@ -11,10 +11,10 @@ use crate::config::BezelStyle;
 
 impl RustboyApp {
     pub(crate) fn draw_status_bar(&mut self, ctx: &egui::Context) {
-        if let Some(t) = &self.toast {
-            if Instant::now() > t.expires_at {
-                self.toast = None;
-            }
+        if let Some(t) = &self.toast
+            && Instant::now() > t.expires_at
+        {
+            self.toast = None;
         }
 
         egui::TopBottomPanel::bottom("telemetry_status_bar")

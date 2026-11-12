@@ -772,10 +772,10 @@ impl RustboyApp {
             self.open_game_settings_for_library_entry(&entry);
         }
 
-        if let Some(path) = launch_target {
-            if let Err(e) = self.open_rom(&path, None, Some(ctx)) {
-                self.notify_error(&e);
-            }
+        if let Some(path) = launch_target
+            && let Err(e) = self.open_rom(&path, None, Some(ctx))
+        {
+            self.notify_error(&e);
         }
     }
 }

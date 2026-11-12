@@ -926,7 +926,7 @@ mod tests {
     #[test]
     fn rbas_container_roundtrips_metadata_thumbnail_and_core_bytes() {
         let mut rgba = vec![0u8; LCD_WIDTH * LCD_HEIGHT * 4];
-        for (i, px) in rgba.chunks_exact_mut(4).enumerate() {
+        for (i, px) in rgba.as_chunks_mut::<4>().0.iter_mut().enumerate() {
             px[0] = (i % 256) as u8;
             px[1] = 128;
             px[2] = 64;

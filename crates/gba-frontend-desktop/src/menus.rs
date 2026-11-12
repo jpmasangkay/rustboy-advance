@@ -166,7 +166,7 @@ impl RustboyApp {
                                 ui.close_menu();
                             }
                             if ui.button("Frame Advance / Step 1 Frame (Ctrl+N)").clicked() {
-                                self.step_single_frame();
+                                self.step_single_frame(ctx);
                                 ui.close_menu();
                             }
                             if ui.button("⏪ Rewind Step (Hold R)").clicked() {
@@ -453,7 +453,7 @@ impl RustboyApp {
                             ui.close_menu();
                         }
                         if ui.button("Controls & Keybindings...").clicked() {
-                            self.debugger.show_controls = true;
+                            self.show_controls_dialog = true;
                             ui.close_menu();
                         }
                         ui.separator();
@@ -565,7 +565,7 @@ impl RustboyApp {
                             .on_hover_text("Advance 1 Frame (Ctrl+N)")
                             .clicked()
                         {
-                            self.step_single_frame();
+                            self.step_single_frame(ctx);
                         }
 
                         let rewind_enabled =

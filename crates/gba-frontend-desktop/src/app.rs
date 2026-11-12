@@ -13,6 +13,7 @@ use crate::config::{AppConfig, SaveOverrideChoice};
 use crate::debugger_ui::{DebugAction, DebuggerWindows};
 use crate::filters::VideoPostProcessor;
 use crate::headless::CliConfig;
+use crate::input::{AutofireState, ControlsTab, PendingInputBind};
 use crate::library::{LibraryScanResult, LibraryViewMode, RomLibraryEntry};
 use crate::rewind::RewindBuffer;
 use crate::rom_loader::{
@@ -118,6 +119,12 @@ pub(crate) struct RustboyApp {
     pub(crate) tab_fast_forward: bool,
     pub(crate) is_fullscreen: bool,
     pub(crate) last_pressed_mask: u16,
+    pub(crate) show_controls_dialog: bool,
+    pub(crate) controls_tab: ControlsTab,
+    pub(crate) awaiting_input_bind: Option<PendingInputBind>,
+    pub(crate) autofire_state: AutofireState,
+    pub(crate) base_pressed_mask: u16,
+    pub(crate) active_turbo_buttons: (bool, bool),
     pub(crate) next_frame_due: Instant,
     pub(crate) last_save_flush: Instant,
     pub(crate) last_fps_sample: Instant,
@@ -186,6 +193,12 @@ impl RustboyApp {
             tab_fast_forward: false,
             is_fullscreen: false,
             last_pressed_mask: 0,
+            show_controls_dialog: false,
+            controls_tab: ControlsTab::Keyboard,
+            awaiting_input_bind: None,
+            autofire_state: AutofireState::default(),
+            base_pressed_mask: 0,
+            active_turbo_buttons: (false, false),
             next_frame_due: Instant::now(),
             last_save_flush: Instant::now(),
             last_fps_sample: Instant::now(),
@@ -412,6 +425,9 @@ impl RustboyApp {
         self.rewind_buffer.clear();
         self.frame_counter = 0;
         self.rewinding = false;
+        self.autofire_state.clear_latches();
+        self.base_pressed_mask = 0;
+        self.active_turbo_buttons = (false, false);
         self.next_frame_due = Instant::now();
         self.frames_in_window = 0;
         self.last_fps_sample = Instant::now();
@@ -470,6 +486,9 @@ impl RustboyApp {
         self.rewind_buffer.clear();
         self.frame_counter = 0;
         self.rewinding = false;
+        self.autofire_state.clear_latches();
+        self.base_pressed_mask = 0;
+        self.active_turbo_buttons = (false, false);
         self.lcd_tex = None;
         self.rescan_rom_folders();
         self.sync_window_title(ctx);
@@ -670,9 +689,15 @@ impl RustboyApp {
         }
     }
 
-    pub(crate) fn step_single_frame(&mut self) {
-        let Some(core) = &mut self.core else { return };
+    pub(crate) fn step_single_frame(&mut self, ctx: &egui::Context) {
+        if self.core.is_none() {
+            return;
+        }
         self.paused = true;
+        self.show_pause_overlay = false;
+        self.sink.keypad = self.poll_inputs(ctx);
+
+        let Some(core) = &mut self.core else { return };
         if self.config.rewind_enabled {
             let interval = self.config.rewind_interval.clamp(1, 4) as u64;
             if self.frame_counter.is_multiple_of(interval)
@@ -813,6 +838,7 @@ impl RustboyApp {
                 break;
             }
             let start_t = Instant::now();
+            self.sink.keypad = self.effective_keypad_for_frame();
             let Some(core) = &mut self.core else { break };
 
             // Capture rewind snapshot before advancing frame so rewind restores exact pre-frame state
@@ -901,6 +927,7 @@ impl RustboyApp {
 impl RustboyApp {
     pub fn update(&mut self, ctx: &egui::Context) {
         self.poll_library_scan(ctx);
+        self.pump_gamepad_events(ctx);
         if self.title_dirty {
             self.sync_window_title(ctx);
             self.title_dirty = false;
@@ -966,9 +993,10 @@ impl RustboyApp {
         // Always render floating OSD toast on top so feedback is never lost
         self.draw_floating_osd_toast(ctx);
 
-        // Visual Save State Manager & Rewind Settings dialogs
+        // Visual Save State Manager, Rewind Settings & Controls dialogs
         self.draw_visual_state_manager(ctx);
         self.draw_rewind_settings_dialog(ctx);
+        self.draw_controls_dialog(ctx);
 
         // Present dockable/floating Debugger & Tool windows
         let pads = self.connected_gamepad_names();
@@ -985,7 +1013,7 @@ impl RustboyApp {
             DebugAction::TogglePause => self.toggle_pause(),
             DebugAction::StepInstruction => self.step_single_instruction(),
             DebugAction::StepScanline => self.step_single_scanline(),
-            DebugAction::StepFrame => self.step_single_frame(),
+            DebugAction::StepFrame => self.step_single_frame(ctx),
             DebugAction::HardReset => self.hard_reset(),
             DebugAction::ConfigChanged => {
                 self.save_rom_specific_settings();

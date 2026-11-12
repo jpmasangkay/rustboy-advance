@@ -188,9 +188,6 @@ name = "armwrestler/arm-ldm-stm"
 rom_path = "test-roms/armwrestler/armwrestler-gba-fixed.gba"
 frames = 115
 criterion = "screenshot"
-known_failure = true
-known_bad_crc32 = "0xceba5d77"
-notes = "8/12 pass; LDMIBS!, LDMIAS!, LDMDBS!, LDMDBA! fail with BAD Rn (user-bank writeback suppressed)"
 inputs = [
     { frame = 25, duration = 12, keys = ["DOWN"] },
     { frame = 49, duration = 12, keys = ["DOWN"] },
@@ -403,9 +400,6 @@ name = "nba-hw-test/ppu/vram-mirror.gba"
 rom_path = "test-roms/nba-hw-test/ppu/vram-mirror/vram-mirror.gba"
 frames = 180
 criterion = "screenshot"
-known_failure = true
-known_bad_crc32 = "0x2b146cf1"
-notes = "7/10 pass; Mode 3 0x06018000 mirror leaks into 0x06010000 and fails to return 0"
 
 [[tests]]
 id = "nba_timer_reload"

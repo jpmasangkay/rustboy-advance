@@ -233,16 +233,9 @@ impl SysBus {
                     None
                 }
                 0x06 => {
-                    let off = (addr as usize) & 0x1FFFF;
-                    // Only first 64KB + 32KB (96KB) are contiguous, 0x18000..0x1FFFF mirrors 0x10000..0x17FFF
-                    let mir = Ppu::mirror_vram(off, self.ppu.dispcnt);
-                    if let Some(mir) = mir
-                        && mir <= 0x14000
-                    {
-                        Some(unsafe { self.ppu.vram.as_ptr().add(mir) })
-                    } else {
-                        None
-                    }
+                    // VRAM mirroring depends dynamically on DISPCNT mode (Modes 0-2 vs 3-5),
+                    // so do not map to fastmem; route through Ppu::mirror_vram.
+                    None
                 }
                 0x08..=0x0D => {
                     let off = (addr as usize) & 0x01FF_FFFF;

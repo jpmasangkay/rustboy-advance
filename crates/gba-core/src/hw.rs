@@ -745,6 +745,7 @@ impl SysBus {
     fn read_io_16_for_rmw(&self, aligned: u32) -> u16 {
         match aligned {
             0x0400_0000 => self.ppu.dispcnt,
+            0x0400_0002 => self.ppu.greenswap,
             0x0400_0004 => self.ppu.dispstat,
             0x0400_0008..=0x0400_000E => self.ppu.bgcnt[((aligned - 0x0400_0008) / 2) as usize],
             0x0400_0040 => self.ppu.winh[0],

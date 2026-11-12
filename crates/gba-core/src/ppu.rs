@@ -325,6 +325,20 @@ impl Ppu {
         }
         self.begin_scanline(y);
         self.render_dot_range(y, 0, LCD_WIDTH);
+        if (self.greenswap & 1) != 0 {
+            let row_start = y * LCD_WIDTH;
+            let mut i = row_start;
+            let end = row_start + LCD_WIDTH;
+            while i + 1 < end {
+                let p0 = self.framebuffer[i];
+                let p1 = self.framebuffer[i + 1];
+                let g0 = (p0 >> 5) & 0x1F;
+                let g1 = (p1 >> 5) & 0x1F;
+                self.framebuffer[i] = (p0 & !0x03E0) | (g1 << 5);
+                self.framebuffer[i + 1] = (p1 & !0x03E0) | (g0 << 5);
+                i += 2;
+            }
+        }
         self.end_scanline();
     }
 
@@ -821,21 +835,6 @@ impl Ppu {
             };
 
             self.framebuffer[row_start + x] = final_col;
-        }
-
-        if (self.greenswap & 1) != 0 {
-            let start = row_start + (x_start & !1);
-            let end = (row_start + x_end).min(row_start + LCD_WIDTH);
-            let mut i = start;
-            while i + 1 < end {
-                let p0 = self.framebuffer[i];
-                let p1 = self.framebuffer[i + 1];
-                let g0 = (p0 >> 5) & 0x1F;
-                let g1 = (p1 >> 5) & 0x1F;
-                self.framebuffer[i] = (p0 & !0x03E0) | (g1 << 5);
-                self.framebuffer[i + 1] = (p1 & !0x03E0) | (g0 << 5);
-                i += 2;
-            }
         }
     }
 

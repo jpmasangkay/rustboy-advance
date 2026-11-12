@@ -1,66 +1,66 @@
 # Test ROM Results
 
 - **BIOS mode:** HLE (built-in)
-- **Summary:** 35 passed, 17 failed, 2 skipped (missing ROM), 2 skipped (missing golden) out of 56 total
+- **Summary:** 37 passed, 15 failed, 2 skipped (missing ROM), 2 skipped (missing golden) out of 56 total
 
 ## Results Table
 
 | ROM | Criterion | Status | Notes | Frame Time (ms) |
 |-----|-----------|--------|-------|-----------------|
-| `jsmolka/arm.gba` | `register` | **PASS** | r12=0 at idle PC=0x08001EC4 (5f) | 17.027 |
-| `jsmolka/thumb.gba` | `register` | **PASS** | r7=0 at idle PC=0x08000AAC (5f) | 18.230 |
-| `jsmolka/memory.gba` | `register` | **PASS** | r12=0 at idle PC=0x080004C8 (5f) | 18.310 |
-| `jsmolka/nes.gba` | `register` | **PASS** | r12=0 at idle PC=0x06014248 (5f) | 30.186 |
-| `jsmolka/bios.gba` | `register` | **PASS** | r12=0 at idle PC=0x080003C0 (5f) | 19.234 |
-| `jsmolka/unsafe.gba` | `register` | **PASS** | r12=0 at idle PC=0x08000304 (5f) | 20.584 |
-| `jsmolka/save/none.gba` | `register` | **PASS** | r12=0 at idle PC=0x080002A8 (5f) | 17.299 |
-| `jsmolka/save/sram.gba` | `register` | **PASS** | r12=0 at idle PC=0x08000470 (5f) | 17.283 |
-| `jsmolka/save/flash64.gba` | `register` | **PASS** | r12=0 at idle PC=0x08000AC8 (71f) | 28.107 |
-| `jsmolka/save/flash128.gba` | `register` | **PASS** | r12=0 at idle PC=0x08000C4C (71f) | 34.211 |
-| `jsmolka/ppu/hello.gba` | `screenshot` | **PASS** | pixel-exact match (crc32=0x1862be60) | 18.976 |
-| `jsmolka/ppu/shades.gba` | `fb_hash` | **PASS** | hash 0x06da45bf84412325 (crc32=0x1a9c4c92) | 21.249 |
-| `jsmolka/ppu/stripes.gba` | `fb_hash` | **PASS** | hash 0xb804d1be99fc7525 (crc32=0x05166c70) | 23.813 |
-| `fuzzarm/FuzzARM.gba` | `screenshot` | **PASS** | pixel-exact match (crc32=0x472273a5) | 22.539 |
-| `fuzzarm/ARM_Any.gba` | `screenshot` | **PASS** | pixel-exact match (crc32=0x472273a5) | 22.546 |
-| `fuzzarm/ARM_DataProcessing.gba` | `screenshot` | **PASS** | pixel-exact match (crc32=0x472273a5) | 21.683 |
-| `fuzzarm/THUMB_Any.gba` | `screenshot` | **PASS** | pixel-exact match (crc32=0x472273a5) | 21.018 |
-| `fuzzarm/THUMB_DataProcessing.gba` | `screenshot` | **PASS** | pixel-exact match (crc32=0x472273a5) | 20.977 |
-| `armwrestler/arm-alu` | `screenshot` | **PASS** | pixel-exact match (crc32=0x77b5e53b) | 27.282 |
-| `armwrestler/arm-ldr-str` | `screenshot` | **PASS** | pixel-exact match (crc32=0x3fbfcf52) | 28.361 |
-| `armwrestler/arm-ldm-stm` | `screenshot` | **FAIL** | 8/12 pass; LDMIBS!, LDMIAS!, LDMDBS!, LDMDBA! fail with BAD Rn (user-bank writeback suppressed) (crc32=0xceba5d77) | 29.663 |
-| `armwrestler/thumb-alu` | `screenshot` | **PASS** | pixel-exact match (crc32=0xfa0784c1) | 28.270 |
-| `armwrestler/thumb-ldr-str` | `screenshot` | **PASS** | pixel-exact match (crc32=0x1a59d72e) | 27.441 |
-| `armwrestler/thumb-ldm-stm` | `screenshot` | **PASS** | pixel-exact match (crc32=0x18495aad) | 29.477 |
-| `nba-hw-test/bus/128kb-boundary.gba` | `screenshot` | **FAIL** | 13/16 pass; DMA DEC 07FFFFF8 (68 vs 63) & 0801FFF0/0803FFF0 (68 vs 70) fail (crc32=0xef43f2c5) | 31.298 |
-| `nba-hw-test/dma/burst-into-tears.gba` | `screenshot` | **FAIL** | 0/3 pass (1ST: 0x2e vs 0xea00, 2ND: 0xea00 vs 0xff24, DMA TIME: 43 vs 41) (crc32=0x53e7d0fe) | 28.586 |
-| `nba-hw-test/dma/force-nseq-access.gba` | `screenshot` | **FAIL** | 0/2 pass (EWRAM DMA: 78 vs 88, ROM DMA: 78 vs 88) (crc32=0x0aeb8290) | 15.878 |
-| `nba-hw-test/dma/latch.gba` | `screenshot` | **FAIL** | 2/4 pass (DMA LATCH 1: 0xc0de vs 0xdead, DMA LATCH 2: 0xc0de vs 0x1234) (crc32=0xcf7649a4) | 15.489 |
-| `nba-hw-test/dma/start-delay.gba` | `screenshot` | **FAIL** | 0/1 pass (IMM: 18 vs 20) (crc32=0xcd81f685) | 29.140 |
-| `nba-hw-test/haltcnt.gba` | `screenshot` | **FAIL** | 0/6 pass (HALTCNT DIRECT/CPUSET/POSTFLG/TIME IWRAM & ROM) (crc32=0x39cd150e) | 49.084 |
-| `nba-hw-test/irq/irq-delay.gba` | `screenshot` | **FAIL** | 0/3 pass (IWRAM: 95 vs 92, EWRAM: 115 vs 112, ROM: 115 vs 120) (crc32=0x4fc84cc5) | 49.409 |
-| `nba-hw-test/ppu/bgpd.gba` | `fb_hash` | **FAIL** | Visual mismatch vs expected.png (3 linear grey ramps instead of 2 ramps) (crc32=0x41b13174) | 55.028 |
-| `nba-hw-test/ppu/bgx.gba` | `fb_hash` | **FAIL** | Visual mismatch vs expected.png (solid green; missing center vertical white line) (crc32=0xd5370a26) | 50.064 |
-| `nba-hw-test/ppu/dispcnt-latch.gba` | `fb_hash` | **FAIL** | Visual mismatch vs expected.png (full-height BCDEF/DEFGH; missing scanline latch delay) (crc32=0x7ccd9bca) | 21.930 |
-| `nba-hw-test/ppu/greenswap.gba` | `fb_hash` | **FAIL** | Visual mismatch vs expected.png (uniform RGB stripes; GREENSWAP swap unimplemented) (crc32=0x9a420c77) | 19.441 |
-| `nba-hw-test/ppu/ram-access-timing.gba` | `screenshot` | **SKIP (missing golden)** | missing golden PNG `golden/nba_ppu_ram_access_timing.png` (observed 0x52a00a16cb1ce049, crc32=0x7f87eab3) — Interactive mode-selection hardware test (no automated pass/fail screen) | 21.532 |
-| `nba-hw-test/ppu/sprite-hmosaic.gba` | `fb_hash` | **FAIL** | Visual mismatch vs expected.png (rows 9-14 horizontal mosaic stretch differs) (crc32=0x99822121) | 16.893 |
-| `nba-hw-test/ppu/status-irq-dma.gba` | `screenshot` | **SKIP (missing golden)** | missing golden PNG `golden/nba_ppu_status_irq_dma.png` (observed 0x70602ed9184b6557, crc32=0x15185496) — Interactive raster/menu hardware test (no automated pass/fail screen) | 21.596 |
-| `nba-hw-test/ppu/vram-mirror.gba` | `screenshot` | **FAIL** | 7/10 pass; Mode 3 0x06018000 mirror leaks into 0x06010000 and fails to return 0 (crc32=0x2b146cf1) | 75.043 |
-| `nba-hw-test/timer/reload.gba` | `screenshot` | **FAIL** | 4/7 pass (FFF8 32 7: 0xdeae vs 0xfff9; FFFF 16/32 0: 0xdeb5 vs 0xdeb4) (crc32=0x56386c33) | 51.741 |
-| `nba-hw-test/timer/start-stop.gba` | `screenshot` | **FAIL** | 1/2 pass (2ND: 7 vs 8) (crc32=0x29380c6f) | 52.387 |
-| `nba-hw-test/timer/tick-before-reload.gba` | `screenshot` | **FAIL** | 0/2 pass (TM1CNT_L: 0 vs 1, IF: 0 vs 8) (crc32=0xf9bb7091) | 54.146 |
-| `tonc/bm_modes.gba` | `fb_hash` | **PASS** | hash 0x961b0d921dc3abf6 (crc32=0xcf60ed03) | 15.382 |
-| `tonc/mos_demo.gba` | `fb_hash` | **PASS** | hash 0x62d60e0245b1448d (crc32=0x38ab65c8) | 17.903 |
-| `tonc/win_demo.gba` | `fb_hash` | **PASS** | hash 0x646144f68f7bca7e (crc32=0x457181d4) | 17.945 |
-| `tonc/bld_demo.gba` | `fb_hash` | **PASS** | hash 0x6edb60f4d6745eb0 (crc32=0xf33ed441) | 20.217 |
-| `tonc/obj_aff.gba` | `fb_hash` | **PASS** | hash 0xaffdef941e408537 (crc32=0x4d59dde2) | 18.843 |
-| `tonc/obj_demo.gba` | `fb_hash` | **PASS** | hash 0xf5f7eb2443b88837 (crc32=0x68dc09d6) | 15.993 |
-| `tonc/m7_demo.gba` | `fb_hash` | **PASS** | hash 0xb91cab92fe7965cf (crc32=0x893a5b88) | 18.396 |
-| `tonc/prio_demo.gba` | `fb_hash` | **PASS** | hash 0xfd0522e59d004833 (crc32=0x38097e6d) | 18.113 |
-| `tonc/tte_demo.gba` | `fb_hash` | **PASS** | hash 0x79a60db2a397d56c (crc32=0x8be71ff8) | 9.726 |
-| `tonc/irq_demo.gba` | `fb_hash` | **PASS** | hash 0x2b7dce9043cb4c63 (crc32=0xf8556dcc) | 20.575 |
-| `tonc/tmr_demo.gba` | `fb_hash` | **PASS** | hash 0x6dbbc2cecf358dd5 (crc32=0x6b6de4b0) | 17.494 |
-| `tonc/dma_demo.gba` | `fb_hash` | **PASS** | hash 0x9c4c8f185b506e2f (crc32=0x4f581c12) | 20.202 |
+| `jsmolka/arm.gba` | `register` | **PASS** | r12=0 at idle PC=0x08001EC4 (5f) | 7.305 |
+| `jsmolka/thumb.gba` | `register` | **PASS** | r7=0 at idle PC=0x08000AAC (5f) | 7.222 |
+| `jsmolka/memory.gba` | `register` | **PASS** | r12=0 at idle PC=0x080004C8 (5f) | 7.207 |
+| `jsmolka/nes.gba` | `register` | **PASS** | r12=0 at idle PC=0x06014248 (5f) | 10.554 |
+| `jsmolka/bios.gba` | `register` | **PASS** | r12=0 at idle PC=0x080003C0 (5f) | 7.267 |
+| `jsmolka/unsafe.gba` | `register` | **PASS** | r12=0 at idle PC=0x08000304 (5f) | 8.688 |
+| `jsmolka/save/none.gba` | `register` | **PASS** | r12=0 at idle PC=0x080002A8 (5f) | 7.249 |
+| `jsmolka/save/sram.gba` | `register` | **PASS** | r12=0 at idle PC=0x08000470 (5f) | 7.186 |
+| `jsmolka/save/flash64.gba` | `register` | **PASS** | r12=0 at idle PC=0x08000AC8 (71f) | 13.995 |
+| `jsmolka/save/flash128.gba` | `register` | **PASS** | r12=0 at idle PC=0x08000C4C (71f) | 14.652 |
+| `jsmolka/ppu/hello.gba` | `screenshot` | **PASS** | pixel-exact match (crc32=0x1862be60) | 6.326 |
+| `jsmolka/ppu/shades.gba` | `fb_hash` | **PASS** | hash 0x06da45bf84412325 (crc32=0x1a9c4c92) | 7.740 |
+| `jsmolka/ppu/stripes.gba` | `fb_hash` | **PASS** | hash 0xb804d1be99fc7525 (crc32=0x05166c70) | 7.466 |
+| `fuzzarm/FuzzARM.gba` | `screenshot` | **PASS** | pixel-exact match (crc32=0x472273a5) | 8.186 |
+| `fuzzarm/ARM_Any.gba` | `screenshot` | **PASS** | pixel-exact match (crc32=0x472273a5) | 8.464 |
+| `fuzzarm/ARM_DataProcessing.gba` | `screenshot` | **PASS** | pixel-exact match (crc32=0x472273a5) | 8.934 |
+| `fuzzarm/THUMB_Any.gba` | `screenshot` | **PASS** | pixel-exact match (crc32=0x472273a5) | 8.860 |
+| `fuzzarm/THUMB_DataProcessing.gba` | `screenshot` | **PASS** | pixel-exact match (crc32=0x472273a5) | 8.856 |
+| `armwrestler/arm-alu` | `screenshot` | **PASS** | pixel-exact match (crc32=0x77b5e53b) | 9.981 |
+| `armwrestler/arm-ldr-str` | `screenshot` | **PASS** | pixel-exact match (crc32=0x3fbfcf52) | 11.131 |
+| `armwrestler/arm-ldm-stm` | `screenshot` | **PASS** | pixel-exact match (crc32=0xbd7dfb8b) | 11.489 |
+| `armwrestler/thumb-alu` | `screenshot` | **PASS** | pixel-exact match (crc32=0xfa0784c1) | 11.151 |
+| `armwrestler/thumb-ldr-str` | `screenshot` | **PASS** | pixel-exact match (crc32=0x1a59d72e) | 11.159 |
+| `armwrestler/thumb-ldm-stm` | `screenshot` | **PASS** | pixel-exact match (crc32=0x18495aad) | 10.551 |
+| `nba-hw-test/bus/128kb-boundary.gba` | `screenshot` | **FAIL** | 13/16 pass; DMA DEC 07FFFFF8 (68 vs 63) & 0801FFF0/0803FFF0 (68 vs 70) fail (crc32=0xef43f2c5) | 8.771 |
+| `nba-hw-test/dma/burst-into-tears.gba` | `screenshot` | **FAIL** | 0/3 pass (1ST: 0x2e vs 0xea00, 2ND: 0xea00 vs 0xff24, DMA TIME: 43 vs 41) (crc32=0x53e7d0fe) | 8.061 |
+| `nba-hw-test/dma/force-nseq-access.gba` | `screenshot` | **FAIL** | 0/2 pass (EWRAM DMA: 78 vs 88, ROM DMA: 78 vs 88) (crc32=0x0aeb8290) | 7.908 |
+| `nba-hw-test/dma/latch.gba` | `screenshot` | **FAIL** | 2/4 pass (DMA LATCH 1: 0xc0de vs 0xdead, DMA LATCH 2: 0xc0de vs 0x1234) (crc32=0xcf7649a4) | 8.377 |
+| `nba-hw-test/dma/start-delay.gba` | `screenshot` | **FAIL** | 0/1 pass (IMM: 18 vs 20) (crc32=0xcd81f685) | 7.714 |
+| `nba-hw-test/haltcnt.gba` | `screenshot` | **FAIL** | 0/6 pass (HALTCNT DIRECT/CPUSET/POSTFLG/TIME IWRAM & ROM) (crc32=0x39cd150e) | 8.198 |
+| `nba-hw-test/irq/irq-delay.gba` | `screenshot` | **FAIL** | 0/3 pass (IWRAM: 95 vs 92, EWRAM: 115 vs 112, ROM: 115 vs 120) (crc32=0x4fc84cc5) | 7.908 |
+| `nba-hw-test/ppu/bgpd.gba` | `fb_hash` | **FAIL** | Visual mismatch vs expected.png (3 linear grey ramps instead of 2 ramps) (crc32=0x41b13174) | 14.500 |
+| `nba-hw-test/ppu/bgx.gba` | `fb_hash` | **FAIL** | Visual mismatch vs expected.png (solid green; missing center vertical white line) (crc32=0xd5370a26) | 13.391 |
+| `nba-hw-test/ppu/dispcnt-latch.gba` | `fb_hash` | **FAIL** | Visual mismatch vs expected.png (full-height BCDEF/DEFGH; missing scanline latch delay) (crc32=0x7ccd9bca) | 9.555 |
+| `nba-hw-test/ppu/greenswap.gba` | `fb_hash` | **FAIL** | Visual mismatch vs expected.png (uniform RGB stripes; GREENSWAP swap unimplemented) (crc32=0x9a420c77) | 11.585 |
+| `nba-hw-test/ppu/ram-access-timing.gba` | `screenshot` | **SKIP (missing golden)** | missing golden PNG `golden/nba_ppu_ram_access_timing.png` (observed 0x52a00a16cb1ce049, crc32=0x7f87eab3) — Interactive mode-selection hardware test (no automated pass/fail screen) | 11.928 |
+| `nba-hw-test/ppu/sprite-hmosaic.gba` | `fb_hash` | **FAIL** | Visual mismatch vs expected.png (rows 9-14 horizontal mosaic stretch differs) (crc32=0x99822121) | 9.044 |
+| `nba-hw-test/ppu/status-irq-dma.gba` | `screenshot` | **SKIP (missing golden)** | missing golden PNG `golden/nba_ppu_status_irq_dma.png` (observed 0x70602ed9184b6557, crc32=0x15185496) — Interactive raster/menu hardware test (no automated pass/fail screen) | 11.754 |
+| `nba-hw-test/ppu/vram-mirror.gba` | `screenshot` | **PASS** | pixel-exact match (crc32=0xaf8aa1ec) | 15.620 |
+| `nba-hw-test/timer/reload.gba` | `screenshot` | **FAIL** | 4/7 pass (FFF8 32 7: 0xdeae vs 0xfff9; FFFF 16/32 0: 0xdeb5 vs 0xdeb4) (crc32=0x56386c33) | 8.168 |
+| `nba-hw-test/timer/start-stop.gba` | `screenshot` | **FAIL** | 1/2 pass (2ND: 7 vs 8) (crc32=0x29380c6f) | 7.687 |
+| `nba-hw-test/timer/tick-before-reload.gba` | `screenshot` | **FAIL** | 0/2 pass (TM1CNT_L: 0 vs 1, IF: 0 vs 8) (crc32=0xf9bb7091) | 7.998 |
+| `tonc/bm_modes.gba` | `fb_hash` | **PASS** | hash 0x961b0d921dc3abf6 (crc32=0xcf60ed03) | 8.117 |
+| `tonc/mos_demo.gba` | `fb_hash` | **PASS** | hash 0x62d60e0245b1448d (crc32=0x38ab65c8) | 11.240 |
+| `tonc/win_demo.gba` | `fb_hash` | **PASS** | hash 0x646144f68f7bca7e (crc32=0x457181d4) | 11.054 |
+| `tonc/bld_demo.gba` | `fb_hash` | **PASS** | hash 0x6edb60f4d6745eb0 (crc32=0xf33ed441) | 13.384 |
+| `tonc/obj_aff.gba` | `fb_hash` | **PASS** | hash 0xaffdef941e408537 (crc32=0x4d59dde2) | 11.632 |
+| `tonc/obj_demo.gba` | `fb_hash` | **PASS** | hash 0xf5f7eb2443b88837 (crc32=0x68dc09d6) | 7.576 |
+| `tonc/m7_demo.gba` | `fb_hash` | **PASS** | hash 0xb91cab92fe7965cf (crc32=0x893a5b88) | 8.930 |
+| `tonc/prio_demo.gba` | `fb_hash` | **PASS** | hash 0xfd0522e59d004833 (crc32=0x38097e6d) | 12.149 |
+| `tonc/tte_demo.gba` | `fb_hash` | **PASS** | hash 0x79a60db2a397d56c (crc32=0x8be71ff8) | 6.916 |
+| `tonc/irq_demo.gba` | `fb_hash` | **PASS** | hash 0x2b7dce9043cb4c63 (crc32=0xf8556dcc) | 9.052 |
+| `tonc/tmr_demo.gba` | `fb_hash` | **PASS** | hash 0x6dbbc2cecf358dd5 (crc32=0x6b6de4b0) | 7.124 |
+| `tonc/dma_demo.gba` | `fb_hash` | **PASS** | hash 0x9c4c8f185b506e2f (crc32=0x4f581c12) | 10.718 |
 | `mgba/suite.gba (all)` | `screenshot` | **SKIP (missing ROM)** | Requires devkitARM-built suite.gba (see scripts/README.md) | - |
 | `ags/ags.gba` | `screenshot` | **SKIP (missing ROM)** | Proprietary Nintendo AGS Aging Cartridge (user-supplied) | - |
 

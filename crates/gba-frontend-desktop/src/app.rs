@@ -13,8 +13,11 @@ use crate::config::{AppConfig, SaveOverrideChoice};
 use crate::debugger_ui::{DebugAction, DebuggerWindows};
 use crate::filters::VideoPostProcessor;
 use crate::headless::CliConfig;
-use crate::library::{LibraryViewMode, RomLibraryEntry};
+use crate::library::{LibraryScanResult, LibraryViewMode, RomLibraryEntry};
 use crate::rewind::RewindBuffer;
+use crate::rom_loader::{
+    apply_auto_patch_if_present, apply_patch_file, is_patch_extension, load_rom_bytes,
+};
 use crate::savestates::SlotMetaEntry;
 
 pub(crate) const CONFIG_FILE: &str = "rustboy_library.cfg";
@@ -97,6 +100,9 @@ pub(crate) struct RustboyApp {
     // ROM Library & Folder Scanner
     pub(crate) rom_folders: Vec<PathBuf>,
     pub(crate) library_entries: Vec<RomLibraryEntry>,
+    pub(crate) library_scanning: bool,
+    pub(crate) library_scan_rx: Option<std::sync::mpsc::Receiver<LibraryScanResult>>,
+    pub(crate) library_scan_error: Option<String>,
     pub(crate) favorites: HashSet<PathBuf>,
     pub(crate) search_query: String,
     pub(crate) filter_favorites_only: bool,
@@ -165,6 +171,9 @@ impl RustboyApp {
             active_cheats: Vec::new(),
             rom_folders: Vec::new(),
             library_entries: Vec::new(),
+            library_scanning: false,
+            library_scan_rx: None,
+            library_scan_error: None,
             favorites: HashSet::new(),
             search_query: String::new(),
             filter_favorites_only: false,
@@ -330,11 +339,27 @@ impl RustboyApp {
         custom_sav: Option<&Path>,
         ctx: Option<&egui::Context>,
     ) -> Result<(), String> {
+        self.open_rom_with_patch(rom_path, custom_sav, None, ctx)
+    }
+
+    pub(crate) fn open_rom_with_patch(
+        &mut self,
+        rom_path: &Path,
+        custom_sav: Option<&Path>,
+        explicit_patch: Option<&Path>,
+        ctx: Option<&egui::Context>,
+    ) -> Result<(), String> {
         self.flush_battery_save();
         self.save_rom_specific_settings();
 
-        let mut rom_bytes = fs::read(rom_path).map_err(|e| format!("Failed reading ROM: {e}"))?;
-        let ips_applied = Self::apply_ips_patch_if_present(rom_path, &mut rom_bytes);
+        let mut loaded = load_rom_bytes(rom_path)?;
+        let patch_applied = if let Some(patch_path) = explicit_patch {
+            Some(apply_patch_file(patch_path, &mut loaded.bytes)?)
+        } else {
+            apply_auto_patch_if_present(rom_path, &mut loaded.bytes)?
+        };
+        let rom_bytes = loaded.bytes;
+        let archive_badge = loaded.source_kind.badge();
         let rom_crc32 = crc32fast::hash(&rom_bytes);
 
         let sav_path = custom_sav
@@ -413,8 +438,15 @@ impl RustboyApp {
             self.sync_window_title(c);
             self.title_dirty = false;
         }
-        let patch_tag = if ips_applied { " (IPS Patched)" } else { "" };
-        self.notify(&format!("Playing {title} [{code}]{patch_tag}"));
+        let patch_tag = match patch_applied {
+            Some(fmt) => format!(" ({} Patched)", fmt.label()),
+            None => String::new(),
+        };
+        let archive_tag = match archive_badge {
+            Some(kind) => format!(" [{kind}]"),
+            None => String::new(),
+        };
+        self.notify(&format!("Playing {title} [{code}]{archive_tag}{patch_tag}"));
         Ok(())
     }
 
@@ -681,12 +713,11 @@ impl RustboyApp {
     pub(crate) fn trigger_open_rom_dialog(&mut self, ctx: &egui::Context) {
         if let Some(path) = rfd::FileDialog::new()
             .set_title("Open Game Boy Advance ROM")
-            .add_filter("GBA ROMs", &["gba", "agb", "bin"])
+            .add_filter("GBA ROMs & Archives", &["gba", "agb", "bin", "zip", "7z"])
             .pick_file()
+            && let Err(e) = self.open_rom(&path, None, Some(ctx))
         {
-            if let Err(e) = self.open_rom(&path, None, Some(ctx)) {
-                self.notify(&e);
-            }
+            self.notify_error(&e);
         }
     }
 
@@ -704,10 +735,7 @@ impl RustboyApp {
                     self.rom_folders.push(path);
                     self.save_persistent_config();
                     self.rescan_rom_folders();
-                    self.notify(&format!(
-                        "Added ROM folder — {} GBA title(s) in library",
-                        self.library_entries.len()
-                    ));
+                    self.notify("Added ROM directory — Scanning library...");
                 }
                 continue;
             }
@@ -724,9 +752,18 @@ impl RustboyApp {
                 }
             } else if ext == "state" || ext == "gbas" {
                 self.load_state_from_path(&path, "Loaded dropped Save State");
+            } else if is_patch_extension(&path) {
+                if let Some(base_rom) = self.rom_path.clone() {
+                    if let Err(e) = self.open_rom_with_patch(&base_rom, None, Some(&path), Some(ctx))
+                    {
+                        self.notify_error(&e);
+                    }
+                } else {
+                    self.notify_error("Load a ROM first before dropping a .bps/.ups/.ips patch");
+                }
             } else {
                 if let Err(e) = self.open_rom(&path, None, Some(ctx)) {
-                    self.notify(&e);
+                    self.notify_error(&e);
                 }
                 break;
             }
@@ -863,6 +900,7 @@ impl RustboyApp {
 
 impl RustboyApp {
     pub fn update(&mut self, ctx: &egui::Context) {
+        self.poll_library_scan(ctx);
         if self.title_dirty {
             self.sync_window_title(ctx);
             self.title_dirty = false;

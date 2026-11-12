@@ -46,7 +46,7 @@ impl RustboyApp {
                                         ui.close_menu();
                                         let p = PathBuf::from(&entry.path);
                                         if let Err(e) = self.open_rom(&p, None, Some(ctx)) {
-                                            self.notify(&e);
+                                            self.notify_error(&e);
                                         }
                                     }
                                 }
@@ -81,6 +81,10 @@ impl RustboyApp {
                             {
                                 ui.close_menu();
                                 self.close_rom(ctx);
+                            }
+                            if ui.button("Load Patch (BPS / UPS / IPS)...").clicked() {
+                                ui.close_menu();
+                                self.load_patch_dialog(ctx);
                             }
                             ui.separator();
                             ui.menu_button("Save State", |ui| {

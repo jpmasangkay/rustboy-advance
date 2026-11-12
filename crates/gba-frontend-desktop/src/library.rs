@@ -1,9 +1,13 @@
 use std::fs;
 use std::path::{Path, PathBuf};
+use std::sync::mpsc;
 
 use egui::{self, Align, Color32, CornerRadius, Layout, RichText, Sense, Stroke};
 
 use crate::app::{RustboyApp, ACCENT_TEAL, BG_CARD, BG_PANEL, BORDER_HAIRLINE, TEXT_MUTED};
+use crate::rom_loader::{
+    is_supported_rom_or_archive_extension, read_rom_header_summary, RomSourceKind,
+};
 
 #[derive(Clone, Debug)]
 pub struct RomLibraryEntry {
@@ -14,6 +18,12 @@ pub struct RomLibraryEntry {
     pub region: &'static str,
     pub size_mb: f32,
     pub has_battery_sav: bool,
+    pub source_kind: RomSourceKind,
+}
+
+pub(crate) struct LibraryScanResult {
+    pub(crate) entries: Vec<RomLibraryEntry>,
+    pub(crate) error: Option<String>,
 }
 
 #[derive(Copy, Clone, PartialEq, Eq, Debug)]
@@ -33,12 +43,7 @@ impl RustboyApp {
         for entry in entries.flatten() {
             let p = entry.path();
             if p.is_file() {
-                let ext = p
-                    .extension()
-                    .and_then(|s| s.to_str())
-                    .unwrap_or("")
-                    .to_ascii_lowercase();
-                if matches!(ext.as_str(), "gba" | "agb" | "bin") {
+                if is_supported_rom_or_archive_extension(&p) {
                     out.push(p);
                 }
             } else if p.is_dir() {
@@ -48,12 +53,10 @@ impl RustboyApp {
     }
 
     pub(crate) fn parse_gba_header(path: &Path) -> Option<RomLibraryEntry> {
-        use std::io::Read;
-        let mut file = fs::File::open(path).ok()?;
-        let metadata = file.metadata().ok()?;
-        let size_mb = (metadata.len() as f32) / (1024.0 * 1024.0);
-        let mut header = [0u8; 0xC0];
-        let bytes_read = file.read(&mut header).ok()?;
+        let summary = read_rom_header_summary(path)?;
+        let size_mb = (summary.rom_size_bytes as f32) / (1024.0 * 1024.0);
+        let header = summary.header;
+        let bytes_read = summary.bytes_read;
 
         let display_name = path
             .file_stem()
@@ -107,44 +110,98 @@ impl RustboyApp {
             region,
             size_mb,
             has_battery_sav,
+            source_kind: summary.source_kind,
         })
     }
 
-    pub(crate) fn rescan_rom_folders(&mut self) {
-        self.library_entries.clear();
+    pub(crate) fn scan_folders_collect(folders: &[PathBuf]) -> LibraryScanResult {
+        let mut missing = Vec::new();
         let mut found_files = Vec::new();
-        for folder in &self.rom_folders {
+        for folder in folders {
+            if !folder.exists() {
+                missing.push(folder.display().to_string());
+                continue;
+            }
             Self::scan_folder_recursive(folder, 0, &mut found_files);
         }
         found_files.sort();
         found_files.dedup();
 
+        let mut entries = Vec::with_capacity(found_files.len());
         for path in found_files {
             if let Some(entry) = Self::parse_gba_header(&path) {
-                self.library_entries.push(entry);
+                entries.push(entry);
             }
         }
-        self.library_entries.sort_by(|a, b| {
+        entries.sort_by(|a, b| {
             a.display_name
                 .to_lowercase()
                 .cmp(&b.display_name.to_lowercase())
         });
+
+        let error = if missing.is_empty() {
+            None
+        } else {
+            Some(format!(
+                "Unreachable ROM folder{}: {}",
+                if missing.len() == 1 { "" } else { "s" },
+                missing.join(", ")
+            ))
+        };
+        LibraryScanResult { entries, error }
+    }
+
+    pub(crate) fn rescan_rom_folders(&mut self) {
+        if self.rom_folders.is_empty() {
+            self.library_entries.clear();
+            self.library_scanning = false;
+            self.library_scan_rx = None;
+            self.library_scan_error = None;
+            return;
+        }
+        let folders = self.rom_folders.clone();
+        let (tx, rx) = mpsc::channel();
+        self.library_scanning = true;
+        self.library_scan_error = None;
+        self.library_scan_rx = Some(rx);
+
+        std::thread::spawn(move || {
+            let res = Self::scan_folders_collect(&folders);
+            let _ = tx.send(res);
+        });
+    }
+
+    pub(crate) fn poll_library_scan(&mut self, ctx: &egui::Context) {
+        let Some(rx) = &self.library_scan_rx else {
+            return;
+        };
+        match rx.try_recv() {
+            Ok(result) => {
+                self.library_entries = result.entries;
+                self.library_scan_error = result.error;
+                self.library_scanning = false;
+                self.library_scan_rx = None;
+            }
+            Err(mpsc::TryRecvError::Empty) => {
+                ctx.request_repaint();
+            }
+            Err(mpsc::TryRecvError::Disconnected) => {
+                self.library_scanning = false;
+                self.library_scan_rx = None;
+            }
+        }
     }
 
     pub(crate) fn add_rom_folder_dialog(&mut self) {
         if let Some(folder) = rfd::FileDialog::new()
             .set_title("Select ROM Directory")
             .pick_folder()
+            && !self.rom_folders.contains(&folder)
         {
-            if !self.rom_folders.contains(&folder) {
-                self.rom_folders.push(folder);
-                self.save_persistent_config();
-                self.rescan_rom_folders();
-                self.notify(&format!(
-                    "Added folder — {} GBA title(s) in library",
-                    self.library_entries.len()
-                ));
-            }
+            self.rom_folders.push(folder);
+            self.save_persistent_config();
+            self.rescan_rom_folders();
+            self.notify("Added ROM directory — Scanning library...");
         }
     }
 
@@ -229,7 +286,52 @@ impl RustboyApp {
 
         ui.add_space(6.0);
 
-        // 2. Empty States
+        if let Some(scan_err) = self.library_scan_error.clone() {
+            egui::Frame::new()
+                .fill(Color32::from_rgb(56, 24, 28))
+                .stroke(Stroke::new(1.0_f32, Color32::from_rgb(170, 64, 68)))
+                .corner_radius(CornerRadius::same(4))
+                .inner_margin(egui::Margin::symmetric(12, 6))
+                .show(ui, |ui| {
+                    ui.horizontal(|ui| {
+                        ui.label(
+                            RichText::new(scan_err)
+                                .small()
+                                .color(Color32::from_rgb(255, 165, 165)),
+                        );
+                        ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                            if ui.button(RichText::new("Dismiss").small()).clicked() {
+                                self.library_scan_error = None;
+                            }
+                            if ui.button(RichText::new("Retry").small()).clicked() {
+                                self.rescan_rom_folders();
+                            }
+                        });
+                    });
+                });
+            ui.add_space(6.0);
+        }
+
+        if self.library_scanning && !self.library_entries.is_empty() {
+            egui::Frame::new()
+                .fill(BG_PANEL)
+                .stroke(Stroke::new(1.0_f32, BORDER_HAIRLINE))
+                .corner_radius(CornerRadius::same(4))
+                .inner_margin(egui::Margin::symmetric(12, 6))
+                .show(ui, |ui| {
+                    ui.horizontal(|ui| {
+                        ui.spinner();
+                        ui.label(
+                            RichText::new("Scanning ROM folders and archives...")
+                                .small()
+                                .color(TEXT_MUTED),
+                        );
+                    });
+                });
+            ui.add_space(6.0);
+        }
+
+        // 2. Empty & Loading States
         if self.rom_folders.is_empty() && filtered.is_empty() {
             ui.centered_and_justified(|ui| {
                 ui.vertical_centered(|ui| {
@@ -242,7 +344,7 @@ impl RustboyApp {
                     ui.add_space(8.0);
                     ui.label(
                         RichText::new(
-                            "Add a folder containing your .gba ROMs to populate the game list, or open a single file.",
+                            "Add a folder containing your .gba, .zip, or .7z ROMs to populate the game list, or open a single file.",
                         )
                         .color(TEXT_MUTED),
                     );
@@ -268,6 +370,23 @@ impl RustboyApp {
             return;
         }
 
+        if self.library_scanning && self.library_entries.is_empty() {
+            ui.centered_and_justified(|ui| {
+                ui.vertical_centered(|ui| {
+                    ui.add_space(ui.available_height() * 0.25);
+                    ui.spinner();
+                    ui.add_space(10.0);
+                    ui.heading(RichText::new("Scanning ROM Library...").size(18.0).strong());
+                    ui.add_space(6.0);
+                    ui.label(
+                        RichText::new("Indexing .gba, .agb, .bin, .zip, and .7z ROM headers")
+                            .color(TEXT_MUTED),
+                    );
+                });
+            });
+            return;
+        }
+
         if !self.rom_folders.is_empty() && self.library_entries.is_empty() {
             ui.centered_and_justified(|ui| {
                 ui.vertical_centered(|ui| {
@@ -280,7 +399,7 @@ impl RustboyApp {
                     ui.add_space(8.0);
                     ui.label(
                         RichText::new(
-                            "The configured directories do not contain any .gba, .agb, or .bin ROM files.",
+                            "The configured directories do not contain any .gba, .agb, .bin, .zip, or .7z ROM files.",
                         )
                         .color(TEXT_MUTED),
                     );
@@ -379,9 +498,14 @@ impl RustboyApp {
                                         self.save_persistent_config();
                                     }
 
+                                    let title_text = if let Some(badge) = entry.source_kind.badge() {
+                                        format!("{} [{}]", entry.display_name, badge)
+                                    } else {
+                                        entry.display_name.clone()
+                                    };
                                     let resp = ui.selectable_label(
                                         false,
-                                        RichText::new(&entry.display_name).strong(),
+                                        RichText::new(title_text).strong(),
                                     );
                                     if resp.double_clicked() {
                                         launch_target = Some(entry.path.clone());
@@ -648,7 +772,7 @@ impl RustboyApp {
 
         if let Some(path) = launch_target {
             if let Err(e) = self.open_rom(&path, None, Some(ctx)) {
-                self.notify(&e);
+                self.notify_error(&e);
             }
             if open_overrides {
                 self.debugger.show_overrides = true;

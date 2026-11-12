@@ -37,3 +37,6 @@ test_output/
 .gemini/
 .antigravity/
 
+
+# WebAssembly build output (rebuilt locally and in CI)
+web/pkg/

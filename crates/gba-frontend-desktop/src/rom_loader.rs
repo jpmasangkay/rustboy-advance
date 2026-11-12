@@ -40,6 +40,23 @@ impl RomSourceKind {
     }
 }
 
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub enum RomPlatform {
+    Gba,
+    Gb,
+    Gbc,
+}
+
+impl RomPlatform {
+    pub const fn badge(self) -> &'static str {
+        match self {
+            Self::Gba => "GBA",
+            Self::Gb => "GB",
+            Self::Gbc => "GBC",
+        }
+    }
+}
+
 pub(crate) struct LoadedRomSource {
     pub(crate) bytes: Vec<u8>,
     pub(crate) inner_name: Option<String>,
@@ -47,10 +64,86 @@ pub(crate) struct LoadedRomSource {
 }
 
 pub(crate) struct RomHeaderSummary {
-    pub(crate) header: [u8; 0xC0],
+    pub(crate) header: [u8; 0x150],
     pub(crate) bytes_read: usize,
     pub(crate) rom_size_bytes: u64,
+    pub(crate) inner_name: Option<String>,
     pub(crate) source_kind: RomSourceKind,
+}
+
+pub(crate) fn is_gb_extension(name_or_path: &str) -> bool {
+    let ext = Path::new(name_or_path)
+        .extension()
+        .and_then(|s| s.to_str())
+        .unwrap_or("")
+        .to_ascii_lowercase();
+    matches!(ext.as_str(), "gb" | "gbc")
+}
+
+pub(crate) fn detect_rom_platform(
+    path: &Path,
+    inner_name: Option<&str>,
+    header_or_rom: &[u8],
+) -> RomPlatform {
+    let candidate = inner_name.unwrap_or_else(|| path.to_str().unwrap_or(""));
+    if is_gb_extension(candidate) {
+        let ext_is_gbc = Path::new(candidate)
+            .extension()
+            .and_then(|s| s.to_str())
+            .is_some_and(|e| e.eq_ignore_ascii_case("gbc"));
+        let cgb_flag = header_or_rom.get(0x0143).copied().unwrap_or(0);
+        if ext_is_gbc || (cgb_flag & 0x80) != 0 {
+            RomPlatform::Gbc
+        } else {
+            RomPlatform::Gb
+        }
+    } else {
+        RomPlatform::Gba
+    }
+}
+
+pub(crate) const fn gb_cart_type_label(cart_type: u8) -> &'static str {
+    match cart_type {
+        0x00 => "ROM ONLY",
+        0x01 => "MBC1",
+        0x02 => "MBC1+RAM",
+        0x03 => "MBC1+RAM+BATT",
+        0x05 => "MBC2",
+        0x06 => "MBC2+BATT",
+        0x08 => "ROM+RAM",
+        0x09 => "ROM+RAM+BATT",
+        0x0B => "MMM01",
+        0x0C => "MMM01+RAM",
+        0x0D => "MMM01+RAM+BATT",
+        0x0F => "MBC3+RTC+BATT",
+        0x10 => "MBC3+RTC+RAM+BATT",
+        0x11 => "MBC3",
+        0x12 => "MBC3+RAM",
+        0x13 => "MBC3+RAM+BATT",
+        0x19 => "MBC5",
+        0x1A => "MBC5+RAM",
+        0x1B => "MBC5+RAM+BATT",
+        0x1C => "MBC5+RUMBLE",
+        0x1D => "MBC5+RUMBLE+RAM",
+        0x1E => "MBC5+RUMBLE+RAM+BATT",
+        0x20 => "MBC6",
+        0x22 => "MBC7+SENSOR+RUMBLE+BATT",
+        0xFC => "POCKET CAMERA",
+        0xFD => "BANDAI TAMA5",
+        0xFE => "HuC3",
+        0xFF => "HuC1+RAM+BATT",
+        _ => "MBC/Other",
+    }
+}
+
+/// Deterministic 4-ASCII-character ID for GB/GBC save states & playtime keys (`RBAS` uses `[u8; 4]`).
+pub(crate) fn gb_short_game_code(rom_or_hdr: &[u8], is_cgb: bool) -> String {
+    let prefix = if is_cgb { 'C' } else { 'G' };
+    let hdr_chk = rom_or_hdr.get(0x014D).copied().unwrap_or(0) as u16;
+    let glob_hi = rom_or_hdr.get(0x014E).copied().unwrap_or(0) as u16;
+    let glob_lo = rom_or_hdr.get(0x014F).copied().unwrap_or(0) as u16;
+    let hash = ((hdr_chk << 4) ^ (glob_hi << 8) ^ glob_lo) & 0x0FFF;
+    format!("{prefix}{hash:03X}")
 }
 
 pub(crate) fn has_rom_extension(name_or_path: &str) -> bool {
@@ -59,7 +152,7 @@ pub(crate) fn has_rom_extension(name_or_path: &str) -> bool {
         .and_then(|s| s.to_str())
         .unwrap_or("")
         .to_ascii_lowercase();
-    matches!(ext.as_str(), "gba" | "agb" | "bin")
+    matches!(ext.as_str(), "gba" | "agb" | "bin" | "gb" | "gbc")
 }
 
 pub(crate) fn is_patch_extension(path: &Path) -> bool {
@@ -77,7 +170,10 @@ pub(crate) fn is_supported_rom_or_archive_extension(path: &Path) -> bool {
         .and_then(|s| s.to_str())
         .unwrap_or("")
         .to_ascii_lowercase();
-    matches!(ext.as_str(), "gba" | "agb" | "bin" | "zip" | "7z")
+    matches!(
+        ext.as_str(),
+        "gba" | "agb" | "bin" | "gb" | "gbc" | "zip" | "7z"
+    )
 }
 
 /// Reads a single bijective VLQ integer used by BPS and UPS patch formats.
@@ -498,7 +594,7 @@ fn load_rom_from_zip(path: &Path) -> Result<LoadedRomSource, String> {
             });
         }
     }
-    Err("No .gba, .agb, or .bin ROM found inside ZIP archive".into())
+    Err("No .gba, .agb, .bin, .gb, or .gbc ROM found inside ZIP archive".into())
 }
 
 fn load_rom_from_7z(path: &Path) -> Result<LoadedRomSource, String> {
@@ -535,7 +631,7 @@ fn load_rom_from_7z(path: &Path) -> Result<LoadedRomSource, String> {
             source_kind: RomSourceKind::SevenZip,
         })
     } else {
-        Err("No .gba, .agb, or .bin ROM found inside 7z archive".into())
+        Err("No .gba, .agb, .bin, .gb, or .gbc ROM found inside 7z archive".into())
     }
 }
 
@@ -554,12 +650,14 @@ pub(crate) fn read_rom_header_summary(path: &Path) -> Option<RomHeaderSummary> {
                 let entry = archive.by_index(idx).ok()?;
                 if !entry.is_dir() && has_rom_extension(entry.name()) {
                     let size = entry.size();
-                    let mut header = [0u8; 0xC0];
+                    let inner_name = entry.name().to_string();
+                    let mut header = [0u8; 0x150];
                     let bytes_read = read_up_to(entry, &mut header).ok()?;
                     return Some(RomHeaderSummary {
                         header,
                         bytes_read,
                         rom_size_bytes: size,
+                        inner_name: Some(inner_name),
                         source_kind: RomSourceKind::Zip,
                     });
                 }
@@ -572,12 +670,13 @@ pub(crate) fn read_rom_header_summary(path: &Path) -> Option<RomHeaderSummary> {
             let mut found: Option<RomHeaderSummary> = None;
             let _ = reader.for_each_entries_with_decision(|entry, rdr| {
                 if !entry.is_directory() && has_rom_extension(entry.name()) {
-                    let mut header = [0u8; 0xC0];
+                    let mut header = [0u8; 0x150];
                     let bytes_read = read_up_to(rdr, &mut header)?;
                     found = Some(RomHeaderSummary {
                         header,
                         bytes_read,
                         rom_size_bytes: entry.size(),
+                        inner_name: Some(entry.name().to_string()),
                         source_kind: RomSourceKind::SevenZip,
                     });
                     Ok(sevenz_rust2::EntryDecision::Stop)
@@ -590,12 +689,13 @@ pub(crate) fn read_rom_header_summary(path: &Path) -> Option<RomHeaderSummary> {
         _ => {
             let mut file = File::open(path).ok()?;
             let meta = file.metadata().ok()?;
-            let mut header = [0u8; 0xC0];
+            let mut header = [0u8; 0x150];
             let bytes_read = read_up_to(&mut file, &mut header).ok()?;
             Some(RomHeaderSummary {
                 header,
                 bytes_read,
                 rom_size_bytes: meta.len(),
+                inner_name: None,
                 source_kind: RomSourceKind::Raw,
             })
         }
@@ -880,6 +980,43 @@ mod tests {
         assert_eq!(loaded.source_kind, RomSourceKind::Zip);
         assert_eq!(loaded.inner_name.as_deref(), Some("folder/test_game.gba"));
         assert_eq!(loaded.bytes, rom);
+
+        let _ = fs::remove_dir_all(&temp_dir);
+    }
+
+    #[test]
+    fn test_zip_gb_archive_header_and_platform_detection() {
+        let temp_dir = std::env::temp_dir().join("rba_test_zip_gbc_rom");
+        let _ = fs::remove_dir_all(&temp_dir);
+        fs::create_dir_all(&temp_dir).unwrap();
+        let zip_path = temp_dir.join("gbc_bundle.zip");
+
+        let mut rom = vec![0u8; 0x8000];
+        rom[0x0134..0x013F].copy_from_slice(b"PKMNCRYSTAL");
+        rom[0x0143] = 0xC0; // CGB only
+        rom[0x0147] = 0x10; // MBC3+TIMER+RAM+BATTERY
+
+        {
+            let f = File::create(&zip_path).unwrap();
+            let mut zw = zip::ZipWriter::new(f);
+            let opts = zip::write::SimpleFileOptions::default()
+                .compression_method(zip::CompressionMethod::Deflated);
+            zw.start_file("roms/crystal.gbc", opts).unwrap();
+            zw.write_all(&rom).unwrap();
+            zw.finish().unwrap();
+        }
+
+        let summary = read_rom_header_summary(&zip_path).unwrap();
+        assert_eq!(summary.source_kind, RomSourceKind::Zip);
+        assert_eq!(summary.inner_name.as_deref(), Some("roms/crystal.gbc"));
+        assert_eq!(
+            detect_rom_platform(&zip_path, summary.inner_name.as_deref(), &summary.header),
+            RomPlatform::Gbc
+        );
+
+        let loaded = load_rom_bytes(&zip_path).unwrap();
+        assert_eq!(loaded.inner_name.as_deref(), Some("roms/crystal.gbc"));
+        assert_eq!(loaded.bytes.len(), 0x8000);
 
         let _ = fs::remove_dir_all(&temp_dir);
     }

@@ -699,6 +699,32 @@ impl ColorProfileChoice {
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize, Default)]
+pub enum DmgPaletteChoice {
+    #[default]
+    GbaColorized,
+    Greyscale,
+    ClassicGreen,
+}
+
+impl DmgPaletteChoice {
+    pub fn to_core(self) -> gb_core::DmgPalette {
+        match self {
+            Self::Greyscale => gb_core::DmgPalette::Greyscale,
+            Self::GbaColorized => gb_core::DmgPalette::GbaColorized,
+            Self::ClassicGreen => gb_core::DmgPalette::ClassicGreen,
+        }
+    }
+
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Greyscale => "Greyscale",
+            Self::GbaColorized => "GBA Colorized",
+            Self::ClassicGreen => "Classic Green",
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize, Default)]
 pub enum BezelStyle {
     #[default]
     None,
@@ -816,6 +842,8 @@ pub struct AppConfig {
     pub lcd_ghosting: bool,
     pub scanline_grid: bool,
     pub dot_accurate_ppu: bool,
+    #[serde(default)]
+    pub dmg_palette: DmgPaletteChoice,
     pub master_volume: u8,
     pub muted: bool,
     pub speed_multiplier: f32,
@@ -857,6 +885,7 @@ impl Default for AppConfig {
             lcd_ghosting: false,
             scanline_grid: false,
             dot_accurate_ppu: false,
+            dmg_palette: DmgPaletteChoice::default(),
             master_volume: 100,
             muted: false,
             speed_multiplier: 1.0,

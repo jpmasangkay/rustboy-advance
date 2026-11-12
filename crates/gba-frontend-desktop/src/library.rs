@@ -6,7 +6,8 @@ use egui::{self, Align, Color32, CornerRadius, Layout, RichText, Sense, Stroke};
 
 use crate::app::{RustboyApp, ACCENT_TEAL, BG_CARD, BG_PANEL, BORDER_HAIRLINE, TEXT_MUTED};
 use crate::rom_loader::{
-    is_supported_rom_or_archive_extension, read_rom_header_summary, RomSourceKind,
+    detect_rom_platform, gb_cart_type_label, gb_short_game_code,
+    is_supported_rom_or_archive_extension, read_rom_header_summary, RomPlatform, RomSourceKind,
 };
 
 #[derive(Clone, Debug)]
@@ -19,6 +20,8 @@ pub struct RomLibraryEntry {
     pub size_mb: f32,
     pub has_battery_sav: bool,
     pub source_kind: RomSourceKind,
+    pub platform: RomPlatform,
+    pub cart_type_label: String,
 }
 
 pub(crate) struct LibraryScanResult {
@@ -52,7 +55,7 @@ impl RustboyApp {
         }
     }
 
-    pub(crate) fn parse_gba_header(path: &Path) -> Option<RomLibraryEntry> {
+    pub(crate) fn parse_rom_header(path: &Path) -> Option<RomLibraryEntry> {
         let summary = read_rom_header_summary(path)?;
         let size_mb = (summary.rom_size_bytes as f32) / (1024.0 * 1024.0);
         let header = summary.header;
@@ -64,40 +67,78 @@ impl RustboyApp {
             .unwrap_or("Unknown")
             .to_string();
 
-        let (internal_title, game_code, region) = if bytes_read >= 0xB0 {
-            let title_raw = &header[0xA0..0xAC];
-            let title_clean: String = title_raw
-                .iter()
-                .take_while(|&&c| c != 0)
-                .map(|&c| {
-                    if c.is_ascii_graphic() || c == b' ' {
-                        c as char
-                    } else {
-                        ' '
-                    }
-                })
-                .collect();
-            let code_raw = &header[0xAC..0xB0];
-            let code_clean: String = code_raw
-                .iter()
-                .map(|&c| {
-                    if c.is_ascii_alphanumeric() {
-                        c as char
-                    } else {
-                        '-'
-                    }
-                })
-                .collect();
-            let reg = match code_raw.get(3).copied().unwrap_or(b' ') {
-                b'E' | b'U' => "USA",
-                b'P' | b'D' | b'F' | b'I' | b'S' => "EUR",
-                b'J' => "JPN",
-                b'A' => "World",
-                _ => "Unk",
-            };
-            (title_clean.trim().to_string(), code_clean, reg)
-        } else {
-            (String::from("Homebrew"), String::from("HOME"), "Unk")
+        let platform = detect_rom_platform(
+            path,
+            summary.inner_name.as_deref(),
+            &header[..bytes_read],
+        );
+
+        let (internal_title, game_code, region, cart_type_label) = match platform {
+            RomPlatform::Gb | RomPlatform::Gbc => {
+                let slice = &header[..bytes_read];
+                let gb_hdr = gb_core::CartridgeHeader::parse(slice);
+                let title = if gb_hdr.title.is_empty() {
+                    display_name.clone()
+                } else {
+                    gb_hdr.title.clone()
+                };
+                let is_cgb = platform == RomPlatform::Gbc;
+                let code = gb_short_game_code(slice, is_cgb);
+                let reg = match slice.get(0x014A).copied().unwrap_or(0xFF) {
+                    0x00 => "JPN",
+                    0x01 => "World",
+                    _ => "Unk",
+                };
+                let cart = gb_cart_type_label(gb_hdr.cart_type).to_string();
+                (title, code, reg, cart)
+            }
+            RomPlatform::Gba => {
+                if bytes_read >= 0xB0 {
+                    let title_raw = &header[0xA0..0xAC];
+                    let title_clean: String = title_raw
+                        .iter()
+                        .take_while(|&&c| c != 0)
+                        .map(|&c| {
+                            if c.is_ascii_graphic() || c == b' ' {
+                                c as char
+                            } else {
+                                ' '
+                            }
+                        })
+                        .collect();
+                    let code_raw = &header[0xAC..0xB0];
+                    let code_clean: String = code_raw
+                        .iter()
+                        .map(|&c| {
+                            if c.is_ascii_alphanumeric() {
+                                c as char
+                            } else {
+                                '-'
+                            }
+                        })
+                        .collect();
+                    let reg = match code_raw.get(3).copied().unwrap_or(b' ') {
+                        b'E' | b'U' => "USA",
+                        b'P' | b'D' | b'F' | b'I' | b'S' => "EUR",
+                        b'J' => "JPN",
+                        b'A' => "World",
+                        _ => "Unk",
+                    };
+                    (
+                        title_clean.trim().to_string(),
+                        code_clean,
+                        reg,
+                        String::from("GBA Cart"),
+                    )
+                } else {
+                    (
+                        String::from("Homebrew"),
+                        String::from("HOME"),
+                        "Unk",
+                        String::from("GBA ROM"),
+                    )
+                }
+            }
         };
 
         let has_battery_sav = path.with_extension("sav").exists();
@@ -111,7 +152,14 @@ impl RustboyApp {
             size_mb,
             has_battery_sav,
             source_kind: summary.source_kind,
+            platform,
+            cart_type_label,
         })
+    }
+
+    #[cfg(test)]
+    pub(crate) fn parse_gba_header(path: &Path) -> Option<RomLibraryEntry> {
+        Self::parse_rom_header(path)
     }
 
     pub(crate) fn scan_folders_collect(folders: &[PathBuf]) -> LibraryScanResult {
@@ -129,7 +177,7 @@ impl RustboyApp {
 
         let mut entries = Vec::with_capacity(found_files.len());
         for path in found_files {
-            if let Some(entry) = Self::parse_gba_header(&path) {
+            if let Some(entry) = Self::parse_rom_header(&path) {
                 entries.push(entry);
             }
         }
@@ -220,6 +268,8 @@ impl RustboyApp {
                 e.display_name.to_lowercase().contains(&query)
                     || e.internal_title.to_lowercase().contains(&query)
                     || e.game_code.to_lowercase().contains(&query)
+                    || e.platform.badge().to_lowercase().contains(&query)
+                    || e.cart_type_label.to_lowercase().contains(&query)
             })
             .cloned()
             .collect();
@@ -344,7 +394,7 @@ impl RustboyApp {
                     ui.add_space(8.0);
                     ui.label(
                         RichText::new(
-                            "Add a folder containing your .gba, .zip, or .7z ROMs to populate the game list, or open a single file.",
+                            "Add a folder containing your .gba, .gb, .gbc, .zip, or .7z ROMs to populate the game list, or open a single file.",
                         )
                         .color(TEXT_MUTED),
                     );
@@ -379,7 +429,7 @@ impl RustboyApp {
                     ui.heading(RichText::new("Scanning ROM Library...").size(18.0).strong());
                     ui.add_space(6.0);
                     ui.label(
-                        RichText::new("Indexing .gba, .agb, .bin, .zip, and .7z ROM headers")
+                        RichText::new("Indexing .gba, .agb, .bin, .gb, .gbc, .zip, and .7z ROM headers")
                             .color(TEXT_MUTED),
                     );
                 });
@@ -399,7 +449,7 @@ impl RustboyApp {
                     ui.add_space(8.0);
                     ui.label(
                         RichText::new(
-                            "The configured directories do not contain any .gba, .agb, .bin, .zip, or .7z ROM files.",
+                            "The configured directories do not contain any .gba, .agb, .bin, .gb, .gbc, .zip, or .7z ROM files.",
                         )
                         .color(TEXT_MUTED),
                     );
@@ -465,9 +515,10 @@ impl RustboyApp {
                             .spacing([16.0, 7.0])
                             .show(ui, |ui| {
                                 ui.strong("★");
+                                ui.strong("System");
                                 ui.strong("Game Title (Filename)");
                                 ui.strong("Internal Header");
-                                ui.strong("Game ID");
+                                ui.strong("Cartridge / ID");
                                 ui.strong("Region");
                                 ui.strong("Size");
                                 ui.strong("Playtime");
@@ -497,6 +548,18 @@ impl RustboyApp {
                                         }
                                         self.save_persistent_config();
                                     }
+
+                                    let plat_color = match entry.platform {
+                                        RomPlatform::Gba => ACCENT_TEAL,
+                                        RomPlatform::Gb => Color32::from_rgb(160, 210, 120),
+                                        RomPlatform::Gbc => Color32::from_rgb(235, 185, 95),
+                                    };
+                                    ui.monospace(
+                                        RichText::new(format!("[{}]", entry.platform.badge()))
+                                            .small()
+                                            .strong()
+                                            .color(plat_color),
+                                    );
 
                                     let title_text = if let Some(badge) = entry.source_kind.badge() {
                                         format!("{} [{}]", entry.display_name, badge)
@@ -558,7 +621,13 @@ impl RustboyApp {
                                     ui.monospace(
                                         RichText::new(&entry.internal_title).color(TEXT_MUTED),
                                     );
-                                    ui.monospace(RichText::new(&entry.game_code).strong());
+                                    let id_text = match entry.platform {
+                                        RomPlatform::Gba => entry.game_code.clone(),
+                                        RomPlatform::Gb | RomPlatform::Gbc => {
+                                            format!("{} ({})", entry.cart_type_label, entry.game_code)
+                                        }
+                                    };
+                                    ui.monospace(RichText::new(id_text).strong());
                                     ui.label(RichText::new(entry.region).color(match entry.region {
                                         "USA" => Color32::from_rgb(120, 180, 255),
                                         "EUR" => Color32::from_rgb(120, 220, 160),
@@ -650,6 +719,17 @@ impl RustboyApp {
 
                                         ui.add_space(4.0);
                                         ui.horizontal(|ui| {
+                                            let plat_color = match entry.platform {
+                                                RomPlatform::Gba => ACCENT_TEAL,
+                                                RomPlatform::Gb => Color32::from_rgb(160, 210, 120),
+                                                RomPlatform::Gbc => Color32::from_rgb(235, 185, 95),
+                                            };
+                                            ui.monospace(
+                                                RichText::new(format!("[{}]", entry.platform.badge()))
+                                                    .small()
+                                                    .strong()
+                                                    .color(plat_color),
+                                            );
                                             ui.monospace(
                                                 RichText::new(format!("[{}]", entry.game_code))
                                                     .small(),
@@ -673,9 +753,12 @@ impl RustboyApp {
                                         });
 
                                         ui.label(
-                                            RichText::new(format!("Header: {}", entry.internal_title))
-                                                .small()
-                                                .color(TEXT_MUTED),
+                                            RichText::new(format!(
+                                                "{} • {}",
+                                                entry.internal_title, entry.cart_type_label
+                                            ))
+                                            .small()
+                                            .color(TEXT_MUTED),
                                         );
 
                                         let pt_str = self
@@ -811,6 +894,46 @@ mod tests {
         fs::write(&sav_path, b"SAVEDATA").unwrap();
         let parsed_with_sav = RustboyApp::parse_gba_header(&rom_path).unwrap();
         assert!(parsed_with_sav.has_battery_sav);
+
+        let _ = fs::remove_dir_all(&temp_dir);
+    }
+
+    #[test]
+    fn test_gb_and_gbc_header_parsing_in_library() {
+        let temp_dir = std::env::temp_dir().join("rba_test_gb_header");
+        let _ = fs::remove_dir_all(&temp_dir);
+        fs::create_dir_all(&temp_dir).unwrap();
+
+        let mut dmg_rom = vec![0u8; 0x8000];
+        dmg_rom[0x0134..0x0142].copy_from_slice(b"LINKS AWAKENIN");
+        dmg_rom[0x0143] = 0x00;
+        dmg_rom[0x0147] = 0x03; // MBC1+RAM+BATT
+        dmg_rom[0x014A] = 0x01; // Non-Japanese -> World
+        let dmg_path = temp_dir.join("Links Awakening.gb");
+        fs::write(&dmg_path, &dmg_rom).unwrap();
+
+        let dmg_entry = RustboyApp::parse_rom_header(&dmg_path).expect("dmg parse");
+        assert_eq!(dmg_entry.platform, RomPlatform::Gb);
+        assert_eq!(dmg_entry.internal_title, "LINKS AWAKENIN");
+        assert_eq!(dmg_entry.cart_type_label, "MBC1+RAM+BATT");
+        assert_eq!(dmg_entry.region, "World");
+        assert_eq!(dmg_entry.game_code.len(), 4);
+        assert!(dmg_entry.game_code.starts_with('G'));
+
+        let mut cgb_rom = vec![0u8; 0x8000];
+        cgb_rom[0x0134..0x013F].copy_from_slice(b"POKEMON_SLV");
+        cgb_rom[0x0143] = 0x80; // Dual-mode GBC
+        cgb_rom[0x0147] = 0x10; // MBC3+RTC+RAM+BATT
+        cgb_rom[0x014A] = 0x00; // JPN
+        let cgb_path = temp_dir.join("Pokemon Silver.gbc");
+        fs::write(&cgb_path, &cgb_rom).unwrap();
+
+        let cgb_entry = RustboyApp::parse_rom_header(&cgb_path).expect("cgb parse");
+        assert_eq!(cgb_entry.platform, RomPlatform::Gbc);
+        assert_eq!(cgb_entry.internal_title, "POKEMON_SLV");
+        assert_eq!(cgb_entry.cart_type_label, "MBC3+RTC+RAM+BATT");
+        assert_eq!(cgb_entry.region, "JPN");
+        assert!(cgb_entry.game_code.starts_with('C'));
 
         let _ = fs::remove_dir_all(&temp_dir);
     }

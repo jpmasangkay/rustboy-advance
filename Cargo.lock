@@ -1076,11 +1076,23 @@ dependencies = [
 ]
 
 [[package]]
+name = "gb-core"
+version = "0.1.0"
+dependencies = [
+ "bitflags 2.13.2",
+ "image",
+ "log",
+ "postcard",
+ "serde",
+]
+
+[[package]]
 name = "gba-core"
 version = "0.1.0"
 dependencies = [
  "bitflags 2.13.2",
  "log",
+ "lz4_flex",
  "postcard",
  "serde",
 ]
@@ -1102,6 +1114,7 @@ dependencies = [
  "egui",
  "egui-winit",
  "egui_glow",
+ "gb-core",
  "gba-core",
  "gba-debugger",
  "gilrs",
@@ -1126,6 +1139,7 @@ version = "0.1.0"
 dependencies = [
  "gba-core",
  "log",
+ "wasm-bindgen",
 ]
 
 [[package]]

@@ -4,10 +4,60 @@ use serde::{Deserialize, Serialize};
 
 use crate::apu::Apu;
 use crate::cartridge::{Cartridge, SaveType};
-use crate::hw::{HardwareControl, IRQ_HBLANK, IRQ_VBLANK, IRQ_VCOUNT};
+use crate::hw::{HardwareControl, IRQ_HBLANK, IRQ_SERIAL, IRQ_VBLANK, IRQ_VCOUNT, SioResponse};
 use crate::ppu::Ppu;
 use crate::serde_helpers::{alloc_boxed_array, box_bytes};
 use crate::{APU_SAMPLE_INTERVAL, EventType, Scheduler};
+
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub enum WatchpointKind {
+    Read,
+    Write,
+    ReadWrite,
+}
+
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub struct Watchpoint {
+    pub start: u32,
+    pub end: u32,
+    pub kind: WatchpointKind,
+}
+
+impl Watchpoint {
+    pub const fn new(start: u32, end: u32, kind: WatchpointKind) -> Self {
+        Self { start, end, kind }
+    }
+
+    pub const fn addr(addr: u32, kind: WatchpointKind) -> Self {
+        Self {
+            start: addr,
+            end: addr,
+            kind,
+        }
+    }
+
+    #[inline]
+    pub fn matches_access(&self, access_addr: u32, size: u32, write: bool) -> bool {
+        let kind_ok = match self.kind {
+            WatchpointKind::Read => !write,
+            WatchpointKind::Write => write,
+            WatchpointKind::ReadWrite => true,
+        };
+        if !kind_ok {
+            return false;
+        }
+        let access_end = access_addr.saturating_add(size.saturating_sub(1));
+        access_addr <= self.end && access_end >= self.start
+    }
+}
+
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub struct WatchpointHit {
+    pub addr: u32,
+    pub pc: u32,
+    pub write: bool,
+    pub value: u32,
+}
 
 #[derive(Copy, Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub enum AccessType {
@@ -78,6 +128,16 @@ pub struct SysBus {
     fastmem_read: Box<[Option<NonNull<u8>>; 16384]>,
     // Track last opcode access cycles cleanly for CPU stepping.
     pub last_cycles: u64,
+
+    // Debug watchpoints (fast-path `watchpoint_active` bool avoids overhead when empty).
+    #[serde(skip)]
+    pub watchpoint_active: bool,
+    #[serde(skip)]
+    pub debug_pc: u32,
+    #[serde(skip)]
+    pub watchpoint_hit: Option<WatchpointHit>,
+    #[serde(skip)]
+    pub watchpoints: Vec<Watchpoint>,
 }
 
 fn empty_fastmem() -> Box<[Option<NonNull<u8>>; 16384]> {
@@ -124,6 +184,10 @@ impl SysBus {
             irq_sync_delay: 0,
             fastmem_read: empty_fastmem(),
             last_cycles: 0,
+            watchpoint_active: false,
+            debug_pc: 0,
+            watchpoint_hit: None,
+            watchpoints: Vec::new(),
         };
         bus.update_waitcnt(0x0000);
         bus.rebuild_fastmem();
@@ -355,7 +419,67 @@ impl SysBus {
                 self.scheduler
                     .schedule(ev_cycle + APU_SAMPLE_INTERVAL, EventType::ApuSampleTick);
             }
+            EventType::SioTransferComplete => {
+                self.complete_sio_no_cable();
+            }
             EventType::IrqSynchronizer | EventType::None => {}
+        }
+    }
+
+    /// Auto-completes internal-clock SIO transfers when no link cable is connected.
+    pub fn complete_sio_no_cable(&mut self) {
+        if self.hw.link_connected || (self.hw.siocnt & 0x0080) == 0 {
+            return;
+        }
+        let mode_bits = (self.hw.siocnt >> 12) & 0x03;
+        match mode_bits {
+            0 => {
+                self.hw.siodata8 = 0x00FF;
+            }
+            1 => {
+                self.hw.siomulti[0] = 0xFFFF;
+                self.hw.siomulti[1] = 0xFFFF;
+            }
+            2 => {
+                self.hw.siomulti[0] = self.hw.siodata8;
+                self.hw.siomulti[1] = 0xFFFF;
+                self.hw.siomulti[2] = 0xFFFF;
+                self.hw.siomulti[3] = 0xFFFF;
+                // Parent ID = 0 (bits 5..4 = 0), Error = 0 (bit 6 = 0), SD = 1 (bit 3 = 1).
+                self.hw.siocnt = (self.hw.siocnt & !0x0074) | 0x0008;
+            }
+            _ => {}
+        }
+        self.hw.siocnt &= !0x0080;
+        if (self.hw.siocnt & 0x4000) != 0 {
+            self.hw.request_irq(IRQ_SERIAL);
+        }
+    }
+
+    /// Completes an active SIO transfer with peer data delivered by a link-cable frontend.
+    pub fn complete_sio_transfer(&mut self, resp: SioResponse) {
+        let mode_bits = (self.hw.siocnt >> 12) & 0x03;
+        match mode_bits {
+            0 => {
+                self.hw.siodata8 = u16::from(resp.data8);
+            }
+            1 => {
+                self.hw.siomulti[0] = resp.data32 as u16;
+                self.hw.siomulti[1] = (resp.data32 >> 16) as u16;
+            }
+            2 => {
+                self.hw.siomulti = resp.multi;
+                let id_bits = (u16::from(resp.multi_id) & 0x03) << 4;
+                let err_bit = if resp.error { 0x0040 } else { 0 };
+                self.hw.siocnt = (self.hw.siocnt & !0x0074) | 0x0008 | id_bits | err_bit;
+            }
+            _ => {}
+        }
+        self.hw.siocnt &= !0x0080;
+        self.hw.pending_sio_transfer = None;
+        self.scheduler.cancel(EventType::SioTransferComplete);
+        if (self.hw.siocnt & 0x4000) != 0 {
+            self.hw.request_irq(IRQ_SERIAL);
         }
     }
 
@@ -462,12 +586,12 @@ impl SysBus {
     #[inline]
     fn read_rom_half_raw(&self, aligned: u32) -> u16 {
         let page = (aligned >> 14) as usize;
-        if page < 16384 {
-            if let Some(ptr) = self.fastmem_read[page] {
-                let off = (aligned & 0x3FFE) as usize;
-                let bytes = unsafe { core::slice::from_raw_parts(ptr.as_ptr().add(off), 2) };
-                return u16::from_le_bytes([bytes[0], bytes[1]]);
-            }
+        if page < 16384
+            && let Some(ptr) = self.fastmem_read[page]
+        {
+            let off = (aligned & 0x3FFE) as usize;
+            let bytes = unsafe { core::slice::from_raw_parts(ptr.as_ptr().add(off), 2) };
+            return u16::from_le_bytes([bytes[0], bytes[1]]);
         }
         self.cart.read_rom_16(aligned)
     }
@@ -475,17 +599,59 @@ impl SysBus {
     #[inline]
     fn read_rom_word_raw(&self, aligned: u32) -> u32 {
         let page = (aligned >> 14) as usize;
-        if page < 16384 {
-            if let Some(ptr) = self.fastmem_read[page] {
-                let off = (aligned & 0x3FFC) as usize;
-                let bytes = unsafe { core::slice::from_raw_parts(ptr.as_ptr().add(off), 4) };
-                return u32::from_le_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]);
-            }
+        if page < 16384
+            && let Some(ptr) = self.fastmem_read[page]
+        {
+            let off = (aligned & 0x3FFC) as usize;
+            let bytes = unsafe { core::slice::from_raw_parts(ptr.as_ptr().add(off), 4) };
+            return u32::from_le_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]);
         }
         self.cart.read_rom_32(aligned)
     }
 
+    #[inline]
+    pub fn set_watchpoints(&mut self, wps: &[Watchpoint]) {
+        self.watchpoints.clear();
+        self.watchpoints.extend_from_slice(wps);
+        self.watchpoint_active = !self.watchpoints.is_empty();
+        self.watchpoint_hit = None;
+    }
+
+    #[inline]
+    pub fn clear_watchpoints(&mut self) {
+        self.watchpoint_active = false;
+        self.watchpoint_hit = None;
+        self.watchpoints.clear();
+    }
+
+    #[cold]
+    fn check_watchpoint(&mut self, addr: u32, size: u32, write: bool, value: u32) {
+        if self.watchpoint_hit.is_some() {
+            return;
+        }
+        for wp in &self.watchpoints {
+            if wp.matches_access(addr, size, write) {
+                self.watchpoint_hit = Some(WatchpointHit {
+                    addr,
+                    pc: self.debug_pc,
+                    write,
+                    value,
+                });
+                return;
+            }
+        }
+    }
+
+    #[inline]
     pub fn read_8(&mut self, addr: u32, access: AccessType, pc: u32, is_thumb: bool) -> u8 {
+        let val = self.read_8_inner(addr, access, pc, is_thumb);
+        if self.watchpoint_active {
+            self.check_watchpoint(addr, 1, false, val as u32);
+        }
+        val
+    }
+
+    fn read_8_inner(&mut self, addr: u32, access: AccessType, pc: u32, is_thumb: bool) -> u8 {
         self.last_cycles = 1;
         if addr < 0x1000_0000 {
             let page = (addr >> 14) as usize;
@@ -567,7 +733,16 @@ impl SysBus {
         val
     }
 
+    #[inline]
     pub fn read_16(&mut self, addr: u32, access: AccessType, pc: u32, is_thumb: bool) -> u16 {
+        let val = self.read_16_inner(addr, access, pc, is_thumb);
+        if self.watchpoint_active {
+            self.check_watchpoint(addr & !1, 2, false, val as u32);
+        }
+        val
+    }
+
+    fn read_16_inner(&mut self, addr: u32, access: AccessType, pc: u32, is_thumb: bool) -> u16 {
         let aligned = addr & !1;
         if addr < 0x1000_0000 {
             let page = (aligned >> 14) as usize;
@@ -683,7 +858,16 @@ impl SysBus {
         }
     }
 
+    #[inline]
     pub fn read_32(&mut self, addr: u32, access: AccessType, pc: u32) -> u32 {
+        let val = self.read_32_inner(addr, access, pc);
+        if self.watchpoint_active {
+            self.check_watchpoint(addr & !3, 4, false, val);
+        }
+        val
+    }
+
+    fn read_32_inner(&mut self, addr: u32, access: AccessType, pc: u32) -> u32 {
         let aligned = addr & !3;
         if addr < 0x1000_0000 {
             let page = (aligned >> 14) as usize;
@@ -845,7 +1029,16 @@ impl SysBus {
         (v, self.last_cycles)
     }
 
-    pub fn write_8(&mut self, addr: u32, val: u8, _access: AccessType) -> u64 {
+    #[inline]
+    pub fn write_8(&mut self, addr: u32, val: u8, access: AccessType) -> u64 {
+        let cyc = self.write_8_inner(addr, val, access);
+        if self.watchpoint_active {
+            self.check_watchpoint(addr, 1, true, val as u32);
+        }
+        cyc
+    }
+
+    fn write_8_inner(&mut self, addr: u32, val: u8, _access: AccessType) -> u64 {
         let region = (addr >> 24) & 0x0F;
         let cyc = match addr >> 24 {
             0x02 => {
@@ -901,7 +1094,16 @@ impl SysBus {
         cyc
     }
 
+    #[inline]
     pub fn write_16(&mut self, addr: u32, val: u16, access: AccessType) -> u64 {
+        let cyc = self.write_16_inner(addr, val, access);
+        if self.watchpoint_active {
+            self.check_watchpoint(addr & !1, 2, true, val as u32);
+        }
+        cyc
+    }
+
+    fn write_16_inner(&mut self, addr: u32, val: u16, access: AccessType) -> u64 {
         let aligned = addr & !1;
         let bytes = val.to_le_bytes();
         let region = (aligned >> 24) & 0x0F;
@@ -956,7 +1158,16 @@ impl SysBus {
         cyc
     }
 
+    #[inline]
     pub fn write_32(&mut self, addr: u32, val: u32, access: AccessType) -> u64 {
+        let cyc = self.write_32_inner(addr, val, access);
+        if self.watchpoint_active {
+            self.check_watchpoint(addr & !3, 4, true, val);
+        }
+        cyc
+    }
+
+    fn write_32_inner(&mut self, addr: u32, val: u32, access: AccessType) -> u64 {
         let aligned = addr & !3;
         let bytes = val.to_le_bytes();
         let region = (aligned >> 24) & 0x0F;
@@ -1080,9 +1291,10 @@ impl SysBus {
             0x0400_0124 => self.hw.siomulti[2],
             0x0400_0126 => self.hw.siomulti[3],
             0x0400_0128 => self.hw.siocnt,
+            0x0400_012A => self.hw.siodata8,
             0x0400_0130 => self.hw.keyinput,
             0x0400_0132 => self.hw.keycnt,
-            0x0400_0134 => self.hw.rcnt,
+            0x0400_0134 => self.hw.rcnt & 0xC1FF,
             0x0400_0200 => self.hw.ie,
             0x0400_0202 => self.hw.if_flag,
             0x0400_0204 => self.hw.waitcnt & 0x7FFF,
@@ -1133,6 +1345,42 @@ impl SysBus {
             self.debug_read_8(a.wrapping_add(2)),
             self.debug_read_8(a.wrapping_add(3)),
         ])
+    }
+
+    /// Side-effect-free write for Lua/GDB/debug `poke*` APIs; ignores IO so no side effects trigger.
+    pub fn debug_write_8(&mut self, addr: u32, val: u8) {
+        match (addr >> 24) & 0xFF {
+            0x02 => self.ewram[(addr as usize) & 0x3FFFF] = val,
+            0x03 => self.iwram[(addr as usize) & 0x7FFF] = val,
+            0x05 => self.ppu.pram[(addr as usize) & 0x3FF] = val,
+            0x06 => self.ppu.vram[Ppu::mirror_vram(addr as usize)] = val,
+            0x07 => self.ppu.oam[(addr as usize) & 0x3FF] = val,
+            0x08..=0x0D => {
+                let off = (addr as usize) & 0x01FF_FFFF;
+                if off < self.cart.rom.len() {
+                    self.cart.rom[off] = val;
+                    self.rebuild_fastmem();
+                }
+            }
+            0x0E | 0x0F if addr < 0x1000_0000 => self.cart.debug_write_sram(addr, val),
+            _ => {}
+        }
+    }
+
+    pub fn debug_write_16(&mut self, addr: u32, val: u16) {
+        let a = addr & !1;
+        let bytes = val.to_le_bytes();
+        self.debug_write_8(a, bytes[0]);
+        self.debug_write_8(a.wrapping_add(1), bytes[1]);
+    }
+
+    pub fn debug_write_32(&mut self, addr: u32, val: u32) {
+        let a = addr & !3;
+        let bytes = val.to_le_bytes();
+        self.debug_write_8(a, bytes[0]);
+        self.debug_write_8(a.wrapping_add(1), bytes[1]);
+        self.debug_write_8(a.wrapping_add(2), bytes[2]);
+        self.debug_write_8(a.wrapping_add(3), bytes[3]);
     }
 
     /// Writes a cheat value into RAM, Video RAM, or ROM memory safely.

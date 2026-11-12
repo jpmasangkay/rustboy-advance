@@ -18,7 +18,7 @@ pub mod box_bytes {
     use super::*;
 
     pub fn serialize<const N: usize, S: Serializer>(
-        val: &Box<[u8; N]>,
+        val: &[u8; N],
         serializer: S,
     ) -> Result<S::Ok, S::Error> {
         serializer.serialize_bytes(&val[..])
@@ -75,7 +75,7 @@ pub mod box_u16s {
     use super::*;
 
     pub fn serialize<const N: usize, S: Serializer>(
-        val: &Box<[u16; N]>,
+        val: &[u16; N],
         serializer: S,
     ) -> Result<S::Ok, S::Error> {
         serializer.collect_seq(val.iter())

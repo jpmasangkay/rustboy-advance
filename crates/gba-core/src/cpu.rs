@@ -54,8 +54,8 @@ impl CpuMode {
 type ArmFn = fn(&mut Arm7tdmi, &mut SysBus, u32) -> u64;
 type ThumbFn = fn(&mut Arm7tdmi, &mut SysBus, u16) -> u64;
 
-const ARM_LUT: [ArmFn; 4096] = build_arm_lut();
-const THUMB_LUT: [ThumbFn; 1024] = build_thumb_lut();
+static ARM_LUT: [ArmFn; 4096] = build_arm_lut();
+static THUMB_LUT: [ThumbFn; 1024] = build_thumb_lut();
 
 #[derive(Clone, Serialize, Deserialize)]
 pub struct Arm7tdmi {
@@ -68,6 +68,8 @@ pub struct Arm7tdmi {
     pub spsr_banked: [u32; 6],
     pub pipeline: [u32; 2],
     pub halted: bool,
+    #[serde(default)]
+    pub stopped: bool,
     pub intr_wait: Option<u16>,
     #[serde(default)]
     pub pipeline_flushed: bool,
@@ -87,6 +89,7 @@ impl Arm7tdmi {
             spsr_banked: [0; 6],
             pipeline: [0; 2],
             halted: false,
+            stopped: false,
             intr_wait: None,
             pipeline_flushed: false,
             flush_cycles: 0,
@@ -251,6 +254,7 @@ impl Arm7tdmi {
 
     pub fn trigger_irq(&mut self, bus: &mut SysBus) {
         self.halted = false;
+        self.stopped = false;
         let lr_irq = if self.is_thumb() {
             self.gpr[15] // A + 4
         } else {
@@ -471,6 +475,98 @@ impl Arm7tdmi {
     }
 }
 
+macro_rules! lut_4 {
+    ($fn:ident) => {
+        [$fn::<0>, $fn::<1>, $fn::<2>, $fn::<3>]
+    };
+}
+
+macro_rules! lut_8 {
+    ($fn:ident) => {
+        [
+            $fn::<0>, $fn::<1>, $fn::<2>, $fn::<3>, $fn::<4>, $fn::<5>, $fn::<6>, $fn::<7>,
+        ]
+    };
+}
+
+macro_rules! lut_16 {
+    ($fn:ident) => {
+        [
+            $fn::<0>, $fn::<1>, $fn::<2>, $fn::<3>, $fn::<4>, $fn::<5>, $fn::<6>, $fn::<7>,
+            $fn::<8>, $fn::<9>, $fn::<10>, $fn::<11>, $fn::<12>, $fn::<13>, $fn::<14>, $fn::<15>,
+        ]
+    };
+}
+
+macro_rules! lut_32 {
+    ($fn:ident) => {
+        [
+            $fn::<0>, $fn::<1>, $fn::<2>, $fn::<3>, $fn::<4>, $fn::<5>, $fn::<6>, $fn::<7>,
+            $fn::<8>, $fn::<9>, $fn::<10>, $fn::<11>, $fn::<12>, $fn::<13>, $fn::<14>, $fn::<15>,
+            $fn::<16>, $fn::<17>, $fn::<18>, $fn::<19>, $fn::<20>, $fn::<21>, $fn::<22>, $fn::<23>,
+            $fn::<24>, $fn::<25>, $fn::<26>, $fn::<27>, $fn::<28>, $fn::<29>, $fn::<30>, $fn::<31>,
+        ]
+    };
+}
+
+macro_rules! lut_64 {
+    ($fn:ident) => {
+        [
+            $fn::<0>, $fn::<1>, $fn::<2>, $fn::<3>, $fn::<4>, $fn::<5>, $fn::<6>, $fn::<7>,
+            $fn::<8>, $fn::<9>, $fn::<10>, $fn::<11>, $fn::<12>, $fn::<13>, $fn::<14>, $fn::<15>,
+            $fn::<16>, $fn::<17>, $fn::<18>, $fn::<19>, $fn::<20>, $fn::<21>, $fn::<22>, $fn::<23>,
+            $fn::<24>, $fn::<25>, $fn::<26>, $fn::<27>, $fn::<28>, $fn::<29>, $fn::<30>, $fn::<31>,
+            $fn::<32>, $fn::<33>, $fn::<34>, $fn::<35>, $fn::<36>, $fn::<37>, $fn::<38>, $fn::<39>,
+            $fn::<40>, $fn::<41>, $fn::<42>, $fn::<43>, $fn::<44>, $fn::<45>, $fn::<46>, $fn::<47>,
+            $fn::<48>, $fn::<49>, $fn::<50>, $fn::<51>, $fn::<52>, $fn::<53>, $fn::<54>, $fn::<55>,
+            $fn::<56>, $fn::<57>, $fn::<58>, $fn::<59>, $fn::<60>, $fn::<61>, $fn::<62>, $fn::<63>,
+        ]
+    };
+}
+
+macro_rules! lut_128 {
+    ($fn:ident) => {
+        [
+            $fn::<0>, $fn::<1>, $fn::<2>, $fn::<3>, $fn::<4>, $fn::<5>, $fn::<6>, $fn::<7>,
+            $fn::<8>, $fn::<9>, $fn::<10>, $fn::<11>, $fn::<12>, $fn::<13>, $fn::<14>, $fn::<15>,
+            $fn::<16>, $fn::<17>, $fn::<18>, $fn::<19>, $fn::<20>, $fn::<21>, $fn::<22>, $fn::<23>,
+            $fn::<24>, $fn::<25>, $fn::<26>, $fn::<27>, $fn::<28>, $fn::<29>, $fn::<30>, $fn::<31>,
+            $fn::<32>, $fn::<33>, $fn::<34>, $fn::<35>, $fn::<36>, $fn::<37>, $fn::<38>, $fn::<39>,
+            $fn::<40>, $fn::<41>, $fn::<42>, $fn::<43>, $fn::<44>, $fn::<45>, $fn::<46>, $fn::<47>,
+            $fn::<48>, $fn::<49>, $fn::<50>, $fn::<51>, $fn::<52>, $fn::<53>, $fn::<54>, $fn::<55>,
+            $fn::<56>, $fn::<57>, $fn::<58>, $fn::<59>, $fn::<60>, $fn::<61>, $fn::<62>, $fn::<63>,
+            $fn::<64>, $fn::<65>, $fn::<66>, $fn::<67>, $fn::<68>, $fn::<69>, $fn::<70>, $fn::<71>,
+            $fn::<72>, $fn::<73>, $fn::<74>, $fn::<75>, $fn::<76>, $fn::<77>, $fn::<78>, $fn::<79>,
+            $fn::<80>, $fn::<81>, $fn::<82>, $fn::<83>, $fn::<84>, $fn::<85>, $fn::<86>, $fn::<87>,
+            $fn::<88>, $fn::<89>, $fn::<90>, $fn::<91>, $fn::<92>, $fn::<93>, $fn::<94>, $fn::<95>,
+            $fn::<96>, $fn::<97>, $fn::<98>, $fn::<99>, $fn::<100>, $fn::<101>, $fn::<102>,
+            $fn::<103>, $fn::<104>, $fn::<105>, $fn::<106>, $fn::<107>, $fn::<108>, $fn::<109>,
+            $fn::<110>, $fn::<111>, $fn::<112>, $fn::<113>, $fn::<114>, $fn::<115>, $fn::<116>,
+            $fn::<117>, $fn::<118>, $fn::<119>, $fn::<120>, $fn::<121>, $fn::<122>, $fn::<123>,
+            $fn::<124>, $fn::<125>, $fn::<126>, $fn::<127>,
+        ]
+    };
+}
+
+const ARM_BLOCK_FNS: [ArmFn; 32] = lut_32!(arm_block_transfer);
+const ARM_SINGLE_FNS: [ArmFn; 64] = lut_64!(arm_single_transfer);
+const ARM_HALFWORD_FNS: [ArmFn; 128] = lut_128!(arm_halfword_transfer);
+const ARM_DATA_PROC_FNS: [ArmFn; 128] = lut_128!(arm_data_proc);
+const ARM_MUL_FNS: [ArmFn; 4] = lut_4!(arm_mul);
+const ARM_MULL_FNS: [ArmFn; 8] = lut_8!(arm_mull);
+const ARM_PSR_REG_FNS: [ArmFn; 4] = lut_4!(arm_psr_reg);
+
+const THUMB_MOVE_SHIFTED_FNS: [ThumbFn; 4] = lut_4!(thumb_move_shifted);
+const THUMB_ADD_SUB_FNS: [ThumbFn; 4] = lut_4!(thumb_add_sub);
+const THUMB_ALU_IMM_FNS: [ThumbFn; 4] = lut_4!(thumb_alu_imm);
+const THUMB_ALU_REG_FNS: [ThumbFn; 16] = lut_16!(thumb_alu_reg);
+const THUMB_HI_REG_FNS: [ThumbFn; 16] = lut_16!(thumb_hi_reg_bx);
+const THUMB_LDR_STR_REG_FNS: [ThumbFn; 4] = lut_4!(thumb_ldr_str_reg);
+const THUMB_LDR_STR_HALF_SIGN_FNS: [ThumbFn; 4] = lut_4!(thumb_ldr_str_half_sign);
+const THUMB_LDR_STR_IMM_FNS: [ThumbFn; 4] = lut_4!(thumb_ldr_str_imm);
+const THUMB_PUSH_POP_FNS: [ThumbFn; 4] = lut_4!(thumb_push_pop);
+const THUMB_COND_BRANCH_FNS: [ThumbFn; 16] = lut_16!(thumb_cond_branch);
+
 const fn build_arm_lut() -> [ArmFn; 4096] {
     let mut lut: [ArmFn; 4096] = [arm_undefined; 4096];
     let mut i = 0usize;
@@ -479,36 +575,48 @@ const fn build_arm_lut() -> [ArmFn; 4096] {
         let lo = i & 0x0F;
         lut[i] = if (hi & 0xF0) == 0xF0 {
             arm_swi
-        } else if (hi & 0xE0) == 0xE0 {
-            arm_undefined
-        } else if (hi & 0xE0) == 0xC0 {
+        } else if (hi & 0xC0) == 0xC0 {
             arm_undefined
         } else if (hi & 0xE0) == 0xA0 {
-            arm_branch
+            if (hi & 0x10) != 0 {
+                arm_branch::<true>
+            } else {
+                arm_branch::<false>
+            }
         } else if (hi & 0xE0) == 0x80 {
-            arm_block_transfer
+            ARM_BLOCK_FNS[hi & 0x1F]
         } else if (hi & 0xE0) == 0x60 && (lo & 0x01) != 0 {
             arm_undefined
         } else if (hi & 0xC0) == 0x40 {
-            arm_single_transfer
+            ARM_SINGLE_FNS[hi & 0x3F]
         } else if hi == 0x12 && lo == 0x1 {
             arm_bx
         } else if (hi & 0xFC) == 0x00 && lo == 0x9 {
-            arm_mul
+            ARM_MUL_FNS[hi & 0x03]
         } else if (hi & 0xF8) == 0x08 && lo == 0x9 {
-            arm_mull
+            ARM_MULL_FNS[hi & 0x07]
         } else if (hi & 0xFB) == 0x10 && lo == 0x9 {
-            arm_swp
+            if (hi & 0x04) != 0 {
+                arm_swp::<true>
+            } else {
+                arm_swp::<false>
+            }
         } else if (hi & 0x20) == 0 && (lo & 0x9) == 0x9 && lo != 0x9 {
-            arm_halfword_transfer
+            ARM_HALFWORD_FNS[((hi & 0x1F) << 2) | ((lo >> 1) & 0x03)]
         } else if (hi & 0xFB) == 0x32 {
-            arm_msr_imm
+            if (hi & 0x04) != 0 {
+                arm_msr_imm::<true>
+            } else {
+                arm_msr_imm::<false>
+            }
         } else if (hi & 0xD9) == 0x10 && lo == 0x0 {
-            arm_psr_reg
+            ARM_PSR_REG_FNS[(hi >> 1) & 0x03]
         } else if (hi & 0x20) == 0 && (lo & 0x9) == 0x9 {
             arm_undefined
         } else {
-            arm_data_proc
+            let imm_bit = (hi >> 5) & 1;
+            let reg_shift = if imm_bit == 0 { lo & 1 } else { 0 };
+            ARM_DATA_PROC_FNS[((hi & 0x3F) << 1) | reg_shift]
         };
         i += 1;
     }
@@ -521,45 +629,70 @@ const fn build_thumb_lut() -> [ThumbFn; 1024] {
     while i < 1024 {
         let top = (i << 6) as u16;
         lut[i] = if (top & 0xF800) == 0x1800 {
-            thumb_add_sub
+            THUMB_ADD_SUB_FNS[((top >> 9) & 0x03) as usize]
         } else if (top & 0xE000) == 0x0000 {
-            thumb_move_shifted
+            THUMB_MOVE_SHIFTED_FNS[((top >> 11) & 0x03) as usize]
         } else if (top & 0xE000) == 0x2000 {
-            thumb_alu_imm
+            THUMB_ALU_IMM_FNS[((top >> 11) & 0x03) as usize]
         } else if (top & 0xFC00) == 0x4000 {
-            thumb_alu_reg
+            THUMB_ALU_REG_FNS[((top >> 6) & 0x0F) as usize]
         } else if (top & 0xFC00) == 0x4400 {
-            thumb_hi_reg_bx
+            THUMB_HI_REG_FNS[((top >> 6) & 0x0F) as usize]
         } else if (top & 0xF800) == 0x4800 {
             thumb_pc_ldr
         } else if (top & 0xF200) == 0x5000 {
-            thumb_ldr_str_reg
+            THUMB_LDR_STR_REG_FNS[((top >> 10) & 0x03) as usize]
         } else if (top & 0xF200) == 0x5200 {
-            thumb_ldr_str_half_sign
+            THUMB_LDR_STR_HALF_SIGN_FNS[((top >> 10) & 0x03) as usize]
         } else if (top & 0xE000) == 0x6000 {
-            thumb_ldr_str_imm
+            THUMB_LDR_STR_IMM_FNS[((top >> 11) & 0x03) as usize]
         } else if (top & 0xF000) == 0x8000 {
-            thumb_ldr_str_half_imm
+            if (top & (1 << 11)) != 0 {
+                thumb_ldr_str_half_imm::<true>
+            } else {
+                thumb_ldr_str_half_imm::<false>
+            }
         } else if (top & 0xF000) == 0x9000 {
-            thumb_ldr_str_sp
+            if (top & (1 << 11)) != 0 {
+                thumb_ldr_str_sp::<true>
+            } else {
+                thumb_ldr_str_sp::<false>
+            }
         } else if (top & 0xF000) == 0xA000 {
-            thumb_load_addr
+            if (top & (1 << 11)) != 0 {
+                thumb_load_addr::<true>
+            } else {
+                thumb_load_addr::<false>
+            }
         } else if (top & 0xFF00) == 0xB000 {
-            thumb_add_sp
+            if (top & (1 << 7)) != 0 {
+                thumb_add_sp::<true>
+            } else {
+                thumb_add_sp::<false>
+            }
         } else if (top & 0xF600) == 0xB400 {
-            thumb_push_pop
+            let idx = (((top >> 10) & 0x02) | ((top >> 8) & 0x01)) as usize;
+            THUMB_PUSH_POP_FNS[idx]
         } else if (top & 0xF000) == 0xC000 {
-            thumb_ldm_stm
+            if (top & (1 << 11)) != 0 {
+                thumb_ldm_stm::<true>
+            } else {
+                thumb_ldm_stm::<false>
+            }
         } else if (top & 0xFF00) == 0xDF00 {
             thumb_swi
         } else if (top & 0xFF00) == 0xDE00 {
             thumb_undefined
         } else if (top & 0xF000) == 0xD000 {
-            thumb_cond_branch
+            THUMB_COND_BRANCH_FNS[((top >> 8) & 0x0F) as usize]
         } else if (top & 0xF800) == 0xE000 {
             thumb_uncond_branch
         } else if (top & 0xF000) == 0xF000 {
-            thumb_long_bl
+            if (top & (1 << 11)) != 0 {
+                thumb_long_bl::<true>
+            } else {
+                thumb_long_bl::<false>
+            }
         } else {
             thumb_undefined
         };
@@ -612,10 +745,9 @@ fn arm_bx(cpu: &mut Arm7tdmi, bus: &mut SysBus, instr: u32) -> u64 {
     1
 }
 
-fn arm_branch(cpu: &mut Arm7tdmi, bus: &mut SysBus, instr: u32) -> u64 {
-    let link = (instr & (1 << 24)) != 0;
+fn arm_branch<const LINK: bool>(cpu: &mut Arm7tdmi, bus: &mut SysBus, instr: u32) -> u64 {
     let offset = (((instr & 0x00FF_FFFF) as i32) << 8) >> 6;
-    if link {
+    if LINK {
         cpu.gpr[14] = cpu.gpr[15].wrapping_sub(4);
     }
     let target = cpu.gpr[15].wrapping_add(offset as u32);
@@ -623,9 +755,9 @@ fn arm_branch(cpu: &mut Arm7tdmi, bus: &mut SysBus, instr: u32) -> u64 {
     1
 }
 
-fn arm_psr_reg(cpu: &mut Arm7tdmi, _bus: &mut SysBus, instr: u32) -> u64 {
-    let spsr_flag = (instr & (1 << 22)) != 0;
-    let is_msr = (instr & (1 << 21)) != 0;
+fn arm_psr_reg<const CFG: u8>(cpu: &mut Arm7tdmi, _bus: &mut SysBus, instr: u32) -> u64 {
+    let spsr_flag = (CFG & 2) != 0;
+    let is_msr = (CFG & 1) != 0;
     if !is_msr {
         // MRS
         let rd = ((instr >> 12) & 0xF) as usize;
@@ -642,15 +774,11 @@ fn arm_psr_reg(cpu: &mut Arm7tdmi, _bus: &mut SysBus, instr: u32) -> u64 {
     0
 }
 
-fn arm_msr_imm(cpu: &mut Arm7tdmi, _bus: &mut SysBus, instr: u32) -> u64 {
-    if (instr & (1 << 21)) == 0 {
-        return 0;
-    }
-    let spsr_flag = (instr & (1 << 22)) != 0;
+fn arm_msr_imm<const SPSR_FLAG: bool>(cpu: &mut Arm7tdmi, _bus: &mut SysBus, instr: u32) -> u64 {
     let imm8 = instr & 0xFF;
     let rot = ((instr >> 8) & 0xF) * 2;
     let val = imm8.rotate_right(rot);
-    apply_msr(cpu, spsr_flag, instr, val);
+    apply_msr(cpu, SPSR_FLAG, instr, val);
     0
 }
 
@@ -684,15 +812,15 @@ fn apply_msr(cpu: &mut Arm7tdmi, spsr_flag: bool, instr: u32, val: u32) {
     }
 }
 
-fn arm_data_proc(cpu: &mut Arm7tdmi, bus: &mut SysBus, instr: u32) -> u64 {
-    let imm = (instr & (1 << 25)) != 0;
-    let opcode = (instr >> 21) & 0xF;
-    let set_flags = (instr & (1 << 20)) != 0;
+fn arm_data_proc<const CFG: u8>(cpu: &mut Arm7tdmi, bus: &mut SysBus, instr: u32) -> u64 {
+    let imm = (CFG & 64) != 0;
+    let opcode = (CFG >> 2) & 0xF;
+    let set_flags = (CFG & 2) != 0;
+    let reg_shift = !imm && (CFG & 1) != 0;
     let rn = ((instr >> 16) & 0xF) as usize;
     let rd = ((instr >> 12) & 0xF) as usize;
 
     let mut extra_cycles = 0u64;
-    let reg_shift = !imm && (instr & (1 << 4)) != 0;
 
     let (op2, shifter_carry) = if imm {
         let imm8 = instr & 0xFF;
@@ -854,9 +982,9 @@ fn arm_data_proc(cpu: &mut Arm7tdmi, bus: &mut SysBus, instr: u32) -> u64 {
     extra_cycles
 }
 
-fn arm_mul(cpu: &mut Arm7tdmi, bus: &mut SysBus, instr: u32) -> u64 {
-    let acc = (instr & (1 << 21)) != 0;
-    let set_flags = (instr & (1 << 20)) != 0;
+fn arm_mul<const CFG: u8>(cpu: &mut Arm7tdmi, bus: &mut SysBus, instr: u32) -> u64 {
+    let acc = (CFG & 2) != 0;
+    let set_flags = (CFG & 1) != 0;
     let rd = ((instr >> 16) & 0xF) as usize;
     let rn = ((instr >> 12) & 0xF) as usize;
     let rs = ((instr >> 8) & 0xF) as usize;
@@ -880,10 +1008,10 @@ fn arm_mul(cpu: &mut Arm7tdmi, bus: &mut SysBus, instr: u32) -> u64 {
     extra
 }
 
-fn arm_mull(cpu: &mut Arm7tdmi, bus: &mut SysBus, instr: u32) -> u64 {
-    let signed = (instr & (1 << 22)) != 0;
-    let acc = (instr & (1 << 21)) != 0;
-    let set_flags = (instr & (1 << 20)) != 0;
+fn arm_mull<const CFG: u8>(cpu: &mut Arm7tdmi, bus: &mut SysBus, instr: u32) -> u64 {
+    let signed = (CFG & 4) != 0;
+    let acc = (CFG & 2) != 0;
+    let set_flags = (CFG & 1) != 0;
     let rd_hi = ((instr >> 16) & 0xF) as usize;
     let rd_lo = ((instr >> 12) & 0xF) as usize;
     let rs = ((instr >> 8) & 0xF) as usize;
@@ -921,8 +1049,7 @@ fn arm_mull(cpu: &mut Arm7tdmi, bus: &mut SysBus, instr: u32) -> u64 {
     extra
 }
 
-fn arm_swp(cpu: &mut Arm7tdmi, bus: &mut SysBus, instr: u32) -> u64 {
-    let byte = (instr & (1 << 22)) != 0;
+fn arm_swp<const BYTE: bool>(cpu: &mut Arm7tdmi, bus: &mut SysBus, instr: u32) -> u64 {
     let rn = ((instr >> 16) & 0xF) as usize;
     let rd = ((instr >> 12) & 0xF) as usize;
     let rm = (instr & 0xF) as usize;
@@ -931,7 +1058,7 @@ fn arm_swp(cpu: &mut Arm7tdmi, bus: &mut SysBus, instr: u32) -> u64 {
     let val_to_write = cpu.gpr[rm];
     let mut cycles = 1u64; // internal swap cycle
 
-    if byte {
+    if BYTE {
         let old = bus.read_8(addr, AccessType::NonSequential, cpu.gpr[15], false) as u32;
         cycles += bus.last_cycles;
         cycles += bus.write_8(addr, val_to_write as u8, AccessType::NonSequential);
@@ -950,13 +1077,13 @@ fn arm_swp(cpu: &mut Arm7tdmi, bus: &mut SysBus, instr: u32) -> u64 {
     cycles
 }
 
-fn arm_single_transfer(cpu: &mut Arm7tdmi, bus: &mut SysBus, instr: u32) -> u64 {
-    let reg_off = (instr & (1 << 25)) != 0;
-    let pre = (instr & (1 << 24)) != 0;
-    let add = (instr & (1 << 23)) != 0;
-    let byte = (instr & (1 << 22)) != 0;
-    let writeback = (instr & (1 << 21)) != 0;
-    let load = (instr & (1 << 20)) != 0;
+fn arm_single_transfer<const CFG: u8>(cpu: &mut Arm7tdmi, bus: &mut SysBus, instr: u32) -> u64 {
+    let reg_off = (CFG & 32) != 0;
+    let pre = (CFG & 16) != 0;
+    let add = (CFG & 8) != 0;
+    let byte = (CFG & 4) != 0;
+    let writeback = (CFG & 2) != 0;
+    let load = (CFG & 1) != 0;
     let rn = ((instr >> 16) & 0xF) as usize;
     let rd = ((instr >> 12) & 0xF) as usize;
 
@@ -1017,15 +1144,19 @@ fn arm_single_transfer(cpu: &mut Arm7tdmi, bus: &mut SysBus, instr: u32) -> u64 
     cyc
 }
 
-fn arm_halfword_transfer(cpu: &mut Arm7tdmi, bus: &mut SysBus, instr: u32) -> u64 {
-    let pre = (instr & (1 << 24)) != 0;
-    let add = (instr & (1 << 23)) != 0;
-    let imm = (instr & (1 << 22)) != 0;
-    let writeback = (instr & (1 << 21)) != 0;
-    let load = (instr & (1 << 20)) != 0;
+fn arm_halfword_transfer<const CFG: u8>(
+    cpu: &mut Arm7tdmi,
+    bus: &mut SysBus,
+    instr: u32,
+) -> u64 {
+    let pre = (CFG & 64) != 0;
+    let add = (CFG & 32) != 0;
+    let imm = (CFG & 16) != 0;
+    let writeback = (CFG & 8) != 0;
+    let load = (CFG & 4) != 0;
+    let sh = CFG & 3;
     let rn = ((instr >> 16) & 0xF) as usize;
     let rd = ((instr >> 12) & 0xF) as usize;
-    let sh = (instr >> 5) & 0x3;
 
     let offset = if imm {
         ((instr >> 4) & 0xF0) | (instr & 0xF)
@@ -1046,7 +1177,8 @@ fn arm_halfword_transfer(cpu: &mut Arm7tdmi, bus: &mut SysBus, instr: u32) -> u6
         let val: u32 = match sh {
             1 => {
                 // LDRH: unaligned rotates right by 8
-                let raw = bus.read_16(access_addr, AccessType::NonSequential, cpu.gpr[15], false) as u32;
+                let raw = bus.read_16(access_addr, AccessType::NonSequential, cpu.gpr[15], false)
+                    as u32;
                 cyc += bus.last_cycles;
                 if (access_addr & 1) != 0 {
                     raw.rotate_right(8)
@@ -1056,18 +1188,22 @@ fn arm_halfword_transfer(cpu: &mut Arm7tdmi, bus: &mut SysBus, instr: u32) -> u6
             }
             2 => {
                 // LDRSB
-                let v = bus.read_8(access_addr, AccessType::NonSequential, cpu.gpr[15], false) as i8 as i32 as u32;
+                let v = bus.read_8(access_addr, AccessType::NonSequential, cpu.gpr[15], false)
+                    as i8 as i32 as u32;
                 cyc += bus.last_cycles;
                 v
             }
             3 => {
                 // LDRSH: unaligned behaves like LDRSB on ARMv4T!
                 if (access_addr & 1) != 0 {
-                    let v = bus.read_8(access_addr, AccessType::NonSequential, cpu.gpr[15], false) as i8 as i32 as u32;
+                    let v = bus.read_8(access_addr, AccessType::NonSequential, cpu.gpr[15], false)
+                        as i8 as i32 as u32;
                     cyc += bus.last_cycles;
                     v
                 } else {
-                    let v = bus.read_16(access_addr, AccessType::NonSequential, cpu.gpr[15], false) as i16 as i32 as u32;
+                    let v =
+                        bus.read_16(access_addr, AccessType::NonSequential, cpu.gpr[15], false)
+                            as i16 as i32 as u32;
                     cyc += bus.last_cycles;
                     v
                 }
@@ -1101,12 +1237,12 @@ fn arm_halfword_transfer(cpu: &mut Arm7tdmi, bus: &mut SysBus, instr: u32) -> u6
     cyc
 }
 
-fn arm_block_transfer(cpu: &mut Arm7tdmi, bus: &mut SysBus, instr: u32) -> u64 {
-    let pre = (instr & (1 << 24)) != 0;
-    let inc = (instr & (1 << 23)) != 0;
-    let s_bit = (instr & (1 << 22)) != 0;
-    let writeback = (instr & (1 << 21)) != 0;
-    let load = (instr & (1 << 20)) != 0;
+fn arm_block_transfer<const CFG: u8>(cpu: &mut Arm7tdmi, bus: &mut SysBus, instr: u32) -> u64 {
+    let pre = (CFG & 16) != 0;
+    let inc = (CFG & 8) != 0;
+    let s_bit = (CFG & 4) != 0;
+    let writeback = (CFG & 2) != 0;
+    let load = (CFG & 1) != 0;
     let rn = ((instr >> 16) & 0xF) as usize;
     let rlist = instr & 0xFFFF;
 
@@ -1249,21 +1385,20 @@ fn thumb_swi(cpu: &mut Arm7tdmi, bus: &mut SysBus, instr: u16) -> u64 {
     1
 }
 
-fn thumb_move_shifted(cpu: &mut Arm7tdmi, _bus: &mut SysBus, instr: u16) -> u64 {
-    let op = ((instr >> 11) & 3) as u32;
+fn thumb_move_shifted<const OP: u8>(cpu: &mut Arm7tdmi, _bus: &mut SysBus, instr: u16) -> u64 {
     let imm5 = ((instr >> 6) & 0x1F) as u32;
     let rs = ((instr >> 3) & 0x7) as usize;
     let rd = (instr & 0x7) as usize;
 
-    let (res, c) = cpu.barrel_shift(cpu.gpr[rs], op, imm5, false);
+    let (res, c) = cpu.barrel_shift(cpu.gpr[rs], u32::from(OP), imm5, false);
     cpu.gpr[rd] = res;
     cpu.set_nzc(res, c);
     0
 }
 
-fn thumb_add_sub(cpu: &mut Arm7tdmi, _bus: &mut SysBus, instr: u16) -> u64 {
-    let imm = (instr & (1 << 10)) != 0;
-    let sub = (instr & (1 << 9)) != 0;
+fn thumb_add_sub<const CFG: u8>(cpu: &mut Arm7tdmi, _bus: &mut SysBus, instr: u16) -> u64 {
+    let imm = (CFG & 2) != 0;
+    let sub = (CFG & 1) != 0;
     let rn_imm = ((instr >> 6) & 0x7) as u32;
     let rs = ((instr >> 3) & 0x7) as usize;
     let rd = (instr & 0x7) as usize;
@@ -1281,12 +1416,11 @@ fn thumb_add_sub(cpu: &mut Arm7tdmi, _bus: &mut SysBus, instr: u16) -> u64 {
     0
 }
 
-fn thumb_alu_imm(cpu: &mut Arm7tdmi, _bus: &mut SysBus, instr: u16) -> u64 {
-    let op = (instr >> 11) & 3;
+fn thumb_alu_imm<const OP: u8>(cpu: &mut Arm7tdmi, _bus: &mut SysBus, instr: u16) -> u64 {
     let rd = ((instr >> 8) & 0x7) as usize;
     let imm = (instr & 0xFF) as u32;
 
-    match op {
+    match OP {
         0 => {
             cpu.gpr[rd] = imm;
             cpu.set_nz(imm);
@@ -1309,8 +1443,7 @@ fn thumb_alu_imm(cpu: &mut Arm7tdmi, _bus: &mut SysBus, instr: u16) -> u64 {
     0
 }
 
-fn thumb_alu_reg(cpu: &mut Arm7tdmi, bus: &mut SysBus, instr: u16) -> u64 {
-    let op = (instr >> 6) & 0xF;
+fn thumb_alu_reg<const OP: u8>(cpu: &mut Arm7tdmi, bus: &mut SysBus, instr: u16) -> u64 {
     let rs = ((instr >> 3) & 0x7) as usize;
     let rd = (instr & 0x7) as usize;
 
@@ -1318,7 +1451,7 @@ fn thumb_alu_reg(cpu: &mut Arm7tdmi, bus: &mut SysBus, instr: u16) -> u64 {
     let op2 = cpu.gpr[rs];
     let mut cyc = 0u64;
 
-    match op {
+    match OP {
         0x0 => {
             let r = op1 & op2;
             cpu.gpr[rd] = r;
@@ -1409,12 +1542,12 @@ fn thumb_alu_reg(cpu: &mut Arm7tdmi, bus: &mut SysBus, instr: u16) -> u64 {
     cyc
 }
 
-fn thumb_hi_reg_bx(cpu: &mut Arm7tdmi, bus: &mut SysBus, instr: u16) -> u64 {
-    let op = (instr >> 8) & 0x3;
-    let h1 = (instr >> 7) & 1;
-    let h2 = (instr >> 6) & 1;
-    let rs = (((h2 << 3) | ((instr >> 3) & 0x7)) & 0xF) as usize;
-    let rd = (((h1 << 3) | (instr & 0x7)) & 0xF) as usize;
+fn thumb_hi_reg_bx<const CFG: u8>(cpu: &mut Arm7tdmi, bus: &mut SysBus, instr: u16) -> u64 {
+    let op = (CFG >> 2) & 0x3;
+    let h1 = usize::from((CFG & 2) != 0);
+    let h2 = usize::from((CFG & 1) != 0);
+    let rs = (h2 << 3) | (((instr >> 3) & 0x7) as usize);
+    let rd = (h1 << 3) | ((instr & 0x7) as usize);
 
     let op1 = cpu.gpr[rd];
     let op2 = cpu.gpr[rs];
@@ -1463,9 +1596,9 @@ fn thumb_pc_ldr(cpu: &mut Arm7tdmi, bus: &mut SysBus, instr: u16) -> u64 {
     rc + 1
 }
 
-fn thumb_ldr_str_reg(cpu: &mut Arm7tdmi, bus: &mut SysBus, instr: u16) -> u64 {
-    let load = (instr & (1 << 11)) != 0;
-    let byte = (instr & (1 << 10)) != 0;
+fn thumb_ldr_str_reg<const CFG: u8>(cpu: &mut Arm7tdmi, bus: &mut SysBus, instr: u16) -> u64 {
+    let load = (CFG & 2) != 0;
+    let byte = (CFG & 1) != 0;
     let ro = ((instr >> 6) & 0x7) as usize;
     let rb = ((instr >> 3) & 0x7) as usize;
     let rd = (instr & 0x7) as usize;
@@ -1473,11 +1606,9 @@ fn thumb_ldr_str_reg(cpu: &mut Arm7tdmi, bus: &mut SysBus, instr: u16) -> u64 {
     let addr = cpu.gpr[rb].wrapping_add(cpu.gpr[ro]);
     if load {
         let val = if byte {
-            let v = bus.read_8(addr, AccessType::NonSequential, cpu.gpr[15], true) as u32;
-            v
+            bus.read_8(addr, AccessType::NonSequential, cpu.gpr[15], true) as u32
         } else {
-            let (v, _) = cpu.bus_read_32_rot(bus, addr, AccessType::NonSequential, true);
-            v
+            cpu.bus_read_32_rot(bus, addr, AccessType::NonSequential, true).0
         };
         let rc = bus.last_cycles;
         cpu.gpr[rd] = val;
@@ -1490,19 +1621,22 @@ fn thumb_ldr_str_reg(cpu: &mut Arm7tdmi, bus: &mut SysBus, instr: u16) -> u64 {
     }
 }
 
-fn thumb_ldr_str_half_sign(cpu: &mut Arm7tdmi, bus: &mut SysBus, instr: u16) -> u64 {
-    let op = (instr >> 10) & 0x3;
+fn thumb_ldr_str_half_sign<const OP: u8>(
+    cpu: &mut Arm7tdmi,
+    bus: &mut SysBus,
+    instr: u16,
+) -> u64 {
     let ro = ((instr >> 6) & 0x7) as usize;
     let rb = ((instr >> 3) & 0x7) as usize;
     let rd = (instr & 0x7) as usize;
     let addr = cpu.gpr[rb].wrapping_add(cpu.gpr[ro]);
 
-    if op == 0 {
+    if OP == 0 {
         // STRH
         return bus.write_16(addr, cpu.gpr[rd] as u16, AccessType::NonSequential);
     }
 
-    let val: u32 = match op {
+    let val: u32 = match OP {
         1 => bus.read_8(addr, AccessType::NonSequential, cpu.gpr[15], true) as i8 as i32 as u32,
         2 => {
             let raw = bus.read_16(addr, AccessType::NonSequential, cpu.gpr[15], true) as u32;
@@ -1526,9 +1660,9 @@ fn thumb_ldr_str_half_sign(cpu: &mut Arm7tdmi, bus: &mut SysBus, instr: u16) -> 
     rc + 1
 }
 
-fn thumb_ldr_str_imm(cpu: &mut Arm7tdmi, bus: &mut SysBus, instr: u16) -> u64 {
-    let byte = (instr & (1 << 12)) != 0;
-    let load = (instr & (1 << 11)) != 0;
+fn thumb_ldr_str_imm<const CFG: u8>(cpu: &mut Arm7tdmi, bus: &mut SysBus, instr: u16) -> u64 {
+    let byte = (CFG & 2) != 0;
+    let load = (CFG & 1) != 0;
     let imm5 = ((instr >> 6) & 0x1F) as u32;
     let rb = ((instr >> 3) & 0x7) as usize;
     let rd = (instr & 0x7) as usize;
@@ -1553,14 +1687,17 @@ fn thumb_ldr_str_imm(cpu: &mut Arm7tdmi, bus: &mut SysBus, instr: u16) -> u64 {
     }
 }
 
-fn thumb_ldr_str_half_imm(cpu: &mut Arm7tdmi, bus: &mut SysBus, instr: u16) -> u64 {
-    let load = (instr & (1 << 11)) != 0;
+fn thumb_ldr_str_half_imm<const LOAD: bool>(
+    cpu: &mut Arm7tdmi,
+    bus: &mut SysBus,
+    instr: u16,
+) -> u64 {
     let imm = (((instr >> 6) & 0x1F) as u32) << 1;
     let rb = ((instr >> 3) & 0x7) as usize;
     let rd = (instr & 0x7) as usize;
     let addr = cpu.gpr[rb].wrapping_add(imm);
 
-    if load {
+    if LOAD {
         let raw = bus.read_16(addr, AccessType::NonSequential, cpu.gpr[15], true) as u32;
         let rc = bus.last_cycles;
         cpu.gpr[rd] = if (addr & 1) != 0 {
@@ -1575,13 +1712,12 @@ fn thumb_ldr_str_half_imm(cpu: &mut Arm7tdmi, bus: &mut SysBus, instr: u16) -> u
     }
 }
 
-fn thumb_ldr_str_sp(cpu: &mut Arm7tdmi, bus: &mut SysBus, instr: u16) -> u64 {
-    let load = (instr & (1 << 11)) != 0;
+fn thumb_ldr_str_sp<const LOAD: bool>(cpu: &mut Arm7tdmi, bus: &mut SysBus, instr: u16) -> u64 {
     let rd = ((instr >> 8) & 0x7) as usize;
     let offset = ((instr & 0xFF) as u32) << 2;
     let addr = cpu.gpr[13].wrapping_add(offset);
 
-    if load {
+    if LOAD {
         let (val, rc) = cpu.bus_read_32_rot(bus, addr, AccessType::NonSequential, true);
         cpu.gpr[rd] = val;
         bus.step_internal(1);
@@ -1591,19 +1727,17 @@ fn thumb_ldr_str_sp(cpu: &mut Arm7tdmi, bus: &mut SysBus, instr: u16) -> u64 {
     }
 }
 
-fn thumb_load_addr(cpu: &mut Arm7tdmi, _bus: &mut SysBus, instr: u16) -> u64 {
-    let sp = (instr & (1 << 11)) != 0;
+fn thumb_load_addr<const SP: bool>(cpu: &mut Arm7tdmi, _bus: &mut SysBus, instr: u16) -> u64 {
     let rd = ((instr >> 8) & 0x7) as usize;
     let imm = ((instr & 0xFF) as u32) << 2;
-    let base = if sp { cpu.gpr[13] } else { cpu.gpr[15] & !3 };
+    let base = if SP { cpu.gpr[13] } else { cpu.gpr[15] & !3 };
     cpu.gpr[rd] = base.wrapping_add(imm);
     0
 }
 
-fn thumb_add_sp(cpu: &mut Arm7tdmi, _bus: &mut SysBus, instr: u16) -> u64 {
-    let sub = (instr & (1 << 7)) != 0;
+fn thumb_add_sp<const SUB: bool>(cpu: &mut Arm7tdmi, _bus: &mut SysBus, instr: u16) -> u64 {
     let imm = ((instr & 0x7F) as u32) << 2;
-    cpu.gpr[13] = if sub {
+    cpu.gpr[13] = if SUB {
         cpu.gpr[13].wrapping_sub(imm)
     } else {
         cpu.gpr[13].wrapping_add(imm)
@@ -1611,9 +1745,9 @@ fn thumb_add_sp(cpu: &mut Arm7tdmi, _bus: &mut SysBus, instr: u16) -> u64 {
     0
 }
 
-fn thumb_push_pop(cpu: &mut Arm7tdmi, bus: &mut SysBus, instr: u16) -> u64 {
-    let load = (instr & (1 << 11)) != 0;
-    let p_r = (instr & (1 << 8)) != 0;
+fn thumb_push_pop<const CFG: u8>(cpu: &mut Arm7tdmi, bus: &mut SysBus, instr: u16) -> u64 {
+    let load = (CFG & 2) != 0;
+    let p_r = (CFG & 1) != 0;
     let rlist = instr & 0xFF;
 
     let mut sp = cpu.gpr[13];
@@ -1694,15 +1828,14 @@ fn thumb_push_pop(cpu: &mut Arm7tdmi, bus: &mut SysBus, instr: u16) -> u64 {
     }
 }
 
-fn thumb_ldm_stm(cpu: &mut Arm7tdmi, bus: &mut SysBus, instr: u16) -> u64 {
-    let load = (instr & (1 << 11)) != 0;
+fn thumb_ldm_stm<const LOAD: bool>(cpu: &mut Arm7tdmi, bus: &mut SysBus, instr: u16) -> u64 {
     let rb = ((instr >> 8) & 0x7) as usize;
     let rlist = (instr & 0xFF) as u32;
 
     let base = cpu.gpr[rb];
     if rlist == 0 {
         let new_base = base.wrapping_add(0x40);
-        if load {
+        if LOAD {
             let v = bus.read_32(base, AccessType::NonSequential, cpu.gpr[15]);
             let rc = bus.last_cycles;
             cpu.gpr[rb] = new_base;
@@ -1723,7 +1856,7 @@ fn thumb_ldm_stm(cpu: &mut Arm7tdmi, bus: &mut SysBus, instr: u16) -> u64 {
     let mut cyc = 0u64;
     let mut first = true;
 
-    if load {
+    if LOAD {
         for r in 0..8usize {
             if (rlist & (1 << r)) != 0 {
                 let acc = if first {
@@ -1766,12 +1899,11 @@ fn thumb_ldm_stm(cpu: &mut Arm7tdmi, bus: &mut SysBus, instr: u16) -> u64 {
     }
 }
 
-fn thumb_cond_branch(cpu: &mut Arm7tdmi, bus: &mut SysBus, instr: u16) -> u64 {
-    let cond = ((instr >> 8) & 0xF) as u32;
-    if cond >= 0xE {
+fn thumb_cond_branch<const COND: u8>(cpu: &mut Arm7tdmi, bus: &mut SysBus, instr: u16) -> u64 {
+    if COND >= 0xE {
         return 0;
     }
-    if cpu.check_cond(cond) {
+    if cpu.check_cond(u32::from(COND)) {
         let offset = ((instr as i8) as i32) << 1;
         let target = cpu.gpr[15].wrapping_add(offset as u32);
         cpu.flush_pipeline(bus, target);
@@ -1786,10 +1918,9 @@ fn thumb_uncond_branch(cpu: &mut Arm7tdmi, bus: &mut SysBus, instr: u16) -> u64 
     0
 }
 
-fn thumb_long_bl(cpu: &mut Arm7tdmi, bus: &mut SysBus, instr: u16) -> u64 {
-    let h = (instr & (1 << 11)) != 0;
+fn thumb_long_bl<const SECOND: bool>(cpu: &mut Arm7tdmi, bus: &mut SysBus, instr: u16) -> u64 {
     let offset11 = (instr & 0x07FF) as u32;
-    if !h {
+    if !SECOND {
         let signed = (((offset11 as i32) << 21) >> 9) as u32;
         cpu.gpr[14] = cpu.gpr[15].wrapping_add(signed);
     } else {

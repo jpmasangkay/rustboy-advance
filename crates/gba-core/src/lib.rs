@@ -11,15 +11,18 @@ pub mod apu;
 pub mod bus;
 pub mod cartridge;
 pub mod cpu;
+pub mod gamedb;
 pub mod hw;
 pub mod ppu;
 pub mod serde_helpers;
 
-use alloc::vec::Vec;
+use alloc::{string::String, vec::Vec};
 use serde::{Deserialize, Serialize};
 
-use crate::bus::SysBus;
+pub use crate::bus::{SysBus, Watchpoint, WatchpointHit, WatchpointKind};
+use crate::cartridge::SaveType;
 use crate::cpu::Arm7tdmi;
+pub use crate::hw::{SioMode, SioResponse, SioTransfer};
 
 pub const CPU_CLOCK_HZ: u32 = 16_777_216;
 pub const CYCLES_PER_SCANLINE: u64 = 1_232;
@@ -68,7 +71,29 @@ pub enum EventType {
     DmaActivate(u8),
     ApuSampleTick,
     IrqSynchronizer,
+    SioTransferComplete,
 }
+
+impl EventType {
+    /// Returns the fixed scheduler slot index for this event variant, or `None` for `EventType::None`.
+    #[inline]
+    pub const fn slot_index(self) -> Option<usize> {
+        match self {
+            EventType::None => None,
+            EventType::PpuHDrawEnd => Some(0),
+            EventType::PpuHBlank => Some(1),
+            EventType::PpuDotStep => Some(2),
+            EventType::TimerOverflow(ch) if ch < 4 => Some(3 + ch as usize),
+            EventType::DmaActivate(ch) if ch < 4 => Some(7 + ch as usize),
+            EventType::ApuSampleTick => Some(11),
+            EventType::IrqSynchronizer => Some(12),
+            EventType::SioTransferComplete => Some(13),
+            EventType::TimerOverflow(_) | EventType::DmaActivate(_) => None,
+        }
+    }
+}
+
+pub const SCHEDULER_SLOTS: usize = 14;
 
 #[derive(Copy, Clone, Debug, Serialize, Deserialize)]
 pub struct ScheduledEvent {
@@ -91,7 +116,7 @@ impl ScheduledEvent {
 pub struct Scheduler {
     pub current_cycle: u64,
     pub next_event_cycle: u64,
-    pub events: [ScheduledEvent; 24],
+    pub events: [ScheduledEvent; SCHEDULER_SLOTS],
 }
 
 impl Scheduler {
@@ -99,47 +124,27 @@ impl Scheduler {
         Self {
             current_cycle: 0,
             next_event_cycle: u64::MAX,
-            events: [ScheduledEvent::empty(); 24],
+            events: [ScheduledEvent::empty(); SCHEDULER_SLOTS],
         }
     }
 
     pub fn schedule(&mut self, target_cycle: u64, kind: EventType) {
-        if kind == EventType::None {
+        let Some(idx) = kind.slot_index() else {
             return;
-        }
-        // Replace existing slot with same EventType if already queued.
-        let mut free_idx = None;
-        for (i, ev) in self.events.iter().enumerate() {
-            if ev.active && ev.kind == kind {
-                self.events[i].cycle = target_cycle;
-                self.recompute_next();
-                return;
-            }
-            if !ev.active && free_idx.is_none() {
-                free_idx = Some(i);
-            }
-        }
-        if let Some(idx) = free_idx {
-            self.events[idx] = ScheduledEvent {
-                cycle: target_cycle,
-                kind,
-                active: true,
-            };
-        } else {
-            // Fallback: replace the farthest inactive/latest slot only if out of 24 slots
-            log::warn!("Scheduler event table full; dropping {:?}", kind);
-        }
+        };
+        self.events[idx] = ScheduledEvent {
+            cycle: target_cycle,
+            kind,
+            active: true,
+        };
         self.recompute_next();
     }
 
     pub fn cancel(&mut self, kind: EventType) {
-        for ev in self.events.iter_mut() {
-            if ev.active && ev.kind == kind {
-                ev.active = false;
-                ev.cycle = u64::MAX;
-                ev.kind = EventType::None;
-            }
-        }
+        let Some(idx) = kind.slot_index() else {
+            return;
+        };
+        self.events[idx] = ScheduledEvent::empty();
         self.recompute_next();
     }
 
@@ -172,6 +177,74 @@ impl Scheduler {
         }
         self.next_event_cycle = min_cycle;
     }
+
+    pub fn shift_by(&mut self, delta: u64) {
+        self.current_cycle = self.current_cycle.saturating_add(delta);
+        if self.next_event_cycle != u64::MAX {
+            self.next_event_cycle = self.next_event_cycle.saturating_add(delta);
+        }
+        for ev in self.events.iter_mut() {
+            if ev.active && ev.cycle != u64::MAX {
+                ev.cycle = ev.cycle.saturating_add(delta);
+            }
+        }
+    }
+}
+
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub enum MemoryRegionKind {
+    Ewram,
+    Iwram,
+    PaletteRam,
+    Vram,
+    Oam,
+    Sram,
+}
+
+#[derive(Copy, Clone, Debug)]
+pub struct MemoryRegionSlice<'a> {
+    pub kind: MemoryRegionKind,
+    pub name: &'static str,
+    pub base: u32,
+    pub len: usize,
+    pub data: &'a [u8],
+}
+
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub enum StopReason {
+    FrameComplete,
+    Breakpoint(u32),
+    Watchpoint {
+        addr: u32,
+        pc: u32,
+        write: bool,
+        value: u32,
+    },
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct DebugControl {
+    pub breakpoints: Vec<u32>,
+    pub watchpoints: Vec<Watchpoint>,
+}
+
+impl DebugControl {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    pub fn with_breakpoints(breakpoints: &[u32]) -> Self {
+        Self {
+            breakpoints: breakpoints.to_vec(),
+            watchpoints: Vec::new(),
+        }
+    }
+}
+
+enum InternalStep {
+    Continue,
+    StoppedFrame(u64),
+    DebugStop(StopReason),
 }
 
 #[derive(Serialize, Deserialize)]
@@ -183,13 +256,20 @@ struct SaveStatePayload {
 pub struct GbaCore {
     pub cpu: Arm7tdmi,
     pub bus: SysBus,
+    pub idle_skip_enabled: bool,
+    pending_idle_check_pc: Option<u32>,
 }
 
 impl GbaCore {
     pub fn new(bios: Option<&[u8]>, rom: Vec<u8>) -> Self {
         let mut bus = SysBus::new(bios, rom);
         let cpu = Arm7tdmi::new(&mut bus);
-        Self { cpu, bus }
+        Self {
+            cpu,
+            bus,
+            idle_skip_enabled: true,
+            pending_idle_check_pc: None,
+        }
     }
 
     pub fn reset(&mut self) {
@@ -209,6 +289,8 @@ impl GbaCore {
         let rom = core::mem::take(&mut self.bus.cart.rom);
         let save_type = self.bus.cart.save_type;
         let save_type_override = self.bus.cart.save_type_override;
+        let flash_id_override = self.bus.cart.flash.id_override;
+        let idle_loop_addr = self.bus.cart.idle_loop_addr;
         let rtc_override = self.bus.cart.rtc_override;
         let solar_lux = self.bus.cart.solar_lux;
         let solar_enabled = self.bus.cart.solar_enabled;
@@ -224,10 +306,14 @@ impl GbaCore {
         let layer_mask = self.bus.ppu.layer_enable_mask;
         let chan_mask = self.bus.apu.channel_enable_mask;
         let master_vol = self.bus.apu.master_volume_pct;
+        let idle_skip_enabled = self.idle_skip_enabled;
 
         *self = Self::new(bios, rom);
+        self.idle_skip_enabled = idle_skip_enabled;
         self.bus.cart.save_type = save_type;
         self.bus.cart.set_save_type_override(save_type_override);
+        self.bus.cart.set_flash_id_override(flash_id_override);
+        self.bus.cart.idle_loop_addr = idle_loop_addr;
         self.bus.cart.rtc_override = rtc_override;
         self.bus.cart.solar_lux = solar_lux;
         self.bus.cart.solar_enabled = solar_enabled;
@@ -250,6 +336,10 @@ impl GbaCore {
         let boot_ewram = self.bus.iwram[0x7FFA] != 0;
         self.bus.iwram[0x7E00..0x8000].fill(0);
         self.cpu.halted = false;
+        self.cpu.stopped = false;
+        self.pending_idle_check_pc = None;
+        self.bus.hw.halt_requested = false;
+        self.bus.hw.stop_requested = false;
         self.bus.hw.ime = 0;
         self.bus.hw.ie = 0;
         self.bus.hw.if_flag = 0;
@@ -276,32 +366,95 @@ impl GbaCore {
 
     #[inline]
     pub fn step_one(&mut self) {
+        let _ = self.step_internal(&[], None, false);
+    }
+
+    pub fn step_one_debug(&mut self, ctrl: &DebugControl) -> Option<StopReason> {
+        let has_watchpoints = !ctrl.watchpoints.is_empty();
+        if has_watchpoints {
+            self.bus.set_watchpoints(&ctrl.watchpoints);
+        }
+        let res = match self.step_internal(&ctrl.breakpoints, None, false) {
+            InternalStep::DebugStop(reason) => Some(reason),
+            InternalStep::Continue | InternalStep::StoppedFrame(_) => None,
+        };
+        if has_watchpoints {
+            self.bus.clear_watchpoints();
+        }
+        res
+    }
+
+    fn step_internal(
+        &mut self,
+        breakpoints: &[u32],
+        halt_end_cycle: Option<u64>,
+        allow_idle_skip: bool,
+    ) -> InternalStep {
         while let Some((ev_cycle, kind)) = self.bus.scheduler.pop_due() {
             self.bus.dispatch_event(ev_cycle, kind);
         }
 
+        if self.bus.hw.stop_requested {
+            self.cpu.stopped = true;
+            self.cpu.halted = false;
+            self.bus.hw.stop_requested = false;
+        }
         if self.bus.hw.halt_requested {
-            self.cpu.halted = true;
+            if !self.cpu.stopped {
+                self.cpu.halted = true;
+            }
             self.bus.hw.halt_requested = false;
         }
 
+        if self.cpu.stopped {
+            if (self.bus.hw.ie & self.bus.hw.if_flag & hw::IRQ_STOP_WAKE_MASK) != 0 {
+                self.cpu.stopped = false;
+            } else {
+                let delta = halt_end_cycle
+                    .map(|end| end.saturating_sub(self.bus.scheduler.current_cycle).max(1))
+                    .unwrap_or(4);
+                self.bus.scheduler.shift_by(delta);
+                self.bus.hw.shift_timers_by(delta);
+                self.bus.ppu.framebuffer.fill(0x7FFF);
+                if halt_end_cycle.is_some() {
+                    return InternalStep::StoppedFrame(delta);
+                }
+                return InternalStep::Continue;
+            }
+        }
+
         if self.bus.hw.active_dma.is_some() {
+            if self.bus.watchpoint_active {
+                self.bus.debug_pc = self.cpu.current_exec_pc();
+                self.bus.watchpoint_hit = None;
+            }
             let cycles = self.bus.step_active_dma();
             self.bus.scheduler.current_cycle += cycles.max(1);
-            return;
+            if let Some(hit) = self.bus.watchpoint_hit.take() {
+                return InternalStep::DebugStop(StopReason::Watchpoint {
+                    addr: hit.addr,
+                    pc: hit.pc,
+                    write: hit.write,
+                    value: hit.value,
+                });
+            }
+            return InternalStep::Continue;
         }
 
         if self.cpu.halted {
             if (self.bus.hw.ie & self.bus.hw.if_flag) != 0 {
                 self.cpu.halted = false;
             } else {
-                let target = self.bus.scheduler.next_event_cycle;
-                if target != u64::MAX && target > self.bus.scheduler.current_cycle {
-                    self.bus.scheduler.current_cycle = target;
+                let next = match halt_end_cycle {
+                    Some(end) => self.bus.scheduler.next_event_cycle.min(end),
+                    None => self.bus.scheduler.next_event_cycle,
+                };
+                if next != u64::MAX && next > self.bus.scheduler.current_cycle {
+                    self.bus.scheduler.current_cycle = next;
                 } else {
                     self.bus.scheduler.current_cycle += 4;
                 }
-                return;
+                return InternalStep::Continue;
             }
         }
 
@@ -310,96 +463,299 @@ impl GbaCore {
             && !self.cpu.is_irq_disabled()
             && self.bus.irq_sync_delay == 0
         {
+            self.pending_idle_check_pc = None;
             self.cpu.trigger_irq(&mut self.bus);
             self.bus.scheduler.current_cycle += 3;
-            return;
+            return InternalStep::Continue;
         }
 
         if self.bus.irq_sync_delay > 0 {
             self.bus.irq_sync_delay = self.bus.irq_sync_delay.saturating_sub(1);
         }
 
+        let exec_pc = self.cpu.current_exec_pc();
+        if !breakpoints.is_empty() && breakpoints.contains(&exec_pc) {
+            return InternalStep::DebugStop(StopReason::Breakpoint(exec_pc));
+        }
+
+        if allow_idle_skip && self.pending_idle_check_pc == Some(exec_pc) {
+            self.pending_idle_check_pc = None;
+            if self.is_safe_idle_loop(exec_pc) {
+                let target = match halt_end_cycle {
+                    Some(end) => self.bus.scheduler.next_event_cycle.min(end),
+                    None => self.bus.scheduler.next_event_cycle,
+                };
+                if target != u64::MAX && target > self.bus.scheduler.current_cycle {
+                    self.bus.scheduler.current_cycle = target;
+                    return InternalStep::Continue;
+                }
+            }
+        }
+
+        if self.bus.watchpoint_active {
+            self.bus.debug_pc = exec_pc;
+            self.bus.watchpoint_hit = None;
+        }
         let cycles = self.cpu.step(&mut self.bus);
         self.bus.scheduler.current_cycle += cycles.max(1);
+
+        if allow_idle_skip {
+            let next_pc = self.cpu.current_exec_pc();
+            if next_pc <= exec_pc && !self.cpu.halted && !self.cpu.stopped {
+                self.pending_idle_check_pc = Some(next_pc);
+            } else {
+                self.pending_idle_check_pc = None;
+            }
+        }
+
+        if let Some(hit) = self.bus.watchpoint_hit.take() {
+            return InternalStep::DebugStop(StopReason::Watchpoint {
+                addr: hit.addr,
+                pc: hit.pc,
+                write: hit.write,
+                value: hit.value,
+            });
+        }
+        InternalStep::Continue
+    }
+
+    fn is_safe_idle_loop(&self, loop_start: u32) -> bool {
+        let region = (loop_start >> 24) & 0xFF;
+        if !matches!(region, 0x02 | 0x03 | 0x08..=0x0D) {
+            return false;
+        }
+        if self.bus.cart.idle_loop_addr == Some(loop_start) {
+            return true;
+        }
+        if self.cpu.is_thumb() {
+            self.is_safe_thumb_idle_loop(loop_start)
+        } else {
+            self.is_safe_arm_idle_loop(loop_start)
+        }
+    }
+
+    fn is_safe_thumb_idle_loop(&self, loop_start: u32) -> bool {
+        let mut saw_poll_load = false;
+        let mut base_regs_mask: u16 = 0;
+        let mut written_regs_mask: u16 = 0;
+
+        for i in 0..3u32 {
+            let addr = loop_start.wrapping_add(i * 2);
+            let op = self.bus.debug_read_16(addr);
+
+            if i == 0 && op == 0xE7FE {
+                return true;
+            }
+            if (op & 0xF000) == 0xD000 && (op & 0x0F00) < 0x0E00 {
+                let imm8 = (op & 0xFF) as i8 as i32;
+                let target = addr.wrapping_add(4).wrapping_add_signed(imm8 << 1);
+                return target == loop_start
+                    && saw_poll_load
+                    && (written_regs_mask & base_regs_mask) == 0;
+            }
+            if (op & 0xF800) == 0xE000 {
+                let imm11 = ((op & 0x07FF) as i32) << 21 >> 21;
+                let target = addr.wrapping_add(4).wrapping_add_signed(imm11 << 1);
+                return target == loop_start
+                    && saw_poll_load
+                    && (written_regs_mask & base_regs_mask) == 0;
+            }
+            if i == 2 {
+                return false;
+            }
+
+            match op & 0xF800 {
+                0x6800 | 0x7800 | 0x8800 => {
+                    let scale = match op & 0xF800 {
+                        0x6800 => 4,
+                        0x8800 => 2,
+                        _ => 1,
+                    };
+                    let rn = (op >> 3) & 7;
+                    let rd = op & 7;
+                    let imm = u32::from((op >> 6) & 0x1F) * scale;
+                    let eff = self.cpu.gpr[rn as usize].wrapping_add(imm);
+                    if !is_safe_idle_poll_addr(eff) {
+                        return false;
+                    }
+                    base_regs_mask |= 1 << rn;
+                    written_regs_mask |= 1 << rd;
+                    saw_poll_load = true;
+                }
+                0x5800 => {
+                    let kind_bits = op & 0xFE00;
+                    if !matches!(kind_bits, 0x5800 | 0x5A00 | 0x5C00 | 0x5E00) {
+                        return false;
+                    }
+                    let rn = (op >> 3) & 7;
+                    let rm = (op >> 6) & 7;
+                    let rd = op & 7;
+                    let eff = self.cpu.gpr[rn as usize].wrapping_add(self.cpu.gpr[rm as usize]);
+                    if !is_safe_idle_poll_addr(eff) {
+                        return false;
+                    }
+                    base_regs_mask |= (1 << rn) | (1 << rm);
+                    written_regs_mask |= 1 << rd;
+                    saw_poll_load = true;
+                }
+                0x2800 => {} // CMP Rn, #imm8 (flags only)
+                _ => {
+                    if matches!(op & 0xFFC0, 0x4200 | 0x4280 | 0x42C0) {
+                        // TST / CMP / CMN (flags only)
+                    } else if ((op & 0xE000) == 0x0000 && (op & 0xF800) != 0x1800)
+                        || (op & 0xFC00) == 0x4000
+                    {
+                        written_regs_mask |= 1 << (op & 7);
+                    } else {
+                        return false;
+                    }
+                }
+            }
+        }
+        false
+    }
+
+    fn is_safe_arm_idle_loop(&self, loop_start: u32) -> bool {
+        let mut saw_poll_load = false;
+        let mut base_regs_mask: u16 = 0;
+        let mut written_regs_mask: u16 = 0;
+
+        for i in 0..3u32 {
+            let addr = loop_start.wrapping_add(i * 4);
+            let instr = self.bus.debug_read_32(addr);
+            if (instr >> 28) == 15 {
+                return false;
+            }
+            if i == 0 && instr == 0xEAFF_FFFE {
+                return true;
+            }
+            if ((instr >> 24) & 0x0F) == 0x0A {
+                let imm24 = ((instr as i32) << 8) >> 8;
+                let target = addr.wrapping_add(8).wrapping_add_signed(imm24 << 2);
+                return target == loop_start
+                    && saw_poll_load
+                    && (written_regs_mask & base_regs_mask) == 0;
+            }
+            if i == 2 {
+                return false;
+            }
+
+            if (instr & 0x0F30_0000) == 0x0510_0000 {
+                // LDR / LDRB [Rn, #+/-imm] with P=1, W=0, L=1
+                let rn = ((instr >> 16) & 0xF) as u16;
+                let rd = ((instr >> 12) & 0xF) as u16;
+                if rn == 15 || rd == 15 {
+                    return false;
+                }
+                let off = instr & 0xFFF;
+                let base = self.cpu.gpr[rn as usize];
+                let eff = if (instr & 0x0080_0000) != 0 {
+                    base.wrapping_add(off)
+                } else {
+                    base.wrapping_sub(off)
+                };
+                if !is_safe_idle_poll_addr(eff) {
+                    return false;
+                }
+                base_regs_mask |= 1 << rn;
+                written_regs_mask |= 1 << rd;
+                saw_poll_load = true;
+            } else if (instr & 0x0F70_0090) == 0x0150_0090 && (instr & 0x0000_0060) != 0 {
+                // LDRH / LDRSB / LDRSH [Rn, #+/-imm8] with P=1, I=1, W=0, L=1
+                let rn = ((instr >> 16) & 0xF) as u16;
+                let rd = ((instr >> 12) & 0xF) as u16;
+                if rn == 15 || rd == 15 {
+                    return false;
+                }
+                let off = ((instr >> 4) & 0xF0) | (instr & 0x0F);
+                let base = self.cpu.gpr[rn as usize];
+                let eff = if (instr & 0x0080_0000) != 0 {
+                    base.wrapping_add(off)
+                } else {
+                    base.wrapping_sub(off)
+                };
+                if !is_safe_idle_poll_addr(eff) {
+                    return false;
+                }
+                base_regs_mask |= 1 << rn;
+                written_regs_mask |= 1 << rd;
+                saw_poll_load = true;
+            } else if (instr & 0x0C00_0000) == 0
+                && ((instr & 0x0200_0000) != 0 || (instr & 0x0000_0010) == 0)
+            {
+                let opcode = (instr >> 21) & 0xF;
+                let rd = ((instr >> 12) & 0xF) as u16;
+                if (0x8..=0xB).contains(&opcode) {
+                    if (instr & 0x0010_0000) == 0 {
+                        // MRS / MSR
+                        return false;
+                    }
+                } else if rd != 15 {
+                    written_regs_mask |= 1 << rd;
+                } else {
+                    return false;
+                }
+            } else {
+                return false;
+            }
+        }
+        false
     }
 
     pub fn run_frame<F: HostFrontend + ?Sized>(&mut self, frontend: &mut F) {
-        let _ = self.run_frame_with_breakpoints(frontend, &[]);
+        let _ = self.run_frame_debug(frontend, &DebugControl::default());
     }
 
-    /// Runs a single GBA frame, stopping early if an instruction PC matches `breakpoints`.
-    /// Returns `Some(hit_pc)` when halted at a breakpoint, or `None` after completing the frame.
-    pub fn run_frame_with_breakpoints<F: HostFrontend + ?Sized>(
+    /// Runs a single GBA frame with breakpoint and memory watchpoint support.
+    pub fn run_frame_debug<F: HostFrontend + ?Sized>(
         &mut self,
         frontend: &mut F,
-        breakpoints: &[u32],
-    ) -> Option<u32> {
+        ctrl: &DebugControl,
+    ) -> StopReason {
         let keypad = frontend.poll_keypad() & 0x03FF;
         self.bus.hw.update_keypad(keypad);
 
+        let has_watchpoints = !ctrl.watchpoints.is_empty();
+        if has_watchpoints {
+            self.bus.set_watchpoints(&ctrl.watchpoints);
+        }
+        let allow_idle_skip =
+            self.idle_skip_enabled && ctrl.breakpoints.is_empty() && !has_watchpoints;
+
         let end_cycle = self.bus.scheduler.current_cycle + CYCLES_PER_FRAME;
         while self.bus.scheduler.current_cycle < end_cycle {
-            while let Some((ev_cycle, kind)) = self.bus.scheduler.pop_due() {
-                self.bus.dispatch_event(ev_cycle, kind);
-            }
-
+            let step = self.step_internal(&ctrl.breakpoints, Some(end_cycle), allow_idle_skip);
             if self.bus.ppu.frame_ready {
                 frontend.present_frame(&self.bus.ppu.framebuffer);
                 self.bus.ppu.frame_ready = false;
             }
-
-            if self.bus.hw.halt_requested {
-                self.cpu.halted = true;
-                self.bus.hw.halt_requested = false;
-            }
-
-            if self.bus.hw.active_dma.is_some() {
-                let cycles = self.bus.step_active_dma();
-                self.bus.scheduler.current_cycle += cycles.max(1);
-                continue;
-            }
-
-            if self.cpu.halted {
-                if (self.bus.hw.ie & self.bus.hw.if_flag) != 0 {
-                    self.cpu.halted = false;
-                } else {
-                    let next = self.bus.scheduler.next_event_cycle.min(end_cycle);
-                    if next > self.bus.scheduler.current_cycle {
-                        self.bus.scheduler.current_cycle = next;
-                    } else {
-                        self.bus.scheduler.current_cycle += 1;
-                    }
-                    continue;
-                }
-            }
-
-            if self.bus.hw.ime != 0
-                && (self.bus.hw.ie & self.bus.hw.if_flag) != 0
-                && !self.cpu.is_irq_disabled()
-                && self.bus.irq_sync_delay == 0
-            {
-                self.cpu.trigger_irq(&mut self.bus);
-                self.bus.scheduler.current_cycle += 3;
-                continue;
-            }
-
-            if self.bus.irq_sync_delay > 0 {
-                self.bus.irq_sync_delay = self.bus.irq_sync_delay.saturating_sub(1);
-            }
-
-            if !breakpoints.is_empty() {
-                let exec_pc = self.cpu.current_exec_pc();
-                if breakpoints.contains(&exec_pc) {
+            match step {
+                InternalStep::Continue => {}
+                InternalStep::StoppedFrame(delta) => {
+                    frontend.present_frame(&self.bus.ppu.framebuffer);
                     if !self.bus.apu.output_buffer.is_empty() {
                         frontend.push_audio_samples(&self.bus.apu.output_buffer);
                         self.bus.apu.output_buffer.clear();
                     }
-                    return Some(exec_pc);
+                    let silence_samples = ((delta / APU_SAMPLE_INTERVAL).max(1) as usize) * 2;
+                    let silence = alloc::vec![0i16; silence_samples];
+                    frontend.push_audio_samples(&silence);
+                    if has_watchpoints {
+                        self.bus.clear_watchpoints();
+                    }
+                    return StopReason::FrameComplete;
+                }
+                InternalStep::DebugStop(reason) => {
+                    if !self.bus.apu.output_buffer.is_empty() {
+                        frontend.push_audio_samples(&self.bus.apu.output_buffer);
+                        self.bus.apu.output_buffer.clear();
+                    }
+                    if has_watchpoints {
+                        self.bus.clear_watchpoints();
+                    }
+                    return reason;
                 }
             }
-
-            let cycles = self.cpu.step(&mut self.bus);
-            self.bus.scheduler.current_cycle += cycles.max(1);
         }
 
         while let Some((ev_cycle, kind)) = self.bus.scheduler.pop_due() {
@@ -415,10 +771,27 @@ impl GbaCore {
             frontend.push_audio_samples(&self.bus.apu.output_buffer);
             self.bus.apu.output_buffer.clear();
         }
-        None
+        if has_watchpoints {
+            self.bus.clear_watchpoints();
+        }
+        StopReason::FrameComplete
     }
 
-    pub fn save_state(&self) -> Result<Vec<u8>, postcard::Error> {
+    /// Runs a single GBA frame, stopping early if an instruction PC matches `breakpoints`.
+    /// Returns `Some(hit_pc)` when halted at a breakpoint, or `None` after completing the frame.
+    pub fn run_frame_with_breakpoints<F: HostFrontend + ?Sized>(
+        &mut self,
+        frontend: &mut F,
+        breakpoints: &[u32],
+    ) -> Option<u32> {
+        let ctrl = DebugControl::with_breakpoints(breakpoints);
+        match self.run_frame_debug(frontend, &ctrl) {
+            StopReason::Breakpoint(pc) => Some(pc),
+            StopReason::FrameComplete | StopReason::Watchpoint { .. } => None,
+        }
+    }
+
+    pub fn save_state(&self) -> Result<Vec<u8>, SaveStateError> {
         let mut bus_clone = self.bus.clone();
         // Avoid duplicating multi-megabyte immutable ROM inside save state files.
         bus_clone.cart.rom.clear();
@@ -426,17 +799,269 @@ impl GbaCore {
             cpu: self.cpu.clone(),
             bus: bus_clone,
         };
-        postcard::to_allocvec(&payload)
+        let raw = postcard::to_allocvec(&payload).map_err(|_| SaveStateError::Corrupt)?;
+        let payload_len = u32::try_from(raw.len()).map_err(|_| SaveStateError::Corrupt)?;
+        let compressed = lz4_flex::block::compress(&raw);
+
+        let mut out = Vec::with_capacity(STATE_HEADER_LEN + compressed.len());
+        out.extend_from_slice(&STATE_MAGIC);
+        out.extend_from_slice(&STATE_VERSION.to_le_bytes());
+        out.extend_from_slice(&self.rom_crc32().to_le_bytes());
+        out.extend_from_slice(&payload_len.to_le_bytes());
+        out.extend_from_slice(&compressed);
+        Ok(out)
     }
 
-    pub fn load_state(&mut self, bytes: &[u8]) -> Result<(), postcard::Error> {
-        let mut payload: SaveStatePayload = postcard::from_bytes(bytes)?;
+    pub fn load_state(&mut self, bytes: &[u8]) -> Result<(), SaveStateError> {
+        let header = state_info(bytes)?;
+        if header.version != STATE_VERSION {
+            return Err(SaveStateError::VersionMismatch);
+        }
+        let expected_crc = self.rom_crc32();
+        if header.rom_crc32 != expected_crc {
+            return Err(SaveStateError::RomMismatch {
+                expected: expected_crc,
+                found: header.rom_crc32,
+            });
+        }
+
+        let payload_len = header.payload_len as usize;
+        if payload_len == 0 || payload_len > MAX_STATE_PAYLOAD_LEN {
+            return Err(SaveStateError::Corrupt);
+        }
+        let compressed = &bytes[STATE_HEADER_LEN..];
+        if compressed.is_empty() {
+            return Err(SaveStateError::Corrupt);
+        }
+
+        let uncompressed = lz4_flex::block::decompress(compressed, payload_len)
+            .map_err(|_| SaveStateError::Corrupt)?;
+        if uncompressed.len() != payload_len {
+            return Err(SaveStateError::Corrupt);
+        }
+
+        let (mut payload, remaining): (SaveStatePayload, &[u8]) =
+            postcard::take_from_bytes(&uncompressed).map_err(|_| SaveStateError::Corrupt)?;
+        if !remaining.is_empty() {
+            return Err(SaveStateError::Corrupt);
+        }
+
         let rom = core::mem::take(&mut self.bus.cart.rom);
         payload.bus.cart.rom = rom;
         payload.bus.rebuild_fastmem();
+        payload.bus.clear_watchpoints();
         self.cpu = payload.cpu;
         self.bus = payload.bus;
+        self.pending_idle_check_pc = None;
         Ok(())
     }
+
+    #[inline]
+    pub fn state_info(bytes: &[u8]) -> Result<StateHeader, SaveStateError> {
+        state_info(bytes)
+    }
+
+    #[inline]
+    pub fn peek8(&self, addr: u32) -> u8 {
+        self.bus.debug_read_8(addr)
+    }
+
+    #[inline]
+    pub fn peek16(&self, addr: u32) -> u16 {
+        self.bus.debug_read_16(addr)
+    }
+
+    #[inline]
+    pub fn peek32(&self, addr: u32) -> u32 {
+        self.bus.debug_read_32(addr)
+    }
+
+    #[inline]
+    pub fn poke8(&mut self, addr: u32, val: u8) {
+        self.bus.debug_write_8(addr, val);
+    }
+
+    #[inline]
+    pub fn poke16(&mut self, addr: u32, val: u16) {
+        self.bus.debug_write_16(addr, val);
+    }
+
+    #[inline]
+    pub fn poke32(&mut self, addr: u32, val: u32) {
+        self.bus.debug_write_32(addr, val);
+    }
+
+    pub fn memory_regions(&self) -> [MemoryRegionSlice<'_>; 6] {
+        let sram_slice = match self.bus.cart.effective_save_type() {
+            SaveType::Flash64K => &self.bus.cart.sram[..0x10000],
+            SaveType::Flash128K => &self.bus.cart.sram[..0x20000],
+            SaveType::Eeprom512B => &self.bus.cart.sram[..512],
+            SaveType::Eeprom8K => &self.bus.cart.sram[..0x2000],
+            SaveType::Sram32K | SaveType::None => &self.bus.cart.sram[..0x8000],
+        };
+        [
+            MemoryRegionSlice {
+                kind: MemoryRegionKind::Ewram,
+                name: "EWRAM",
+                base: 0x0200_0000,
+                len: self.bus.ewram.len(),
+                data: &self.bus.ewram[..],
+            },
+            MemoryRegionSlice {
+                kind: MemoryRegionKind::Iwram,
+                name: "IWRAM",
+                base: 0x0300_0000,
+                len: self.bus.iwram.len(),
+                data: &self.bus.iwram[..],
+            },
+            MemoryRegionSlice {
+                kind: MemoryRegionKind::PaletteRam,
+                name: "Palette RAM",
+                base: 0x0500_0000,
+                len: self.bus.ppu.pram.len(),
+                data: &self.bus.ppu.pram[..],
+            },
+            MemoryRegionSlice {
+                kind: MemoryRegionKind::Vram,
+                name: "VRAM",
+                base: 0x0600_0000,
+                len: self.bus.ppu.vram.len(),
+                data: &self.bus.ppu.vram[..],
+            },
+            MemoryRegionSlice {
+                kind: MemoryRegionKind::Oam,
+                name: "OAM",
+                base: 0x0700_0000,
+                len: self.bus.ppu.oam.len(),
+                data: &self.bus.ppu.oam[..],
+            },
+            MemoryRegionSlice {
+                kind: MemoryRegionKind::Sram,
+                name: "SRAM",
+                base: 0x0E00_0000,
+                len: sram_slice.len(),
+                data: sram_slice,
+            },
+        ]
+    }
+
+    #[inline]
+    pub fn rom_crc32(&self) -> u32 {
+        self.bus.cart.rom_crc32
+    }
+
+    #[inline]
+    pub fn game_code(&self) -> String {
+        self.bus.cart.game_code()
+    }
+
+    /// Returns whether an external link cable is attached for SIO transfers.
+    ///
+    /// When `false` (the default), internal-clock Normal and Multiplayer transfers complete
+    /// automatically after their cycle duration; when `true`, initiated transfers are staged for
+    /// [`Self::take_pending_sio_transfer`] and completed via [`Self::complete_sio_transfer`].
+    #[inline]
+    pub fn link_connected(&self) -> bool {
+        self.bus.hw.link_connected
+    }
+
+    /// Enables or disables external link-cable mode for SIO transfers.
+    #[inline]
+    pub fn set_link_connected(&mut self, connected: bool) {
+        self.bus.hw.link_connected = connected;
+        if !connected {
+            self.bus.hw.pending_sio_transfer = None;
+        }
+    }
+
+    /// Pops a queued outgoing SIO transfer when [`Self::link_connected`] is `true`.
+    #[inline]
+    pub fn take_pending_sio_transfer(&mut self) -> Option<SioTransfer> {
+        self.bus.hw.pending_sio_transfer.take()
+    }
+
+    /// Applies peer response data from a link cable, clearing busy status and firing `IRQ_SERIAL`
+    /// if enabled in `SIOCNT`.
+    #[inline]
+    pub fn complete_sio_transfer(&mut self, response: SioResponse) {
+        self.bus.complete_sio_transfer(response);
+    }
 }
+
+#[inline]
+fn is_safe_idle_poll_addr(addr: u32) -> bool {
+    match addr >> 24 {
+        0x02 | 0x03 => true,
+        0x04 => matches!(
+            addr & 0xFFFF_FFFE,
+            0x0400_0004
+                | 0x0400_0006
+                | 0x0400_0128
+                | 0x0400_0130
+                | 0x0400_0200
+                | 0x0400_0202
+        ),
+        _ => false,
+    }
+}
+
+pub const STATE_MAGIC: [u8; 4] = *b"RBAS";
+pub const STATE_VERSION: u16 = 1;
+const STATE_HEADER_LEN: usize = 14;
+const MAX_STATE_PAYLOAD_LEN: usize = 8 * 1024 * 1024;
+
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub struct StateHeader {
+    pub magic: [u8; 4],
+    pub version: u16,
+    pub rom_crc32: u32,
+    pub payload_len: u32,
+}
+
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub enum SaveStateError {
+    BadMagic,
+    VersionMismatch,
+    RomMismatch { expected: u32, found: u32 },
+    Corrupt,
+}
+
+impl core::fmt::Display for SaveStateError {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        match *self {
+            Self::BadMagic => write!(f, "invalid save state magic (expected RBAS)"),
+            Self::VersionMismatch => write!(f, "unsupported save state format version"),
+            Self::RomMismatch { expected, found } => write!(
+                f,
+                "save state ROM mismatch (expected CRC32 {expected:#010X}, found {found:#010X})"
+            ),
+            Self::Corrupt => write!(f, "corrupt save state payload"),
+        }
+    }
+}
+
+impl core::error::Error for SaveStateError {}
+
+/// Parses and validates the `RBAS` save state header without decompressing the payload.
+pub fn state_info(bytes: &[u8]) -> Result<StateHeader, SaveStateError> {
+    if bytes.len() >= 4 && bytes[..4] != STATE_MAGIC {
+        return Err(SaveStateError::BadMagic);
+    }
+    if bytes.len() < STATE_HEADER_LEN {
+        return Err(SaveStateError::Corrupt);
+    }
+
+    let magic = [bytes[0], bytes[1], bytes[2], bytes[3]];
+    let version = u16::from_le_bytes([bytes[4], bytes[5]]);
+    let rom_crc32 = u32::from_le_bytes([bytes[6], bytes[7], bytes[8], bytes[9]]);
+    let payload_len = u32::from_le_bytes([bytes[10], bytes[11], bytes[12], bytes[13]]);
+
+    Ok(StateHeader {
+        magic,
+        version,
+        rom_crc32,
+        payload_len,
+    })
+}
+
 

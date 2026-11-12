@@ -15,7 +15,7 @@ pub struct RecentRomEntry {
     pub code: String,
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub enum GbaButton {
     A,
     B,
@@ -74,7 +74,422 @@ impl GbaButton {
     }
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub enum ControlTarget {
+    Button(GbaButton),
+    TurboA,
+    TurboB,
+}
+
+impl ControlTarget {
+    pub const ALL: [ControlTarget; 12] = [
+        ControlTarget::Button(GbaButton::Up),
+        ControlTarget::Button(GbaButton::Down),
+        ControlTarget::Button(GbaButton::Left),
+        ControlTarget::Button(GbaButton::Right),
+        ControlTarget::Button(GbaButton::A),
+        ControlTarget::Button(GbaButton::B),
+        ControlTarget::Button(GbaButton::L),
+        ControlTarget::Button(GbaButton::R),
+        ControlTarget::Button(GbaButton::Start),
+        ControlTarget::Button(GbaButton::Select),
+        ControlTarget::TurboA,
+        ControlTarget::TurboB,
+    ];
+
+    pub const fn label(self) -> &'static str {
+        match self {
+            Self::Button(btn) => btn.label(),
+            Self::TurboA => "Turbo A (Autofire)",
+            Self::TurboB => "Turbo B (Autofire)",
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub enum GamepadButtonCode {
+    South,
+    East,
+    North,
+    West,
+    C,
+    Z,
+    LeftTrigger,
+    LeftTrigger2,
+    RightTrigger,
+    RightTrigger2,
+    Select,
+    Start,
+    Mode,
+    LeftThumb,
+    RightThumb,
+    DPadUp,
+    DPadDown,
+    DPadLeft,
+    DPadRight,
+}
+
+impl GamepadButtonCode {
+    pub const fn label(self) -> &'static str {
+        match self {
+            Self::South => "Face South (A/Cross)",
+            Self::East => "Face East (B/Circle)",
+            Self::North => "Face North (Y/Triangle)",
+            Self::West => "Face West (X/Square)",
+            Self::C => "Button C",
+            Self::Z => "Button Z",
+            Self::LeftTrigger => "LB / L1",
+            Self::LeftTrigger2 => "LT / L2",
+            Self::RightTrigger => "RB / R1",
+            Self::RightTrigger2 => "RT / R2",
+            Self::Select => "Back / Select",
+            Self::Start => "Start / Options",
+            Self::Mode => "Guide / Home",
+            Self::LeftThumb => "L3 (Left Stick)",
+            Self::RightThumb => "R3 (Right Stick)",
+            Self::DPadUp => "D-Pad Up",
+            Self::DPadDown => "D-Pad Down",
+            Self::DPadLeft => "D-Pad Left",
+            Self::DPadRight => "D-Pad Right",
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub enum GamepadAxisCode {
+    LeftStickX,
+    LeftStickY,
+    RightStickX,
+    RightStickY,
+    DPadX,
+    DPadY,
+    LeftZ,
+    RightZ,
+}
+
+impl GamepadAxisCode {
+    pub const fn label(self) -> &'static str {
+        match self {
+            Self::LeftStickX => "Left Stick X",
+            Self::LeftStickY => "Left Stick Y",
+            Self::RightStickX => "Right Stick X",
+            Self::RightStickY => "Right Stick Y",
+            Self::DPadX => "D-Pad Axis X",
+            Self::DPadY => "D-Pad Axis Y",
+            Self::LeftZ => "Left Trigger Axis",
+            Self::RightZ => "Right Trigger Axis",
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub enum GamepadInput {
+    Button(GamepadButtonCode),
+    AxisNegative(GamepadAxisCode),
+    AxisPositive(GamepadAxisCode),
+}
+
+impl GamepadInput {
+    pub fn label(self) -> String {
+        match self {
+            Self::Button(b) => b.label().to_string(),
+            Self::AxisNegative(a) => format!("{} (-)", a.label()),
+            Self::AxisPositive(a) => format!("{} (+)", a.label()),
+        }
+    }
+}
+
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct GamepadBindings {
+    pub a: Option<GamepadInput>,
+    pub b: Option<GamepadInput>,
+    pub select: Option<GamepadInput>,
+    pub start: Option<GamepadInput>,
+    pub right: Option<GamepadInput>,
+    pub left: Option<GamepadInput>,
+    pub up: Option<GamepadInput>,
+    pub down: Option<GamepadInput>,
+    pub r: Option<GamepadInput>,
+    pub l: Option<GamepadInput>,
+    pub turbo_a: Option<GamepadInput>,
+    pub turbo_b: Option<GamepadInput>,
+    pub left_stick_as_dpad: bool,
+}
+
+impl Default for GamepadBindings {
+    fn default() -> Self {
+        use GamepadButtonCode as B;
+        Self {
+            a: Some(GamepadInput::Button(B::East)),
+            b: Some(GamepadInput::Button(B::South)),
+            select: Some(GamepadInput::Button(B::Select)),
+            start: Some(GamepadInput::Button(B::Start)),
+            right: Some(GamepadInput::Button(B::DPadRight)),
+            left: Some(GamepadInput::Button(B::DPadLeft)),
+            up: Some(GamepadInput::Button(B::DPadUp)),
+            down: Some(GamepadInput::Button(B::DPadDown)),
+            r: Some(GamepadInput::Button(B::RightTrigger)),
+            l: Some(GamepadInput::Button(B::LeftTrigger)),
+            turbo_a: Some(GamepadInput::Button(B::North)),
+            turbo_b: Some(GamepadInput::Button(B::West)),
+            left_stick_as_dpad: true,
+        }
+    }
+}
+
+impl GamepadBindings {
+    pub fn get(&self, target: ControlTarget) -> Option<GamepadInput> {
+        match target {
+            ControlTarget::Button(GbaButton::A) => self.a,
+            ControlTarget::Button(GbaButton::B) => self.b,
+            ControlTarget::Button(GbaButton::Select) => self.select,
+            ControlTarget::Button(GbaButton::Start) => self.start,
+            ControlTarget::Button(GbaButton::Right) => self.right,
+            ControlTarget::Button(GbaButton::Left) => self.left,
+            ControlTarget::Button(GbaButton::Up) => self.up,
+            ControlTarget::Button(GbaButton::Down) => self.down,
+            ControlTarget::Button(GbaButton::R) => self.r,
+            ControlTarget::Button(GbaButton::L) => self.l,
+            ControlTarget::TurboA => self.turbo_a,
+            ControlTarget::TurboB => self.turbo_b,
+        }
+    }
+
+    pub fn set(&mut self, target: ControlTarget, input: Option<GamepadInput>) {
+        let slot = match target {
+            ControlTarget::Button(GbaButton::A) => &mut self.a,
+            ControlTarget::Button(GbaButton::B) => &mut self.b,
+            ControlTarget::Button(GbaButton::Select) => &mut self.select,
+            ControlTarget::Button(GbaButton::Start) => &mut self.start,
+            ControlTarget::Button(GbaButton::Right) => &mut self.right,
+            ControlTarget::Button(GbaButton::Left) => &mut self.left,
+            ControlTarget::Button(GbaButton::Up) => &mut self.up,
+            ControlTarget::Button(GbaButton::Down) => &mut self.down,
+            ControlTarget::Button(GbaButton::R) => &mut self.r,
+            ControlTarget::Button(GbaButton::L) => &mut self.l,
+            ControlTarget::TurboA => &mut self.turbo_a,
+            ControlTarget::TurboB => &mut self.turbo_b,
+        };
+        *slot = input;
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize, Default)]
+pub enum AutofireMode {
+    #[default]
+    Hold,
+    Toggle,
+}
+
+impl AutofireMode {
+    pub const fn label(self) -> &'static str {
+        match self {
+            Self::Hold => "Hold (while pressed)",
+            Self::Toggle => "Toggle (press to latch)",
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub enum HotkeyAction {
+    SaveState,
+    LoadState,
+    Rewind,
+    FastForward,
+    Pause,
+    Screenshot,
+    FrameAdvance,
+    HardReset,
+    Mute,
+    Fullscreen,
+    StateManager,
+}
+
+impl HotkeyAction {
+    pub const ALL: [HotkeyAction; 11] = [
+        Self::Pause,
+        Self::FastForward,
+        Self::Rewind,
+        Self::FrameAdvance,
+        Self::SaveState,
+        Self::LoadState,
+        Self::StateManager,
+        Self::Screenshot,
+        Self::HardReset,
+        Self::Mute,
+        Self::Fullscreen,
+    ];
+
+    pub const fn label(self) -> &'static str {
+        match self {
+            Self::SaveState => "Quick Save (Slot 1)",
+            Self::LoadState => "Quick Load (Slot 1)",
+            Self::Rewind => "Rewind (Hold)",
+            Self::FastForward => "Fast-Forward (Hold)",
+            Self::Pause => "Pause / Resume",
+            Self::Screenshot => "Take Screenshot",
+            Self::FrameAdvance => "Frame Advance",
+            Self::HardReset => "Hard Reset",
+            Self::Mute => "Mute / Unmute Audio",
+            Self::Fullscreen => "Toggle Fullscreen",
+            Self::StateManager => "Save State Manager",
+        }
+    }
+
+    pub const fn is_hold_action(self) -> bool {
+        matches!(self, Self::Rewind | Self::FastForward)
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub struct HotkeyChord {
+    pub key: String,
+    #[serde(default)]
+    pub ctrl: bool,
+    #[serde(default)]
+    pub shift: bool,
+    #[serde(default)]
+    pub alt: bool,
+}
+
+impl HotkeyChord {
+    pub fn simple(key: &str) -> Self {
+        Self {
+            key: key.to_string(),
+            ctrl: false,
+            shift: false,
+            alt: false,
+        }
+    }
+
+    pub fn with_ctrl(key: &str) -> Self {
+        Self {
+            key: key.to_string(),
+            ctrl: true,
+            shift: false,
+            alt: false,
+        }
+    }
+
+    pub fn with_shift(key: &str) -> Self {
+        Self {
+            key: key.to_string(),
+            ctrl: false,
+            shift: true,
+            alt: false,
+        }
+    }
+
+    pub fn egui_key(&self) -> Option<Key> {
+        parse_key_name(&self.key)
+    }
+
+    pub fn display(&self) -> String {
+        let mut parts = Vec::new();
+        if self.ctrl {
+            parts.push("Ctrl");
+        }
+        if self.shift {
+            parts.push("Shift");
+        }
+        if self.alt {
+            parts.push("Alt");
+        }
+        parts.push(&self.key);
+        parts.join("+")
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct HotkeyBindings {
+    pub save_state: Option<HotkeyChord>,
+    pub load_state: Option<HotkeyChord>,
+    pub rewind: Option<HotkeyChord>,
+    pub fast_forward: Option<HotkeyChord>,
+    pub pause: Option<HotkeyChord>,
+    pub screenshot: Option<HotkeyChord>,
+    pub frame_advance: Option<HotkeyChord>,
+    pub hard_reset: Option<HotkeyChord>,
+    pub mute: Option<HotkeyChord>,
+    pub fullscreen: Option<HotkeyChord>,
+    pub state_manager: Option<HotkeyChord>,
+}
+
+impl Default for HotkeyBindings {
+    fn default() -> Self {
+        Self {
+            save_state: Some(HotkeyChord::simple("F1")),
+            load_state: Some(HotkeyChord::with_shift("F1")),
+            rewind: Some(HotkeyChord::simple("R")),
+            fast_forward: Some(HotkeyChord::simple("Tab")),
+            pause: Some(HotkeyChord::simple("Space")),
+            screenshot: Some(HotkeyChord::simple("F12")),
+            frame_advance: Some(HotkeyChord::with_ctrl("N")),
+            hard_reset: Some(HotkeyChord::with_ctrl("R")),
+            mute: Some(HotkeyChord::with_ctrl("M")),
+            fullscreen: Some(HotkeyChord::simple("F11")),
+            state_manager: Some(HotkeyChord::simple("F6")),
+        }
+    }
+}
+
+impl HotkeyBindings {
+    pub fn get(&self, action: HotkeyAction) -> Option<&HotkeyChord> {
+        match action {
+            HotkeyAction::SaveState => self.save_state.as_ref(),
+            HotkeyAction::LoadState => self.load_state.as_ref(),
+            HotkeyAction::Rewind => self.rewind.as_ref(),
+            HotkeyAction::FastForward => self.fast_forward.as_ref(),
+            HotkeyAction::Pause => self.pause.as_ref(),
+            HotkeyAction::Screenshot => self.screenshot.as_ref(),
+            HotkeyAction::FrameAdvance => self.frame_advance.as_ref(),
+            HotkeyAction::HardReset => self.hard_reset.as_ref(),
+            HotkeyAction::Mute => self.mute.as_ref(),
+            HotkeyAction::Fullscreen => self.fullscreen.as_ref(),
+            HotkeyAction::StateManager => self.state_manager.as_ref(),
+        }
+    }
+
+    pub fn set(&mut self, action: HotkeyAction, chord: Option<HotkeyChord>) {
+        let slot = match action {
+            HotkeyAction::SaveState => &mut self.save_state,
+            HotkeyAction::LoadState => &mut self.load_state,
+            HotkeyAction::Rewind => &mut self.rewind,
+            HotkeyAction::FastForward => &mut self.fast_forward,
+            HotkeyAction::Pause => &mut self.pause,
+            HotkeyAction::Screenshot => &mut self.screenshot,
+            HotkeyAction::FrameAdvance => &mut self.frame_advance,
+            HotkeyAction::HardReset => &mut self.hard_reset,
+            HotkeyAction::Mute => &mut self.mute,
+            HotkeyAction::Fullscreen => &mut self.fullscreen,
+            HotkeyAction::StateManager => &mut self.state_manager,
+        };
+        *slot = chord;
+    }
+
+    pub fn display(&self, action: HotkeyAction) -> String {
+        self.get(action)
+            .map(HotkeyChord::display)
+            .unwrap_or_else(|| "Unbound".to_string())
+    }
+}
+
+fn default_turbo_a() -> Option<String> {
+    Some("V".to_string())
+}
+
+fn default_turbo_b() -> Option<String> {
+    Some("C".to_string())
+}
+
+fn default_autofire_interval() -> u8 {
+    4
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
 pub struct KeyBindings {
     pub a: String,
     pub b: String,
@@ -86,6 +501,18 @@ pub struct KeyBindings {
     pub down: String,
     pub r: String,
     pub l: String,
+    #[serde(default = "default_turbo_a")]
+    pub turbo_a: Option<String>,
+    #[serde(default = "default_turbo_b")]
+    pub turbo_b: Option<String>,
+    #[serde(default)]
+    pub autofire_mode: AutofireMode,
+    #[serde(default = "default_autofire_interval")]
+    pub autofire_interval_frames: u8,
+    #[serde(default)]
+    pub gamepad: GamepadBindings,
+    #[serde(default)]
+    pub hotkeys: HotkeyBindings,
 }
 
 impl Default for KeyBindings {
@@ -101,6 +528,12 @@ impl Default for KeyBindings {
             down: "ArrowDown".to_string(),
             r: "E".to_string(),
             l: "Q".to_string(),
+            turbo_a: default_turbo_a(),
+            turbo_b: default_turbo_b(),
+            autofire_mode: AutofireMode::Hold,
+            autofire_interval_frames: default_autofire_interval(),
+            gamepad: GamepadBindings::default(),
+            hotkeys: HotkeyBindings::default(),
         }
     }
 }
@@ -139,6 +572,35 @@ impl KeyBindings {
 
     pub fn egui_key(&self, btn: GbaButton) -> Option<Key> {
         parse_key_name(self.key_name(btn))
+    }
+
+    pub fn target_key_name(&self, target: ControlTarget) -> Option<&str> {
+        match target {
+            ControlTarget::Button(btn) => {
+                let s = self.key_name(btn);
+                if s.is_empty() {
+                    None
+                } else {
+                    Some(s)
+                }
+            }
+            ControlTarget::TurboA => self.turbo_a.as_deref(),
+            ControlTarget::TurboB => self.turbo_b.as_deref(),
+        }
+    }
+
+    pub fn set_target_key_name(&mut self, target: ControlTarget, name: Option<String>) {
+        match target {
+            ControlTarget::Button(btn) => {
+                self.set_key_name(btn, name.unwrap_or_default());
+            }
+            ControlTarget::TurboA => self.turbo_a = name,
+            ControlTarget::TurboB => self.turbo_b = name,
+        }
+    }
+
+    pub fn target_egui_key(&self, target: ControlTarget) -> Option<Key> {
+        self.target_key_name(target).and_then(parse_key_name)
     }
 }
 
@@ -288,12 +750,57 @@ impl RomPlaytime {
 }
 
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
+#[serde(default)]
 pub struct RomSpecificSettings {
     pub save_override: Option<SaveOverrideChoice>,
     pub rtc_override: Option<bool>,
     pub solar_lux: Option<u8>,
     pub cheats: Vec<CheatEntry>,
     pub custom_color_profile: Option<ColorProfileChoice>,
+    pub speed_multiplier: Option<f32>,
+    pub rumble_enabled: Option<bool>,
+    pub solar_enabled: Option<bool>,
+    pub tilt_enabled: Option<bool>,
+    pub gyro_enabled: Option<bool>,
+}
+
+impl RomSpecificSettings {
+    pub fn is_empty(&self) -> bool {
+        self.save_override.is_none()
+            && self.rtc_override.is_none()
+            && self.solar_lux.is_none()
+            && self.cheats.is_empty()
+            && self.custom_color_profile.is_none()
+            && self.speed_multiplier.is_none()
+            && self.rumble_enabled.is_none()
+            && self.solar_enabled.is_none()
+            && self.tilt_enabled.is_none()
+            && self.gyro_enabled.is_none()
+    }
+}
+
+pub fn game_settings_key(code: &str, rom_crc32: u32) -> String {
+    format!("{code}_{rom_crc32:08X}")
+}
+
+fn default_rewind_enabled() -> bool {
+    true
+}
+
+fn default_rewind_budget_mb() -> u32 {
+    64
+}
+
+fn default_rewind_interval() -> u8 {
+    1
+}
+
+fn default_rewind_speed() -> u8 {
+    1
+}
+
+fn default_fast_forward_speed() -> f32 {
+    4.0
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -312,6 +819,8 @@ pub struct AppConfig {
     pub master_volume: u8,
     pub muted: bool,
     pub speed_multiplier: f32,
+    #[serde(default = "default_fast_forward_speed")]
+    pub fast_forward_speed: f32,
     pub layer_mask: u8,
     pub audio_channel_mask: u8,
     pub keybindings: KeyBindings,
@@ -325,6 +834,14 @@ pub struct AppConfig {
     pub rumble_enabled: bool,
     pub pause_overlay_enabled: bool,
     pub playtimes: BTreeMap<String, RomPlaytime>,
+    #[serde(default = "default_rewind_enabled")]
+    pub rewind_enabled: bool,
+    #[serde(default = "default_rewind_budget_mb")]
+    pub rewind_budget_mb: u32,
+    #[serde(default = "default_rewind_interval")]
+    pub rewind_interval: u8,
+    #[serde(default = "default_rewind_speed")]
+    pub rewind_speed: u8,
 }
 
 impl Default for AppConfig {
@@ -343,6 +860,7 @@ impl Default for AppConfig {
             master_volume: 100,
             muted: false,
             speed_multiplier: 1.0,
+            fast_forward_speed: default_fast_forward_speed(),
             layer_mask: 0x1F,
             audio_channel_mask: 0x3F,
             keybindings: KeyBindings::default(),
@@ -356,6 +874,10 @@ impl Default for AppConfig {
             rumble_enabled: true,
             pause_overlay_enabled: true,
             playtimes: BTreeMap::new(),
+            rewind_enabled: default_rewind_enabled(),
+            rewind_budget_mb: default_rewind_budget_mb(),
+            rewind_interval: default_rewind_interval(),
+            rewind_speed: default_rewind_speed(),
         }
     }
 }
@@ -413,5 +935,89 @@ impl AppConfig {
         );
         self.recent_roms.truncate(10);
         self.save();
+    }
+
+    pub fn get_game_settings(&self, code: &str, rom_crc32: u32) -> Option<&RomSpecificSettings> {
+        let exact_key = game_settings_key(code, rom_crc32);
+        self.per_rom
+            .get(&exact_key)
+            .or_else(|| self.per_rom.get(code))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_playtime_and_settings() {
+        let empty = RomPlaytime::default();
+        assert_eq!(empty.formatted_playtime(), "-");
+
+        let thirty_secs = RomPlaytime {
+            total_seconds: 30,
+            last_played_timestamp: 0,
+            launch_count: 1,
+        };
+        assert_eq!(thirty_secs.formatted_playtime(), "30s");
+
+        let five_mins = RomPlaytime {
+            total_seconds: 310,
+            last_played_timestamp: 0,
+            launch_count: 2,
+        };
+        assert_eq!(five_mins.formatted_playtime(), "5m");
+
+        let two_hours = RomPlaytime {
+            total_seconds: 7325,
+            last_played_timestamp: 0,
+            launch_count: 5,
+        };
+        assert_eq!(two_hours.formatted_playtime(), "2h 2m");
+
+        // Verify color profile labels
+        for profile in ColorProfileChoice::ALL {
+            assert!(!profile.label().is_empty());
+        }
+
+        // Verify bezel labels
+        for bezel in BezelStyle::ALL {
+            assert!(!bezel.label().is_empty());
+        }
+    }
+
+    #[test]
+    fn legacy_config_migrates_with_defaults() {
+        let legacy_json = r#"{
+            "window_scale": 4,
+            "muted": true,
+            "keybindings": {
+                "a": "J",
+                "b": "K",
+                "select": "Backspace",
+                "start": "Enter",
+                "right": "D",
+                "left": "A",
+                "up": "W",
+                "down": "S",
+                "r": "I",
+                "l": "U"
+            }
+        }"#;
+
+        let parsed: AppConfig = serde_json::from_str(legacy_json).expect("legacy config parse");
+        assert_eq!(parsed.window_scale, 4);
+        assert!(parsed.muted);
+        assert_eq!(parsed.keybindings.a, "J");
+        assert_eq!(parsed.keybindings.turbo_a.as_deref(), Some("V"));
+        assert_eq!(parsed.keybindings.turbo_b.as_deref(), Some("C"));
+        assert_eq!(parsed.keybindings.autofire_interval_frames, 4);
+        assert_eq!(parsed.keybindings.gamepad, GamepadBindings::default());
+        assert_eq!(parsed.keybindings.hotkeys, HotkeyBindings::default());
+        assert!(parsed.rewind_enabled);
+        assert_eq!(parsed.rewind_budget_mb, 64);
+        assert_eq!(parsed.rewind_interval, 1);
+        assert_eq!(parsed.rewind_speed, 1);
+        assert!((parsed.fast_forward_speed - 4.0).abs() < f32::EPSILON);
     }
 }

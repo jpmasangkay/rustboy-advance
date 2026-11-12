@@ -199,8 +199,8 @@ pub fn decode_cheat_lines(code: &str, format: CheatFormat) -> Result<Vec<CheatAc
             continue;
         }
         // Join into pairs; users sometimes paste codes with spaces or without spaces (e.g. 16 hex chars).
-        let pairs: Vec<(&str, &str)> = if tokens.len() >= 2 && tokens.len() % 2 == 0 {
-            tokens.chunks_exact(2).map(|c| (c[0], c[1])).collect()
+        let pairs: Vec<(&str, &str)> = if tokens.len() >= 2 && tokens.len().is_multiple_of(2) {
+            tokens.as_chunks::<2>().0.iter().map(|c| (c[0], c[1])).collect()
         } else if tokens.len() == 1 && tokens[0].len() == 16 {
             vec![(&tokens[0][..8], &tokens[0][8..16])]
         } else if tokens.len() == 1 && tokens[0].len() == 12 {

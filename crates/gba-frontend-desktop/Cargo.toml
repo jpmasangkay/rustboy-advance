@@ -25,6 +25,10 @@ rfd = "0.15"
 cpal = "0.15"
 ringbuf = "0.4"
 image = { version = "0.25", default-features = false, features = ["png"] }
+lz4_flex = "0.14"
+crc32fast = "1.5"
+zip = { version = "2", default-features = false, features = ["deflate"] }
+sevenz-rust2 = { version = "0.25", default-features = false, features = ["util"] }
 
 [target.'cfg(windows)'.dependencies]
 gilrs = { version = "0.11", default-features = false, features = ["xinput"] }

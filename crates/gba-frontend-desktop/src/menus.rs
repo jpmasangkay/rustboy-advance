@@ -171,17 +171,11 @@ impl RustboyApp {
                             }
                             ui.separator();
                             if ui.button("Soft Reset (SWI 00h)").clicked() {
-                                if let Some(core) = &mut self.core {
-                                    core.soft_reset();
-                                    self.notify("Soft Reset");
-                                }
+                                self.soft_reset();
                                 ui.close_menu();
                             }
                             if ui.button("Hard Reset (Ctrl+R)").clicked() {
-                                if let Some(core) = &mut self.core {
-                                    core.reset();
-                                    self.notify("Hard Reset");
-                                }
+                                self.hard_reset();
                                 ui.close_menu();
                             }
                             if ui.button("⏹ Stop & Return to Library (Esc)").clicked() {
@@ -212,6 +206,10 @@ impl RustboyApp {
                                     .color(TEXT_MUTED),
                             );
                         });
+                        if ui.button("Rewind Settings...").clicked() {
+                            self.show_rewind_settings = true;
+                            ui.close_menu();
+                        }
                         ui.menu_button("PPU Accuracy", |ui| {
                             if ui
                                 .radio(!self.config.dot_accurate_ppu, "Fast Scanline Renderer")
@@ -566,7 +564,8 @@ impl RustboyApp {
                             self.step_single_frame();
                         }
 
-                        let rewind_enabled = !self.rewind_buffer.is_empty();
+                        let rewind_enabled =
+                            self.config.rewind_enabled && !self.rewind_buffer.is_empty();
                         let rew_btn = egui::Button::new(RichText::new("⏪ Rewind").small());
                         if ui
                             .add_enabled(rewind_enabled, rew_btn)
@@ -581,10 +580,7 @@ impl RustboyApp {
                             .on_hover_text("Hard Reset (Ctrl+R)")
                             .clicked()
                         {
-                            if let Some(core) = &mut self.core {
-                                core.reset();
-                                self.notify("Hard Reset");
-                            }
+                            self.hard_reset();
                         }
 
                         let turbo_on = self.tab_fast_forward

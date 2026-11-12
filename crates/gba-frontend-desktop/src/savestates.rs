@@ -70,6 +70,8 @@ impl RustboyApp {
             Ok(()) => {
                 self.sink.framebuffer.copy_from_slice(&*core.bus.ppu.framebuffer);
                 self.sink.frame_dirty = true;
+                self.rewind_buffer.clear();
+                self.rewinding = false;
                 self.undo_state_buffer = cur;
                 self.notify("Undo: Reverted state to previous checkpoint");
             }
@@ -116,6 +118,8 @@ impl RustboyApp {
                     core.bus.apu.master_volume_pct = self.config.master_volume;
                     self.sink.framebuffer.copy_from_slice(&*core.bus.ppu.framebuffer);
                     self.sink.frame_dirty = true;
+                    self.rewind_buffer.clear();
+                    self.rewinding = false;
                     self.notify(success_msg);
                 }
                 Err(e) => self.notify(&format!("Invalid save state: {e}")),

@@ -1,4 +1,4 @@
-use std::collections::{HashSet, VecDeque};
+use std::collections::HashSet;
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
@@ -14,6 +14,7 @@ use crate::debugger_ui::{DebugAction, DebuggerWindows};
 use crate::filters::VideoPostProcessor;
 use crate::headless::CliConfig;
 use crate::library::{LibraryViewMode, RomLibraryEntry};
+use crate::rewind::RewindBuffer;
 
 pub(crate) const CONFIG_FILE: &str = "rustboy_library.cfg";
 pub(crate) const GBA_FRAME_SECS: f64 = 280_896.0 / 16_777_216.0; // Exact GBA refresh ~16.7427ms (~59.7275 Hz)
@@ -92,9 +93,10 @@ pub(crate) struct RustboyApp {
     pub(crate) library_view_mode: LibraryViewMode,
 
     // Real-Time Rewind Buffer
-    pub(crate) rewind_buffer: VecDeque<Vec<u8>>,
+    pub(crate) rewind_buffer: RewindBuffer,
     pub(crate) frame_counter: u64,
     pub(crate) rewinding: bool,
+    pub(crate) show_rewind_settings: bool,
 
     pub(crate) paused: bool,
     pub(crate) tab_fast_forward: bool,
@@ -123,6 +125,7 @@ pub(crate) struct RustboyApp {
 impl RustboyApp {
     pub(crate) fn new(cli: CliConfig) -> Self {
         let config = AppConfig::load();
+        let rewind_budget_mb = config.rewind_budget_mb;
         let audio = AudioOutput::start();
         audio.set_muted(config.muted);
         let sink = CoreSink::new(audio);
@@ -153,9 +156,10 @@ impl RustboyApp {
             search_query: String::new(),
             filter_favorites_only: false,
             library_view_mode: LibraryViewMode::Table,
-            rewind_buffer: VecDeque::with_capacity(60),
+            rewind_buffer: RewindBuffer::new(rewind_budget_mb),
             frame_counter: 0,
             rewinding: false,
+            show_rewind_settings: false,
             paused: false,
             tab_fast_forward: false,
             is_fullscreen: false,
@@ -344,6 +348,7 @@ impl RustboyApp {
         self.paused = false;
         self.show_pause_overlay = false;
         self.show_state_manager = false;
+        self.rewind_buffer.set_budget_mb(self.config.rewind_budget_mb);
         self.rewind_buffer.clear();
         self.frame_counter = 0;
         self.rewinding = false;
@@ -388,6 +393,7 @@ impl RustboyApp {
         self.paused = false;
         self.show_pause_overlay = false;
         self.show_state_manager = false;
+        self.rewind_buffer.set_budget_mb(self.config.rewind_budget_mb);
         self.rewind_buffer.clear();
         self.frame_counter = 0;
         self.rewinding = false;
@@ -553,6 +559,30 @@ impl RustboyApp {
         ctx.send_viewport_cmd(egui::ViewportCommand::InnerSize(Vec2::new(w, h)));
     }
 
+    pub(crate) fn soft_reset(&mut self) {
+        if let Some(core) = &mut self.core {
+            core.soft_reset();
+            self.rewind_buffer.clear();
+            self.frame_counter = 0;
+            self.rewinding = false;
+            self.next_frame_due = Instant::now();
+            self.notify("Soft Reset");
+        }
+    }
+
+    pub(crate) fn hard_reset(&mut self) {
+        if let Some(core) = &mut self.core {
+            core.reset();
+            self.rewind_buffer.clear();
+            self.frame_counter = 0;
+            self.rewinding = false;
+            self.sink.framebuffer.fill(0);
+            self.sink.frame_dirty = true;
+            self.next_frame_due = Instant::now();
+            self.notify("Hard Reset");
+        }
+    }
+
     pub(crate) fn toggle_pause(&mut self) {
         self.paused = !self.paused;
         if !self.paused {
@@ -570,8 +600,17 @@ impl RustboyApp {
     pub(crate) fn step_single_frame(&mut self) {
         let Some(core) = &mut self.core else { return };
         self.paused = true;
+        if self.config.rewind_enabled {
+            let interval = self.config.rewind_interval.clamp(1, 4) as u64;
+            if self.frame_counter.is_multiple_of(interval)
+                && let Ok(state) = core.save_state()
+            {
+                self.rewind_buffer.push(state);
+            }
+        }
         apply_cheats_to_core(core, &self.active_cheats);
         let _ = core.run_frame_with_breakpoints(&mut self.sink, &[]);
+        self.frame_counter += 1;
         self.sink.framebuffer.copy_from_slice(&*core.bus.ppu.framebuffer);
         self.sink.frame_dirty = true;
     }
@@ -658,9 +697,14 @@ impl RustboyApp {
             return;
         }
 
-        // Handle active real-time rewind
+        // Handle active real-time rewind paced at GBA frame cadence
         if self.rewinding {
-            self.step_rewind_frame();
+            self.sink.suppress_audio = true;
+            let now = Instant::now();
+            if now >= self.next_frame_due {
+                self.step_rewind_frame();
+                self.next_frame_due = now + Duration::from_secs_f64(GBA_FRAME_SECS);
+            }
             ctx.request_repaint();
             return;
         }
@@ -692,6 +736,17 @@ impl RustboyApp {
             }
             let start_t = Instant::now();
             let Some(core) = &mut self.core else { break };
+
+            // Capture rewind snapshot before advancing frame so rewind restores exact pre-frame state
+            if self.config.rewind_enabled {
+                let interval = self.config.rewind_interval.clamp(1, 4) as u64;
+                if self.frame_counter.is_multiple_of(interval)
+                    && let Ok(state) = core.save_state()
+                {
+                    self.rewind_buffer.push(state);
+                }
+            }
+
             self.sink.suppress_audio = turbo && executed > 0;
             apply_cheats_to_core(core, &self.active_cheats);
 
@@ -700,16 +755,6 @@ impl RustboyApp {
             executed += 1;
             self.frames_in_window += 1;
             self.frame_counter += 1;
-
-            // Push a rewind snapshot every 30 frames (~0.5s)
-            if self.frame_counter % 30 == 0 {
-                if let Ok(state) = core.save_state() {
-                    if self.rewind_buffer.len() >= 60 {
-                        self.rewind_buffer.pop_front();
-                    }
-                    self.rewind_buffer.push_back(state);
-                }
-            }
 
             if let Some(bp_pc) = bp_hit {
                 self.paused = true;
@@ -842,8 +887,9 @@ impl RustboyApp {
         // Always render floating OSD toast on top so feedback is never lost
         self.draw_floating_osd_toast(ctx);
 
-        // Visual Save State Manager dialog
+        // Visual Save State Manager & Rewind Settings dialogs
         self.draw_visual_state_manager(ctx);
+        self.draw_rewind_settings_dialog(ctx);
 
         // Present dockable/floating Debugger & Tool windows
         let pads = self.connected_gamepad_names();
@@ -861,12 +907,7 @@ impl RustboyApp {
             DebugAction::StepInstruction => self.step_single_instruction(),
             DebugAction::StepScanline => self.step_single_scanline(),
             DebugAction::StepFrame => self.step_single_frame(),
-            DebugAction::HardReset => {
-                if let Some(core) = &mut self.core {
-                    core.reset();
-                    self.notify("Hard Reset");
-                }
-            }
+            DebugAction::HardReset => self.hard_reset(),
             DebugAction::ConfigChanged => {
                 self.save_rom_specific_settings();
                 self.config.save();

@@ -32,8 +32,32 @@ impl RustboyApp {
         }
 
         // Holding R in-game rewinds real-time
-        self.rewinding = self.core.is_some()
+        let was_rewinding = self.rewinding;
+        let rewind_held = self.core.is_some()
             && ctx.input(|i| i.key_down(Key::R) && !i.modifiers.ctrl && !i.modifiers.alt);
+        if rewind_held {
+            if !self.config.rewind_enabled {
+                if !was_rewinding && ctx.input(|i| i.key_pressed(Key::R)) {
+                    self.notify("Rewind is disabled in Emulation -> Rewind Settings");
+                }
+                self.rewinding = false;
+            } else if self.rewind_buffer.is_empty() {
+                if !was_rewinding && ctx.input(|i| i.key_pressed(Key::R)) {
+                    self.notify("Rewind buffer empty");
+                }
+                self.rewinding = false;
+            } else {
+                if !was_rewinding {
+                    self.next_frame_due = std::time::Instant::now();
+                }
+                self.rewinding = true;
+            }
+        } else {
+            self.rewinding = false;
+            if was_rewinding {
+                self.next_frame_due = std::time::Instant::now();
+            }
+        }
 
         let open_rom = ctx.input(|i| i.modifiers.ctrl && i.key_pressed(Key::O));
         let step_frame = ctx.input(|i| i.modifiers.ctrl && i.key_pressed(Key::N));
@@ -115,10 +139,7 @@ impl RustboyApp {
             self.step_single_frame();
         }
         if hard_reset {
-            if let Some(core) = &mut self.core {
-                core.reset();
-                self.notify("Hard Reset");
-            }
+            self.hard_reset();
         }
         if toggle_mute {
             self.config.muted = !self.config.muted;

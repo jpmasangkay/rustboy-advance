@@ -1,6 +1,24 @@
-#![no_std]
+#![cfg_attr(not(feature = "std"), no_std)]
 
 extern crate alloc;
+
+pub mod callstack;
+#[cfg(feature = "std")]
+pub mod gdb;
+pub mod io_regs;
+pub mod rsp;
+
+pub use callstack::{
+    CallFrame, CallStackTracker, MAX_CALL_STACK_DEPTH, PreStepSnapshot, arm_cond_passed,
+    is_call_instruction, is_return_instruction, step_out_return_addr,
+};
+#[cfg(feature = "std")]
+pub use gdb::{GdbPollOutcome, GdbStub};
+pub use io_regs::{IoField, IoRegDesc, decode_io_reg, known_io_regs};
+pub use rsp::{
+    ARM7TDMI_TARGET_XML, GdbAction, GdbSession, PacketOutcome, RspEvent, RspParser,
+    encode_rsp_packet, escape_rsp_bytes, rsp_checksum, unescape_rsp_bytes,
+};
 
 use alloc::format;
 use alloc::string::{String, ToString};

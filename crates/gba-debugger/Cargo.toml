@@ -8,3 +8,7 @@ license.workspace = true
 gba-core = { path = "../gba-core" }
 log.workspace = true
 
+[features]
+default = []
+std = []
+

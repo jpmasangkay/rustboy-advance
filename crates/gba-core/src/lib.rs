@@ -8,6 +8,7 @@
 extern crate alloc;
 
 pub mod apu;
+pub mod blip;
 pub mod bus;
 pub mod cartridge;
 pub mod cpu;
@@ -26,8 +27,9 @@ pub const CYCLES_PER_SCANLINE: u64 = 1_232;
 pub const CYCLES_PER_FRAME: u64 = 280_896;
 pub const LCD_WIDTH: usize = 240;
 pub const LCD_HEIGHT: usize = 160;
-pub const SAMPLE_RATE_HZ: u32 = 32_768;
+pub const SAMPLE_RATE_HZ: u32 = 48_000;
 pub const APU_SAMPLE_INTERVAL: u64 = 512; // 16_777_216 / 32_768
+pub const APU_FRAME_SEQ_INTERVAL: u64 = 32_768; // 512 Hz PSG frame sequencer
 
 // Active-high masks to construct active-low KEYINPUT register via `encode_keyinput`.
 pub const KEY_A: u16 = 1 << 0;
@@ -224,6 +226,7 @@ impl GbaCore {
         let layer_mask = self.bus.ppu.layer_enable_mask;
         let chan_mask = self.bus.apu.channel_enable_mask;
         let master_vol = self.bus.apu.master_volume_pct;
+        let fifo_interp = self.bus.apu.fifo_interpolation;
 
         *self = Self::new(bios, rom);
         self.bus.cart.save_type = save_type;
@@ -243,6 +246,7 @@ impl GbaCore {
         self.bus.ppu.layer_enable_mask = layer_mask;
         self.bus.apu.channel_enable_mask = chan_mask;
         self.bus.apu.master_volume_pct = master_vol;
+        self.bus.apu.fifo_interpolation = fifo_interp;
     }
 
     /// Mimics GBA SWI 0x00 SoftReset: resets stacks, clears top 0x200 bytes of IWRAM, and restarts entry.
@@ -390,6 +394,7 @@ impl GbaCore {
             if !breakpoints.is_empty() {
                 let exec_pc = self.cpu.current_exec_pc();
                 if breakpoints.contains(&exec_pc) {
+                    self.bus.apu.flush(self.bus.scheduler.current_cycle);
                     if !self.bus.apu.output_buffer.is_empty() {
                         frontend.push_audio_samples(&self.bus.apu.output_buffer);
                         self.bus.apu.output_buffer.clear();
@@ -411,6 +416,7 @@ impl GbaCore {
             self.bus.ppu.frame_ready = false;
         }
 
+        self.bus.apu.flush(self.bus.scheduler.current_cycle);
         if !self.bus.apu.output_buffer.is_empty() {
             frontend.push_audio_samples(&self.bus.apu.output_buffer);
             self.bus.apu.output_buffer.clear();

@@ -63,13 +63,13 @@ impl RustboyApp {
                         };
 
                         if let Some(_core) = &self.core {
+                            let eff_speed = self.effective_speed_multiplier();
                             let speed_str = if self.paused {
                                 "PAUSED".to_string()
-                            } else if self.tab_fast_forward || self.config.speed_multiplier <= 0.0
-                            {
-                                "TURBO".to_string()
+                            } else if eff_speed <= 0.0 {
+                                "UNLIMITED".to_string()
                             } else {
-                                format!("{:.1}x", self.config.speed_multiplier)
+                                format!("{eff_speed:.1}x")
                             };
                             ui.monospace(RichText::new(speed_str).small().color(ACCENT_TEAL));
                             ui.separator();
@@ -273,12 +273,9 @@ impl RustboyApp {
             self.show_state_manager = true;
         }
         if hard_reset {
-            if let Some(core) = &mut self.core {
-                core.reset();
-                self.notify("Hard Reset");
-                self.show_pause_overlay = false;
-                self.paused = false;
-            }
+            self.hard_reset();
+            self.show_pause_overlay = false;
+            self.paused = false;
         }
         if close_game {
             self.show_pause_overlay = false;
@@ -325,12 +322,16 @@ impl RustboyApp {
             });
     }
 
+    // WAVE-2 HOOK: Active viewport post-processing & HUD overlay rendering.
+    // GLSL/WGSL shader passes plug in alongside `self.postproc.process_frame`, and
+    // RetroAchievements unlock banners / Lua script canvas overlays draw over `disp_rect`.
     pub(crate) fn draw_active_viewport(&mut self, ctx: &egui::Context, ui: &mut egui::Ui) {
         if self.sink.frame_dirty {
+            let color_profile = self.effective_color_profile();
             let color_img = self.postproc.process_frame(
                 &self.sink.framebuffer,
                 self.config.color_correction,
-                self.config.color_profile,
+                color_profile,
                 self.config.lcd_ghosting,
                 self.config.scanline_grid,
             );

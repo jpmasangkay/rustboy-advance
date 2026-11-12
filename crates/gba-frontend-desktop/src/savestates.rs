@@ -407,13 +407,6 @@ impl RustboyApp {
         )
     }
 
-    fn effective_color_profile(&self) -> crate::config::ColorProfileChoice {
-        self.config
-            .get_game_settings(&self.rom_code, self.rom_crc32)
-            .and_then(|ov| ov.custom_color_profile)
-            .unwrap_or(self.config.color_profile)
-    }
-
     pub(crate) fn quick_save(&mut self, slot: usize) {
         let Some(path) = self.slot_path(slot) else {
             return;

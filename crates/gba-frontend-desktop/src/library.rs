@@ -451,7 +451,7 @@ impl RustboyApp {
 
         // 3. Render Table or Grid View
         let mut launch_target: Option<PathBuf> = None;
-        let mut open_overrides = false;
+        let mut game_settings_entry: Option<RomLibraryEntry> = None;
         let mut rescan_needed = false;
 
         match self.library_view_mode {
@@ -524,9 +524,8 @@ impl RustboyApp {
                                             }
                                             ui.close_menu();
                                         }
-                                        if ui.button("⚙ Configure Game Overrides").clicked() {
-                                            launch_target = Some(entry.path.clone());
-                                            open_overrides = true;
+                                        if ui.button("⚙ Game Settings...").clicked() {
+                                            game_settings_entry = Some(entry.clone());
                                             ui.close_menu();
                                         }
                                         if ui
@@ -729,9 +728,8 @@ impl RustboyApp {
                                         }
                                         ui.close_menu();
                                     }
-                                    if ui.button("⚙ Configure Game Overrides").clicked() {
-                                        launch_target = Some(entry.path.clone());
-                                        open_overrides = true;
+                                    if ui.button("⚙ Game Settings...").clicked() {
+                                        game_settings_entry = Some(entry.clone());
                                         ui.close_menu();
                                     }
                                     if ui
@@ -770,12 +768,13 @@ impl RustboyApp {
             self.rescan_rom_folders();
         }
 
+        if let Some(entry) = game_settings_entry {
+            self.open_game_settings_for_library_entry(&entry);
+        }
+
         if let Some(path) = launch_target {
             if let Err(e) = self.open_rom(&path, None, Some(ctx)) {
                 self.notify_error(&e);
-            }
-            if open_overrides {
-                self.debugger.show_overrides = true;
             }
         }
     }

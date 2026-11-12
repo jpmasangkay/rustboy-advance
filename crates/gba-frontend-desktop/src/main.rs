@@ -5,6 +5,7 @@ mod cheats;
 mod config;
 mod debugger_ui;
 mod filters;
+mod game_settings;
 mod headless;
 mod hotkeys;
 mod hud;

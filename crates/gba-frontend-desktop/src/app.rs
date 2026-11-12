@@ -12,6 +12,10 @@ use crate::cheats::{apply_cheats_to_core, CheatEntry};
 use crate::config::{AppConfig, SaveOverrideChoice};
 use crate::debugger_ui::{DebugAction, DebuggerWindows};
 use crate::filters::VideoPostProcessor;
+use crate::game_settings::{
+    load_effective_settings, save_game_settings_entry, CartridgeHardwareDefaults,
+    GameSettingsTarget,
+};
 use crate::headless::CliConfig;
 use crate::input::{AutofireState, ControlsTab, PendingInputBind};
 use crate::library::{LibraryScanResult, LibraryViewMode, RomLibraryEntry};
@@ -83,6 +87,8 @@ pub(crate) struct ToastMessage {
 
 pub(crate) struct RustboyApp {
     pub(crate) config: AppConfig,
+    // WAVE-2 HOOK: Core emulator handle (`core.bus.*` memory, PPU, APU, Link/SIO)
+    // shared with Debugger, Lua scripting, RetroAchievements, and Netplay/Link Cable.
     pub(crate) core: Option<GbaCore>,
     pub(crate) sink: CoreSink,
     pub(crate) postproc: VideoPostProcessor,
@@ -97,6 +103,10 @@ pub(crate) struct RustboyApp {
     pub(crate) rom_crc32: u32,
     pub(crate) bios_bytes: Option<Vec<u8>>,
     pub(crate) active_cheats: Vec<CheatEntry>,
+    pub(crate) cart_hw_defaults: CartridgeHardwareDefaults,
+    pub(crate) session_speed_override: Option<f32>,
+    pub(crate) show_game_settings: bool,
+    pub(crate) game_settings_target: Option<GameSettingsTarget>,
 
     // ROM Library & Folder Scanner
     pub(crate) rom_folders: Vec<PathBuf>,
@@ -176,6 +186,10 @@ impl RustboyApp {
             rom_crc32: 0,
             bios_bytes,
             active_cheats: Vec::new(),
+            cart_hw_defaults: CartridgeHardwareDefaults::default(),
+            session_speed_override: None,
+            show_game_settings: false,
+            game_settings_target: None,
             rom_folders: Vec::new(),
             library_entries: Vec::new(),
             library_scanning: false,
@@ -386,31 +400,12 @@ impl RustboyApp {
 
         let title = core.bus.cart.game_title();
         let code = core.bus.cart.game_code();
-
-        // Apply saved overrides & cheats for this ROM if present, else global config settings
-        core.bus.ppu.dot_accurate_mode = self.config.dot_accurate_ppu;
-        core.bus.ppu.layer_enable_mask = self.config.layer_mask;
-        core.bus.apu.channel_enable_mask = self.config.audio_channel_mask;
-        core.bus.apu.master_volume_pct = self.config.master_volume;
-
-        let rom_key = code.clone();
-        if let Some(ov) = self.config.per_rom.get(&rom_key).cloned() {
-            if let Some(sv) = ov.save_override {
-                core.bus.cart.set_save_type_override(sv.to_core());
-            }
-            if ov.rtc_override.is_some() {
-                core.bus.cart.rtc_override = ov.rtc_override;
-            }
-            if let Some(lux) = ov.solar_lux {
-                core.bus.cart.solar_lux = lux;
-            }
-            if let Some(cp) = ov.custom_color_profile {
-                self.config.color_profile = cp;
-            }
-            self.active_cheats = ov.cheats;
-        } else {
-            self.active_cheats.clear();
-        }
+        self.cart_hw_defaults = CartridgeHardwareDefaults {
+            solar_enabled: core.bus.cart.solar_enabled,
+            tilt_enabled: core.bus.cart.tilt_enabled,
+            gyro_enabled: core.bus.cart.gyro_enabled,
+            rumble_enabled: core.bus.cart.rumble_enabled,
+        };
 
         self.core = Some(core);
         self.rom_path = Some(rom_path.to_path_buf());
@@ -418,6 +413,10 @@ impl RustboyApp {
         self.rom_title = title.clone();
         self.rom_code = code.clone();
         self.rom_crc32 = rom_crc32;
+        self.session_speed_override = None;
+        self.show_game_settings = false;
+        self.game_settings_target = None;
+        self.apply_active_game_settings_to_core();
         self.paused = false;
         self.show_pause_overlay = false;
         self.show_state_manager = false;
@@ -476,6 +475,10 @@ impl RustboyApp {
         self.rom_code.clear();
         self.rom_crc32 = 0;
         self.active_cheats.clear();
+        self.cart_hw_defaults = CartridgeHardwareDefaults::default();
+        self.session_speed_override = None;
+        self.show_game_settings = false;
+        self.game_settings_target = None;
         self.slot_thumbnails = [None, None, None, None, None];
         self.slot_meta = [None, None, None, None, None];
         self.state_manager_error = None;
@@ -497,20 +500,25 @@ impl RustboyApp {
 
     pub(crate) fn save_rom_specific_settings(&mut self) {
         let Some(core) = &self.core else { return };
-        let key = self.rom_code.clone();
-        if key.is_empty() {
+        if self.rom_code.is_empty() {
             return;
         }
-        let mut ov = self.config.per_rom.get(&key).cloned().unwrap_or_default();
-        ov.save_override = Some(SaveOverrideChoice::from_core(
-            core.bus.cart.save_type_override,
-        ));
-        ov.rtc_override = core.bus.cart.rtc_override;
-        ov.solar_lux = Some(core.bus.cart.solar_lux);
+        let mut ov = load_effective_settings(&self.config, &self.rom_code, self.rom_crc32);
+        if ov.save_override.is_some() || core.bus.cart.save_type_override.is_some() {
+            ov.save_override = core
+                .bus
+                .cart
+                .save_type_override
+                .map(|st| SaveOverrideChoice::from_core(Some(st)));
+        }
+        if ov.rtc_override.is_some() || core.bus.cart.rtc_override.is_some() {
+            ov.rtc_override = core.bus.cart.rtc_override;
+        }
+        if ov.solar_lux.is_some() || core.bus.cart.solar_enabled {
+            ov.solar_lux = Some(core.bus.cart.solar_lux);
+        }
         ov.cheats = self.active_cheats.clone();
-        ov.custom_color_profile = Some(self.config.color_profile);
-        self.config.per_rom.insert(key, ov);
-        self.config.save();
+        save_game_settings_entry(&mut self.config, &self.rom_code, self.rom_crc32, ov);
     }
 
     pub(crate) fn flush_battery_save(&mut self) {
@@ -671,6 +679,7 @@ impl RustboyApp {
             self.sink.framebuffer.fill(0);
             self.sink.frame_dirty = true;
             self.next_frame_due = Instant::now();
+            self.apply_active_game_settings_to_core();
             self.notify("Hard Reset");
         }
     }
@@ -795,6 +804,8 @@ impl RustboyApp {
         }
     }
 
+    // WAVE-2 HOOK: Per-frame emulation loop — Lua `onframe`, RetroAchievements frame tick,
+    // Movie frame advance, and Link Cable / SIO sync integrate inside this cadence loop.
     pub(crate) fn advance_emulation(&mut self, ctx: &egui::Context) {
         if self.core.is_none() {
             return;
@@ -817,11 +828,7 @@ impl RustboyApp {
         }
 
         self.sink.keypad = self.poll_inputs(ctx);
-        let speed = if self.tab_fast_forward {
-            0.0 // Unthrottled fast-forward while Tab held
-        } else {
-            self.config.speed_multiplier
-        };
+        let speed = self.effective_speed_multiplier();
         let turbo = speed <= 0.0;
         let frame_interval = if turbo {
             Duration::from_millis(0)
@@ -830,7 +837,11 @@ impl RustboyApp {
         };
 
         let now = Instant::now();
-        let max_catchup = if turbo { 8 } else if speed > 1.5 { 4 } else { 2 };
+        let max_catchup = if turbo {
+            16
+        } else {
+            (speed.ceil() as usize + 1).clamp(2, 16)
+        };
         let mut executed = 0usize;
 
         while executed < max_catchup && (turbo || now >= self.next_frame_due) {
@@ -851,7 +862,7 @@ impl RustboyApp {
                 }
             }
 
-            self.sink.suppress_audio = turbo && executed > 0;
+            self.sink.suppress_audio = (turbo || speed > 1.5) && executed > 0;
             apply_cheats_to_core(core, &self.active_cheats);
 
             let bp_hit = core.run_frame_with_breakpoints(&mut self.sink, &self.debugger.breakpoints);
@@ -869,9 +880,6 @@ impl RustboyApp {
 
             if turbo {
                 self.next_frame_due = Instant::now();
-                if executed >= 4 {
-                    break;
-                }
             } else {
                 self.next_frame_due += frame_interval;
                 if now.saturating_duration_since(self.next_frame_due) > Duration::from_millis(60) {
@@ -904,10 +912,12 @@ impl RustboyApp {
             }
         }
 
-        if self.config.rumble_enabled {
+        if self.effective_rumble_enabled() {
             if let Some(core) = &self.core {
                 self.rumble_in_progress = core.bus.cart.rumble_active;
             }
+        } else {
+            self.rumble_in_progress = false;
         }
 
         if !self.paused {
@@ -993,10 +1003,11 @@ impl RustboyApp {
         // Always render floating OSD toast on top so feedback is never lost
         self.draw_floating_osd_toast(ctx);
 
-        // Visual Save State Manager, Rewind Settings & Controls dialogs
+        // Visual Save State Manager, Rewind Settings, Controls & Per-Game Settings dialogs
         self.draw_visual_state_manager(ctx);
         self.draw_rewind_settings_dialog(ctx);
         self.draw_controls_dialog(ctx);
+        self.draw_game_settings_dialog(ctx);
 
         // Present dockable/floating Debugger & Tool windows
         let pads = self.connected_gamepad_names();

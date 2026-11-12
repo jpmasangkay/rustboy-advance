@@ -7,9 +7,11 @@ use gba_core::{LCD_HEIGHT, LCD_WIDTH};
 use crate::app::{
     RustboyApp, ACCENT_TEAL, ACCENT_TEAL_BG, BG_PANEL, BORDER_HAIRLINE, TEXT_MUTED,
 };
-use crate::config::{AppConfig, BezelStyle, ColorProfileChoice};
+use crate::config::{AppConfig, BezelStyle, ColorProfileChoice, HotkeyAction};
 
 impl RustboyApp {
+    // WAVE-2 HOOK: Top menu bar — wave-2 agents should add menu entries here for
+    // GLSL Shaders, Lua Script Console, RetroAchievements, Movies, and Link Cable.
     pub(crate) fn draw_menu_bar(&mut self, ctx: &egui::Context) {
         egui::TopBottomPanel::top("top_menu_bar")
             .frame(
@@ -189,26 +191,54 @@ impl RustboyApp {
                         });
                         ui.separator();
                         ui.menu_button("Speed Multiplier", |ui| {
+                            let active_speed = self.effective_speed_multiplier();
+                            let ff_hotkey = self
+                                .config
+                                .keybindings
+                                .hotkeys
+                                .display(HotkeyAction::FastForward);
                             for (mult, lbl) in [
                                 (0.5, "0.5x Slow Motion"),
                                 (1.0, "1.0x Normal"),
+                                (1.5, "1.5x Crisp"),
                                 (2.0, "2.0x Fast"),
+                                (3.0, "3.0x Turbo"),
                                 (4.0, "4.0x Ultra"),
                                 (0.0, "Unthrottled Turbo"),
                             ] {
-                                let selected = (self.config.speed_multiplier - mult).abs() < 0.01;
+                                let selected = (active_speed - mult).abs() < 0.01;
                                 if ui.selectable_label(selected, lbl).clicked() {
-                                    self.config.speed_multiplier = mult;
-                                    self.config.save();
+                                    if self.has_per_game_speed_override() {
+                                        self.session_speed_override = Some(mult);
+                                    } else {
+                                        self.session_speed_override = None;
+                                        self.config.speed_multiplier = mult;
+                                        self.config.save();
+                                    }
                                     ui.close_menu();
                                 }
                             }
                             ui.separator();
                             ui.label(
-                                RichText::new("Tip: Hold Tab anytime for Turbo")
+                                RichText::new(format!("Hold {ff_hotkey} for Fast-Forward"))
                                     .small()
                                     .color(TEXT_MUTED),
                             );
+                        });
+                        ui.menu_button("Fast-Forward Speed", |ui| {
+                            for (mult, lbl) in [
+                                (2.0, "2x Fast"),
+                                (3.0, "3x Turbo"),
+                                (4.0, "4x Ultra"),
+                                (0.0, "Unlimited (Unthrottled)"),
+                            ] {
+                                let selected = (self.config.fast_forward_speed - mult).abs() < 0.01;
+                                if ui.selectable_label(selected, lbl).clicked() {
+                                    self.config.fast_forward_speed = mult;
+                                    self.config.save();
+                                    ui.close_menu();
+                                }
+                            }
                         });
                         if ui.button("Rewind Settings...").clicked() {
                             self.show_rewind_settings = true;
@@ -442,6 +472,13 @@ impl RustboyApp {
                         }
                         ui.separator();
                         if ui
+                            .add_enabled(has_rom, egui::Button::new("Game Settings..."))
+                            .clicked()
+                        {
+                            self.open_game_settings_for_active_rom();
+                            ui.close_menu();
+                        }
+                        if ui
                             .add_enabled(has_rom, egui::Button::new("Game Overrides & Sensors..."))
                             .clicked()
                         {
@@ -587,20 +624,36 @@ impl RustboyApp {
                             self.hard_reset();
                         }
 
-                        let turbo_on = self.tab_fast_forward
-                            || self.config.speed_multiplier > 1.5
-                            || self.config.speed_multiplier <= 0.0;
+                        let eff_speed = self.effective_speed_multiplier();
+                        let turbo_on = self.tab_fast_forward || eff_speed > 1.05 || eff_speed <= 0.0;
+                        let ff_hotkey = self
+                            .config
+                            .keybindings
+                            .hotkeys
+                            .display(HotkeyAction::FastForward);
+                        let ff_label = if self.config.fast_forward_speed <= 0.0 {
+                            "Unlimited".to_string()
+                        } else {
+                            format!("{:.0}x", self.config.fast_forward_speed)
+                        };
                         if toggle_btn(ui, "FF >>", turbo_on)
-                            .on_hover_text("Toggle 4x Fast-Forward (or Hold Tab)")
+                            .on_hover_text(format!(
+                                "Toggle {ff_label} Fast-Forward (or Hold {ff_hotkey})"
+                            ))
                             .clicked()
                         {
-                            self.config.speed_multiplier =
-                                if self.config.speed_multiplier > 1.5 {
-                                    1.0
-                                } else {
-                                    4.0
-                                };
-                            self.config.save();
+                            let target_speed = if eff_speed > 1.05 || eff_speed <= 0.0 {
+                                1.0
+                            } else {
+                                self.config.fast_forward_speed
+                            };
+                            if self.has_per_game_speed_override() {
+                                self.session_speed_override = Some(target_speed);
+                            } else {
+                                self.session_speed_override = None;
+                                self.config.speed_multiplier = target_speed;
+                                self.config.save();
+                            }
                         }
 
                         ui.separator();

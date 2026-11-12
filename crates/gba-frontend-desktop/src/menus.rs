@@ -382,6 +382,19 @@ impl RustboyApp {
                                 },
                             );
                             ui.separator();
+                            ui.horizontal(|ui| {
+                                ui.label("LCD Grid Intensity:");
+                                let slider = ui.add(
+                                    egui::Slider::new(&mut self.config.lcd_grid_intensity, 0.0..=0.25)
+                                        .custom_formatter(|n, _| format!("{:.0}%", n * 100.0)),
+                                );
+                                if slider.changed() {
+                                    self.config.save();
+                                    self.sink.frame_dirty = true;
+                                    self.lcd_tex = None;
+                                }
+                            });
+                            ui.separator();
                             if ui
                                 .checkbox(
                                     &mut self.config.color_correction,
@@ -963,6 +976,19 @@ impl RustboyApp {
                                 ui.close_menu();
                             }
                         }
+                        ui.separator();
+                        ui.horizontal(|ui| {
+                            ui.label("Grid Intensity:");
+                            let slider = ui.add(
+                                egui::Slider::new(&mut self.config.lcd_grid_intensity, 0.0..=0.25)
+                                    .custom_formatter(|n, _| format!("{:.0}%", n * 100.0)),
+                            );
+                            if slider.changed() {
+                                self.config.save();
+                                self.sink.frame_dirty = true;
+                                self.lcd_tex = None;
+                            }
+                        });
                     });
 
                     ui.separator();

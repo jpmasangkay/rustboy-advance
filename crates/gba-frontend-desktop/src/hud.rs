@@ -490,6 +490,7 @@ impl RustboyApp {
                     lcd_ghosting,
                     self.config.display_filter,
                     green_swap,
+                    self.config.lcd_grid_intensity,
                 );
                 if let Some(tex) = &mut self.lcd_tex {
                     if tex.size() == color_img.size {
@@ -530,6 +531,7 @@ impl RustboyApp {
                     lcd_ghosting,
                     self.config.display_filter,
                     false,
+                    self.config.lcd_grid_intensity,
                 );
                 let p2_tex = local.p2_lcd_tex.get_or_insert_with(|| {
                     ctx.load_texture("gba_p2_lcd", p2_img.clone(), tex_options)

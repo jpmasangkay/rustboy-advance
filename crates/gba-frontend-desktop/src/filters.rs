@@ -203,6 +203,7 @@ pub struct VideoPostProcessor {
     pub prev_rgb: Vec<[u8; 3]>,
     pub output_image: egui::ColorImage,
     pub filter: DisplayFilter,
+    pub lcd_grid_intensity: f32,
 }
 
 impl Default for VideoPostProcessor {
@@ -224,8 +225,9 @@ impl VideoPostProcessor {
 
             base_rgb: vec![[0u8; 3]; LCD_WIDTH * LCD_HEIGHT],
             prev_rgb: vec![[0u8; 3]; LCD_WIDTH * LCD_HEIGHT],
-            output_image: egui::ColorImage::new([LCD_WIDTH * 3, LCD_HEIGHT * 3], egui::Color32::BLACK),
-            filter: DisplayFilter::AuthenticGbaLcd,
+            output_image: egui::ColorImage::new([LCD_WIDTH * 2, LCD_HEIGHT * 2], egui::Color32::BLACK),
+            filter: DisplayFilter::SoftHandheld,
+            lcd_grid_intensity: 0.08,
         }
     }
 

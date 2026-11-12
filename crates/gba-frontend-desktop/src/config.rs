@@ -673,8 +673,8 @@ impl SaveOverrideChoice {
 
 #[derive(Copy, Clone, PartialEq, Eq, Debug, Serialize, Deserialize, Default)]
 pub enum DisplayFilter {
-    #[default]
     AuthenticGbaLcd, // 3x (720x480) LCD Subpixel Dot-Matrix
+    #[default]
     SoftHandheld,    // 2x (480x320) Sharp-Bilinear
     SmoothScale2x,   // 2x (480x320) EPX / Scale2x diagonal smoothing
     RawNearest,      // 1x (240x160) Raw square pixels
@@ -735,8 +735,8 @@ impl DisplayFilter {
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize, Default)]
 pub enum ShaderPreset {
-    #[default]
     Nearest,
+    #[default]
     SharpBilinear,
     LcdGrid,
     CrtScanlines,
@@ -951,6 +951,10 @@ fn default_ra_rich_presence() -> bool {
     true
 }
 
+fn default_lcd_grid_intensity() -> f32 {
+    0.08
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(default)]
 pub struct AppConfig {
@@ -963,6 +967,8 @@ pub struct AppConfig {
     pub bezel_style: BezelStyle,
     pub lcd_ghosting: bool,
     pub scanline_grid: bool,
+    #[serde(default = "default_lcd_grid_intensity")]
+    pub lcd_grid_intensity: f32,
     #[serde(default)]
     pub display_filter: DisplayFilter,
     #[serde(default)]
@@ -1019,8 +1025,9 @@ impl Default for AppConfig {
             bezel_style: BezelStyle::None,
             lcd_ghosting: false,
             scanline_grid: false,
-            display_filter: DisplayFilter::AuthenticGbaLcd,
-            shader_preset: ShaderPreset::LcdGrid,
+            lcd_grid_intensity: 0.08,
+            display_filter: DisplayFilter::SoftHandheld,
+            shader_preset: ShaderPreset::SharpBilinear,
             frame_blending: false,
             dot_accurate_ppu: false,
             dmg_palette: DmgPaletteChoice::default(),
@@ -1080,18 +1087,23 @@ impl AppConfig {
         let mut cfg: Self = serde_json::from_str(raw).unwrap_or_default();
         if let Ok(val) = serde_json::from_str::<serde_json::Value>(raw) {
             if val.get("display_filter").is_none() {
-                if cfg.scanline_grid || cfg.shader_preset == ShaderPreset::LcdGrid {
-                    cfg.display_filter = DisplayFilter::AuthenticGbaLcd;
-                } else if cfg.shader_preset == ShaderPreset::SharpBilinear {
-                    cfg.display_filter = DisplayFilter::SoftHandheld;
-                } else if cfg.shader_preset == ShaderPreset::ScaleEdge {
-                    cfg.display_filter = DisplayFilter::SmoothScale2x;
-                } else if cfg.shader_preset == ShaderPreset::Nearest {
-                    cfg.display_filter = DisplayFilter::RawNearest;
+                if val.get("scanline_grid").is_some() || val.get("shader_preset").is_some() {
+                    if cfg.scanline_grid || cfg.shader_preset == ShaderPreset::LcdGrid {
+                        cfg.display_filter = DisplayFilter::AuthenticGbaLcd;
+                    } else if cfg.shader_preset == ShaderPreset::SharpBilinear {
+                        cfg.display_filter = DisplayFilter::SoftHandheld;
+                    } else if cfg.shader_preset == ShaderPreset::ScaleEdge {
+                        cfg.display_filter = DisplayFilter::SmoothScale2x;
+                    } else if cfg.shader_preset == ShaderPreset::Nearest {
+                        cfg.display_filter = DisplayFilter::RawNearest;
+                    }
                 }
             }
             if val.get("shader_preset").is_none() && cfg.scanline_grid {
                 cfg.shader_preset = ShaderPreset::LcdGrid;
+            }
+            if val.get("lcd_grid_intensity").is_none() {
+                cfg.lcd_grid_intensity = 0.08;
             }
         }
         cfg
@@ -1253,5 +1265,11 @@ mod tests {
         assert_eq!(modern.shader_preset, ShaderPreset::CrtScanlines);
         assert_eq!(modern.effective_shader_preset(), ShaderPreset::CrtScanlines);
         assert!(modern.frame_blending);
+        assert_eq!(modern.display_filter, DisplayFilter::AuthenticGbaLcd);
+        assert!((modern.lcd_grid_intensity - 0.08).abs() < 1e-4);
+
+        let default_cfg = AppConfig::from_json_str("{}");
+        assert_eq!(default_cfg.display_filter, DisplayFilter::SoftHandheld);
+        assert!((default_cfg.lcd_grid_intensity - 0.08).abs() < 1e-4);
     }
 }

@@ -1,4 +1,4 @@
-use std::collections::HashSet;
+use std::collections::{HashSet, VecDeque};
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
@@ -9,6 +9,7 @@ use gba_core::{GbaCore, HostFrontend, LCD_HEIGHT, LCD_WIDTH};
 use gilrs::Gilrs;
 
 use crate::audio::AudioOutput;
+use crate::capture::CaptureController;
 use crate::cheats::{apply_cheats_to_core, CheatEntry};
 use crate::config::{AppConfig, SaveOverrideChoice};
 use crate::debugger_ui::{DebugAction, DebuggerWindows};
@@ -20,6 +21,7 @@ use crate::game_settings::{
 use crate::headless::CliConfig;
 use crate::input::{AutofireState, ControlsTab, PendingInputBind};
 use crate::library::{LibraryScanResult, LibraryViewMode, RomLibraryEntry};
+use crate::movies::MovieController;
 use crate::rewind::RewindBuffer;
 use crate::rom_loader::{
     apply_auto_patch_if_present, apply_patch_file, is_patch_extension, load_rom_bytes,
@@ -46,6 +48,8 @@ pub(crate) struct CoreSink {
     pub(crate) keypad: u16,
     pub(crate) frame_dirty: bool,
     pub(crate) suppress_audio: bool,
+    pub(crate) capture_audio: bool,
+    pub(crate) captured_audio: Vec<i16>,
 }
 
 impl CoreSink {
@@ -59,6 +63,8 @@ impl CoreSink {
             keypad: 0x03FF,
             frame_dirty: false,
             suppress_audio: false,
+            capture_audio: false,
+            captured_audio: Vec::new(),
         }
     }
 
@@ -87,6 +93,9 @@ impl HostFrontend for CoreSink {
     fn push_audio_samples(&mut self, samples: &[i16]) {
         if !self.suppress_audio {
             self.audio.push_interleaved(samples);
+        }
+        if self.capture_audio {
+            self.captured_audio.extend_from_slice(samples);
         }
     }
 
@@ -179,6 +188,12 @@ pub(crate) struct RustboyApp {
     pub(crate) state_manager_error: Option<String>,
     pub(crate) playtime_timer: Instant,
     pub(crate) rumble_in_progress: bool,
+
+    // TAS Input Movies & Media Capture
+    pub(crate) movie: MovieController,
+    pub(crate) capture: CaptureController,
+    pub(crate) show_movies: bool,
+    pub(crate) rewind_movie_frames: VecDeque<usize>,
 }
 
 impl RustboyApp {
@@ -256,6 +271,10 @@ impl RustboyApp {
             state_manager_error: None,
             playtime_timer: Instant::now(),
             rumble_in_progress: false,
+            movie: MovieController::new(),
+            capture: CaptureController::new(),
+            show_movies: false,
+            rewind_movie_frames: VecDeque::new(),
         };
 
         app.load_persistent_config();
@@ -403,6 +422,8 @@ impl RustboyApp {
     ) -> Result<(), String> {
         self.flush_battery_save();
         self.save_rom_specific_settings();
+        self.stop_all_captures(true);
+        self.movie.reset_for_rom_change();
 
         let mut loaded = load_rom_bytes(rom_path)?;
         let patch_applied = if let Some(patch_path) = explicit_patch {
@@ -448,6 +469,7 @@ impl RustboyApp {
         self.show_state_manager = false;
         self.rewind_buffer.set_budget_mb(self.config.rewind_budget_mb);
         self.rewind_buffer.clear();
+        self.rewind_movie_frames.clear();
         self.frame_counter = 0;
         self.rewinding = false;
         self.autofire_state.clear_latches();
@@ -494,6 +516,9 @@ impl RustboyApp {
     pub(crate) fn close_rom(&mut self, ctx: &egui::Context) {
         self.flush_battery_save();
         self.save_rom_specific_settings();
+        self.stop_all_captures(true);
+        self.movie.reset_for_rom_change();
+        self.rewind_movie_frames.clear();
         self.core = None;
         self.rom_path = None;
         self.sav_path = None;
@@ -513,6 +538,7 @@ impl RustboyApp {
         self.show_state_manager = false;
         self.rewind_buffer.set_budget_mb(self.config.rewind_budget_mb);
         self.rewind_buffer.clear();
+        self.rewind_movie_frames.clear();
         self.frame_counter = 0;
         self.rewinding = false;
         self.autofire_state.clear_latches();
@@ -702,10 +728,16 @@ impl RustboyApp {
         if let Some(core) = &mut self.core {
             core.soft_reset();
             self.rewind_buffer.clear();
+            self.rewind_movie_frames.clear();
             self.frame_counter = 0;
             self.rewinding = false;
             self.next_frame_due = Instant::now();
-            self.notify("Soft Reset");
+            if self.movie.is_active() {
+                self.movie.stop();
+                self.notify("Soft Reset — Active TAS Movie stopped");
+            } else {
+                self.notify("Soft Reset");
+            }
         }
     }
 
@@ -713,13 +745,19 @@ impl RustboyApp {
         if let Some(core) = &mut self.core {
             core.reset();
             self.rewind_buffer.clear();
+            self.rewind_movie_frames.clear();
             self.frame_counter = 0;
             self.rewinding = false;
             self.postproc.reset();
             self.sink.clear_frames();
             self.next_frame_due = Instant::now();
             self.apply_active_game_settings_to_core();
-            self.notify("Hard Reset");
+            if self.movie.is_active() {
+                self.movie.stop();
+                self.notify("Hard Reset — Active TAS Movie stopped");
+            } else {
+                self.notify("Hard Reset");
+            }
         }
     }
 
@@ -743,22 +781,43 @@ impl RustboyApp {
         }
         self.paused = true;
         self.show_pause_overlay = false;
-        self.sink.keypad = self.poll_inputs(ctx);
+        let _ = self.poll_live_inputs(ctx);
+        let live_keypad = self.effective_live_keypad_for_frame();
+        self.sink.keypad = self.movie.step_frame(live_keypad);
+        self.sink.capture_audio = self.capture.is_wav_recording();
+        self.sink.captured_audio.clear();
+        let color_profile = self.effective_color_profile();
+        let color_corr = self.config.color_correction;
+        let movie_frame_for_rewind = self.movie.current_frame();
 
-        let Some(core) = &mut self.core else { return };
-        if self.config.rewind_enabled {
-            let interval = self.config.rewind_interval.clamp(1, 4) as u64;
-            if self.frame_counter.is_multiple_of(interval)
-                && let Ok(state) = core.save_state()
-            {
-                self.rewind_buffer.push(state);
+        {
+            let Some(core) = &mut self.core else { return };
+            if self.config.rewind_enabled {
+                let interval = self.config.rewind_interval.clamp(1, 4) as u64;
+                if self.frame_counter.is_multiple_of(interval)
+                    && let Ok(state) = core.save_state()
+                {
+                    record_rewind_snapshot(
+                        &mut self.rewind_buffer,
+                        &mut self.rewind_movie_frames,
+                        state,
+                        movie_frame_for_rewind,
+                    );
+                }
             }
+            apply_cheats_to_core(core, &self.active_cheats);
+            let _ = core.run_frame_with_breakpoints(&mut self.sink, &[]);
+            self.frame_counter += 1;
+            self.sink
+                .framebuffer
+                .copy_from_slice(&*core.bus.ppu.framebuffer);
+            self.sink.frame_dirty = true;
         }
-        apply_cheats_to_core(core, &self.active_cheats);
-        let _ = core.run_frame_with_breakpoints(&mut self.sink, &[]);
-        self.frame_counter += 1;
-        self.sink.framebuffer.copy_from_slice(&*core.bus.ppu.framebuffer);
-        self.sink.frame_dirty = true;
+
+        self.flush_frame_captures(true, color_corr, color_profile);
+        if let Some(msg) = self.movie.take_notice() {
+            self.notify(&msg);
+        }
     }
 
     pub(crate) fn step_single_instruction(&mut self) {
@@ -851,9 +910,13 @@ impl RustboyApp {
         // Handle active real-time rewind paced at GBA frame cadence
         if self.rewinding {
             self.sink.suppress_audio = true;
+            self.sink.capture_audio = false;
+            self.sink.captured_audio.clear();
             let now = Instant::now();
             if now >= self.next_frame_due {
+                let prev_len = self.rewind_buffer.len();
                 self.step_rewind_frame();
+                self.sync_movie_after_rewind(prev_len);
                 self.next_frame_due = now + Duration::from_secs_f64(GBA_FRAME_SECS);
             }
             ctx.request_repaint();
@@ -886,27 +949,45 @@ impl RustboyApp {
                 break;
             }
             let start_t = Instant::now();
-            self.sink.keypad = self.effective_keypad_for_frame();
-            let Some(core) = &mut self.core else { break };
+            let live_keypad = self.effective_live_keypad_for_frame();
+            self.sink.keypad = self.movie.step_frame(live_keypad);
+            self.sink.capture_audio = self.capture.is_wav_recording();
+            self.sink.captured_audio.clear();
+            let color_profile = self.effective_color_profile();
+            let color_corr = self.config.color_correction;
+            let movie_frame_for_rewind = self.movie.current_frame();
 
-            // Capture rewind snapshot before advancing frame so rewind restores exact pre-frame state
-            if self.config.rewind_enabled {
-                let interval = self.config.rewind_interval.clamp(1, 4) as u64;
-                if self.frame_counter.is_multiple_of(interval)
-                    && let Ok(state) = core.save_state()
-                {
-                    self.rewind_buffer.push(state);
+            let bp_hit = {
+                let Some(core) = &mut self.core else { break };
+
+                // Capture rewind snapshot before advancing frame so rewind restores exact pre-frame state
+                if self.config.rewind_enabled {
+                    let interval = self.config.rewind_interval.clamp(1, 4) as u64;
+                    if self.frame_counter.is_multiple_of(interval)
+                        && let Ok(state) = core.save_state()
+                    {
+                        record_rewind_snapshot(
+                            &mut self.rewind_buffer,
+                            &mut self.rewind_movie_frames,
+                            state,
+                            movie_frame_for_rewind,
+                        );
+                    }
                 }
-            }
 
-            self.sink.suppress_audio = (turbo || speed > 1.5) && executed > 0;
-            apply_cheats_to_core(core, &self.active_cheats);
+                self.sink.suppress_audio = (turbo || speed > 1.5) && executed > 0;
+                apply_cheats_to_core(core, &self.active_cheats);
 
-            let bp_hit = core.run_frame_with_breakpoints(&mut self.sink, &self.debugger.breakpoints);
-            self.last_core_ms = start_t.elapsed().as_secs_f32() * 1000.0;
-            executed += 1;
-            self.frames_in_window += 1;
-            self.frame_counter += 1;
+                let bp_hit =
+                    core.run_frame_with_breakpoints(&mut self.sink, &self.debugger.breakpoints);
+                self.last_core_ms = start_t.elapsed().as_secs_f32() * 1000.0;
+                executed += 1;
+                self.frames_in_window += 1;
+                self.frame_counter += 1;
+                bp_hit
+            };
+
+            self.flush_frame_captures(bp_hit.is_none(), color_corr, color_profile);
 
             if let Some(bp_pc) = bp_hit {
                 self.paused = true;
@@ -925,6 +1006,10 @@ impl RustboyApp {
             }
         }
         self.sink.suppress_audio = false;
+        self.sink.capture_audio = false;
+        if let Some(msg) = self.movie.take_notice() {
+            self.notify(&msg);
+        }
 
         if self.last_fps_sample.elapsed() >= Duration::from_millis(500) {
             let secs = self.last_fps_sample.elapsed().as_secs_f32();
@@ -1041,11 +1126,12 @@ impl RustboyApp {
         // Always render floating OSD toast on top so feedback is never lost
         self.draw_floating_osd_toast(ctx);
 
-        // Visual Save State Manager, Rewind Settings, Controls & Per-Game Settings dialogs
+        // Visual Save State Manager, Rewind Settings, Controls, Movies & Per-Game Settings dialogs
         self.draw_visual_state_manager(ctx);
         self.draw_rewind_settings_dialog(ctx);
         self.draw_controls_dialog(ctx);
         self.draw_game_settings_dialog(ctx);
+        self.draw_movies_panel(ctx);
 
         // Present dockable/floating Debugger & Tool windows
         let pads = self.connected_gamepad_names();
@@ -1099,10 +1185,196 @@ impl RustboyApp {
 
     pub fn on_exit(&mut self) {
         self.destroy_gl();
+        self.stop_all_captures(false);
         self.flush_battery_save();
         self.save_rom_specific_settings();
         self.save_persistent_config();
         self.config.save();
+    }
+
+    pub(crate) fn sync_movie_after_rewind(&mut self, prev_rewind_len: usize) {
+        let new_len = self.rewind_buffer.len();
+        let mut last_popped_frame = None;
+        while self.rewind_movie_frames.len() > new_len {
+            last_popped_frame = self.rewind_movie_frames.pop_back();
+        }
+        if new_len < prev_rewind_len {
+            if let Some(core) = &self.core {
+                self.movie.on_state_loaded_at(core, last_popped_frame);
+            }
+            if let Some(msg) = self.movie.take_notice() {
+                self.notify(&msg);
+            }
+        }
+    }
+
+    pub(crate) fn rewind_manual_with_movie_sync(&mut self) {
+        let prev_len = self.rewind_buffer.len();
+        self.step_rewind_manual();
+        self.sync_movie_after_rewind(prev_len);
+    }
+
+    pub(crate) fn capture_toggle_gif(&mut self) {
+        if self.capture.is_gif_recording() {
+            match self.capture.stop_gif() {
+                Ok(Some(sum)) => {
+                    let fname = capture_path_name(sum.path.as_deref(), "capture.gif");
+                    self.notify(&format!(
+                        "GIF saved ({} frames): {}",
+                        sum.frames_written, fname
+                    ));
+                }
+                Ok(None) => {}
+                Err(err) => self.notify(&format!("GIF finalize failed: {err}")),
+            }
+            return;
+        }
+        if self.core.is_none() {
+            self.notify("Open a ROM before starting GIF capture");
+            return;
+        }
+        let title = if self.rom_title.is_empty() {
+            "rustboy_capture"
+        } else {
+            &self.rom_title
+        };
+        match self.capture.start_gif(title, None) {
+            Ok(path) => {
+                let fname = capture_path_name(Some(&path), "capture.gif");
+                self.notify(&format!(
+                    "GIF Recording started ({}): {}",
+                    self.capture.gif_fps_mode.label(),
+                    fname
+                ));
+            }
+            Err(err) => self.notify(&format!("GIF start failed: {err}")),
+        }
+    }
+
+    pub(crate) fn capture_toggle_wav(&mut self) {
+        if self.capture.is_wav_recording() {
+            self.sink.capture_audio = false;
+            self.sink.captured_audio.clear();
+            match self.capture.stop_wav() {
+                Ok(Some(sum)) => {
+                    let fname = capture_path_name(sum.path.as_deref(), "capture.wav");
+                    self.notify(&format!(
+                        "WAV saved ({:.1}s): {}",
+                        sum.duration_secs(),
+                        fname
+                    ));
+                }
+                Ok(None) => {}
+                Err(err) => self.notify(&format!("WAV finalize failed: {err}")),
+            }
+            return;
+        }
+        if self.core.is_none() {
+            self.notify("Open a ROM before starting WAV capture");
+            return;
+        }
+        let title = if self.rom_title.is_empty() {
+            "rustboy_capture"
+        } else {
+            &self.rom_title
+        };
+        match self.capture.start_wav(title, None) {
+            Ok(path) => {
+                self.sink.captured_audio.clear();
+                self.sink.capture_audio = true;
+                let fname = capture_path_name(Some(&path), "capture.wav");
+                self.notify(&format!("WAV Recording started: {fname}"));
+            }
+            Err(err) => self.notify(&format!("WAV start failed: {err}")),
+        }
+    }
+
+    fn flush_frame_captures(
+        &mut self,
+        video_ready: bool,
+        color_correction: bool,
+        color_profile: crate::config::ColorProfileChoice,
+    ) {
+        if self.capture.is_wav_recording() && !self.sink.captured_audio.is_empty() {
+            let res = self.capture.push_audio_samples(&self.sink.captured_audio);
+            self.sink.captured_audio.clear();
+            if let Err(err) = res {
+                self.sink.capture_audio = false;
+                let _ = self.capture.stop_wav();
+                self.notify(&format!("WAV recording error: {err}"));
+            }
+        }
+        if video_ready
+            && self.capture.is_gif_recording()
+            && let Err(err) =
+                self.capture
+                    .push_video_frame(&self.sink.framebuffer, color_correction, color_profile)
+        {
+            let _ = self.capture.stop_gif();
+            self.notify(&format!("GIF recording error: {err}"));
+        }
+    }
+
+    pub(crate) fn stop_all_captures(&mut self, notify_user: bool) {
+        self.sink.capture_audio = false;
+        self.sink.captured_audio.clear();
+        let (gif_res, wav_res) = self.capture.stop_all();
+        if !notify_user {
+            return;
+        }
+        match (gif_res, wav_res) {
+            (Ok(Some(g)), Ok(Some(w))) => {
+                self.notify(&format!(
+                    "Saved GIF ({} frames) & WAV ({:.1}s)",
+                    g.frames_written,
+                    w.duration_secs()
+                ));
+            }
+            (gif, wav) => {
+                match gif {
+                    Ok(Some(sum)) => {
+                        let fname = capture_path_name(sum.path.as_deref(), "capture.gif");
+                        self.notify(&format!(
+                            "GIF saved ({} frames): {}",
+                            sum.frames_written, fname
+                        ));
+                    }
+                    Err(e) => self.notify(&format!("GIF save error: {e}")),
+                    Ok(None) => {}
+                }
+                match wav {
+                    Ok(Some(sum)) => {
+                        let fname = capture_path_name(sum.path.as_deref(), "capture.wav");
+                        self.notify(&format!(
+                            "WAV saved ({:.1}s): {}",
+                            sum.duration_secs(),
+                            fname
+                        ));
+                    }
+                    Err(e) => self.notify(&format!("WAV save error: {e}")),
+                    Ok(None) => {}
+                }
+            }
+        }
+    }
+}
+
+fn capture_path_name<'a>(path: Option<&'a Path>, fallback: &'a str) -> &'a str {
+    path.and_then(|p| p.file_name())
+        .and_then(|n| n.to_str())
+        .unwrap_or(fallback)
+}
+
+fn record_rewind_snapshot(
+    rewind_buffer: &mut RewindBuffer,
+    rewind_movie_frames: &mut VecDeque<usize>,
+    state: Vec<u8>,
+    movie_frame: usize,
+) {
+    rewind_buffer.push(state);
+    rewind_movie_frames.push_back(movie_frame);
+    while rewind_movie_frames.len() > rewind_buffer.len() {
+        rewind_movie_frames.pop_front();
     }
 }
 

@@ -1,6 +1,7 @@
 mod app;
 mod app_host;
 mod audio;
+mod capture;
 mod cheats;
 mod config;
 mod debugger_ui;
@@ -12,6 +13,7 @@ mod hud;
 mod input;
 mod library;
 mod menus;
+mod movies;
 mod rewind;
 mod rom_loader;
 mod savestates;

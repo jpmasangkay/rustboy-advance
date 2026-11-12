@@ -7,6 +7,7 @@ use gba_core::{LCD_HEIGHT, LCD_WIDTH};
 use crate::app::{
     RustboyApp, ACCENT_TEAL, ACCENT_TEAL_BG, BG_PANEL, BORDER_HAIRLINE, TEXT_MUTED,
 };
+use crate::capture::GifFpsMode;
 use crate::config::{AppConfig, BezelStyle, ColorProfileChoice, HotkeyAction, ShaderPreset};
 
 impl RustboyApp {
@@ -172,7 +173,7 @@ impl RustboyApp {
                                 ui.close_menu();
                             }
                             if ui.button("⏪ Rewind Step (Hold R)").clicked() {
-                                self.step_rewind_manual();
+                                self.rewind_manual_with_movie_sync();
                                 ui.close_menu();
                             }
                             ui.separator();
@@ -517,6 +518,69 @@ impl RustboyApp {
                             ui.close_menu();
                         }
                         ui.separator();
+                        let movie_lbl = if self.movie.is_recording() {
+                            format!("Input Movies (TAS)... [REC {}f]", self.movie.current_frame())
+                        } else if self.movie.is_playing() {
+                            format!(
+                                "Input Movies (TAS)... [PLAY {}/{}]",
+                                self.movie.current_frame(),
+                                self.movie.total_frames()
+                            )
+                        } else {
+                            "Input Movies (TAS)...".to_string()
+                        };
+                        if ui.button(movie_lbl).clicked() {
+                            self.show_movies = true;
+                            ui.close_menu();
+                        }
+                        ui.menu_button("Capture GIF / WAV", |ui| {
+                            let gif_rec = self.capture.is_gif_recording();
+                            let gif_lbl = if gif_rec {
+                                format!("Stop GIF Recording ({}f)", self.capture.gif_frames())
+                            } else {
+                                "Start GIF Recording".to_string()
+                            };
+                            if ui
+                                .add_enabled(has_rom || gif_rec, egui::Button::new(gif_lbl))
+                                .clicked()
+                            {
+                                self.capture_toggle_gif();
+                                ui.close_menu();
+                            }
+                            ui.add_enabled_ui(!gif_rec, |ui| {
+                                ui.horizontal(|ui| {
+                                    ui.label(RichText::new("GIF Rate:").small().color(TEXT_MUTED));
+                                    ui.radio_value(
+                                        &mut self.capture.gif_fps_mode,
+                                        GifFpsMode::Fps30,
+                                        "30fps",
+                                    );
+                                    ui.radio_value(
+                                        &mut self.capture.gif_fps_mode,
+                                        GifFpsMode::Fps60,
+                                        "60fps",
+                                    );
+                                });
+                            });
+                            ui.separator();
+                            let wav_rec = self.capture.is_wav_recording();
+                            let wav_lbl = if wav_rec {
+                                format!(
+                                    "Stop WAV Audio Recording ({:.1}s)",
+                                    self.capture.wav_duration_secs()
+                                )
+                            } else {
+                                "Start WAV Audio Recording".to_string()
+                            };
+                            if ui
+                                .add_enabled(has_rom || wav_rec, egui::Button::new(wav_lbl))
+                                .clicked()
+                            {
+                                self.capture_toggle_wav();
+                                ui.close_menu();
+                            }
+                        });
+                        ui.separator();
                         if ui
                             .checkbox(&mut self.config.rumble_enabled, "Gamepad Haptic Rumble")
                             .changed()
@@ -524,7 +588,7 @@ impl RustboyApp {
                             self.config.save();
                         }
                         ui.separator();
-                        if ui.button("Open Screenshots Folder").clicked() {
+                        if ui.button("Open Screenshots / Captures Folder").clicked() {
                             let dir = AppConfig::screenshots_dir();
                             let _ = fs::create_dir_all(&dir);
                             #[cfg(target_os = "windows")]
@@ -636,7 +700,7 @@ impl RustboyApp {
                             .on_hover_text("Rewind ~0.5s (or hold R key in-game)")
                             .clicked()
                         {
-                            self.step_rewind_manual();
+                            self.rewind_manual_with_movie_sync();
                         }
 
                         if ui

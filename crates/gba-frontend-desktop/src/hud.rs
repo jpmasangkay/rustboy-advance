@@ -88,6 +88,56 @@ impl RustboyApp {
                         } else {
                             ui.monospace(RichText::new(bios_lbl).small().color(TEXT_MUTED));
                         }
+
+                        if self.capture.is_wav_recording() {
+                            ui.separator();
+                            draw_status_pill(
+                                ui,
+                                &format!("WAV {:.1}s", self.capture.wav_duration_secs()),
+                                Color32::from_rgb(245, 180, 66),
+                                Color32::from_rgb(130, 88, 32),
+                                Color32::from_rgb(36, 26, 16),
+                            );
+                        }
+                        if self.capture.is_gif_recording() {
+                            ui.separator();
+                            draw_status_pill(
+                                ui,
+                                &format!("GIF {}f", self.capture.gif_frames()),
+                                Color32::from_rgb(248, 113, 113),
+                                Color32::from_rgb(138, 46, 52),
+                                Color32::from_rgb(38, 18, 22),
+                            );
+                        }
+                        if self.movie.is_recording() {
+                            ui.separator();
+                            draw_status_pill(
+                                ui,
+                                &format!(
+                                    "REC {}f (RR:{})",
+                                    self.movie.current_frame(),
+                                    self.movie.rerecord_count()
+                                ),
+                                Color32::from_rgb(248, 113, 113),
+                                Color32::from_rgb(138, 46, 52),
+                                Color32::from_rgb(38, 18, 22),
+                            );
+                        } else if self.movie.is_playing() {
+                            ui.separator();
+                            let mode = if self.movie.read_only() { "RO" } else { "RW" };
+                            draw_status_pill(
+                                ui,
+                                &format!(
+                                    "PLAY {}/{} [{}]",
+                                    self.movie.current_frame(),
+                                    self.movie.total_frames(),
+                                    mode
+                                ),
+                                ACCENT_TEAL,
+                                Color32::from_rgb(36, 108, 104),
+                                Color32::from_rgb(16, 34, 38),
+                            );
+                        }
                     });
                 });
             });
@@ -465,6 +515,9 @@ impl RustboyApp {
 
                 // Render in-game pause overlay
                 self.draw_pause_overlay(ui, rect);
+
+                // Subtle corner REC / PLAY / GIF / WAV indicator pill
+                self.draw_viewport_recording_pill(ui, rect);
             }
         });
 
@@ -478,4 +531,94 @@ impl RustboyApp {
             });
         }
     }
+
+    fn draw_viewport_recording_pill(&self, ui: &egui::Ui, screen_rect: egui::Rect) {
+        let mut segments: Vec<(String, Color32)> = Vec::new();
+        if self.movie.is_recording() {
+            segments.push((
+                format!("REC {}f", self.movie.current_frame()),
+                Color32::from_rgb(248, 113, 113),
+            ));
+        } else if self.movie.is_playing() {
+            segments.push((
+                format!(
+                    "PLAY {}/{}",
+                    self.movie.current_frame(),
+                    self.movie.total_frames()
+                ),
+                ACCENT_TEAL,
+            ));
+        }
+        if self.capture.is_gif_recording() {
+            segments.push((
+                format!("GIF {}f", self.capture.gif_frames()),
+                Color32::from_rgb(248, 113, 113),
+            ));
+        }
+        if self.capture.is_wav_recording() {
+            segments.push((
+                format!("WAV {:.1}s", self.capture.wav_duration_secs()),
+                Color32::from_rgb(245, 180, 66),
+            ));
+        }
+        if segments.is_empty() {
+            return;
+        }
+
+        let label = segments
+            .iter()
+            .map(|(s, _)| s.as_str())
+            .collect::<Vec<_>>()
+            .join(" | ");
+        let accent = segments[0].1;
+        let galley = ui.painter().layout_no_wrap(
+            label,
+            egui::FontId::monospace(10.5),
+            Color32::from_rgb(236, 240, 248),
+        );
+        let pad = Vec2::new(7.0, 3.0);
+        let dot_w = 10.0;
+        let box_size = Vec2::new(galley.size().x + pad.x * 2.0 + dot_w, galley.size().y + pad.y * 2.0);
+        let pill_rect = egui::Rect::from_min_size(
+            egui::pos2(
+                screen_rect.right() - box_size.x - 8.0,
+                screen_rect.top() + 8.0,
+            ),
+            box_size,
+        );
+        ui.painter().rect_filled(
+            pill_rect,
+            CornerRadius::same(3),
+            Color32::from_rgba_unmultiplied(15, 18, 25, 215),
+        );
+        ui.painter().rect_stroke(
+            pill_rect,
+            CornerRadius::same(3),
+            Stroke::new(1.0_f32, BORDER_HAIRLINE),
+            egui::StrokeKind::Inside,
+        );
+        let dot_center = egui::pos2(pill_rect.left() + pad.x + 3.0, pill_rect.center().y);
+        ui.painter().circle_filled(dot_center, 3.0, accent);
+        ui.painter().galley(
+            egui::pos2(pill_rect.left() + pad.x + dot_w, pill_rect.top() + pad.y),
+            galley,
+            Color32::WHITE,
+        );
+    }
+}
+
+fn draw_status_pill(ui: &mut egui::Ui, label: &str, fg: Color32, border: Color32, bg: Color32) {
+    egui::Frame::new()
+        .fill(bg)
+        .stroke(Stroke::new(1.0_f32, border))
+        .corner_radius(CornerRadius::same(3))
+        .inner_margin(egui::Margin::symmetric(6, 1))
+        .show(ui, |ui| {
+            ui.horizontal(|ui| {
+                ui.spacing_mut().item_spacing.x = 4.0;
+                let (dot_rect, _) = ui.allocate_exact_size(Vec2::new(6.0, 6.0), Sense::hover());
+                ui.painter().circle_filled(dot_rect.center(), 2.8, fg);
+                ui.monospace(RichText::new(label).small().color(fg));
+            });
+        });
 }

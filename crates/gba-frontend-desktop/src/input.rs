@@ -334,7 +334,7 @@ impl RustboyApp {
 
     // WAVE-2 HOOK: Input polling entrypoint — Lua scripts (`joypad.get` / `joypad.set`)
     // and Movie playback/recording can inspect or override the active-low `u16` keyinput here.
-    pub(crate) fn poll_inputs(&mut self, ctx: &egui::Context) -> u16 {
+    pub(crate) fn poll_live_inputs(&mut self, ctx: &egui::Context) -> u16 {
         let mut mask = 0u16;
         let mut raw_turbo_a = false;
         let mut raw_turbo_b = false;
@@ -433,7 +433,17 @@ impl RustboyApp {
         encode_keyinput(effective_mask)
     }
 
-    pub(crate) fn effective_keypad_for_frame(&mut self) -> u16 {
+    pub(crate) fn poll_inputs(&mut self, ctx: &egui::Context) -> u16 {
+        let live = self.poll_live_inputs(ctx);
+        if let Some(movie_key) = self.movie.peek_playback_keyinput() {
+            self.last_pressed_mask = (!movie_key) & 0x03FF;
+            movie_key
+        } else {
+            live
+        }
+    }
+
+    pub(crate) fn effective_live_keypad_for_frame(&mut self) -> u16 {
         let effective_mask = self.base_pressed_mask
             | autofire_pulse_mask(
                 self.active_turbo_buttons.0,

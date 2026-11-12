@@ -453,8 +453,10 @@ impl VideoPostProcessor {
         lcd_ghosting: bool,
         filter: DisplayFilter,
         green_swap: bool,
+        grid_intensity: f32,
     ) -> &ColorImage {
         self.filter = filter;
+        self.lcd_grid_intensity = grid_intensity;
         let lut = if color_correction {
             srgb_lut_3()
         } else {
@@ -531,6 +533,26 @@ impl VideoPostProcessor {
                 if self.output_image.size != [out_w, out_h] {
                     self.output_image = egui::ColorImage::new([out_w, out_h], egui::Color32::BLACK);
                 }
+
+                // Precompute dynamic integer multipliers once outside pixel loop (0.0 <= intensity <= 0.25)
+                // At default 8% (0.08), produces subtle authentic ~8% cell boundary gaps (240/235/226):
+                // Left: warm R bias, ~97% G/B (248/245)
+                // Right: ~94% (240/242/246)
+                // Scanline: ~92% (235/235/238)
+                // Corner: ~88% (226/226/228)
+                let intensity = grid_intensity.clamp(0.0, 0.25);
+                let mul_left_g = (256.0 * (1.0 - intensity * 0.40)).round() as u16;
+                let mul_left_b = (256.0 * (1.0 - intensity * 0.55)).round() as u16;
+                let mul_right_r = (256.0 * (1.0 - intensity * 0.78)).round() as u16;
+                let mul_right_g = (256.0 * (1.0 - intensity * 0.68)).round() as u16;
+                let mul_right_b = (256.0 * (1.0 - intensity * 0.49)).round() as u16;
+                let mul_scan_r = (256.0 * (1.0 - intensity * 1.02)).round() as u16;
+                let mul_scan_g = (256.0 * (1.0 - intensity * 1.02)).round() as u16;
+                let mul_scan_b = (256.0 * (1.0 - intensity * 0.88)).round() as u16;
+                let mul_corner_r = (256.0 * (1.0 - intensity * 1.46)).round() as u16;
+                let mul_corner_g = (256.0 * (1.0 - intensity * 1.46)).round() as u16;
+                let mul_corner_b = (256.0 * (1.0 - intensity * 1.37)).round() as u16;
+
                 for y in 0..LCD_HEIGHT {
                     let src_row = y * LCD_WIDTH;
                     let r0 = (y * 3) * out_w;
@@ -541,24 +563,24 @@ impl VideoPostProcessor {
                         let [r, g, b] = self.base_rgb[src_row + x];
                         let c_left = egui::Color32::from_rgb(
                             r,
-                            ((g as u16 * 238) >> 8) as u8,
-                            ((b as u16 * 230) >> 8) as u8,
+                            ((g as u16 * mul_left_g) >> 8) as u8,
+                            ((b as u16 * mul_left_b) >> 8) as u8,
                         );
                         let c_mid = egui::Color32::from_rgb(r, g, b);
                         let c_right = egui::Color32::from_rgb(
-                            ((r as u16 * 215) >> 8) as u8,
-                            ((g as u16 * 218) >> 8) as u8,
-                            ((b as u16 * 228) >> 8) as u8,
+                            ((r as u16 * mul_right_r) >> 8) as u8,
+                            ((g as u16 * mul_right_g) >> 8) as u8,
+                            ((b as u16 * mul_right_b) >> 8) as u8,
                         );
                         let c_scan = egui::Color32::from_rgb(
-                            ((r as u16 * 198) >> 8) as u8,
-                            ((g as u16 * 198) >> 8) as u8,
-                            ((b as u16 * 204) >> 8) as u8,
+                            ((r as u16 * mul_scan_r) >> 8) as u8,
+                            ((g as u16 * mul_scan_g) >> 8) as u8,
+                            ((b as u16 * mul_scan_b) >> 8) as u8,
                         );
                         let c_corner = egui::Color32::from_rgb(
-                            ((r as u16 * 175) >> 8) as u8,
-                            ((g as u16 * 175) >> 8) as u8,
-                            ((b as u16 * 180) >> 8) as u8,
+                            ((r as u16 * mul_corner_r) >> 8) as u8,
+                            ((g as u16 * mul_corner_g) >> 8) as u8,
+                            ((b as u16 * mul_corner_b) >> 8) as u8,
                         );
 
                         let dx = x * 3;
@@ -645,6 +667,7 @@ pub struct FrontendBridge {
     pub output_image: egui::ColorImage,
 
     pub filter: DisplayFilter,
+    pub lcd_grid_intensity: f32,
     pub color_correction: bool,
     pub lcd_ghosting: bool,
     pub green_swap: bool,
@@ -693,8 +716,9 @@ impl FrontendBridge {
             raw_lut,
             base_rgb: vec![[0u8; 3]; LCD_WIDTH * LCD_HEIGHT],
             prev_rgb: vec![[0u8; 3]; LCD_WIDTH * LCD_HEIGHT],
-            output_image: egui::ColorImage::new([LCD_WIDTH * 3, LCD_HEIGHT * 3], egui::Color32::BLACK),
-            filter: DisplayFilter::AuthenticGbaLcd,
+            output_image: egui::ColorImage::new([LCD_WIDTH * 2, LCD_HEIGHT * 2], egui::Color32::BLACK),
+            filter: DisplayFilter::SoftHandheld,
+            lcd_grid_intensity: 0.08,
             color_correction: true,
             lcd_ghosting: true,
             green_swap: false,
@@ -782,6 +806,22 @@ impl HostFrontend for FrontendBridge {
                 if self.output_image.size != [out_w, out_h] {
                     self.output_image = egui::ColorImage::new([out_w, out_h], egui::Color32::BLACK);
                 }
+
+                // Precompute dynamic integer multipliers once outside pixel loop (0.0 <= intensity <= 0.25)
+                // At default 8% (0.08), produces subtle authentic ~8% cell boundary gaps (240/235/226)
+                let intensity = self.lcd_grid_intensity.clamp(0.0, 0.25);
+                let mul_left_g = (256.0 * (1.0 - intensity * 0.40)).round() as u16;
+                let mul_left_b = (256.0 * (1.0 - intensity * 0.55)).round() as u16;
+                let mul_right_r = (256.0 * (1.0 - intensity * 0.78)).round() as u16;
+                let mul_right_g = (256.0 * (1.0 - intensity * 0.68)).round() as u16;
+                let mul_right_b = (256.0 * (1.0 - intensity * 0.49)).round() as u16;
+                let mul_scan_r = (256.0 * (1.0 - intensity * 1.02)).round() as u16;
+                let mul_scan_g = (256.0 * (1.0 - intensity * 1.02)).round() as u16;
+                let mul_scan_b = (256.0 * (1.0 - intensity * 0.88)).round() as u16;
+                let mul_corner_r = (256.0 * (1.0 - intensity * 1.46)).round() as u16;
+                let mul_corner_g = (256.0 * (1.0 - intensity * 1.46)).round() as u16;
+                let mul_corner_b = (256.0 * (1.0 - intensity * 1.37)).round() as u16;
+
                 for y in 0..LCD_HEIGHT {
                     let src_row = y * LCD_WIDTH;
                     let r0 = (y * 3) * out_w;
@@ -792,24 +832,24 @@ impl HostFrontend for FrontendBridge {
                         let [r, g, b] = self.base_rgb[src_row + x];
                         let c_left = egui::Color32::from_rgb(
                             r,
-                            ((g as u16 * 238) >> 8) as u8,
-                            ((b as u16 * 230) >> 8) as u8,
+                            ((g as u16 * mul_left_g) >> 8) as u8,
+                            ((b as u16 * mul_left_b) >> 8) as u8,
                         );
                         let c_mid = egui::Color32::from_rgb(r, g, b);
                         let c_right = egui::Color32::from_rgb(
-                            ((r as u16 * 215) >> 8) as u8,
-                            ((g as u16 * 218) >> 8) as u8,
-                            ((b as u16 * 228) >> 8) as u8,
+                            ((r as u16 * mul_right_r) >> 8) as u8,
+                            ((g as u16 * mul_right_g) >> 8) as u8,
+                            ((b as u16 * mul_right_b) >> 8) as u8,
                         );
                         let c_scan = egui::Color32::from_rgb(
-                            ((r as u16 * 198) >> 8) as u8,
-                            ((g as u16 * 198) >> 8) as u8,
-                            ((b as u16 * 204) >> 8) as u8,
+                            ((r as u16 * mul_scan_r) >> 8) as u8,
+                            ((g as u16 * mul_scan_g) >> 8) as u8,
+                            ((b as u16 * mul_scan_b) >> 8) as u8,
                         );
                         let c_corner = egui::Color32::from_rgb(
-                            ((r as u16 * 175) >> 8) as u8,
-                            ((g as u16 * 175) >> 8) as u8,
-                            ((b as u16 * 180) >> 8) as u8,
+                            ((r as u16 * mul_corner_r) >> 8) as u8,
+                            ((g as u16 * mul_corner_g) >> 8) as u8,
+                            ((b as u16 * mul_corner_b) >> 8) as u8,
                         );
 
                         let dx = x * 3;
@@ -1002,9 +1042,26 @@ mod tests {
         // Also test VideoPostProcessor::process_display_filter directly
         let mut proc = VideoPostProcessor::new();
         for &f in &DisplayFilter::ALL {
-            let img = proc.process_display_filter(&test_fb, true, true, f, false);
+            let img = proc.process_display_filter(&test_fb, true, true, f, false, 0.08);
             let (exp_w, exp_h) = f.target_dimensions();
             assert_eq!(img.size, [exp_w, exp_h]);
         }
+
+        // Verify AuthenticGbaLcd intensity scaling on pure white (0x7FFF)
+        // With intensity 0.08, center is full white (255), scanline is subtle ~92% (234), corner is ~88% (225)
+        let lcd_img_8pct = proc.process_display_filter(&test_fb, false, false, DisplayFilter::AuthenticGbaLcd, false, 0.08);
+        let out_w = LCD_WIDTH * 3;
+        // Pixel (1, 0) is c_mid
+        assert_eq!(lcd_img_8pct.pixels[1], egui::Color32::from_rgb(255, 255, 255));
+        // Pixel (0, 2) is c_scan: [234, 234, 237]
+        assert_eq!(lcd_img_8pct.pixels[2 * out_w], egui::Color32::from_rgb(234, 234, 237));
+        // Pixel (2, 2) is c_corner: [225, 225, 227]
+        assert_eq!(lcd_img_8pct.pixels[2 * out_w + 2], egui::Color32::from_rgb(225, 225, 227));
+
+        // With intensity 0.0, grid is disabled: all subpixels evaluate to full white (255)
+        let lcd_img_0pct = proc.process_display_filter(&test_fb, false, false, DisplayFilter::AuthenticGbaLcd, false, 0.0);
+        assert_eq!(lcd_img_0pct.pixels[1], egui::Color32::from_rgb(255, 255, 255));
+        assert_eq!(lcd_img_0pct.pixels[2 * out_w], egui::Color32::from_rgb(255, 255, 255));
+        assert_eq!(lcd_img_0pct.pixels[2 * out_w + 2], egui::Color32::from_rgb(255, 255, 255));
     }
 }

@@ -111,18 +111,37 @@ pub(crate) fn find_cover_image(entry: &RomLibraryEntry) -> Option<PathBuf> {
     let stem = entry.path.file_stem()?.to_string_lossy();
     let display = &entry.display_name;
 
-    // 1. In ./covers/
-    let cwd_covers = Path::new("covers");
-    let candidates = [
-        cwd_covers.join(format!("{display}.png")),
-        cwd_covers.join(format!("{display}.jpg")),
-        cwd_covers.join(format!("{stem}.png")),
-        cwd_covers.join(format!("{stem}.jpg")),
-        cwd_covers.join(format!("{}.png", entry.game_code)),
-    ];
-    for c in &candidates {
-        if c.exists() {
-            return Some(c.clone());
+    // 1. In ./covers/, %APPDATA%/RustboyAdvance/covers/, and near executable
+    let mut search_dirs = Vec::new();
+    search_dirs.push(PathBuf::from("covers"));
+    search_dirs.push(crate::config::AppConfig::app_data_dir().join("covers"));
+    if let Ok(exe) = std::env::current_exe() {
+        if let Some(exe_dir) = exe.parent() {
+            search_dirs.push(exe_dir.join("covers"));
+            if let Some(target_dir) = exe_dir.parent() {
+                search_dirs.push(target_dir.join("covers"));
+                if let Some(proj_root) = target_dir.parent() {
+                    search_dirs.push(proj_root.join("covers"));
+                }
+            }
+        }
+    }
+
+    for dir in &search_dirs {
+        let candidates = [
+            dir.join(format!("{display}.png")),
+            dir.join(format!("{display}.jpg")),
+            dir.join(format!("{display}.jpeg")),
+            dir.join(format!("{stem}.png")),
+            dir.join(format!("{stem}.jpg")),
+            dir.join(format!("{stem}.jpeg")),
+            dir.join(format!("{}.png", entry.game_code)),
+            dir.join(format!("{}.jpg", entry.game_code)),
+        ];
+        for c in &candidates {
+            if c.exists() {
+                return Some(c.clone());
+            }
         }
     }
 
@@ -132,10 +151,13 @@ pub(crate) fn find_cover_image(entry: &RomLibraryEntry) -> Option<PathBuf> {
         let local_candidates = [
             entry.path.with_extension("png"),
             entry.path.with_extension("jpg"),
+            entry.path.with_extension("jpeg"),
             parent.join(format!("{stem}.cover.png")),
             parent.join(format!("{stem}_cover.png")),
             parent_covers.join(format!("{display}.png")),
+            parent_covers.join(format!("{display}.jpg")),
             parent_covers.join(format!("{stem}.png")),
+            parent_covers.join(format!("{stem}.jpg")),
             parent_covers.join(format!("{}.png", entry.game_code)),
         ];
         for c in &local_candidates {
@@ -150,7 +172,14 @@ pub(crate) fn find_cover_image(entry: &RomLibraryEntry) -> Option<PathBuf> {
 
 pub(crate) fn trigger_cover_download(entry: &RomLibraryEntry) {
     let display_name = entry.display_name.clone();
+    let stem = entry
+        .path
+        .file_stem()
+        .map(|s| s.to_string_lossy().to_string())
+        .unwrap_or_else(|| display_name.clone());
+    let region = entry.region.to_string();
     let platform = entry.platform;
+
     std::thread::spawn(move || {
         let repo_folder = match platform {
             RomPlatform::Gba => "Nintendo_-_Game_Boy_Advance",
@@ -158,18 +187,52 @@ pub(crate) fn trigger_cover_download(entry: &RomLibraryEntry) {
             RomPlatform::Gb => "Nintendo_-_Game_Boy",
         };
 
-        let encoded = url_encode_name(&display_name);
-        let url = format!(
-            "https://raw.githubusercontent.com/libretro-thumbnails/{repo_folder}/master/Named_Boxarts/{encoded}.png"
-        );
-        if let Ok(resp) = ureq::get(&url).timeout(std::time::Duration::from_secs(6)).call() {
-            if resp.status() == 200 {
-                let mut bytes = Vec::new();
-                use std::io::Read;
-                if resp.into_reader().read_to_end(&mut bytes).is_ok() && !bytes.is_empty() {
-                    let _ = std::fs::create_dir_all("covers");
-                    let out = format!("covers/{display_name}.png");
-                    let _ = std::fs::write(out, bytes);
+        // Try candidate names in order
+        let mut candidates = vec![display_name.clone()];
+        if stem != display_name {
+            candidates.push(stem.clone());
+        }
+        if !display_name.contains('(') && !region.is_empty() {
+            candidates.push(format!("{display_name} ({region})"));
+        }
+
+        let mut downloaded_bytes = None;
+        for cand in &candidates {
+            let encoded = url_encode_name(cand);
+            let url = format!(
+                "https://raw.githubusercontent.com/libretro-thumbnails/{repo_folder}/master/Named_Boxarts/{encoded}.png"
+            );
+            if let Ok(resp) = ureq::get(&url).timeout(std::time::Duration::from_secs(6)).call() {
+                if resp.status() == 200 {
+                    let mut bytes = Vec::new();
+                    use std::io::Read;
+                    if resp.into_reader().read_to_end(&mut bytes).is_ok() && !bytes.is_empty() {
+                        downloaded_bytes = Some(bytes);
+                        break;
+                    }
+                }
+            }
+        }
+
+        if let Some(bytes) = downloaded_bytes {
+            let appdata_covers = crate::config::AppConfig::app_data_dir().join("covers");
+            let _ = std::fs::create_dir_all(&appdata_covers);
+            let _ = std::fs::write(appdata_covers.join(format!("{display_name}.png")), &bytes);
+
+            let cwd_covers = PathBuf::from("covers");
+            let _ = std::fs::create_dir_all(&cwd_covers);
+            let _ = std::fs::write(cwd_covers.join(format!("{display_name}.png")), &bytes);
+
+            if let Ok(exe) = std::env::current_exe() {
+                if let Some(exe_dir) = exe.parent() {
+                    let _ = std::fs::create_dir_all(exe_dir.join("covers"));
+                    let _ = std::fs::write(exe_dir.join("covers").join(format!("{display_name}.png")), &bytes);
+                    if let Some(target_dir) = exe_dir.parent() {
+                        if let Some(proj) = target_dir.parent() {
+                            let _ = std::fs::create_dir_all(proj.join("covers"));
+                            let _ = std::fs::write(proj.join("covers").join(format!("{display_name}.png")), &bytes);
+                        }
+                    }
                 }
             }
         }
@@ -1095,149 +1158,171 @@ impl RustboyApp {
                     }
                 }
 
+                if !self.pending_cover_downloads.is_empty() {
+                    ctx.request_repaint_after(std::time::Duration::from_millis(300));
+                }
+
                 egui::ScrollArea::vertical()
                     .auto_shrink([false, false])
                     .show(ui, |ui| {
-                        ui.add_space(8.0);
-                        ui.horizontal_wrapped(|ui| {
-                            let tile_w = 144.0_f32;
-                            let tile_h = 192.0_f32; // Exact 3:4 aspect ratio
+                        egui::Frame::new()
+                            .inner_margin(egui::Margin {
+                                left: 16,
+                                right: 16,
+                                top: 12,
+                                bottom: 16,
+                            })
+                            .show(ui, |ui| {
+                                ui.spacing_mut().item_spacing = egui::vec2(16.0, 20.0);
+                                ui.horizontal_wrapped(|ui| {
+                                    let tile_size = 160.0_f32; // Authentic GBA 1:1 square boxart
+                                    let tile_w = tile_size;
+                                    let tile_h = tile_size;
 
-                            for entry in &filtered {
-                                let is_selected =
-                                    self.selected_rom_path.as_ref() == Some(&entry.path);
+                                    for entry in &filtered {
+                                        let is_selected =
+                                            self.selected_rom_path.as_ref() == Some(&entry.path);
 
-                                ui.allocate_ui_with_layout(
-                                    egui::vec2(tile_w, tile_h + 38.0),
-                                    Layout::top_down(Align::Min),
-                                    |ui| {
-                                        // 1. Cover Tile (3:4 aspect ratio)
-                                        let (tile_rect, tile_resp) = ui.allocate_exact_size(
-                                            egui::vec2(tile_w, tile_h),
-                                            Sense::click(),
-                                        );
+                                        ui.allocate_ui_with_layout(
+                                            egui::vec2(tile_w, tile_h + 38.0),
+                                            Layout::top_down(Align::Min),
+                                            |ui| {
+                                                // 1. Cover Tile (1:1 square aspect ratio)
+                                                let (tile_rect, tile_resp) = ui.allocate_exact_size(
+                                                    egui::vec2(tile_w, tile_h),
+                                                    Sense::click(),
+                                                );
 
-                                        if tile_resp.clicked() {
-                                            self.selected_rom_path = Some(entry.path.clone());
-                                        }
-                                        if tile_resp.double_clicked() {
-                                            launch_target = Some(entry.path.clone());
-                                        }
-
-                                        tile_resp.context_menu(|ui| {
-                                            if ui.button("▶ Play Game").clicked() {
-                                                launch_target = Some(entry.path.clone());
-                                                ui.close_menu();
-                                            }
-                                            if ui.button("📁 Open Save Folder").clicked() {
-                                                if let Some(parent) = entry.path.parent() {
-                                                    #[cfg(target_os = "windows")]
-                                                    let _ = std::process::Command::new("explorer")
-                                                        .arg(parent)
-                                                        .spawn();
+                                                if tile_resp.clicked() {
+                                                    self.selected_rom_path = Some(entry.path.clone());
                                                 }
-                                                ui.close_menu();
-                                            }
-                                            if ui.button("🖼 Refresh / Download Cover").clicked() {
-                                                self.cover_textures.remove(&entry.path);
-                                                self.pending_cover_downloads.remove(&entry.path);
-                                                trigger_cover_download(entry);
-                                                ui.close_menu();
-                                            }
-                                            if ui.button("⚙ Game Settings...").clicked() {
-                                                game_settings_entry = Some(entry.clone());
-                                                ui.close_menu();
-                                            }
-                                            let is_fav = self.favorites.contains(&entry.path);
-                                            if ui
-                                                .button(if is_fav {
-                                                    "☆ Remove from Favorites"
+                                                if tile_resp.double_clicked() {
+                                                    launch_target = Some(entry.path.clone());
+                                                }
+
+                                                tile_resp.context_menu(|ui| {
+                                                    if ui.button("▶ Play Game").clicked() {
+                                                        launch_target = Some(entry.path.clone());
+                                                        ui.close_menu();
+                                                    }
+                                                    if ui.button("📁 Open Save Folder").clicked() {
+                                                        if let Some(parent) = entry.path.parent() {
+                                                            #[cfg(target_os = "windows")]
+                                                            let _ = std::process::Command::new("explorer")
+                                                                .arg(parent)
+                                                                .spawn();
+                                                        }
+                                                        ui.close_menu();
+                                                    }
+                                                    if ui.button("🖼 Refresh / Download Cover").clicked() {
+                                                        self.cover_textures.remove(&entry.path);
+                                                        self.pending_cover_downloads.remove(&entry.path);
+                                                        trigger_cover_download(entry);
+                                                        ui.close_menu();
+                                                    }
+                                                    if ui.button("⚙ Game Settings...").clicked() {
+                                                        game_settings_entry = Some(entry.clone());
+                                                        ui.close_menu();
+                                                    }
+                                                    let is_fav = self.favorites.contains(&entry.path);
+                                                    if ui
+                                                        .button(if is_fav {
+                                                            "☆ Remove from Favorites"
+                                                        } else {
+                                                            "★ Add to Favorites"
+                                                        })
+                                                        .clicked()
+                                                    {
+                                                        if is_fav {
+                                                            self.favorites.remove(&entry.path);
+                                                        } else {
+                                                            self.favorites.insert(entry.path.clone());
+                                                        }
+                                                        self.save_persistent_config();
+                                                        ui.close_menu();
+                                                    }
+                                                    ui.separator();
+                                                    if ui.button("🗑 Remove Folder from Library").clicked() {
+                                                        if let Some(parent) = entry.path.parent() {
+                                                            self.rom_folders.retain(|f| f != parent);
+                                                            self.save_persistent_config();
+                                                            rescan_needed = true;
+                                                        }
+                                                        ui.close_menu();
+                                                    }
+                                                });
+
+                                                // Base tile background
+                                                ui.painter()
+                                                    .rect_filled(tile_rect, RADIUS_DEFAULT, COLOR_TILE);
+
+                                                // Render cover image if loaded, aspect-fitted inside square tile
+                                                if let Some(tex) = self.cover_textures.get(&entry.path) {
+                                                    let tex_w = tex.size()[0] as f32;
+                                                    let tex_h = tex.size()[1] as f32;
+                                                    if tex_w > 0.0 && tex_h > 0.0 {
+                                                        let scale = (tile_w / tex_w).min(tile_h / tex_h);
+                                                        let draw_size = egui::vec2(tex_w * scale, tex_h * scale);
+                                                        let draw_rect = egui::Rect::from_center_size(tile_rect.center(), draw_size);
+                                                        ui.painter().image(
+                                                            tex.id(),
+                                                            draw_rect,
+                                                            egui::Rect::from_min_max(
+                                                                egui::pos2(0.0, 0.0),
+                                                                egui::pos2(1.0, 1.0),
+                                                            ),
+                                                            Color32::WHITE,
+                                                        );
+                                                    }
+                                                }
+
+                                                let stroke = if is_selected {
+                                                    STROKE_TEAL_2PX
                                                 } else {
-                                                    "★ Add to Favorites"
-                                                })
-                                                .clicked()
-                                            {
-                                                if is_fav {
-                                                    self.favorites.remove(&entry.path);
-                                                } else {
-                                                    self.favorites.insert(entry.path.clone());
+                                                    STROKE_BORDER
+                                                };
+                                                ui.painter().rect_stroke(
+                                                    tile_rect,
+                                                    RADIUS_DEFAULT,
+                                                    stroke,
+                                                    egui::StrokeKind::Inside,
+                                                );
+
+                                                // 2. Metadata Directly Below Tile
+                                                ui.add_space(4.0);
+
+                                                // Title 12px white, single-line ellipsis
+                                                let title_lbl = egui::Label::new(
+                                                    RichText::new(&entry.display_name)
+                                                        .color(COLOR_TEXT)
+                                                        .size(12.0),
+                                                )
+                                                .truncate();
+                                                let title_resp = ui.add_sized([tile_w, 16.0], title_lbl);
+                                                if title_resp.clicked() {
+                                                    self.selected_rom_path = Some(entry.path.clone());
                                                 }
-                                                self.save_persistent_config();
-                                                ui.close_menu();
-                                            }
-                                            ui.separator();
-                                            if ui.button("🗑 Remove Folder from Library").clicked() {
-                                                if let Some(parent) = entry.path.parent() {
-                                                    self.rom_folders.retain(|f| f != parent);
-                                                    self.save_persistent_config();
-                                                    rescan_needed = true;
+                                                if title_resp.double_clicked() {
+                                                    launch_target = Some(entry.path.clone());
                                                 }
-                                                ui.close_menu();
-                                            }
-                                        });
 
-                                        // Render cover image if loaded, or flat placeholder
-                                        if let Some(tex) = self.cover_textures.get(&entry.path) {
-                                            ui.painter().image(
-                                                tex.id(),
-                                                tile_rect,
-                                                egui::Rect::from_min_max(
-                                                    egui::pos2(0.0, 0.0),
-                                                    egui::pos2(1.0, 1.0),
-                                                ),
-                                                Color32::WHITE,
-                                            );
-                                        } else {
-                                            ui.painter()
-                                                .rect_filled(tile_rect, RADIUS_DEFAULT, COLOR_TILE);
-                                        }
-
-                                        let stroke = if is_selected {
-                                            STROKE_TEAL_2PX
-                                        } else {
-                                            STROKE_BORDER
-                                        };
-                                        ui.painter().rect_stroke(
-                                            tile_rect,
-                                            RADIUS_DEFAULT,
-                                            stroke,
-                                            egui::StrokeKind::Inside,
+                                                // "REGION · SIZE" in secondary text
+                                                let size_mb_int = entry.size_mb.round() as u32;
+                                                let meta_str = format!(
+                                                    "{} · {} MB",
+                                                    entry.region,
+                                                    size_mb_int.max(1)
+                                                );
+                                                ui.label(
+                                                    RichText::new(meta_str)
+                                                        .color(COLOR_TEXT_SECONDARY)
+                                                        .size(11.0),
+                                                );
+                                            },
                                         );
-
-                                        // 2. Metadata Directly Below Tile
-                                        ui.add_space(4.0);
-
-                                        // Title 12px white, single-line ellipsis
-                                        let title_lbl = egui::Label::new(
-                                            RichText::new(&entry.display_name)
-                                                .color(COLOR_TEXT)
-                                                .size(12.0),
-                                        )
-                                        .truncate();
-                                        let title_resp = ui.add_sized([tile_w, 16.0], title_lbl);
-                                        if title_resp.clicked() {
-                                            self.selected_rom_path = Some(entry.path.clone());
-                                        }
-                                        if title_resp.double_clicked() {
-                                            launch_target = Some(entry.path.clone());
-                                        }
-
-                                        // "REGION · SIZE" in secondary text
-                                        let size_mb_int = entry.size_mb.round() as u32;
-                                        let meta_str = format!(
-                                            "{} · {} MB",
-                                            entry.region,
-                                            size_mb_int.max(1)
-                                        );
-                                        ui.label(
-                                            RichText::new(meta_str)
-                                                .color(COLOR_TEXT_SECONDARY)
-                                                .size(11.0),
-                                        );
-                                    },
-                                );
-                            }
-                        });
+                                    }
+                                });
+                            });
                     });
             }
         }

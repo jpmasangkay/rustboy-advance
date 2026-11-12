@@ -437,6 +437,7 @@ impl RustboyApp {
                     self.slot_thumbnails[slot - 1] = None;
                     self.slot_meta[slot - 1] = None;
                 }
+                self.movie.record_state_bookmark(&path);
                 self.state_manager_error = None;
                 self.notify(&format!("Saved State Slot {slot}"));
             }
@@ -457,6 +458,7 @@ impl RustboyApp {
             && let Ok(cur_bytes) = core.save_state()
         {
             self.undo_state_buffer = Some(cur_bytes);
+            self.movie.record_undo_bookmark();
         }
         self.load_state_from_path(&path, &format!("Loaded State Slot {slot}"));
     }
@@ -474,10 +476,16 @@ impl RustboyApp {
                     .copy_from_slice(&*core.bus.ppu.framebuffer);
                 self.sink.frame_dirty = true;
                 self.rewind_buffer.clear();
+                self.rewind_movie_frames.clear();
                 self.rewinding = false;
                 self.undo_state_buffer = cur;
                 self.state_manager_error = None;
-                self.notify("Undo: Reverted state to previous checkpoint");
+                self.movie.on_undo_state_loaded(core);
+                if let Some(msg) = self.movie.take_notice() {
+                    self.notify(&msg);
+                } else {
+                    self.notify("Undo: Reverted state to previous checkpoint");
+                }
             }
             Err(e) => {
                 let msg = format!("Undo state load failed: {e:?}");
@@ -499,7 +507,10 @@ impl RustboyApp {
         {
             match self.build_current_state_container() {
                 Ok(container) => match fs::write(&path, container) {
-                    Ok(()) => self.notify("Saved State to file"),
+                    Ok(()) => {
+                        self.movie.record_state_bookmark(&path);
+                        self.notify("Saved State to file");
+                    }
                     Err(e) => self.notify_error(&format!("Failed writing state: {e}")),
                 },
                 Err(e) => self.notify_error(&format!("State serialize failed: {e}")),
@@ -555,9 +566,15 @@ impl RustboyApp {
                     .copy_from_slice(&*core.bus.ppu.framebuffer);
                 self.sink.frame_dirty = true;
                 self.rewind_buffer.clear();
+                self.rewind_movie_frames.clear();
                 self.rewinding = false;
                 self.state_manager_error = None;
-                self.notify(success_msg);
+                self.movie.on_state_loaded_from_path(core, path);
+                if let Some(msg) = self.movie.take_notice() {
+                    self.notify(&format!("{success_msg} — {msg}"));
+                } else {
+                    self.notify(success_msg);
+                }
             }
             Err(e) => {
                 let msg = SaveStateError::CoreError(format!("{e:?}")).to_string();

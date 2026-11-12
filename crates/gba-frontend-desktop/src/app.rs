@@ -202,6 +202,10 @@ pub(crate) struct RustboyApp {
     pub(crate) capture: CaptureController,
     pub(crate) show_movies: bool,
     pub(crate) rewind_movie_frames: VecDeque<usize>,
+
+    // Lua Scripting & RetroAchievements
+    pub(crate) lua: crate::lua_engine::LuaEngine,
+    pub(crate) ra: crate::retroachievements::RetroAchievementsManager,
 }
 
 impl RustboyApp {
@@ -211,6 +215,7 @@ impl RustboyApp {
         let audio = AudioOutput::start();
         audio.set_muted(config.muted);
         let sink = CoreSink::new(audio);
+        let ra = crate::retroachievements::RetroAchievementsManager::new(&config);
 
         let bios_bytes = cli
             .bios_path
@@ -288,6 +293,8 @@ impl RustboyApp {
             capture: CaptureController::new(),
             show_movies: false,
             rewind_movie_frames: VecDeque::new(),
+            lua: crate::lua_engine::LuaEngine::new(),
+            ra,
         };
 
         app.load_persistent_config();
@@ -299,6 +306,10 @@ impl RustboyApp {
             app.notify_error(&format!("Failed to load CLI ROM: {e}"));
         }
         app
+    }
+
+    pub(crate) fn is_ra_hardcore_active(&self) -> bool {
+        self.ra.is_hardcore_active(&self.config)
     }
 
     pub(crate) fn notify(&mut self, msg: &str) {
@@ -474,7 +485,7 @@ impl RustboyApp {
 
         self.gb = None;
         let rom_crc32 = crc32fast::hash(&rom_bytes);
-        let mut core = GbaCore::new(self.bios_bytes.as_deref(), rom_bytes);
+        let mut core = GbaCore::new(self.bios_bytes.as_deref(), rom_bytes.clone());
         if let Ok(sav) = fs::read(&sav_path) {
             core.bus.cart.load_save_data(&sav);
         }
@@ -499,6 +510,8 @@ impl RustboyApp {
             ctx,
         );
         self.apply_active_game_settings_to_core();
+        self.ra.on_rom_loaded(&self.config, &rom_bytes, &title);
+        self.lua.on_rom_changed(&title, &code);
 
         let patch_tag = match patch_applied {
             Some(fmt) => format!(" ({} Patched)", fmt.label()),
@@ -1323,8 +1336,18 @@ impl RustboyApp {
             self.sink.suppress_audio = suppress_audio;
             let mut stop_reason = gba_core::StopReason::FrameComplete;
             let ctrl = self.build_debug_control();
+            let hardcore = self.is_ra_hardcore_active();
 
             if let Some(core) = &mut self.core {
+                self.ra.tick_frame(core, &self.config);
+                self.lua.run_frame(
+                    core,
+                    self.frame_counter,
+                    &self.rom_title,
+                    &self.rom_code,
+                    self.base_pressed_mask,
+                    hardcore,
+                );
                 apply_cheats_to_core(core, &self.active_cheats);
                 if let Some(local) = &mut self.link.local {
                     local.step_frame(core, &mut self.sink, p2_kp);
@@ -1421,6 +1444,9 @@ impl RustboyApp {
         self.poll_library_scan(ctx);
         self.pump_gamepad_events(ctx);
         self.poll_gdb_server();
+        if self.ra.poll_events(&mut self.config) {
+            ctx.request_repaint();
+        }
         if self.title_dirty {
             self.sync_window_title(ctx);
             self.title_dirty = false;
@@ -1494,6 +1520,9 @@ impl RustboyApp {
         self.draw_game_settings_dialog(ctx);
         self.draw_movies_panel(ctx);
         self.draw_link_window(ctx);
+        let hardcore = self.is_ra_hardcore_active();
+        self.lua.show_lua_console(ctx, self.core.is_some(), hardcore);
+        self.ra.show_retroachievements_window(ctx, &mut self.config);
 
         // Present dockable/floating Debugger & Tool windows
         let pads = self.connected_gamepad_names();
@@ -1583,6 +1612,8 @@ impl RustboyApp {
     pub fn on_exit(&mut self) {
         self.destroy_gl();
         self.stop_all_captures(false);
+        self.ra.on_rom_closed();
+        self.lua.on_rom_changed("", "");
         self.flush_gb_battery_save(true);
         self.flush_battery_save();
         self.save_rom_specific_settings();

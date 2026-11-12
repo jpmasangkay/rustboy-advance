@@ -297,25 +297,36 @@ impl RustboyApp {
                     resume = true;
                 }
                 ui.add_space(4.0);
+                let hardcore = self.is_ra_hardcore_active();
                 if ui
-                    .add_sized([card_w - 40.0, 26.0], egui::Button::new("💾 Quick Save (Slot 1)"))
+                    .add_enabled(
+                        !hardcore,
+                        egui::Button::new("💾 Quick Save (Slot 1)").min_size(Vec2::new(card_w - 40.0, 26.0)),
+                    )
+                    .on_disabled_hover_text("Disabled in RetroAchievements Hardcore Mode")
                     .clicked()
                 {
                     quick_save = true;
                 }
                 ui.add_space(4.0);
                 if ui
-                    .add_sized([card_w - 40.0, 26.0], egui::Button::new("📂 Quick Load (Slot 1)"))
+                    .add_enabled(
+                        !hardcore,
+                        egui::Button::new("📂 Quick Load (Slot 1)").min_size(Vec2::new(card_w - 40.0, 26.0)),
+                    )
+                    .on_disabled_hover_text("Disabled in RetroAchievements Hardcore Mode")
                     .clicked()
                 {
                     quick_load = true;
                 }
                 ui.add_space(4.0);
                 if ui
-                    .add_sized(
-                        [card_w - 40.0, 26.0],
-                        egui::Button::new("🖼️ Save State Manager (F6)"),
+                    .add_enabled(
+                        !hardcore,
+                        egui::Button::new("🖼️ Save State Manager (F6)")
+                            .min_size(Vec2::new(card_w - 40.0, 26.0)),
                     )
+                    .on_disabled_hover_text("Disabled in RetroAchievements Hardcore Mode")
                     .clicked()
                 {
                     open_states = true;
@@ -656,6 +667,70 @@ impl RustboyApp {
 
                     self.draw_pause_overlay(ui, rect);
                     self.draw_viewport_recording_pill(ui, rect);
+
+                    // Render Lua `gui.rect` / `gui.text` HUD overlays scaled to the GBA viewport
+                    let overlay_painter = ui.painter_at(rect);
+                    let sx = rect.width() / LCD_WIDTH as f32;
+                    let sy = rect.height() / LCD_HEIGHT as f32;
+                    let text_scale = sx.min(sy).max(1.0);
+                    self.lua.with_overlay_commands(|cmds| {
+                        for cmd in cmds {
+                            match cmd {
+                                crate::lua_engine::GuiDrawCmd::Rect {
+                                    x,
+                                    y,
+                                    w,
+                                    h,
+                                    color,
+                                    fill,
+                                } => {
+                                    let r = egui::Rect::from_min_size(
+                                        egui::Pos2::new(rect.left() + x * sx, rect.top() + y * sy),
+                                        Vec2::new(w * sx, h * sy),
+                                    );
+                                    if let Some(f) = fill {
+                                        overlay_painter.rect_filled(
+                                            r,
+                                            CornerRadius::ZERO,
+                                            Color32::from_rgba_unmultiplied(f[0], f[1], f[2], f[3]),
+                                        );
+                                    }
+                                    overlay_painter.rect_stroke(
+                                        r,
+                                        CornerRadius::ZERO,
+                                        Stroke::new(
+                                            1.0_f32,
+                                            Color32::from_rgba_unmultiplied(
+                                                color[0], color[1], color[2], color[3],
+                                            ),
+                                        ),
+                                        egui::StrokeKind::Inside,
+                                    );
+                                }
+                                crate::lua_engine::GuiDrawCmd::Text { x, y, text, color } => {
+                                    overlay_painter.text(
+                                        egui::Pos2::new(rect.left() + x * sx, rect.top() + y * sy),
+                                        egui::Align2::LEFT_TOP,
+                                        text,
+                                        egui::FontId::monospace((8.0 * text_scale).clamp(10.0, 20.0)),
+                                        Color32::from_rgba_unmultiplied(
+                                            color[0], color[1], color[2], color[3],
+                                        ),
+                                    );
+                                }
+                            }
+                        }
+                    });
+
+                    // Render RetroAchievements Achievement Unlocked slide-in toast banner
+                    if let Some(toast) = self.ra.current_unlock_banner() {
+                        crate::retroachievements::draw_unlock_toast_banner(
+                            &ui.painter_at(rect),
+                            rect,
+                            toast,
+                        );
+                        ctx.request_repaint();
+                    }
                 }
             });
         }

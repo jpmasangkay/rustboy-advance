@@ -428,13 +428,15 @@ impl RustboyApp {
         );
         self.active_turbo_buttons = (active_a, active_b);
 
-        let effective_mask = mask
-            | autofire_pulse_mask(
-                active_a,
-                active_b,
-                self.frame_counter,
-                self.config.keybindings.autofire_interval_frames,
-            );
+        let effective_mask = self.lua.apply_joypad_override(
+            mask
+                | autofire_pulse_mask(
+                    active_a,
+                    active_b,
+                    self.frame_counter,
+                    self.config.keybindings.autofire_interval_frames,
+                ),
+        );
         self.last_pressed_mask = effective_mask;
         encode_keyinput(effective_mask)
     }
@@ -450,15 +452,21 @@ impl RustboyApp {
     }
 
     pub(crate) fn effective_live_keypad_for_frame(&mut self) -> u16 {
-        let effective_mask = self.base_pressed_mask
-            | autofire_pulse_mask(
-                self.active_turbo_buttons.0,
-                self.active_turbo_buttons.1,
-                self.frame_counter,
-                self.config.keybindings.autofire_interval_frames,
-            );
+        let effective_mask = self.lua.apply_joypad_override(
+            self.base_pressed_mask
+                | autofire_pulse_mask(
+                    self.active_turbo_buttons.0,
+                    self.active_turbo_buttons.1,
+                    self.frame_counter,
+                    self.config.keybindings.autofire_interval_frames,
+                ),
+        );
         self.last_pressed_mask = effective_mask;
         encode_keyinput(effective_mask)
+    }
+
+    pub(crate) fn effective_keypad_for_frame(&mut self) -> u16 {
+        self.effective_live_keypad_for_frame()
     }
 
     pub(crate) fn poll_p2_inputs(&self, ctx: &egui::Context) -> u16 {

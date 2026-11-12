@@ -881,6 +881,14 @@ fn default_fast_forward_speed() -> f32 {
     4.0
 }
 
+fn default_ra_enabled() -> bool {
+    true
+}
+
+fn default_ra_rich_presence() -> bool {
+    true
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(default)]
 pub struct AppConfig {
@@ -926,6 +934,13 @@ pub struct AppConfig {
     pub rewind_interval: u8,
     #[serde(default = "default_rewind_speed")]
     pub rewind_speed: u8,
+    #[serde(default = "default_ra_enabled")]
+    pub ra_enabled: bool,
+    pub ra_hardcore: bool,
+    #[serde(default = "default_ra_rich_presence")]
+    pub ra_rich_presence: bool,
+    pub ra_username: String,
+    pub ra_token: String,
 }
 
 impl Default for AppConfig {
@@ -965,6 +980,11 @@ impl Default for AppConfig {
             rewind_budget_mb: default_rewind_budget_mb(),
             rewind_interval: default_rewind_interval(),
             rewind_speed: default_rewind_speed(),
+            ra_enabled: default_ra_enabled(),
+            ra_hardcore: false,
+            ra_rich_presence: default_ra_rich_presence(),
+            ra_username: String::new(),
+            ra_token: String::new(),
         }
     }
 }

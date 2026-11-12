@@ -15,6 +15,7 @@ use crate::filters::VideoPostProcessor;
 use crate::headless::CliConfig;
 use crate::library::{LibraryViewMode, RomLibraryEntry};
 use crate::rewind::RewindBuffer;
+use crate::savestates::SlotMetaEntry;
 
 pub(crate) const CONFIG_FILE: &str = "rustboy_library.cfg";
 pub(crate) const GBA_FRAME_SECS: f64 = 280_896.0 / 16_777_216.0; // Exact GBA refresh ~16.7427ms (~59.7275 Hz)
@@ -63,8 +64,16 @@ impl HostFrontend for CoreSink {
     }
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum ToastLevel {
+    Info,
+    Warning,
+    Error,
+}
+
 pub(crate) struct ToastMessage {
     pub(crate) text: String,
+    pub(crate) level: ToastLevel,
     pub(crate) expires_at: Instant,
 }
 
@@ -81,6 +90,7 @@ pub(crate) struct RustboyApp {
     pub(crate) sav_path: Option<PathBuf>,
     pub(crate) rom_title: String,
     pub(crate) rom_code: String,
+    pub(crate) rom_crc32: u32,
     pub(crate) bios_bytes: Option<Vec<u8>>,
     pub(crate) active_cheats: Vec<CheatEntry>,
 
@@ -118,6 +128,8 @@ pub(crate) struct RustboyApp {
     pub(crate) show_state_manager: bool,
     pub(crate) undo_state_buffer: Option<Vec<u8>>,
     pub(crate) slot_thumbnails: [Option<TextureHandle>; 5],
+    pub(crate) slot_meta: [Option<SlotMetaEntry>; 5],
+    pub(crate) state_manager_error: Option<String>,
     pub(crate) playtime_timer: Instant,
     pub(crate) rumble_in_progress: bool,
 }
@@ -148,6 +160,7 @@ impl RustboyApp {
             sav_path: None,
             rom_title: String::new(),
             rom_code: String::new(),
+            rom_crc32: 0,
             bios_bytes,
             active_cheats: Vec::new(),
             rom_folders: Vec::new(),
@@ -178,6 +191,8 @@ impl RustboyApp {
             show_state_manager: false,
             undo_state_buffer: None,
             slot_thumbnails: [None, None, None, None, None],
+            slot_meta: [None, None, None, None, None],
+            state_manager_error: None,
             playtime_timer: Instant::now(),
             rumble_in_progress: false,
         };
@@ -187,7 +202,7 @@ impl RustboyApp {
 
         if let Some(rom_path) = cli.rom_path {
             if let Err(e) = app.open_rom(&rom_path, cli.sav_path.as_deref(), None) {
-                app.notify(&format!("Failed to load CLI ROM: {e}"));
+                app.notify_error(&format!("Failed to load CLI ROM: {e}"));
             }
         }
         app
@@ -196,7 +211,25 @@ impl RustboyApp {
     pub(crate) fn notify(&mut self, msg: &str) {
         self.toast = Some(ToastMessage {
             text: msg.to_string(),
-            expires_at: Instant::now() + Duration::from_millis(3500),
+            level: ToastLevel::Info,
+            expires_at: Instant::now() + Duration::from_millis(3200),
+        });
+    }
+
+    #[allow(dead_code)]
+    pub(crate) fn notify_warn(&mut self, msg: &str) {
+        self.toast = Some(ToastMessage {
+            text: msg.to_string(),
+            level: ToastLevel::Warning,
+            expires_at: Instant::now() + Duration::from_millis(3800),
+        });
+    }
+
+    pub(crate) fn notify_error(&mut self, msg: &str) {
+        self.toast = Some(ToastMessage {
+            text: msg.to_string(),
+            level: ToastLevel::Error,
+            expires_at: Instant::now() + Duration::from_millis(4500),
         });
     }
 
@@ -302,6 +335,7 @@ impl RustboyApp {
 
         let mut rom_bytes = fs::read(rom_path).map_err(|e| format!("Failed reading ROM: {e}"))?;
         let ips_applied = Self::apply_ips_patch_if_present(rom_path, &mut rom_bytes);
+        let rom_crc32 = crc32fast::hash(&rom_bytes);
 
         let sav_path = custom_sav
             .map(PathBuf::from)
@@ -345,6 +379,7 @@ impl RustboyApp {
         self.sav_path = Some(sav_path);
         self.rom_title = title.clone();
         self.rom_code = code.clone();
+        self.rom_crc32 = rom_crc32;
         self.paused = false;
         self.show_pause_overlay = false;
         self.show_state_manager = false;
@@ -359,6 +394,8 @@ impl RustboyApp {
         self.sink.framebuffer.fill(0);
         self.sink.frame_dirty = true;
         self.slot_thumbnails = [None, None, None, None, None];
+        self.slot_meta = [None, None, None, None, None];
+        self.state_manager_error = None;
         self.playtime_timer = Instant::now();
 
         // Track per-game launch count and last played timestamp
@@ -389,7 +426,11 @@ impl RustboyApp {
         self.sav_path = None;
         self.rom_title.clear();
         self.rom_code.clear();
+        self.rom_crc32 = 0;
         self.active_cheats.clear();
+        self.slot_thumbnails = [None, None, None, None, None];
+        self.slot_meta = [None, None, None, None, None];
+        self.state_manager_error = None;
         self.paused = false;
         self.show_pause_overlay = false;
         self.show_state_manager = false;

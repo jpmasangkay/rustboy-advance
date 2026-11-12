@@ -288,22 +288,37 @@ impl RustboyApp {
 
     pub(crate) fn draw_floating_osd_toast(&self, ctx: &egui::Context) {
         let Some(t) = &self.toast else { return };
-        if Instant::now() > t.expires_at {
+        let now = Instant::now();
+        if now > t.expires_at {
             return;
         }
+        let remaining_ms = t.expires_at.saturating_duration_since(now).as_millis() as f32;
+        let alpha = (remaining_ms / 350.0).clamp(0.0, 1.0);
+        let (dot_color, border_color) = match t.level {
+            crate::app::ToastLevel::Info => (ACCENT_TEAL, BORDER_HAIRLINE),
+            crate::app::ToastLevel::Warning => (
+                Color32::from_rgb(240, 180, 90),
+                Color32::from_rgb(130, 95, 45),
+            ),
+            crate::app::ToastLevel::Error => (
+                Color32::from_rgb(235, 95, 95),
+                Color32::from_rgb(150, 52, 52),
+            ),
+        };
         let pos_y = if self.is_fullscreen { 20.0 } else { 76.0 };
         egui::Area::new(egui::Id::new("floating_osd_toast"))
             .anchor(egui::Align2::LEFT_TOP, [20.0, pos_y])
             .interactable(false)
             .show(ctx, |ui| {
+                ui.set_opacity(alpha);
                 egui::Frame::new()
-                    .fill(Color32::from_black_alpha(220))
-                    .stroke(Stroke::new(1.0_f32, BORDER_HAIRLINE))
+                    .fill(Color32::from_black_alpha(230))
+                    .stroke(Stroke::new(1.0_f32, border_color))
                     .corner_radius(CornerRadius::same(6))
                     .inner_margin(egui::Margin::symmetric(12, 7))
                     .show(ui, |ui| {
                         ui.horizontal(|ui| {
-                            ui.label(RichText::new("●").color(ACCENT_TEAL).small());
+                            ui.label(RichText::new("●").color(dot_color).small());
                             ui.label(RichText::new(&t.text).color(Color32::WHITE).strong());
                         });
                     });

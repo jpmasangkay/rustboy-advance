@@ -214,6 +214,11 @@ impl CallStackTracker {
         self.frames.clear();
     }
 
+    /// Truncates the call stack to at most `len` outermost frames.
+    pub fn truncate(&mut self, len: usize) {
+        self.frames.truncate(len);
+    }
+
     /// Returns active frames ordered from outermost caller (`[0]`) to innermost (`last()`).
     pub fn frames(&self) -> &[CallFrame] {
         &self.frames

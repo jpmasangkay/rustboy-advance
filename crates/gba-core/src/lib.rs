@@ -790,7 +790,7 @@ impl GbaCore {
         }
     }
 
-    pub fn save_state(&self) -> Result<Vec<u8>, postcard::Error> {
+    pub fn save_state(&self) -> Result<Vec<u8>, SaveStateError> {
         let mut bus_clone = self.bus.clone();
         // Avoid duplicating multi-megabyte immutable ROM inside save state files.
         bus_clone.cart.rom.clear();
@@ -798,18 +798,66 @@ impl GbaCore {
             cpu: self.cpu.clone(),
             bus: bus_clone,
         };
-        postcard::to_allocvec(&payload)
+        let raw = postcard::to_allocvec(&payload).map_err(|_| SaveStateError::Corrupt)?;
+        let payload_len = u32::try_from(raw.len()).map_err(|_| SaveStateError::Corrupt)?;
+        let compressed = lz4_flex::block::compress(&raw);
+
+        let mut out = Vec::with_capacity(STATE_HEADER_LEN + compressed.len());
+        out.extend_from_slice(&STATE_MAGIC);
+        out.extend_from_slice(&STATE_VERSION.to_le_bytes());
+        out.extend_from_slice(&self.rom_crc32().to_le_bytes());
+        out.extend_from_slice(&payload_len.to_le_bytes());
+        out.extend_from_slice(&compressed);
+        Ok(out)
     }
 
-    pub fn load_state(&mut self, bytes: &[u8]) -> Result<(), postcard::Error> {
-        let mut payload: SaveStatePayload = postcard::from_bytes(bytes)?;
+    pub fn load_state(&mut self, bytes: &[u8]) -> Result<(), SaveStateError> {
+        let header = state_info(bytes)?;
+        if header.version != STATE_VERSION {
+            return Err(SaveStateError::VersionMismatch);
+        }
+        let expected_crc = self.rom_crc32();
+        if header.rom_crc32 != expected_crc {
+            return Err(SaveStateError::RomMismatch {
+                expected: expected_crc,
+                found: header.rom_crc32,
+            });
+        }
+
+        let payload_len = header.payload_len as usize;
+        if payload_len == 0 || payload_len > MAX_STATE_PAYLOAD_LEN {
+            return Err(SaveStateError::Corrupt);
+        }
+        let compressed = &bytes[STATE_HEADER_LEN..];
+        if compressed.is_empty() {
+            return Err(SaveStateError::Corrupt);
+        }
+
+        let uncompressed = lz4_flex::block::decompress(compressed, payload_len)
+            .map_err(|_| SaveStateError::Corrupt)?;
+        if uncompressed.len() != payload_len {
+            return Err(SaveStateError::Corrupt);
+        }
+
+        let (mut payload, remaining): (SaveStatePayload, &[u8]) =
+            postcard::take_from_bytes(&uncompressed).map_err(|_| SaveStateError::Corrupt)?;
+        if !remaining.is_empty() {
+            return Err(SaveStateError::Corrupt);
+        }
+
         let rom = core::mem::take(&mut self.bus.cart.rom);
         payload.bus.cart.rom = rom;
         payload.bus.rebuild_fastmem();
+        payload.bus.clear_watchpoints();
         self.cpu = payload.cpu;
         self.bus = payload.bus;
         self.pending_idle_check_pc = None;
         Ok(())
+    }
+
+    #[inline]
+    pub fn state_info(bytes: &[u8]) -> Result<StateHeader, SaveStateError> {
+        state_info(bytes)
     }
 
     #[inline]
@@ -955,4 +1003,64 @@ fn is_safe_idle_poll_addr(addr: u32) -> bool {
         _ => false,
     }
 }
+
+pub const STATE_MAGIC: [u8; 4] = *b"RBAS";
+pub const STATE_VERSION: u16 = 1;
+const STATE_HEADER_LEN: usize = 14;
+const MAX_STATE_PAYLOAD_LEN: usize = 8 * 1024 * 1024;
+
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub struct StateHeader {
+    pub magic: [u8; 4],
+    pub version: u16,
+    pub rom_crc32: u32,
+    pub payload_len: u32,
+}
+
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub enum SaveStateError {
+    BadMagic,
+    VersionMismatch,
+    RomMismatch { expected: u32, found: u32 },
+    Corrupt,
+}
+
+impl core::fmt::Display for SaveStateError {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        match *self {
+            Self::BadMagic => write!(f, "invalid save state magic (expected RBAS)"),
+            Self::VersionMismatch => write!(f, "unsupported save state format version"),
+            Self::RomMismatch { expected, found } => write!(
+                f,
+                "save state ROM mismatch (expected CRC32 {expected:#010X}, found {found:#010X})"
+            ),
+            Self::Corrupt => write!(f, "corrupt save state payload"),
+        }
+    }
+}
+
+impl core::error::Error for SaveStateError {}
+
+/// Parses and validates the `RBAS` save state header without decompressing the payload.
+pub fn state_info(bytes: &[u8]) -> Result<StateHeader, SaveStateError> {
+    if bytes.len() >= 4 && bytes[..4] != STATE_MAGIC {
+        return Err(SaveStateError::BadMagic);
+    }
+    if bytes.len() < STATE_HEADER_LEN {
+        return Err(SaveStateError::Corrupt);
+    }
+
+    let magic = [bytes[0], bytes[1], bytes[2], bytes[3]];
+    let version = u16::from_le_bytes([bytes[4], bytes[5]]);
+    let rom_crc32 = u32::from_le_bytes([bytes[6], bytes[7], bytes[8], bytes[9]]);
+    let payload_len = u32::from_le_bytes([bytes[10], bytes[11], bytes[12], bytes[13]]);
+
+    Ok(StateHeader {
+        magic,
+        version,
+        rom_crc32,
+        payload_len,
+    })
+}
+
 

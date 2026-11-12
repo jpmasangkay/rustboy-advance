@@ -403,15 +403,14 @@ impl RustboyApp {
         if key.is_empty() {
             return;
         }
-        let ov = crate::config::RomSpecificSettings {
-            save_override: Some(SaveOverrideChoice::from_core(
-                core.bus.cart.save_type_override,
-            )),
-            rtc_override: core.bus.cart.rtc_override,
-            solar_lux: Some(core.bus.cart.solar_lux),
-            cheats: self.active_cheats.clone(),
-            custom_color_profile: Some(self.config.color_profile),
-        };
+        let mut ov = self.config.per_rom.get(&key).cloned().unwrap_or_default();
+        ov.save_override = Some(SaveOverrideChoice::from_core(
+            core.bus.cart.save_type_override,
+        ));
+        ov.rtc_override = core.bus.cart.rtc_override;
+        ov.solar_lux = Some(core.bus.cart.solar_lux);
+        ov.cheats = self.active_cheats.clone();
+        ov.custom_color_profile = Some(self.config.color_profile);
         self.config.per_rom.insert(key, ov);
         self.config.save();
     }

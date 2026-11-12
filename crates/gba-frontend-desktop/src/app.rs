@@ -1,6 +1,7 @@
 use std::collections::HashSet;
 use std::fs;
 use std::path::{Path, PathBuf};
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use egui::{self, Color32, CornerRadius, Stroke, TextureHandle, Vec2};
@@ -24,6 +25,7 @@ use crate::rom_loader::{
     apply_auto_patch_if_present, apply_patch_file, is_patch_extension, load_rom_bytes,
 };
 use crate::savestates::SlotMetaEntry;
+use crate::shaders::GlShaderPipeline;
 
 pub(crate) const CONFIG_FILE: &str = "rustboy_library.cfg";
 pub(crate) const GBA_FRAME_SECS: f64 = 280_896.0 / 16_777_216.0; // Exact GBA refresh ~16.7427ms (~59.7275 Hz)
@@ -38,6 +40,9 @@ pub(crate) const TEXT_MUTED: Color32 = Color32::from_rgb(142, 152, 170);
 pub(crate) struct CoreSink {
     pub(crate) audio: AudioOutput,
     pub(crate) framebuffer: [u16; LCD_WIDTH * LCD_HEIGHT],
+    pub(crate) prev_framebuffer: [u16; LCD_WIDTH * LCD_HEIGHT],
+    pub(crate) has_prev_frame: bool,
+    pub(crate) frame_seq: u64,
     pub(crate) keypad: u16,
     pub(crate) frame_dirty: bool,
     pub(crate) suppress_audio: bool,
@@ -48,17 +53,35 @@ impl CoreSink {
         Self {
             audio,
             framebuffer: [0; LCD_WIDTH * LCD_HEIGHT],
+            prev_framebuffer: [0; LCD_WIDTH * LCD_HEIGHT],
+            has_prev_frame: false,
+            frame_seq: 0,
             keypad: 0x03FF,
             frame_dirty: false,
             suppress_audio: false,
         }
     }
+
+    pub(crate) fn push_frame(&mut self, fb: &[u16; LCD_WIDTH * LCD_HEIGHT]) {
+        self.prev_framebuffer.copy_from_slice(&self.framebuffer);
+        self.framebuffer.copy_from_slice(fb);
+        self.has_prev_frame = true;
+        self.frame_seq = self.frame_seq.wrapping_add(1);
+        self.frame_dirty = true;
+    }
+
+    pub(crate) fn clear_frames(&mut self) {
+        self.framebuffer.fill(0);
+        self.prev_framebuffer.fill(0);
+        self.has_prev_frame = false;
+        self.frame_seq = self.frame_seq.wrapping_add(1);
+        self.frame_dirty = true;
+    }
 }
 
 impl HostFrontend for CoreSink {
     fn present_frame(&mut self, fb: &[u16; LCD_WIDTH * LCD_HEIGHT]) {
-        self.framebuffer.copy_from_slice(fb);
-        self.frame_dirty = true;
+        self.push_frame(fb);
     }
 
     fn push_audio_samples(&mut self, samples: &[i16]) {
@@ -93,6 +116,7 @@ pub(crate) struct RustboyApp {
     pub(crate) sink: CoreSink,
     pub(crate) postproc: VideoPostProcessor,
     pub(crate) lcd_tex: Option<TextureHandle>,
+    pub(crate) gl_shaders: Option<Arc<Mutex<GlShaderPipeline>>>,
     pub(crate) debugger: DebuggerWindows,
     pub(crate) gilrs: Option<Gilrs>,
 
@@ -177,6 +201,7 @@ impl RustboyApp {
             sink,
             postproc: VideoPostProcessor::new(),
             lcd_tex: None,
+            gl_shaders: None,
             debugger: DebuggerWindows::default(),
             gilrs: Gilrs::new().ok(),
             rom_path: None,
@@ -431,9 +456,8 @@ impl RustboyApp {
         self.next_frame_due = Instant::now();
         self.frames_in_window = 0;
         self.last_fps_sample = Instant::now();
-        self.postproc.prev_rgba.fill(0);
-        self.sink.framebuffer.fill(0);
-        self.sink.frame_dirty = true;
+        self.postproc.reset();
+        self.sink.clear_frames();
         self.slot_thumbnails = [None, None, None, None, None];
         self.slot_meta = [None, None, None, None, None];
         self.state_manager_error = None;
@@ -495,6 +519,8 @@ impl RustboyApp {
         self.base_pressed_mask = 0;
         self.active_turbo_buttons = (false, false);
         self.lcd_tex = None;
+        self.postproc.reset();
+        self.sink.clear_frames();
         self.rescan_rom_folders();
         self.sync_window_title(ctx);
         self.notify("Game stopped — Returned to ROM Library");
@@ -623,6 +649,17 @@ impl RustboyApp {
             let _ = fs::create_dir_all(parent);
         }
 
+        let color_profile = self.effective_color_profile();
+        self.postproc.sync_rgba_for_capture(
+            &self.sink.framebuffer,
+            self.sink.has_prev_frame.then_some(&self.sink.prev_framebuffer),
+            self.sink.frame_seq,
+            self.config.color_correction,
+            color_profile,
+            self.config.frame_blending,
+            self.config.lcd_ghosting,
+        );
+
         let res = image::save_buffer_with_format(
             &save_path,
             &self.postproc.curr_rgba,
@@ -678,8 +715,8 @@ impl RustboyApp {
             self.rewind_buffer.clear();
             self.frame_counter = 0;
             self.rewinding = false;
-            self.sink.framebuffer.fill(0);
-            self.sink.frame_dirty = true;
+            self.postproc.reset();
+            self.sink.clear_frames();
             self.next_frame_due = Instant::now();
             self.apply_active_game_settings_to_core();
             self.notify("Hard Reset");
@@ -729,9 +766,8 @@ impl RustboyApp {
         self.paused = true;
         core.step_one();
         if core.bus.ppu.frame_ready {
-            self.sink.framebuffer.copy_from_slice(&*core.bus.ppu.framebuffer);
+            self.sink.push_frame(&core.bus.ppu.framebuffer);
             core.bus.ppu.frame_ready = false;
-            self.sink.frame_dirty = true;
         }
     }
 
@@ -740,9 +776,8 @@ impl RustboyApp {
         self.paused = true;
         core.step_scanline();
         if core.bus.ppu.frame_ready {
-            self.sink.framebuffer.copy_from_slice(&*core.bus.ppu.framebuffer);
+            self.sink.push_frame(&core.bus.ppu.framebuffer);
             core.bus.ppu.frame_ready = false;
-            self.sink.frame_dirty = true;
         }
     }
 
@@ -1042,7 +1077,28 @@ impl RustboyApp {
         }
     }
 
+    pub fn init_gl(&mut self, gl: Arc<glow::Context>) {
+        match GlShaderPipeline::new(gl) {
+            Ok(pipeline) => {
+                self.gl_shaders = Some(Arc::new(Mutex::new(pipeline)));
+            }
+            Err(err) => {
+                log::warn!("GLSL shader pipeline unavailable, using CPU fallback: {err}");
+                self.gl_shaders = None;
+            }
+        }
+    }
+
+    pub fn destroy_gl(&mut self) {
+        if let Some(pipeline) = self.gl_shaders.take()
+            && let Ok(mut guard) = pipeline.lock()
+        {
+            guard.destroy();
+        }
+    }
+
     pub fn on_exit(&mut self) {
+        self.destroy_gl();
         self.flush_battery_save();
         self.save_rom_specific_settings();
         self.save_persistent_config();

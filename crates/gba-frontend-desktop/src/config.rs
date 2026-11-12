@@ -671,6 +671,58 @@ impl SaveOverrideChoice {
     }
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize, Default)]
+pub enum ShaderPreset {
+    #[default]
+    Nearest,
+    SharpBilinear,
+    LcdGrid,
+    CrtScanlines,
+    ScaleEdge,
+}
+
+impl ShaderPreset {
+    pub const COUNT: usize = 5;
+
+    pub const ALL: [ShaderPreset; Self::COUNT] = [
+        Self::Nearest,
+        Self::SharpBilinear,
+        Self::LcdGrid,
+        Self::CrtScanlines,
+        Self::ScaleEdge,
+    ];
+
+    pub const fn index(self) -> usize {
+        match self {
+            Self::Nearest => 0,
+            Self::SharpBilinear => 1,
+            Self::LcdGrid => 2,
+            Self::CrtScanlines => 3,
+            Self::ScaleEdge => 4,
+        }
+    }
+
+    pub const fn label(self) -> &'static str {
+        match self {
+            Self::Nearest => "Nearest (Pixel Perfect)",
+            Self::SharpBilinear => "Sharp Bilinear (Anti-Shimmer)",
+            Self::LcdGrid => "GBA LCD Grid (RGB Subpixels)",
+            Self::CrtScanlines => "CRT Scanlines & Curvature",
+            Self::ScaleEdge => "ScaleEdge (Edge Smoothing)",
+        }
+    }
+
+    pub const fn short_label(self) -> &'static str {
+        match self {
+            Self::Nearest => "Nearest",
+            Self::SharpBilinear => "Sharp",
+            Self::LcdGrid => "LCD Grid",
+            Self::CrtScanlines => "CRT",
+            Self::ScaleEdge => "ScaleEdge",
+        }
+    }
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize, Default)]
 pub enum ColorProfileChoice {
     Linear,
@@ -815,6 +867,10 @@ pub struct AppConfig {
     pub bezel_style: BezelStyle,
     pub lcd_ghosting: bool,
     pub scanline_grid: bool,
+    #[serde(default)]
+    pub shader_preset: ShaderPreset,
+    #[serde(default)]
+    pub frame_blending: bool,
     pub dot_accurate_ppu: bool,
     pub master_volume: u8,
     pub muted: bool,
@@ -856,6 +912,8 @@ impl Default for AppConfig {
             bezel_style: BezelStyle::None,
             lcd_ghosting: false,
             scanline_grid: false,
+            shader_preset: ShaderPreset::Nearest,
+            frame_blending: false,
             dot_accurate_ppu: false,
             master_volume: 100,
             muted: false,
@@ -904,12 +962,31 @@ impl AppConfig {
         Self::app_data_dir().join("screenshots")
     }
 
+    pub fn from_json_str(raw: &str) -> Self {
+        let mut cfg: Self = serde_json::from_str(raw).unwrap_or_default();
+        if let Ok(val) = serde_json::from_str::<serde_json::Value>(raw)
+            && val.get("shader_preset").is_none()
+            && cfg.scanline_grid
+        {
+            cfg.shader_preset = ShaderPreset::LcdGrid;
+        }
+        cfg
+    }
+
+    pub fn effective_shader_preset(&self) -> ShaderPreset {
+        if self.shader_preset == ShaderPreset::Nearest && self.scanline_grid {
+            ShaderPreset::LcdGrid
+        } else {
+            self.shader_preset
+        }
+    }
+
     pub fn load() -> Self {
         let path = Self::config_file_path();
         let Ok(raw) = fs::read_to_string(&path) else {
             return Self::default();
         };
-        serde_json::from_str(&raw).unwrap_or_default()
+        Self::from_json_str(&raw)
     }
 
     pub fn save(&self) {
@@ -1019,5 +1096,29 @@ mod tests {
         assert_eq!(parsed.rewind_interval, 1);
         assert_eq!(parsed.rewind_speed, 1);
         assert!((parsed.fast_forward_speed - 4.0).abs() < f32::EPSILON);
+    }
+
+    #[test]
+    fn shader_preset_roundtrip_and_legacy_scanline_grid_migration() {
+        for preset in ShaderPreset::ALL {
+            assert!(!preset.label().is_empty());
+            assert!(!preset.short_label().is_empty());
+            let json = serde_json::to_string(&preset).expect("serialize preset");
+            let back: ShaderPreset = serde_json::from_str(&json).expect("deserialize preset");
+            assert_eq!(back, preset);
+        }
+
+        let legacy_grid_json = r#"{"scanline_grid": true}"#;
+        let migrated = AppConfig::from_json_str(legacy_grid_json);
+        assert!(migrated.scanline_grid);
+        assert_eq!(migrated.shader_preset, ShaderPreset::LcdGrid);
+        assert_eq!(migrated.effective_shader_preset(), ShaderPreset::LcdGrid);
+        assert!(!migrated.frame_blending);
+
+        let modern_json = r#"{"scanline_grid": true, "shader_preset": "CrtScanlines", "frame_blending": true}"#;
+        let modern = AppConfig::from_json_str(modern_json);
+        assert_eq!(modern.shader_preset, ShaderPreset::CrtScanlines);
+        assert_eq!(modern.effective_shader_preset(), ShaderPreset::CrtScanlines);
+        assert!(modern.frame_blending);
     }
 }

@@ -98,10 +98,61 @@ pub fn ags_001_lut() -> &'static [[u8; 4]; 32_768] {
     })
 }
 
+#[inline]
+pub fn lut_for_profile(color_correction: bool, profile: ColorProfileChoice) -> &'static [[u8; 4]; 32_768] {
+    if !color_correction || profile == ColorProfileChoice::Linear {
+        linear_lut()
+    } else {
+        match profile {
+            ColorProfileChoice::Agb001 => agb_srgb_lut(),
+            ColorProfileChoice::Ags101 => ags_101_lut(),
+            ColorProfileChoice::Ags001 => ags_001_lut(),
+            ColorProfileChoice::Linear => linear_lut(),
+        }
+    }
+}
+
+/// Convert raw BGR555 framebuffer pixels to unfiltered RGBA8 bytes for GPU upload.
+pub fn fill_linear_rgba(fb_bgr555: &[u16; LCD_WIDTH * LCD_HEIGHT], dst_rgba: &mut [u8]) {
+    let lut = linear_lut();
+    for (idx, &px) in fb_bgr555.iter().enumerate() {
+        let off = idx * 4;
+        dst_rgba[off..off + 4].copy_from_slice(&lut[(px & 0x7FFF) as usize]);
+    }
+}
+
+#[derive(Clone, Copy)]
+struct FrameComputeOptions {
+    color_correction: bool,
+    profile: ColorProfileChoice,
+    frame_blending: bool,
+    lcd_ghosting: bool,
+    update_prev_history: bool,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+struct SyncCacheKey {
+    frame_seq: u64,
+    color_correction: bool,
+    profile: ColorProfileChoice,
+    frame_blending: bool,
+    lcd_ghosting: bool,
+}
+
 pub struct VideoPostProcessor {
     pub prev_rgba: Vec<u8>,
     pub curr_rgba: Vec<u8>,
     pub grid_rgba: Vec<u8>,
+    pub prev_bgr555: Vec<u16>,
+    pub has_prev_frame: bool,
+    pub frame_blending: bool,
+    last_sync_key: Option<SyncCacheKey>,
+}
+
+impl Default for VideoPostProcessor {
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 impl VideoPostProcessor {
@@ -110,6 +161,69 @@ impl VideoPostProcessor {
             prev_rgba: vec![0; LCD_WIDTH * LCD_HEIGHT * 4],
             curr_rgba: vec![0; LCD_WIDTH * LCD_HEIGHT * 4],
             grid_rgba: vec![0; (LCD_WIDTH * 3) * (LCD_HEIGHT * 3) * 4],
+            prev_bgr555: vec![0; LCD_WIDTH * LCD_HEIGHT],
+            has_prev_frame: false,
+            frame_blending: false,
+            last_sync_key: None,
+        }
+    }
+
+    pub fn reset(&mut self) {
+        self.prev_rgba.fill(0);
+        self.curr_rgba.fill(0);
+        self.prev_bgr555.fill(0);
+        self.has_prev_frame = false;
+        self.last_sync_key = None;
+    }
+
+    fn compute_rgba_frame(
+        &mut self,
+        fb_bgr555: &[u16; LCD_WIDTH * LCD_HEIGHT],
+        prev_fb_bgr555: Option<&[u16; LCD_WIDTH * LCD_HEIGHT]>,
+        opts: FrameComputeOptions,
+    ) {
+        let lut = lut_for_profile(opts.color_correction, opts.profile);
+        let active_prev: Option<&[u16]> = if opts.frame_blending {
+            prev_fb_bgr555
+                .map(|s| s.as_slice())
+                .or_else(|| self.has_prev_frame.then_some(self.prev_bgr555.as_slice()))
+        } else {
+            None
+        };
+
+        for (idx, &px) in fb_bgr555.iter().enumerate() {
+            let off = idx * 4;
+            let mapped = lut[(px & 0x7FFF) as usize];
+            let blended = if let Some(prev_buf) = active_prev {
+                let prev_mapped = lut[(prev_buf[idx] & 0x7FFF) as usize];
+                [
+                    ((mapped[0] as u16 + prev_mapped[0] as u16) >> 1) as u8,
+                    ((mapped[1] as u16 + prev_mapped[1] as u16) >> 1) as u8,
+                    ((mapped[2] as u16 + prev_mapped[2] as u16) >> 1) as u8,
+                    255,
+                ]
+            } else {
+                mapped
+            };
+
+            if opts.lcd_ghosting && !opts.frame_blending {
+                // Blend ~65% new frame + ~35% previous frame for authentic TFT persistence.
+                let r = ((blended[0] as u16 * 166 + self.prev_rgba[off] as u16 * 90) >> 8) as u8;
+                let g = ((blended[1] as u16 * 166 + self.prev_rgba[off + 1] as u16 * 90) >> 8) as u8;
+                let b = ((blended[2] as u16 * 166 + self.prev_rgba[off + 2] as u16 * 90) >> 8) as u8;
+                self.curr_rgba[off] = r;
+                self.curr_rgba[off + 1] = g;
+                self.curr_rgba[off + 2] = b;
+                self.curr_rgba[off + 3] = 255;
+            } else {
+                self.curr_rgba[off..off + 4].copy_from_slice(&blended);
+            }
+        }
+
+        if opts.update_prev_history {
+            self.prev_rgba.copy_from_slice(&self.curr_rgba);
+            self.prev_bgr555.copy_from_slice(fb_bgr555);
+            self.has_prev_frame = true;
         }
     }
 
@@ -121,34 +235,39 @@ impl VideoPostProcessor {
         lcd_ghosting: bool,
         scanline_grid: bool,
     ) -> ColorImage {
-        let lut = if !color_correction || profile == ColorProfileChoice::Linear {
-            linear_lut()
-        } else {
-            match profile {
-                ColorProfileChoice::Agb001 => agb_srgb_lut(),
-                ColorProfileChoice::Ags101 => ags_101_lut(),
-                ColorProfileChoice::Ags001 => ags_001_lut(),
-                ColorProfileChoice::Linear => linear_lut(),
-            }
-        };
+        self.process_frame_with_blending(
+            fb_bgr555,
+            None,
+            color_correction,
+            profile,
+            self.frame_blending,
+            lcd_ghosting,
+            scanline_grid,
+        )
+    }
 
-        for (idx, &px) in fb_bgr555.iter().enumerate() {
-            let off = idx * 4;
-            let mapped = lut[(px & 0x7FFF) as usize];
-            if lcd_ghosting {
-                // Blend ~65% new frame + ~35% previous frame for authentic TFT persistence.
-                let r = ((mapped[0] as u16 * 166 + self.prev_rgba[off] as u16 * 90) >> 8) as u8;
-                let g = ((mapped[1] as u16 * 166 + self.prev_rgba[off + 1] as u16 * 90) >> 8) as u8;
-                let b = ((mapped[2] as u16 * 166 + self.prev_rgba[off + 2] as u16 * 90) >> 8) as u8;
-                self.curr_rgba[off] = r;
-                self.curr_rgba[off + 1] = g;
-                self.curr_rgba[off + 2] = b;
-                self.curr_rgba[off + 3] = 255;
-            } else {
-                self.curr_rgba[off..off + 4].copy_from_slice(&mapped);
-            }
-        }
-        self.prev_rgba.copy_from_slice(&self.curr_rgba);
+    #[allow(clippy::too_many_arguments)]
+    pub fn process_frame_with_blending(
+        &mut self,
+        fb_bgr555: &[u16; LCD_WIDTH * LCD_HEIGHT],
+        prev_fb_bgr555: Option<&[u16; LCD_WIDTH * LCD_HEIGHT]>,
+        color_correction: bool,
+        profile: ColorProfileChoice,
+        frame_blending: bool,
+        lcd_ghosting: bool,
+        scanline_grid: bool,
+    ) -> ColorImage {
+        self.compute_rgba_frame(
+            fb_bgr555,
+            prev_fb_bgr555,
+            FrameComputeOptions {
+                color_correction,
+                profile,
+                frame_blending,
+                lcd_ghosting,
+                update_prev_history: true,
+            },
+        );
 
         if !scanline_grid {
             return ColorImage::from_rgba_unmultiplied([LCD_WIDTH, LCD_HEIGHT], &self.curr_rgba);
@@ -183,6 +302,44 @@ impl VideoPostProcessor {
         ColorImage::from_rgba_unmultiplied([dst_w, dst_h], &self.grid_rgba)
     }
 
+    /// Keep `curr_rgba` synchronized for screenshots & save-state thumbnails when GPU shaders render the viewport.
+    #[allow(clippy::too_many_arguments)]
+    pub fn sync_rgba_for_capture(
+        &mut self,
+        fb_bgr555: &[u16; LCD_WIDTH * LCD_HEIGHT],
+        prev_fb_bgr555: Option<&[u16; LCD_WIDTH * LCD_HEIGHT]>,
+        frame_seq: u64,
+        color_correction: bool,
+        profile: ColorProfileChoice,
+        frame_blending: bool,
+        lcd_ghosting: bool,
+    ) {
+        let key = SyncCacheKey {
+            frame_seq,
+            color_correction,
+            profile,
+            frame_blending,
+            lcd_ghosting,
+        };
+        if self.last_sync_key == Some(key) {
+            return;
+        }
+        let is_new_frame = self.last_sync_key.is_none_or(|k| k.frame_seq != frame_seq);
+        self.compute_rgba_frame(
+            fb_bgr555,
+            prev_fb_bgr555,
+            FrameComputeOptions {
+                color_correction,
+                profile,
+                frame_blending,
+                lcd_ghosting,
+                update_prev_history: is_new_frame,
+            },
+        );
+        self.last_sync_key = Some(key);
+    }
+
+    #[allow(dead_code)]
     pub fn save_thumbnail_png(&self, path: &Path) -> Result<(), String> {
         if let Some(parent) = path.parent() {
             let _ = std::fs::create_dir_all(parent);
@@ -222,5 +379,71 @@ impl VideoPostProcessor {
         )
         .map_err(|e| format!("PNG encode failed: {e}"))?;
         Ok(path)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn frame_blending_mixes_50_50_without_exponential_decay() {
+        let mut proc = VideoPostProcessor::new();
+        let white_fb = [0x7FFF_u16; LCD_WIDTH * LCD_HEIGHT];
+        let black_fb = [0x0000_u16; LCD_WIDTH * LCD_HEIGHT];
+
+        // First frame with explicit prev=None should not darken against uninitialized history.
+        let img1 = proc.process_frame_with_blending(
+            &white_fb,
+            None,
+            false,
+            ColorProfileChoice::Linear,
+            true,
+            false,
+            false,
+        );
+        assert_eq!(img1.pixels[0], egui::Color32::from_rgba_unmultiplied(255, 255, 255, 255));
+
+        // Second frame (black) blended 50/50 with previous frame (white) -> ~127 gray.
+        let img2 = proc.process_frame_with_blending(
+            &black_fb,
+            Some(&white_fb),
+            false,
+            ColorProfileChoice::Linear,
+            true,
+            false,
+            false,
+        );
+        assert_eq!(img2.pixels[0], egui::Color32::from_rgba_unmultiplied(127, 127, 127, 255));
+
+        // Third frame (white) blended with previous raw frame (black) via internal history
+        // still produces exact 50/50 mix (no exponential flicker decay).
+        proc.frame_blending = true;
+        let img3 = proc.process_frame(&white_fb, false, ColorProfileChoice::Linear, false, false);
+        assert_eq!(img3.pixels[0], egui::Color32::from_rgba_unmultiplied(127, 127, 127, 255));
+
+        // Disabling frame_blending restores full crisp white.
+        proc.frame_blending = false;
+        let img4 = proc.process_frame(&white_fb, false, ColorProfileChoice::Linear, false, false);
+        assert_eq!(img4.pixels[0], egui::Color32::from_rgba_unmultiplied(255, 255, 255, 255));
+    }
+
+    #[test]
+    fn frame_blending_with_explicit_color_channels_averages_each_channel() {
+        let mut proc = VideoPostProcessor::new();
+        // Pure red (r5=31 -> 255) and pure green (g5=31 -> 255)
+        let red_fb = [0x001F_u16; LCD_WIDTH * LCD_HEIGHT];
+        let green_fb = [0x03E0_u16; LCD_WIDTH * LCD_HEIGHT];
+
+        let img = proc.process_frame_with_blending(
+            &red_fb,
+            Some(&green_fb),
+            false,
+            ColorProfileChoice::Linear,
+            true,
+            false,
+            false,
+        );
+        assert_eq!(img.pixels[0], egui::Color32::from_rgba_unmultiplied(127, 127, 0, 255));
     }
 }

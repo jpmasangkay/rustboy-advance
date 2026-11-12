@@ -7,7 +7,10 @@ use egui::{
 use gba_core::{LCD_HEIGHT, LCD_WIDTH};
 
 use crate::app::{RustboyApp, ACCENT_TEAL, BG_CARD, BG_PANEL, BORDER_HAIRLINE, TEXT_MUTED};
-use crate::config::BezelStyle;
+use crate::config::{BezelStyle, ShaderPreset};
+use crate::shaders::{
+    color_profile_uniform, create_viewport_paint_callback, ShaderRenderParams,
+};
 
 impl RustboyApp {
     pub(crate) fn draw_status_bar(&mut self, ctx: &egui::Context) {
@@ -326,29 +329,76 @@ impl RustboyApp {
     // GLSL/WGSL shader passes plug in alongside `self.postproc.process_frame`, and
     // RetroAchievements unlock banners / Lua script canvas overlays draw over `disp_rect`.
     pub(crate) fn draw_active_viewport(&mut self, ctx: &egui::Context, ui: &mut egui::Ui) {
-        if self.sink.frame_dirty {
-            let color_profile = self.effective_color_profile();
-            let color_img = self.postproc.process_frame(
-                &self.sink.framebuffer,
-                self.config.color_correction,
-                color_profile,
-                self.config.lcd_ghosting,
-                self.config.scanline_grid,
-            );
-            let tex = self.lcd_tex.get_or_insert_with(|| {
-                ctx.load_texture("gba_lcd", color_img.clone(), TextureOptions::NEAREST)
-            });
-            tex.set(color_img, TextureOptions::NEAREST);
-            self.sink.frame_dirty = false;
-        } else if self.lcd_tex.is_none() {
-            let blank = self.postproc.process_frame(
-                &self.sink.framebuffer,
-                self.config.color_correction,
-                self.config.color_profile,
-                false,
-                false,
-            );
-            self.lcd_tex = Some(ctx.load_texture("gba_lcd", blank, TextureOptions::NEAREST));
+        let color_profile = self.effective_color_profile();
+        let shader_preset = self.config.effective_shader_preset();
+        let frame_blending = self.config.frame_blending;
+        let mut gl_pipeline_arc = None;
+
+        if let Some(pipeline_arc) = &self.gl_shaders
+            && let Ok(mut pipeline) = pipeline_arc.lock()
+        {
+            if pipeline.is_preset_available(shader_preset) {
+                if self.sink.frame_dirty || pipeline.needs_initial_upload() {
+                    pipeline.stage_frames(
+                        &self.sink.framebuffer,
+                        &self.sink.prev_framebuffer,
+                        self.sink.has_prev_frame,
+                    );
+                    self.postproc.sync_rgba_for_capture(
+                        &self.sink.framebuffer,
+                        self.sink
+                            .has_prev_frame
+                            .then_some(&self.sink.prev_framebuffer),
+                        self.sink.frame_seq,
+                        self.config.color_correction,
+                        color_profile,
+                        frame_blending,
+                        self.config.lcd_ghosting,
+                    );
+                    self.sink.frame_dirty = false;
+                }
+                gl_pipeline_arc = Some(pipeline_arc.clone());
+            } else {
+                pipeline.log_fallback_warning_once(&format!(
+                    "GLSL shader preset {:?} unavailable, falling back to CPU post-processor",
+                    shader_preset
+                ));
+            }
+        }
+
+        if gl_pipeline_arc.is_none() {
+            let scanline_grid = shader_preset == ShaderPreset::LcdGrid || self.config.scanline_grid;
+            if self.sink.frame_dirty {
+                let color_img = self.postproc.process_frame_with_blending(
+                    &self.sink.framebuffer,
+                    self.sink
+                        .has_prev_frame
+                        .then_some(&self.sink.prev_framebuffer),
+                    self.config.color_correction,
+                    color_profile,
+                    frame_blending,
+                    self.config.lcd_ghosting,
+                    scanline_grid,
+                );
+                let tex = self.lcd_tex.get_or_insert_with(|| {
+                    ctx.load_texture("gba_lcd", color_img.clone(), TextureOptions::NEAREST)
+                });
+                tex.set(color_img, TextureOptions::NEAREST);
+                self.sink.frame_dirty = false;
+            } else if self.lcd_tex.is_none() {
+                let blank = self.postproc.process_frame_with_blending(
+                    &self.sink.framebuffer,
+                    self.sink
+                        .has_prev_frame
+                        .then_some(&self.sink.prev_framebuffer),
+                    self.config.color_correction,
+                    color_profile,
+                    frame_blending,
+                    false,
+                    scanline_grid,
+                );
+                self.lcd_tex = Some(ctx.load_texture("gba_lcd", blank, TextureOptions::NEAREST));
+            }
         }
 
         let avail = ui.available_size();
@@ -366,8 +416,24 @@ impl RustboyApp {
         };
 
         let mut toggle_fullscreen = false;
+        let render_params = ShaderRenderParams {
+            preset: shader_preset,
+            color_profile_id: color_profile_uniform(self.config.color_correction, color_profile),
+            frame_blend: if frame_blending && self.sink.has_prev_frame {
+                0.5
+            } else {
+                0.0
+            },
+            lcd_ghosting: if self.config.lcd_ghosting && !frame_blending {
+                0.35
+            } else {
+                0.0
+            },
+        };
+
         ui.centered_and_justified(|ui| {
-            if let Some(tex) = &self.lcd_tex {
+            let has_surface = gl_pipeline_arc.is_some() || self.lcd_tex.is_some();
+            if has_surface {
                 let (rect, resp) = ui.allocate_exact_size(disp_size, Sense::click());
 
                 // Double-click viewport to toggle fullscreen
@@ -378,13 +444,18 @@ impl RustboyApp {
                 // Render authentic GBA bezel frame if enabled
                 self.draw_bezel_frame(ui, rect, avail);
 
-                // Render GBA LCD display
-                ui.painter().image(
-                    tex.id(),
-                    rect,
-                    egui::Rect::from_min_max(egui::Pos2::ZERO, egui::Pos2::new(1.0, 1.0)),
-                    Color32::WHITE,
-                );
+                // Render GBA LCD display via GLSL shader pipeline or CPU texture fallback
+                if let Some(pipeline_arc) = gl_pipeline_arc.take() {
+                    let cb = create_viewport_paint_callback(pipeline_arc, rect, render_params);
+                    ui.painter().add(egui::Shape::Callback(cb));
+                } else if let Some(tex) = &self.lcd_tex {
+                    ui.painter().image(
+                        tex.id(),
+                        rect,
+                        egui::Rect::from_min_max(egui::Pos2::ZERO, egui::Pos2::new(1.0, 1.0)),
+                        Color32::WHITE,
+                    );
+                }
                 ui.painter().rect_stroke(
                     rect,
                     CornerRadius::ZERO,

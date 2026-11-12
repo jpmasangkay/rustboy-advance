@@ -7,7 +7,7 @@ use gba_core::{LCD_HEIGHT, LCD_WIDTH};
 use crate::app::{
     RustboyApp, ACCENT_TEAL, ACCENT_TEAL_BG, BG_PANEL, BORDER_HAIRLINE, TEXT_MUTED,
 };
-use crate::config::{AppConfig, BezelStyle, ColorProfileChoice, HotkeyAction};
+use crate::config::{AppConfig, BezelStyle, ColorProfileChoice, HotkeyAction, ShaderPreset};
 
 impl RustboyApp {
     // WAVE-2 HOOK: Top menu bar — wave-2 agents should add menu entries here for
@@ -309,6 +309,24 @@ impl RustboyApp {
                                 ui.close_menu();
                             }
                         });
+                        let active_shader = self.config.effective_shader_preset();
+                        ui.menu_button(
+                            format!("Shader Preset ({})", active_shader.short_label()),
+                            |ui| {
+                                for preset in ShaderPreset::ALL {
+                                    if ui
+                                        .selectable_label(active_shader == preset, preset.label())
+                                        .clicked()
+                                    {
+                                        self.config.shader_preset = preset;
+                                        self.config.scanline_grid = preset == ShaderPreset::LcdGrid;
+                                        self.config.save();
+                                        self.sink.frame_dirty = true;
+                                        ui.close_menu();
+                                    }
+                                }
+                            },
+                        );
                         ui.menu_button("Display Filters", |ui| {
                             if ui
                                 .checkbox(
@@ -340,19 +358,24 @@ impl RustboyApp {
                             });
                             ui.separator();
                             if ui
-                                .checkbox(&mut self.config.lcd_ghosting, "LCD Interframe Ghosting")
-                                .changed()
-                            {
-                                self.config.save();
-                            }
-                            if ui
                                 .checkbox(
-                                    &mut self.config.scanline_grid,
-                                    "Subpixel Scanline Grid",
+                                    &mut self.config.frame_blending,
+                                    "Frame Blending (Flicker Fix)",
+                                )
+                                .on_hover_text(
+                                    "50/50 temporal blend between previous and current frame to smooth GBA flicker transparency",
                                 )
                                 .changed()
                             {
                                 self.config.save();
+                                self.sink.frame_dirty = true;
+                            }
+                            if ui
+                                .checkbox(&mut self.config.lcd_ghosting, "LCD Interframe Ghosting")
+                                .changed()
+                            {
+                                self.config.save();
+                                self.sink.frame_dirty = true;
                             }
                         });
                         ui.menu_button("GBA Screen Bezel", |ui| {
@@ -714,18 +737,31 @@ impl RustboyApp {
                         self.config.save();
                     }
                     if toggle_btn(ui, "sRGB", self.config.color_correction)
-                        .on_hover_text("AGB-001 sRGB Color Correction")
+                        .on_hover_text("Color Correction")
                         .clicked()
                     {
                         self.config.color_correction = !self.config.color_correction;
                         self.config.save();
+                        self.sink.frame_dirty = true;
                     }
-                    if toggle_btn(ui, "Grid", self.config.scanline_grid)
-                        .on_hover_text("LCD Subpixel Scanline Grid")
+                    let grid_active =
+                        self.config.effective_shader_preset() == ShaderPreset::LcdGrid;
+                    if toggle_btn(ui, "Grid", grid_active)
+                        .on_hover_text(format!(
+                            "Toggle GBA LCD Grid Shader (Current: {})",
+                            self.config.effective_shader_preset().label()
+                        ))
                         .clicked()
                     {
-                        self.config.scanline_grid = !self.config.scanline_grid;
+                        let next = if grid_active {
+                            ShaderPreset::Nearest
+                        } else {
+                            ShaderPreset::LcdGrid
+                        };
+                        self.config.shader_preset = next;
+                        self.config.scanline_grid = next == ShaderPreset::LcdGrid;
                         self.config.save();
+                        self.sink.frame_dirty = true;
                     }
 
                     ui.separator();

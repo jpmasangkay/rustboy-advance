@@ -15,6 +15,7 @@ mod menus;
 mod rewind;
 mod rom_loader;
 mod savestates;
+mod shaders;
 
 use gba_core::{LCD_HEIGHT, LCD_WIDTH};
 

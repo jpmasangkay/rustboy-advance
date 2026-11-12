@@ -249,6 +249,7 @@ impl ApplicationHandler<UserEvent> for HostApp {
 
         let egui_glow = egui_glow::EguiGlow::new(event_loop, gl.clone(), None, None, true);
         configure_obsidian_style(&egui_glow.egui_ctx);
+        self.app.init_gl(gl.clone());
 
         let proxy_mutex = egui::mutex::Mutex::new(self.proxy.clone());
         egui_glow

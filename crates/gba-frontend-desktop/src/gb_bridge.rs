@@ -193,10 +193,47 @@ impl RustboyApp {
         }
     }
 
+    /// Serializes an uncompressed raw state snapshot (no LZ4, no header) from whichever core is active.
+    /// Ideal for in-memory rewind buffers where XOR deltas between consecutive raw states compress
+    /// drastically better and avoid duplicate compression overhead.
+    pub(crate) fn save_active_core_state_raw(&self) -> Result<Vec<u8>, String> {
+        if let Some(core) = &self.core {
+            core.save_state_raw().map_err(|e| format!("{e:?}"))
+        } else if let Some(gb) = &self.gb {
+            gb.core.save_state().map_err(|e| format!("{e:?}"))
+        } else {
+            Err("No active ROM loaded".into())
+        }
+    }
+
     /// Loads a serialized core state snapshot into the active core and refreshes the framebuffer.
     pub(crate) fn load_active_core_state(&mut self, bytes: &[u8]) -> Result<(), String> {
         if let Some(core) = &mut self.core {
             core.load_state(bytes).map_err(|e| format!("{e:?}"))?;
+            core.bus.ppu.dot_accurate_mode = self.config.dot_accurate_ppu;
+            core.bus.ppu.layer_enable_mask = self.config.layer_mask;
+            core.bus.apu.channel_enable_mask = self.config.audio_channel_mask;
+            core.bus.apu.master_volume_pct = self.config.master_volume;
+            self.sink
+                .framebuffer
+                .copy_from_slice(&*core.bus.ppu.framebuffer);
+            self.sink.frame_dirty = true;
+            Ok(())
+        } else if let Some(gb) = &mut self.gb {
+            gb.core.load_state(bytes).map_err(|e| format!("{e:?}"))?;
+            gb.core.set_dmg_palette(self.config.dmg_palette.to_core());
+            blit_gb_to_gba_fb(gb.core.framebuffer(), &mut self.sink.framebuffer);
+            self.sink.frame_dirty = true;
+            Ok(())
+        } else {
+            Err("No active ROM loaded".into())
+        }
+    }
+
+    /// Restores a raw state snapshot into the active core and refreshes PPU/APU state and framebuffer.
+    pub(crate) fn load_active_core_state_raw(&mut self, bytes: &[u8]) -> Result<(), String> {
+        if let Some(core) = &mut self.core {
+            core.load_state_raw(bytes).map_err(|e| format!("{e:?}"))?;
             core.bus.ppu.dot_accurate_mode = self.config.dot_accurate_ppu;
             core.bus.ppu.layer_enable_mask = self.config.layer_mask;
             core.bus.apu.channel_enable_mask = self.config.audio_channel_mask;
@@ -253,8 +290,12 @@ impl RustboyApp {
             return;
         }
         let data = gb.export_sav_with_rtc();
-        if !data.is_empty() && fs::write(sav_path, data).is_ok() {
+        if !data.is_empty() {
             gb.core.clear_battery_dirty();
+            let path = sav_path.clone();
+            std::thread::spawn(move || {
+                let _ = fs::write(path, data);
+            });
         }
     }
 

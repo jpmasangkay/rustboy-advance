@@ -104,6 +104,13 @@ struct SaveStatePayload {
     config: GbConfig,
 }
 
+#[derive(Serialize)]
+struct SaveStatePayloadRef<'a> {
+    cpu: &'a Cpu,
+    bus: &'a GbBus,
+    config: GbConfig,
+}
+
 /// Game Boy / Game Boy Color emulation core (`#![no_std]` + `alloc`).
 pub struct GbCore {
     pub cpu: Cpu,
@@ -237,11 +244,9 @@ impl GbCore {
 
     /// Serializes full emulator state (excluding the ROM bytes) using `postcard`.
     pub fn save_state(&self) -> Result<Vec<u8>, postcard::Error> {
-        let mut bus_clone = self.bus.clone();
-        bus_clone.cart.rom.clear();
-        let payload = SaveStatePayload {
-            cpu: self.cpu.clone(),
-            bus: bus_clone,
+        let payload = SaveStatePayloadRef {
+            cpu: &self.cpu,
+            bus: &self.bus,
             config: self.config,
         };
         postcard::to_allocvec(&payload)

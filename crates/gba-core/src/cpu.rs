@@ -54,8 +54,8 @@ impl CpuMode {
 type ArmFn = fn(&mut Arm7tdmi, &mut SysBus, u32) -> u64;
 type ThumbFn = fn(&mut Arm7tdmi, &mut SysBus, u16) -> u64;
 
-static ARM_LUT: [ArmFn; 4096] = build_arm_lut();
-static THUMB_LUT: [ThumbFn; 1024] = build_thumb_lut();
+pub(crate) static ARM_LUT: [ArmFn; 4096] = build_arm_lut();
+pub(crate) static THUMB_LUT: [ThumbFn; 1024] = build_thumb_lut();
 
 #[derive(Clone, Serialize, Deserialize)]
 pub struct Arm7tdmi {
@@ -205,8 +205,11 @@ impl Arm7tdmi {
             | if overflow { CPSR_V } else { 0 };
     }
 
-    #[inline]
+    #[inline(always)]
     pub fn check_cond(&self, cond: u32) -> bool {
+        if cond == 0xE {
+            return true;
+        }
         let n = (self.cpsr & CPSR_N) != 0;
         let z = (self.cpsr & CPSR_Z) != 0;
         let c = (self.cpsr & CPSR_C) != 0;
@@ -233,6 +236,7 @@ impl Arm7tdmi {
 
     pub fn flush_pipeline(&mut self, bus: &mut SysBus, target_addr: u32) {
         self.pipeline_flushed = true;
+        bus.invalidate_code_page();
         if self.is_thumb() {
             let pc = target_addr & !1;
             let (p0, c0) = bus.fetch_16(pc, AccessType::NonSequential);
@@ -303,11 +307,11 @@ impl Arm7tdmi {
         self.pipeline[0] = self.pipeline[1];
 
         let fetch_cyc = if was_thumb {
-            let (next_h, c) = bus.fetch_16(self.gpr[15], AccessType::Sequential);
+            let (next_h, c) = bus.fetch_16_fast(self.gpr[15]);
             self.pipeline[1] = next_h as u32;
             c
         } else {
-            let (next_w, c) = bus.fetch_32(self.gpr[15], AccessType::Sequential);
+            let (next_w, c) = bus.fetch_32_fast(self.gpr[15]);
             self.pipeline[1] = next_w;
             c
         };
@@ -317,7 +321,7 @@ impl Arm7tdmi {
             THUMB_LUT[lut_idx](self, bus, instr as u16)
         } else {
             let cond = (instr >> 28) & 0xF;
-            if !self.check_cond(cond) {
+            if cond != 0xE && !self.check_cond(cond) {
                 self.gpr[15] = self.gpr[15].wrapping_add(4);
                 return fetch_cyc;
             }
@@ -452,17 +456,34 @@ impl Arm7tdmi {
         (res, carry, overflow)
     }
 
-    #[inline]
+    #[inline(always)]
     fn booth_cycles(rs: u32, signed: bool) -> u64 {
-        let mut mask = 0xFFFF_FF00u32;
-        for cycles in 1..=3 {
-            let masked = rs & mask;
-            if masked == 0 || (signed && masked == mask) {
-                return cycles;
+        if signed {
+            let s1 = (rs as i32) >> 8;
+            if s1 == 0 || s1 == -1 {
+                return 1;
             }
-            mask <<= 8;
+            let s2 = s1 >> 8;
+            if s2 == 0 || s2 == -1 {
+                return 2;
+            }
+            let s3 = s2 >> 8;
+            if s3 == 0 || s3 == -1 {
+                return 3;
+            }
+            4
+        } else {
+            if (rs >> 8) == 0 {
+                return 1;
+            }
+            if (rs >> 16) == 0 {
+                return 2;
+            }
+            if (rs >> 24) == 0 {
+                return 3;
+            }
+            4
         }
-        4
     }
 
     #[inline]
@@ -846,7 +867,11 @@ fn arm_data_proc<const CFG: u8>(cpu: &mut Arm7tdmi, bus: &mut SysBus, instr: u32
         } else {
             (instr >> 7) & 0x1F
         };
-        cpu.barrel_shift(rm_val, shift_type, amount, reg_shift)
+        if !reg_shift && shift_type == 0 && amount == 0 {
+            (rm_val, cpu.carry_flag())
+        } else {
+            cpu.barrel_shift(rm_val, shift_type, amount, reg_shift)
+        }
     };
 
     let op1 = if rn == 15 && reg_shift {
@@ -1301,6 +1326,40 @@ fn arm_block_transfer<const CFG: u8>(cpu: &mut Arm7tdmi, bus: &mut SysBus, instr
     let mut first = true;
 
     if load {
+        let start_addr = addr & !3;
+        let end_addr = start_addr.wrapping_add(total_bytes);
+        if !s_bit && !user_bank && !pc_in_list && !bus.watchpoint_active && !bus.bench_active && start_addr < 0x1000_0000 && (start_addr >> 14) == (end_addr.wrapping_sub(1) >> 14) {
+            let page = (start_addr >> 14) as usize;
+            if let Some(ptr) = bus.fastmem_read[page] {
+                let region = (start_addr >> 24) & 0x0F;
+                if region == 0x02 || region == 0x03 {
+                    let cyc_per_word = if region == 0x02 { 6 } else { 1 };
+                    let total_cyc = (count as u64) * cyc_per_word;
+                    bus.step_prefetch(total_cyc);
+                    for r in 0..15 {
+                        if (rlist & (1 << r)) == 0 {
+                            continue;
+                        }
+                        let off = (addr & 0x3FFF) as usize;
+                        // SAFETY: Both start_addr and end_addr - 1 lie within the same 16 KiB fastmem page.
+                        // ptr points to valid, allocated EWRAM or IWRAM.
+                        // off <= 0x3FFC, reading 4 bytes is strictly inbound and unaligned-safe.
+                        let v = unsafe {
+                            let src = ptr.as_ptr().add(off) as *const u32;
+                            src.read_unaligned()
+                        };
+                        cpu.gpr[r] = v;
+                        addr = addr.wrapping_add(4);
+                    }
+                    if writeback && (rlist & (1 << rn)) == 0 && rn != 15 {
+                        cpu.gpr[rn] = new_base;
+                    }
+                    bus.step_internal(1);
+                    return total_cyc + 1;
+                }
+            }
+        }
+
         for r in 0..16 {
             if (rlist & (1 << r)) == 0 {
                 continue;
@@ -1335,6 +1394,49 @@ fn arm_block_transfer<const CFG: u8>(cpu: &mut Arm7tdmi, bus: &mut SysBus, instr
         cyc += 1;
         bus.step_internal(1);
     } else {
+        let start_addr = addr & !3;
+        let end_addr = start_addr.wrapping_add(total_bytes);
+        if !bus.watchpoint_active && !bus.bench_active && start_addr < 0x1000_0000 && (start_addr >> 14) == (end_addr.wrapping_sub(1) >> 14) {
+            let page = (start_addr >> 14) as usize;
+            if let Some(ptr) = bus.fastmem_write[page] {
+                let region = (start_addr >> 24) & 0x0F;
+                if region == 0x02 || region == 0x03 {
+                    let cyc_per_word = if region == 0x02 { 6 } else { 1 };
+                    let total_cyc = (count as u64) * cyc_per_word;
+                    bus.step_prefetch(total_cyc);
+                    if (page as u32) == bus.code_page_tag {
+                        bus.invalidate_code_page();
+                    }
+                    for r in 0..16 {
+                        if (rlist & (1 << r)) == 0 {
+                            continue;
+                        }
+                        let v = if r == 15 {
+                            cpu.gpr[15].wrapping_add(4)
+                        } else if r == rn && writeback && !rn_lowest {
+                            new_base
+                        } else if user_bank {
+                            cpu.read_usr_reg(r)
+                        } else {
+                            cpu.gpr[r]
+                        };
+                        let off = (addr & 0x3FFF) as usize;
+                        // SAFETY: Both start_addr and end_addr - 1 lie within the same 16 KiB fastmem page.
+                        // ptr points to valid, mutable EWRAM or IWRAM.
+                        // off <= 0x3FFC, writing 4 bytes is strictly inbound and unaligned-safe.
+                        unsafe {
+                            let dest = ptr.as_ptr().add(off) as *mut u32;
+                            dest.write_unaligned(v);
+                        }
+                        addr = addr.wrapping_add(4);
+                    }
+                    if writeback && rn != 15 {
+                        cpu.gpr[rn] = new_base;
+                    }
+                    return total_cyc;
+                }
+            }
+        }
         for r in 0..16 {
             if (rlist & (1 << r)) == 0 {
                 continue;
@@ -1770,6 +1872,33 @@ fn thumb_push_pop<const CFG: u8>(cpu: &mut Arm7tdmi, bus: &mut SysBus, instr: u1
     let mut cyc = 0u64;
     let mut first = true;
     if load {
+        let count = rlist.count_ones();
+        let total_bytes = count * 4;
+        let start_addr = sp & !3;
+        let end_addr = start_addr.wrapping_add(total_bytes);
+        if !p_r && !bus.watchpoint_active && !bus.bench_active && start_addr < 0x1000_0000 && (start_addr >> 14) == (end_addr.wrapping_sub(1) >> 14) {
+            let page = (start_addr >> 14) as usize;
+            if let Some(ptr) = bus.fastmem_read[page] {
+                let region = (start_addr >> 24) & 0x0F;
+                if region == 0x02 || region == 0x03 {
+                    let cyc_per_word = if region == 0x02 { 6 } else { 1 };
+                    let total_cyc = (count as u64) * cyc_per_word;
+                    bus.step_prefetch(total_cyc);
+                    for r in 0..8usize {
+                        if (rlist & (1 << r)) != 0 {
+                            let off = (sp & 0x3FFF) as usize;
+                            let v = unsafe { (ptr.as_ptr().add(off) as *const u32).read_unaligned() };
+                            cpu.gpr[r] = v;
+                            sp = sp.wrapping_add(4);
+                        }
+                    }
+                    cpu.gpr[13] = sp;
+                    bus.step_internal(1);
+                    return total_cyc + 1;
+                }
+            }
+        }
+
         for r in 0..8usize {
             if (rlist & (1 << r)) != 0 {
                 let acc = if first {
@@ -1802,8 +1931,46 @@ fn thumb_push_pop<const CFG: u8>(cpu: &mut Arm7tdmi, bus: &mut SysBus, instr: u1
         cyc + 1
     } else {
         let count = rlist.count_ones() + (p_r as u32);
-        sp = sp.wrapping_sub(count * 4);
+        let total_bytes = count * 4;
+        sp = sp.wrapping_sub(total_bytes);
         cpu.gpr[13] = sp;
+
+        let start_addr = sp & !3;
+        let end_addr = start_addr.wrapping_add(total_bytes);
+        if !bus.watchpoint_active && !bus.bench_active && start_addr < 0x1000_0000 && (start_addr >> 14) == (end_addr.wrapping_sub(1) >> 14) {
+            let page = (start_addr >> 14) as usize;
+            if let Some(ptr) = bus.fastmem_write[page] {
+                let region = (start_addr >> 24) & 0x0F;
+                if region == 0x02 || region == 0x03 {
+                    let cyc_per_word = if region == 0x02 { 6 } else { 1 };
+                    let total_cyc = (count as u64) * cyc_per_word;
+                    bus.step_prefetch(total_cyc);
+                    if (page as u32) == bus.code_page_tag {
+                        bus.invalidate_code_page();
+                    }
+                    let mut addr = sp;
+                    for r in 0..8usize {
+                        if (rlist & (1 << r)) != 0 {
+                            let off = (addr & 0x3FFF) as usize;
+                            unsafe {
+                                let dest = ptr.as_ptr().add(off) as *mut u32;
+                                dest.write_unaligned(cpu.gpr[r]);
+                            }
+                            addr = addr.wrapping_add(4);
+                        }
+                    }
+                    if p_r {
+                        let off = (addr & 0x3FFF) as usize;
+                        unsafe {
+                            let dest = ptr.as_ptr().add(off) as *mut u32;
+                            dest.write_unaligned(cpu.gpr[14]);
+                        }
+                    }
+                    return total_cyc;
+                }
+            }
+        }
+
         let mut addr = sp;
         for r in 0..8usize {
             if (rlist & (1 << r)) != 0 {
@@ -1858,6 +2025,37 @@ fn thumb_ldm_stm<const LOAD: bool>(cpu: &mut Arm7tdmi, bus: &mut SysBus, instr: 
     let mut first = true;
 
     if LOAD {
+        let total_bytes = count * 4;
+        let start_addr = base & !3;
+        let end_addr = start_addr.wrapping_add(total_bytes);
+        if !bus.watchpoint_active && !bus.bench_active && start_addr < 0x1000_0000 && (start_addr >> 14) == (end_addr.wrapping_sub(1) >> 14) {
+            let page = (start_addr >> 14) as usize;
+            if let Some(ptr) = bus.fastmem_read[page] {
+                let region = (start_addr >> 24) & 0x0F;
+                if region == 0x02 || region == 0x03 {
+                    let cyc_per_word = if region == 0x02 { 6 } else { 1 };
+                    let total_cyc = (count as u64) * cyc_per_word;
+                    bus.step_prefetch(total_cyc);
+                    for r in 0..8usize {
+                        if (rlist & (1 << r)) != 0 {
+                            let off = (addr & 0x3FFF) as usize;
+                            let v = unsafe {
+                                let src = ptr.as_ptr().add(off) as *const u32;
+                                src.read_unaligned()
+                            };
+                            cpu.gpr[r] = v;
+                            addr = addr.wrapping_add(4);
+                        }
+                    }
+                    if (rlist & (1 << rb)) == 0 {
+                        cpu.gpr[rb] = new_base;
+                    }
+                    bus.step_internal(1);
+                    return total_cyc + 1;
+                }
+            }
+        }
+
         for r in 0..8usize {
             if (rlist & (1 << r)) != 0 {
                 let acc = if first {
@@ -1878,6 +2076,40 @@ fn thumb_ldm_stm<const LOAD: bool>(cpu: &mut Arm7tdmi, bus: &mut SysBus, instr: 
         bus.step_internal(1);
         cyc + 1
     } else {
+        let total_bytes = count * 4;
+        let start_addr = base & !3;
+        let end_addr = start_addr.wrapping_add(total_bytes);
+        if !bus.watchpoint_active && !bus.bench_active && start_addr < 0x1000_0000 && (start_addr >> 14) == (end_addr.wrapping_sub(1) >> 14) {
+            let page = (start_addr >> 14) as usize;
+            if let Some(ptr) = bus.fastmem_write[page] {
+                let region = (start_addr >> 24) & 0x0F;
+                if region == 0x02 || region == 0x03 {
+                    let cyc_per_word = if region == 0x02 { 6 } else { 1 };
+                    let total_cyc = (count as u64) * cyc_per_word;
+                    bus.step_prefetch(total_cyc);
+                    if (page as u32) == bus.code_page_tag {
+                        bus.invalidate_code_page();
+                    }
+                    for r in 0..8usize {
+                        if (rlist & (1 << r)) != 0 {
+                            let v = if r == rb && !rb_lowest {
+                                new_base
+                            } else {
+                                cpu.gpr[r]
+                            };
+                            let off = (addr & 0x3FFF) as usize;
+                            unsafe {
+                                let dest = ptr.as_ptr().add(off) as *mut u32;
+                                dest.write_unaligned(v);
+                            }
+                            addr = addr.wrapping_add(4);
+                        }
+                    }
+                    cpu.gpr[rb] = new_base;
+                    return total_cyc;
+                }
+            }
+        }
         for r in 0..8usize {
             if (rlist & (1 << r)) != 0 {
                 let acc = if first {

@@ -774,6 +774,9 @@ pub struct Apu {
     /// Current CPU cycle timestamp to which PSG and mixer state are synchronized.
     #[serde(default)]
     pub last_cycle: u64,
+    /// CPU cycle timestamp when the next 512 Hz frame sequencer tick is due.
+    #[serde(default)]
+    pub next_frame_seq_cycle: u64,
 
     #[serde(skip, default = "default_dsp_state")]
     dsp: ApuDspState,
@@ -803,6 +806,7 @@ impl Apu {
             chan_scopes: [[0; 128]; 6],
             scope_cursor: 0,
             last_cycle: 0,
+            next_frame_seq_cycle: crate::APU_FRAME_SEQ_INTERVAL,
             dsp,
         }
     }
@@ -854,6 +858,7 @@ impl Apu {
             self.soundcnt_l = 0;
         } else if !was_enabled && now_enabled {
             self.frame_seq_step = 0;
+            self.next_frame_seq_cycle = self.last_cycle + crate::APU_FRAME_SEQ_INTERVAL;
         }
     }
 
@@ -929,9 +934,31 @@ impl Apu {
         self.drain_blip(cycle);
     }
 
+    /// Advances audio up to `cycle`, ticking the 512 Hz PSG frame sequencer whenever due,
+    /// and draining ready samples into `output_buffer`. Called once per scanline in HBlank.
+    pub fn advance_scanline(&mut self, cycle: u64) {
+        self.ensure_dsp_initialized();
+        if self.next_frame_seq_cycle == 0 {
+            self.next_frame_seq_cycle = self.last_cycle + crate::APU_FRAME_SEQ_INTERVAL;
+        }
+        while self.next_frame_seq_cycle <= cycle {
+            let seq_cycle = self.next_frame_seq_cycle;
+            self.sync(seq_cycle);
+            if self.master_enabled() {
+                self.tick_frame_sequencer();
+                self.commit_mix(seq_cycle);
+            }
+            self.next_frame_seq_cycle += crate::APU_FRAME_SEQ_INTERVAL;
+        }
+        self.sync(cycle);
+        self.commit_mix(cycle);
+        self.drain_blip(cycle);
+    }
+
     /// Re-anchors internal DSP state across a STOP mode cycle jump without losing pre-STOP samples.
     pub fn on_stop_shift(&mut self, new_cycle: u64) {
         self.last_cycle = new_cycle;
+        self.next_frame_seq_cycle = new_cycle + crate::APU_FRAME_SEQ_INTERVAL;
         self.dsp.blip.reset(new_cycle);
         self.dsp.last_mix_l = 0;
         self.dsp.last_mix_r = 0;
@@ -942,9 +969,7 @@ impl Apu {
 
     /// Flushes all audio up to `cycle` into `output_buffer` (called at end of frame or breakpoint).
     pub fn flush(&mut self, cycle: u64) {
-        self.sync(cycle);
-        self.commit_mix(cycle);
-        self.drain_blip(cycle);
+        self.advance_scanline(cycle);
     }
 
     #[inline]

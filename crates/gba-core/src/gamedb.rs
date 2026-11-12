@@ -214,10 +214,57 @@ pub const GAME_DB: &[GameDbEntry] = &[
     GameDbEntry::basic("B3SP", SaveType::Flash64K),
     GameDbEntry::basic("B3SJ", SaveType::Flash64K),
     GameDbEntry::basic("A3UJ", SaveType::Flash64K),
-    // Classic NES Series: Super Mario Bros. (4Kbit EEPROM)
+    // Classic NES Series & Famicom Mini (4Kbit EEPROM)
     GameDbEntry::basic("FSME", SaveType::Eeprom512B),
     GameDbEntry::basic("FSMP", SaveType::Eeprom512B),
     GameDbEntry::basic("FSMJ", SaveType::Eeprom512B),
+    GameDbEntry::basic("FDKE", SaveType::Eeprom512B),
+    GameDbEntry::basic("FDKJ", SaveType::Eeprom512B),
+    GameDbEntry::basic("FICE", SaveType::Eeprom512B),
+    GameDbEntry::basic("FICJ", SaveType::Eeprom512B),
+    GameDbEntry::basic("FEBE", SaveType::Eeprom512B),
+    GameDbEntry::basic("FEBJ", SaveType::Eeprom512B),
+    GameDbEntry::basic("FZLE", SaveType::Eeprom512B),
+    GameDbEntry::basic("FZLJ", SaveType::Eeprom512B),
+    GameDbEntry::basic("FPME", SaveType::Eeprom512B),
+    GameDbEntry::basic("FPMJ", SaveType::Eeprom512B),
+    GameDbEntry::basic("FXVE", SaveType::Eeprom512B),
+    GameDbEntry::basic("FXVJ", SaveType::Eeprom512B),
+    GameDbEntry::basic("FMPJ", SaveType::Eeprom512B),
+    GameDbEntry::basic("FBME", SaveType::Eeprom512B),
+    GameDbEntry::basic("FBMJ", SaveType::Eeprom512B),
+    GameDbEntry::basic("FMRE", SaveType::Eeprom512B),
+    GameDbEntry::basic("FMRJ", SaveType::Eeprom512B),
+    GameDbEntry::basic("FLBE", SaveType::Eeprom512B),
+    GameDbEntry::basic("FLBJ", SaveType::Eeprom512B),
+    GameDbEntry::basic("FDME", SaveType::Eeprom512B),
+    GameDbEntry::basic("FDMJ", SaveType::Eeprom512B),
+    GameDbEntry::basic("FADE", SaveType::Eeprom512B),
+    GameDbEntry::basic("FADJ", SaveType::Eeprom512B),
+    // Mega Man Battle Network 5 & 6 (Flash 128K)
+    GameDbEntry::basic("BRBE", SaveType::Flash128K),
+    GameDbEntry::basic("BRBP", SaveType::Flash128K),
+    GameDbEntry::basic("BRBJ", SaveType::Flash128K),
+    GameDbEntry::basic("BRKE", SaveType::Flash128K),
+    GameDbEntry::basic("BRKP", SaveType::Flash128K),
+    GameDbEntry::basic("BRKJ", SaveType::Flash128K),
+    GameDbEntry::basic("B6GE", SaveType::Flash128K),
+    GameDbEntry::basic("B6GP", SaveType::Flash128K),
+    GameDbEntry::basic("B6GJ", SaveType::Flash128K),
+    GameDbEntry::basic("B6FE", SaveType::Flash128K),
+    GameDbEntry::basic("B6FP", SaveType::Flash128K),
+    GameDbEntry::basic("B6FJ", SaveType::Flash128K),
+    // Rockman EXE 4.5 Real Operation (Flash 128K + RTC)
+    GameDbEntry::with_flags("BR4J", SaveType::Flash128K, true, false, false, false, false),
+    // Dragon Quest Monsters: Caravan Heart & Shin Megami Tensei (Flash 128K)
+    GameDbEntry::basic("A4XJ", SaveType::Flash128K),
+    GameDbEntry::basic("ASMJ", SaveType::Flash128K),
+    GameDbEntry::basic("AG2J", SaveType::Flash128K),
+    // Doom II (USA: A9DE) -> Flash 64K
+    GameDbEntry::basic("A9DE", SaveType::Flash64K),
+    // Duke Nukem Advance (USA: AD9E, EUR: AD9P) -> EEPROM 512B
+    GameDbEntry::basic("AD9E", SaveType::Eeprom512B),
+    GameDbEntry::basic("AD9P", SaveType::Eeprom512B),
 ];
 
 /// Looks up a game database entry by its 4-character cartridge game code (ROM header `0xAC..0xB0`).

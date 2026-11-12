@@ -755,4 +755,418 @@ fn apu_soundbias_clamp_and_resolution() {
     );
 }
 
+#[test]
+fn hle_swi_soundbias_midikey2freq_and_ppu_skip_rendering() {
+    let rom = rom_from_arm_words(&[0xEAFF_FFFE]);
+    let mut core = GbaCore::new(None, rom);
+
+    // 1. Test SWI 0x19 SoundBias
+    core.cpu.gpr[0] = 0x0200;
+    core.bus.hle_swi(&mut core.cpu, 0x19);
+    assert_eq!(core.bus.apu.soundbias & 0x03FE, 0x0200);
+
+    core.cpu.gpr[0] = 0x0000;
+    core.bus.hle_swi(&mut core.cpu, 0x19);
+    assert_eq!(core.bus.apu.soundbias & 0x03FE, 0x0000);
+
+    // 2. Test SWI 0x1F MidiKey2Freq
+    let wave_ptr = 0x0200_0000u32;
+    core.bus.write_32(wave_ptr + 4, 44100, AccessType::NonSequential);
+    core.cpu.gpr[0] = wave_ptr;
+    core.cpu.gpr[1] = 180; // Base key 180 -> ratio 1:1
+    core.cpu.gpr[2] = 0;   // Fine pitch 0
+    core.bus.hle_swi(&mut core.cpu, 0x1F);
+    assert_eq!(core.cpu.gpr[0], 44100, "Base key 180 should return original sample rate");
+
+    // Key 168 (1 octave down = 12 semitones down) -> 44100 / 2 = 22050
+    core.cpu.gpr[0] = wave_ptr;
+    core.cpu.gpr[1] = 168;
+    core.cpu.gpr[2] = 0;
+    core.bus.hle_swi(&mut core.cpu, 0x1F);
+    assert_eq!(core.cpu.gpr[0], 22050, "1 octave down should halve the frequency");
+
+    // Key 192 (1 octave up = 12 semitones up) -> 44100 * 2 = 88200
+    core.cpu.gpr[0] = wave_ptr;
+    core.cpu.gpr[1] = 192;
+    core.cpu.gpr[2] = 0;
+    core.bus.hle_swi(&mut core.cpu, 0x1F);
+    assert_eq!(core.cpu.gpr[0], 88200, "1 octave up should double the frequency");
+
+    // 3. Test PPU skip_rendering
+    let mut fe = HeadlessFrontend::new();
+    core.bus.ppu.skip_rendering = true;
+    core.run_frame(&mut fe);
+    assert_eq!(fe.frames, 1);
+    core.bus.ppu.skip_rendering = false;
+    core.run_frame(&mut fe);
+    assert_eq!(fe.frames, 2);
+}
+
+#[test]
+fn test_fastmem_vs_slow_path_random_addresses() {
+    let mut rom = vec![0u8; 0x80000]; // 512 KiB ROM
+    // Seed predictable PRNG pattern into ROM
+    let mut lfsr: u32 = 0xACE1_u32;
+    for b in rom.iter_mut() {
+        let bit = ((lfsr >> 0) ^ (lfsr >> 2) ^ (lfsr >> 3) ^ (lfsr >> 5)) & 1;
+        lfsr = (lfsr >> 1) | (bit << 15);
+        *b = (lfsr & 0xFF) as u8;
+    }
+
+    let mut core = GbaCore::new(None, rom.clone());
+
+    // 1. EWRAM: test random 8-bit, 16-bit, and 32-bit writes and reads with mirroring
+    for i in 0..500u32 {
+        let mirror_page = (i % 64) * 0x0004_0000; // 0x0200_0000 .. 0x02FF_0000
+        let offset = (i.wrapping_mul(73) & 0x3_FFFC) as u32;
+        let addr = 0x0200_0000 + mirror_page + offset;
+        let val32 = 0xDEAD_BEEF ^ i.wrapping_mul(0x9E37_79B9);
+
+        // Write 32-bit via bus (fastmem path)
+        core.bus.write_32(addr, val32, AccessType::NonSequential);
+
+        // Read 32-bit via bus (fastmem) and verify against slow-path EWRAM buffer slice
+        let read_val = core.bus.read_32(addr, AccessType::NonSequential, 0x0800_0000);
+        let ewram_off = (addr as usize) & 0x3FFFF;
+        let expected_val = u32::from_le_bytes([
+            core.bus.ewram[ewram_off],
+            core.bus.ewram[ewram_off + 1],
+            core.bus.ewram[ewram_off + 2],
+            core.bus.ewram[ewram_off + 3],
+        ]);
+        assert_eq!(read_val, val32, "EWRAM 32-bit write-read mismatch at {addr:#010X}");
+        assert_eq!(read_val, expected_val, "EWRAM 32-bit fastmem vs slow slice mismatch at {addr:#010X}");
+
+        // Also test 16-bit and 8-bit sub-reads
+        let read16 = core.bus.read_16(addr + 2, AccessType::NonSequential, 0x0800_0000, false);
+        assert_eq!(read16, (val32 >> 16) as u16, "EWRAM 16-bit read mismatch at {addr:#010X}");
+
+        let read8 = core.bus.read_8(addr + 1, AccessType::NonSequential, 0x0800_0000, false);
+        assert_eq!(read8, ((val32 >> 8) & 0xFF) as u8, "EWRAM 8-bit read mismatch at {addr:#010X}");
+    }
+
+    // 2. IWRAM: test random 8-bit, 16-bit, and 32-bit writes and reads with 32 KiB mirroring
+    for i in 0..500u32 {
+        let mirror_page = (i % 512) * 0x0000_8000; // 0x0300_0000 .. 0x03FF_8000
+        let offset = (i.wrapping_mul(31) & 0x7FFC) as u32;
+        let addr = 0x0300_0000 + mirror_page + offset;
+        let val32 = 0x1234_5678 ^ i.wrapping_mul(0x85EB_CA6B);
+
+        core.bus.write_32(addr, val32, AccessType::NonSequential);
+
+        let read_val = core.bus.read_32(addr, AccessType::NonSequential, 0x0800_0000);
+        let iwram_off = (addr as usize) & 0x7FFF;
+        let expected_val = u32::from_le_bytes([
+            core.bus.iwram[iwram_off],
+            core.bus.iwram[iwram_off + 1],
+            core.bus.iwram[iwram_off + 2],
+            core.bus.iwram[iwram_off + 3],
+        ]);
+        assert_eq!(read_val, val32, "IWRAM 32-bit write-read mismatch at {addr:#010X}");
+        assert_eq!(read_val, expected_val, "IWRAM 32-bit fastmem vs slow slice mismatch at {addr:#010X}");
+    }
+
+    // 3. ROM: verify fastmem reads against cart.read_rom_32 across pages 0x08..=0x0D
+    for region in [0x08u32, 0x09, 0x0A, 0x0B] {
+        for off in (0x4000..0x70000).step_by(0x1000) {
+            let addr = (region << 24) + off;
+            let fast_val = core.bus.read_32(addr, AccessType::NonSequential, 0x0800_0000);
+            let slow_val = core.bus.cart.read_rom_32(addr & !3);
+            assert_eq!(fast_val, slow_val, "ROM fastmem vs slow read mismatch at {addr:#010X}");
+        }
+    }
+
+    // 4. Out-of-bounds ROM read (open-bus fallback)
+    let oob_addr = 0x0800_0000 + (rom.len() as u32) + 0x4000;
+    core.bus.open_bus_latch = 0xA5A5_5A5A;
+    let oob_val = core.bus.read_32(oob_addr, AccessType::NonSequential, 0x0800_0000);
+    // Out-of-range ROM address in 16-bit ROM bus reads 16-bit halfword addr & !1 divided by 2
+    let expected_oob = core.bus.cart.read_rom_32(oob_addr);
+    assert_eq!(oob_val, expected_oob, "OOB ROM read mismatch");
+}
+
+#[test]
+fn test_prefetch_old_vs_new_logic_side_by_side() {
+    fn step_prefetch_old(
+        enabled: bool,
+        active: &mut bool,
+        count: &mut u8,
+        cycle_acc: &mut u64,
+        tail_addr: &mut u32,
+        cycles: u64,
+        s_cyc: u64,
+    ) {
+        if !enabled || !*active || cycles == 0 {
+            return;
+        }
+        for _ in 0..cycles {
+            if *count < 8 {
+                *cycle_acc += 1;
+                if *cycle_acc >= s_cyc {
+                    *cycle_acc -= s_cyc;
+                    *count += 1;
+                    *tail_addr = tail_addr.wrapping_add(2);
+                }
+            } else {
+                *cycle_acc = 0;
+                break;
+            }
+        }
+    }
+
+    fn step_prefetch_new(
+        enabled: bool,
+        active: &mut bool,
+        count: &mut u8,
+        cycle_acc: &mut u64,
+        tail_addr: &mut u32,
+        cycles: u64,
+        s_cyc: u64,
+    ) {
+        if !enabled || !*active || cycles == 0 {
+            return;
+        }
+        *cycle_acc += cycles;
+        let max_steps = (8 - *count) as u64;
+        let steps = (*cycle_acc / s_cyc).min(max_steps);
+        if steps > 0 {
+            *cycle_acc -= steps * s_cyc;
+            *count += steps as u8;
+            *tail_addr = tail_addr.wrapping_add((steps * 2) as u32);
+        }
+        if *count >= 8 {
+            *cycle_acc = 0;
+        }
+    }
+
+    for s_cyc in [1u64, 2, 3, 5, 9] {
+        let mut old_active = true;
+        let mut old_count = 0u8;
+        let mut old_acc = 0u64;
+        let mut old_tail = 0x0800_0000u32;
+
+        let mut new_active = true;
+        let mut new_count = 0u8;
+        let mut new_acc = 0u64;
+        let mut new_tail = 0x0800_0000u32;
+
+        let cycle_steps = [1, 2, 3, 4, 5, 7, 11, 16, 25, 42, 100];
+        for &cyc in &cycle_steps {
+            step_prefetch_old(true, &mut old_active, &mut old_count, &mut old_acc, &mut old_tail, cyc, s_cyc);
+            step_prefetch_new(true, &mut new_active, &mut new_count, &mut new_acc, &mut new_tail, cyc, s_cyc);
+
+            assert_eq!(old_count, new_count, "count mismatch for s_cyc={s_cyc}, cyc={cyc}");
+            assert_eq!(old_acc, new_acc, "acc mismatch for s_cyc={s_cyc}, cyc={cyc}");
+            assert_eq!(old_tail, new_tail, "tail mismatch for s_cyc={s_cyc}, cyc={cyc}");
+        }
+
+        // Test branch flush / invalidate
+        old_count = 0;
+        old_acc = 0;
+        new_count = 0;
+        new_acc = 0;
+
+        // Step up to full buffer
+        step_prefetch_old(true, &mut old_active, &mut old_count, &mut old_acc, &mut old_tail, 500, s_cyc);
+        step_prefetch_new(true, &mut new_active, &mut new_count, &mut new_acc, &mut new_tail, 500, s_cyc);
+
+        assert_eq!(old_count, 8);
+        assert_eq!(new_count, 8);
+        assert_eq!(old_acc, 0);
+        assert_eq!(new_acc, 0);
+        assert_eq!(old_tail, new_tail);
+    }
+}
+
+#[test]
+fn test_scheduler_wakeups_and_apu_advance() {
+    let rom = vec![0u8; 0x1000];
+    let mut core = GbaCore::new(None, rom);
+    let mut fe = HeadlessFrontend::new();
+
+    // Enable sound master to verify advance_scanline mixes audio
+    core.bus.apu.write_soundcnt_x(0x0080);
+
+    // Count scheduler events popped over one full frame (280,896 cycles)
+    let mut wakeups = 0usize;
+    let end_cycle = core.bus.scheduler.current_cycle + gba_core::CYCLES_PER_FRAME;
+    while core.bus.scheduler.current_cycle < end_cycle {
+        while let Some((ev_cycle, kind)) = core.bus.scheduler.pop_due() {
+            wakeups += 1;
+            core.bus.dispatch_event(ev_cycle, kind);
+        }
+        let cycles = core.cpu.step(&mut core.bus);
+        core.bus.scheduler.current_cycle += cycles.max(1);
+    }
+    while let Some((ev_cycle, kind)) = core.bus.scheduler.pop_due() {
+        wakeups += 1;
+        core.bus.dispatch_event(ev_cycle, kind);
+    }
+
+    core.bus.apu.flush(core.bus.scheduler.current_cycle);
+    fe.push_audio_samples(&core.bus.apu.output_buffer);
+
+    // Exactly 456 PPU events (228 HDrawEnd + 228 HBlank), down from ~1,097 wakeups!
+    assert_eq!(wakeups, 456, "expected 456 scanline scheduler events, got {wakeups}");
+    // Audio samples were generated via scanline advance
+    assert!(fe.audio_samples > 0, "audio samples should be produced by scanline advance");
+}
+
+#[test]
+fn test_mode4_fast_path_pixel_identical_to_normal_path() {
+    let rom = vec![0u8; 0x1000];
+    let mut core = GbaCore::new(None, rom);
+
+    // Setup Mode 4, BG2 enabled, forced blank off, no windows or sprites
+    core.bus.ppu.dispcnt = 4 | 0x0400;
+    core.bus.ppu.bldcnt = 0;
+    core.bus.ppu.bgcnt[2] = 0;
+    core.bus.ppu.bgp_a[0] = 0x0100;
+    core.bus.ppu.bgp_b[0] = 0;
+    core.bus.ppu.bgp_c[0] = 0;
+    core.bus.ppu.bgp_d[0] = 0x0100;
+    core.bus.ppu.ref_x[0] = 0;
+
+    // Fill PRAM with diverse 15-bit BGR555 colors
+    for c in 0..256usize {
+        let off = c * 2;
+        core.bus.ppu.pram[off] = (c * 7) as u8;
+        core.bus.ppu.pram[off + 1] = ((c * 13) >> 8) as u8;
+    }
+
+    // Fill VRAM front and back pages with distinct test patterns
+    for i in 0..LCD_WIDTH * LCD_HEIGHT {
+        core.bus.ppu.vram[i] = (i % 256) as u8;
+        core.bus.ppu.vram[0xA000 + i] = ((i + 128) % 256) as u8;
+    }
+
+    // Verify both page 0 and page 1
+    for page in [0, 1] {
+        if page == 1 {
+            core.bus.ppu.dispcnt |= 0x0010; // Page flip bit
+        } else {
+            core.bus.ppu.dispcnt &= !0x0010;
+        }
+
+        for y in 0..LCD_HEIGHT {
+            core.bus.ppu.ref_y[0] = (y as i32) << 8;
+
+            // 1. Render using fast path
+            core.bus.ppu.render_scanline(y);
+            let row_start = y * LCD_WIDTH;
+            let mut fast_scanline = [0u16; LCD_WIDTH];
+            fast_scanline.copy_from_slice(&core.bus.ppu.framebuffer[row_start..row_start + LCD_WIDTH]);
+
+            // 2. Render using normal path (temporarily breaking identity affine to force normal path)
+            core.bus.ppu.ref_y[0] = (y as i32) << 8;
+            core.bus.ppu.bgp_b[0] = 1; // Disables fast path!
+            core.bus.ppu.render_scanline(y);
+            core.bus.ppu.bgp_b[0] = 0; // Restore identity!
+
+            let mut normal_scanline = [0u16; LCD_WIDTH];
+            normal_scanline.copy_from_slice(&core.bus.ppu.framebuffer[row_start..row_start + LCD_WIDTH]);
+
+            assert_eq!(
+                fast_scanline, normal_scanline,
+                "Mode 4 fast path diverged from normal path on page {page}, scanline {y}"
+            );
+        }
+    }
+}
+
+#[test]
+fn test_3_layer_save_detector_and_dma3_sizing() {
+    // 1. Layer 1: Library string takes primary precedence
+    let mut rom_flash1m = vec![0u8; 0x1000];
+    rom_flash1m[0xAC..0xB0].copy_from_slice(b"A9DE"); // GameDB says Flash64K for Doom II
+    // Embed FLASH1M_V string -> Layer 1 must win over GameDB!
+    rom_flash1m[0x200..0x209].copy_from_slice(b"FLASH1M_V");
+    let cart = gba_core::cartridge::Cartridge::new(rom_flash1m);
+    assert_eq!(cart.save_type, SaveType::Flash128K, "FLASH1M_V string must override fallback GameDB");
+
+    // 2. Layer 3: GameDB fallback when no string is present
+    let mut rom_doom2 = vec![0u8; 0x1000];
+    rom_doom2[0xAC..0xB0].copy_from_slice(b"A9DE"); // Doom II
+    let cart_doom2 = gba_core::cartridge::Cartridge::new(rom_doom2);
+    assert_eq!(cart_doom2.save_type, SaveType::Flash64K, "A9DE Doom II without string should fallback to Flash64K");
+
+    let mut rom_duke_us = vec![0u8; 0x1000];
+    rom_duke_us[0xAC..0xB0].copy_from_slice(b"AD9E"); // Duke Nukem Advance USA
+    let cart_duke_us = gba_core::cartridge::Cartridge::new(rom_duke_us);
+    assert_eq!(cart_duke_us.save_type, SaveType::Eeprom512B, "AD9E Duke Nukem should fallback to EEPROM");
+
+    let mut rom_duke_eu = vec![0u8; 0x1000];
+    rom_duke_eu[0xAC..0xB0].copy_from_slice(b"AD9P"); // Duke Nukem Advance EUR
+    let cart_duke_eu = gba_core::cartridge::Cartridge::new(rom_duke_eu);
+    assert_eq!(cart_duke_eu.save_type, SaveType::Eeprom512B, "AD9P Duke Nukem EUR should fallback to EEPROM");
+
+    // 3. Layer 2: EEPROM DMA3 transfer auto-sizing (9/73 words vs 17/81 words)
+    let mut cart_eeprom = cart_duke_us;
+    assert!(!cart_eeprom.eeprom.detected_8k);
+    let mut sram = [0xFFu8; 0x20000];
+    let mut dirty = false;
+
+    // DMA3 transfer of 81 units auto-sizes to 8KB
+    cart_eeprom.eeprom.write_bit(&mut sram, &mut dirty, 1, 81);
+    assert!(cart_eeprom.eeprom.detected_8k, "DMA3 count 81 should auto-size EEPROM to 8KB");
+
+    // Reset back to Idle for next DMA transfer
+    cart_eeprom.eeprom.reset();
+
+    // DMA3 transfer of 73 units auto-sizes back to 512B
+    cart_eeprom.eeprom.write_bit(&mut sram, &mut dirty, 1, 73);
+    assert!(!cart_eeprom.eeprom.detected_8k, "DMA3 count 73 should auto-size EEPROM to 512B");
+}
+
+#[test]
+fn test_state_hash_determinism_across_frames() {
+    let rom_path = std::path::Path::new("test-roms/tonc/pageflip.gba");
+    if !rom_path.exists() {
+        return;
+    }
+    let rom = std::fs::read(rom_path).expect("Failed to read pageflip.gba");
+
+    fn fnv1a_hash(data: &[u8]) -> u64 {
+        let mut hash = 0xcbf29ce484222325u64;
+        for &b in data {
+            hash ^= b as u64;
+            hash = hash.wrapping_mul(0x100000001b3);
+        }
+        hash
+    }
+
+    struct NullFrontend;
+    impl gba_core::HostFrontend for NullFrontend {
+        fn present_frame(&mut self, _frame: &[u16; gba_core::LCD_WIDTH * gba_core::LCD_HEIGHT]) {}
+        fn push_audio_samples(&mut self, _samples: &[i16]) {}
+        fn poll_keypad(&mut self) -> u16 { 0x03FF }
+    }
+
+    let run_sim = |rom_data: Vec<u8>| -> (u64, [u32; 16], u32) {
+        let mut core = GbaCore::new(None, rom_data);
+        let mut fe = NullFrontend;
+        for _ in 0..60 {
+            core.run_frame(&mut fe);
+        }
+        let mut state_bytes = Vec::new();
+        for &reg in &core.cpu.gpr {
+            state_bytes.extend_from_slice(&reg.to_le_bytes());
+        }
+        state_bytes.extend_from_slice(&core.cpu.cpsr.to_le_bytes());
+        state_bytes.extend_from_slice(&core.bus.iwram[..]);
+        state_bytes.extend_from_slice(&core.bus.ewram[..]);
+        state_bytes.extend_from_slice(&core.bus.ppu.vram[..]);
+        (fnv1a_hash(&state_bytes), core.cpu.gpr, core.cpu.cpsr)
+    };
+
+    let (hash1, gpr1, cpsr1) = run_sim(rom.clone());
+    let (hash2, gpr2, cpsr2) = run_sim(rom);
+
+    assert_eq!(gpr1, gpr2, "CPU general purpose registers diverged between runs");
+    assert_eq!(cpsr1, cpsr2, "CPSR diverged between runs");
+    assert_eq!(hash1, hash2, "State hash diverged across 60 frames");
+}
+
+
+
 

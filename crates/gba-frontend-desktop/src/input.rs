@@ -442,12 +442,75 @@ impl RustboyApp {
     }
 
     pub(crate) fn poll_inputs(&mut self, ctx: &egui::Context) -> u16 {
+        self.poll_motion_sensors(ctx);
         let live = self.poll_live_inputs(ctx);
         if let Some(movie_key) = self.movie.peek_playback_keyinput() {
             self.last_pressed_mask = (!movie_key) & 0x03FF;
             movie_key
         } else {
             live
+        }
+    }
+
+    pub(crate) fn poll_motion_sensors(&mut self, ctx: &egui::Context) {
+        if let Some(core) = &mut self.core {
+            if core.bus.cart.tilt_enabled || core.bus.cart.gyro_enabled {
+                let mut rx = 0.0f32;
+                let mut ry = 0.0f32;
+
+                // 1. Gamepad Right Stick
+                if let Some(gilrs) = &self.gilrs {
+                    for (_id, gamepad) in gilrs.gamepads() {
+                        if !gamepad.is_connected() {
+                            continue;
+                        }
+                        let stick_x = gamepad
+                            .axis_data(Axis::RightStickX)
+                            .map(|d| d.value())
+                            .unwrap_or(0.0);
+                        let stick_y = gamepad
+                            .axis_data(Axis::RightStickY)
+                            .map(|d| d.value())
+                            .unwrap_or(0.0);
+                        if stick_x.abs() > 0.15 {
+                            rx = stick_x;
+                        }
+                        if stick_y.abs() > 0.15 {
+                            ry = stick_y;
+                        }
+                    }
+                }
+
+                // 2. Keyboard Alt + Arrows fallback
+                if rx == 0.0 && ry == 0.0 {
+                    ctx.input(|i| {
+                        if i.key_down(egui::Key::ArrowLeft) && i.modifiers.alt {
+                            rx -= 1.0;
+                        }
+                        if i.key_down(egui::Key::ArrowRight) && i.modifiers.alt {
+                            rx += 1.0;
+                        }
+                        if i.key_down(egui::Key::ArrowUp) && i.modifiers.alt {
+                            ry += 1.0;
+                        }
+                        if i.key_down(egui::Key::ArrowDown) && i.modifiers.alt {
+                            ry -= 1.0;
+                        }
+                    });
+                }
+
+                if core.bus.cart.tilt_enabled {
+                    let tx = ((0x03A0 as f32) + rx * 380.0).clamp(0x0200 as f32, 0x0540 as f32) as u16;
+                    let ty = ((0x03A0 as f32) - ry * 380.0).clamp(0x0200 as f32, 0x0540 as f32) as u16;
+                    core.bus.cart.tilt_x = tx;
+                    core.bus.cart.tilt_y = ty;
+                }
+
+                if core.bus.cart.gyro_enabled {
+                    let g = ((0x06C0 as f32) + rx * 800.0).clamp(0x0200 as f32, 0x0B00 as f32) as u16;
+                    core.bus.cart.gyro_val = g;
+                }
+            }
         }
     }
 

@@ -252,6 +252,7 @@ impl RtcState {
 
 #[derive(Clone, Serialize, Deserialize)]
 pub struct Cartridge {
+    #[serde(skip)]
     pub rom: Vec<u8>,
     pub ram: Vec<u8>,
     pub header: CartridgeHeader,

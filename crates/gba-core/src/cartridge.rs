@@ -1,7 +1,7 @@
 use alloc::{boxed::Box, string::String, vec::Vec};
 use serde::{Deserialize, Serialize};
 
-use crate::serde_helpers::{alloc_boxed_array, box_bytes};
+use crate::serde_helpers::alloc_boxed_array;
 
 #[derive(Copy, Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub enum SaveType {
@@ -258,6 +258,13 @@ impl EepromState {
         }
     }
 
+    pub fn reset(&mut self) {
+        self.stage = EepromStage::Idle;
+        self.cmd_bits = 0;
+        self.cmd_len = 0;
+        self.bit_idx = 0;
+    }
+
     pub fn read_bit(&mut self) -> u16 {
         match self.stage {
             EepromStage::Idle => 1, // Ready
@@ -289,8 +296,10 @@ impl EepromState {
                 self.cmd_bits = bit;
                 self.cmd_len = 1;
                 self.stage = EepromStage::Command;
-                if !self.detected_8k && (dma_count == 17 || dma_count == 81) {
+                if dma_count == 17 || dma_count == 81 {
                     self.detected_8k = true;
+                } else if dma_count == 9 || dma_count == 73 {
+                    self.detected_8k = false;
                 }
             }
             EepromStage::Command => {
@@ -560,10 +569,36 @@ impl GpioRtc {
             let (min, c2) = bcd_inc(self.regs[5] & 0x7F, 60);
             self.regs[5] = min;
             if c2 {
-                let (hr, _) = bcd_inc(self.regs[4] & 0x3F, 24);
+                let (hr, c3) = bcd_inc(self.regs[4] & 0x3F, 24);
                 self.regs[4] = hr;
+                if c3 {
+                    self.regs[3] = (self.regs[3] + 1) % 7;
+                    let (day, c4) = bcd_inc(self.regs[2] & 0x3F, 32);
+                    self.regs[2] = if day == 0 { 1 } else { day };
+                    if c4 {
+                        let (month, c5) = bcd_inc(self.regs[1] & 0x1F, 13);
+                        self.regs[1] = if month == 0 { 1 } else { month };
+                        if c5 {
+                            let (year, _) = bcd_inc(self.regs[0], 100);
+                            self.regs[0] = year;
+                        }
+                    }
+                }
             }
         }
+    }
+
+    pub fn set_datetime(&mut self, year: u8, month: u8, day: u8, dow: u8, hour: u8, min: u8, sec: u8) {
+        fn to_bcd(v: u8) -> u8 {
+            ((v / 10) << 4) | (v % 10)
+        }
+        self.regs[0] = to_bcd(year % 100);
+        self.regs[1] = to_bcd(month.clamp(1, 12));
+        self.regs[2] = to_bcd(day.clamp(1, 31));
+        self.regs[3] = dow % 7;
+        self.regs[4] = to_bcd(hour % 24);
+        self.regs[5] = to_bcd(min % 60);
+        self.regs[6] = to_bcd(sec % 60);
     }
 }
 
@@ -611,6 +646,10 @@ pub fn crc32_ieee(data: &[u8]) -> u32 {
     !crc
 }
 
+fn alloc_sram() -> Box<[u8; 0x20000]> {
+    alloc_boxed_array(0xFFu8)
+}
+
 #[derive(Clone, Serialize, Deserialize)]
 pub struct Cartridge {
     #[serde(skip)]
@@ -620,7 +659,7 @@ pub struct Cartridge {
     pub rom_crc32: u32,
     #[serde(default)]
     pub idle_loop_addr: Option<u32>,
-    #[serde(with = "box_bytes")]
+    #[serde(skip, default = "alloc_sram")]
     pub sram: Box<[u8; 0x20000]>,
     pub save_type: SaveType,
     pub mapper: MapperType,
@@ -674,10 +713,11 @@ impl Cartridge {
         } else {
             None
         };
+        let sig_save_type = Self::detect_save_type(&rom);
         let (save_type, has_rtc, solar_enabled, tilt_enabled, gyro_enabled, rumble_enabled, idle_loop_addr) =
             if let Some(entry) = db_entry {
                 (
-                    entry.save_type,
+                    if sig_save_type != SaveType::None { sig_save_type } else { entry.save_type },
                     entry.has_rtc,
                     entry.solar,
                     entry.tilt,
@@ -688,7 +728,7 @@ impl Cartridge {
             } else {
                 let code3 = if orig_len >= 0xB0 { &rom[0xAC..0xAF] } else { b"---" };
                 (
-                    Self::detect_save_type(&rom),
+                    sig_save_type,
                     Self::detect_rtc(&rom),
                     matches!(code3, b"U3I" | b"U32" | b"U33"),
                     code3 == b"KYG",
@@ -780,7 +820,18 @@ impl Cartridge {
 
     #[inline]
     pub fn effective_save_type(&self) -> SaveType {
-        self.save_type_override.unwrap_or(self.save_type)
+        if let Some(ov) = self.save_type_override {
+            return ov;
+        }
+        if matches!(self.save_type, SaveType::Eeprom512B | SaveType::Eeprom8K) {
+            if self.eeprom.detected_8k {
+                SaveType::Eeprom8K
+            } else {
+                SaveType::Eeprom512B
+            }
+        } else {
+            self.save_type
+        }
     }
 
     #[inline]

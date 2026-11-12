@@ -1,4 +1,4 @@
-#![no_std]
+#![cfg_attr(not(feature = "std"), no_std)]
 #![allow(
     clippy::needless_range_loop,
     clippy::too_many_arguments,
@@ -6,6 +6,8 @@
 )]
 
 extern crate alloc;
+#[cfg(feature = "std")]
+extern crate std;
 
 pub mod apu;
 pub mod blip;
@@ -16,6 +18,7 @@ pub mod gamedb;
 pub mod hw;
 pub mod ppu;
 pub mod serde_helpers;
+pub mod jit;
 
 use alloc::{string::String, vec::Vec};
 use serde::{Deserialize, Serialize};
@@ -255,11 +258,42 @@ struct SaveStatePayload {
     bus: SysBus,
 }
 
+/// Borrowed twin of [`SaveStatePayload`]; serde encodes `&T` exactly like `T`, so this produces
+/// the same bytes without cloning the bus (which would otherwise copy the multi-MiB ROM).
+#[derive(Serialize)]
+struct SaveStatePayloadRef<'a> {
+    cpu: &'a Arm7tdmi,
+    bus: &'a SysBus,
+}
+
+#[derive(Clone, Copy, Debug, Default)]
+pub struct SubsystemTiming {
+    pub total_time: core::time::Duration,
+    pub cpu_time: core::time::Duration,
+    pub ppu_time: core::time::Duration,
+    pub apu_time: core::time::Duration,
+    pub dma_time: core::time::Duration,
+    pub bus_time: core::time::Duration,
+}
+
+#[derive(Clone, Copy, Debug, Default)]
+pub struct FunctionProfile {
+    pub fetch_cycles: u64,
+    pub decode_exec_cycles: u64,
+    pub mem_read_cycles: u64,
+    pub mem_write_cycles: u64,
+    pub branch_flush_cycles: u64,
+    pub ppu_cycles: u64,
+    pub apu_cycles: u64,
+    pub dma_cycles: u64,
+}
+
 pub struct GbaCore {
     pub cpu: Arm7tdmi,
     pub bus: SysBus,
     pub idle_skip_enabled: bool,
     pending_idle_check_pc: Option<u32>,
+    pub jit: jit::JitEngine,
 }
 
 impl GbaCore {
@@ -271,6 +305,7 @@ impl GbaCore {
             bus,
             idle_skip_enabled: true,
             pending_idle_check_pc: None,
+            jit: jit::JitEngine::new(),
         }
     }
 
@@ -388,12 +423,85 @@ impl GbaCore {
         res
     }
 
+    #[inline]
+    pub fn step_jit(&mut self) -> u64 {
+        let pc = self.cpu.current_exec_pc();
+        let is_thumb = self.cpu.is_thumb();
+        let key = jit::BlockKey { pc, is_thumb };
+
+        if let Some(block) = self.jit.get_block(&key) {
+            let block_cyc = block.cycle_count;
+            if self.bus.scheduler.current_cycle + block_cyc >= self.bus.scheduler.next_event_cycle
+                || self.bus.hw.active_dma.is_some()
+                || (self.bus.hw.ime != 0 && (self.bus.hw.ie & self.bus.hw.if_flag) != 0 && !self.cpu.is_irq_disabled())
+            {
+                return self.cpu.step(&mut self.bus);
+            }
+            let cycles = unsafe { (block.func_ptr)(&mut self.cpu as *mut _, &mut self.bus as *mut _) };
+            cycles
+        } else if let Some(block) = self.jit.compile_block(&mut self.cpu, &mut self.bus, key) {
+            let block_cyc = block.cycle_count;
+            if self.bus.scheduler.current_cycle + block_cyc >= self.bus.scheduler.next_event_cycle
+                || self.bus.hw.active_dma.is_some()
+                || (self.bus.hw.ime != 0 && (self.bus.hw.ie & self.bus.hw.if_flag) != 0 && !self.cpu.is_irq_disabled())
+            {
+                return self.cpu.step(&mut self.bus);
+            }
+            let cycles = unsafe { (block.func_ptr)(&mut self.cpu as *mut _, &mut self.bus as *mut _) };
+            cycles
+        } else {
+            self.cpu.step(&mut self.bus)
+        }
+    }
+
+    /// Runs this core in lockstep against a reference interpreter core for `frames` frames,
+    /// asserting 100% equivalence of GPRs, CPSR, scheduler cycles, and memory state after every frame.
+    pub fn run_differential_test<F: HostFrontend + ?Sized>(
+        &mut self,
+        frontend: &mut F,
+        reference_rom: &[u8],
+        frames: usize,
+    ) -> Result<(), String> {
+        let mut ref_core = GbaCore::new(None, reference_rom.to_vec());
+        ref_core.jit.enabled = false;
+        self.jit.enabled = self.jit.available;
+
+        for frame in 0..frames {
+            self.run_frame(frontend);
+            ref_core.run_frame(frontend);
+
+            if self.cpu.gpr != ref_core.cpu.gpr {
+                return Err(format!(
+                    "Divergence at frame {frame}: GPR mismatch!\nJIT: {:08X?}\nREF: {:08X?}",
+                    self.cpu.gpr, ref_core.cpu.gpr
+                ));
+            }
+            if self.cpu.cpsr != ref_core.cpu.cpsr {
+                return Err(format!(
+                    "Divergence at frame {frame}: CPSR mismatch!\nJIT: 0x{:08X}\nREF: 0x{:08X}",
+                    self.cpu.cpsr, ref_core.cpu.cpsr
+                ));
+            }
+            if self.bus.scheduler.current_cycle != ref_core.bus.scheduler.current_cycle {
+                return Err(format!(
+                    "Divergence at frame {frame}: Cycle count mismatch!\nJIT: {}\nREF: {}",
+                    self.bus.scheduler.current_cycle, ref_core.bus.scheduler.current_cycle
+                ));
+            }
+        }
+        Ok(())
+    }
+
     fn step_internal(
         &mut self,
         breakpoints: &[u32],
         halt_end_cycle: Option<u64>,
         allow_idle_skip: bool,
     ) -> InternalStep {
+        if let Some(page) = self.bus.code_page_invalidated.take() {
+            self.jit.invalidate_page(page);
+        }
+
         while let Some((ev_cycle, kind)) = self.bus.scheduler.pop_due() {
             self.bus.dispatch_event(ev_cycle, kind);
         }
@@ -498,11 +606,48 @@ impl GbaCore {
             }
         }
 
+        if halt_end_cycle.is_some()
+            && breakpoints.is_empty()
+            && !self.bus.watchpoint_active
+            && !allow_idle_skip
+        {
+            let target_cycle = match halt_end_cycle {
+                Some(end) => self.bus.scheduler.next_event_cycle.min(end),
+                None => self.bus.scheduler.next_event_cycle,
+            };
+
+            let mut cur_cycle = self.bus.scheduler.current_cycle;
+            while cur_cycle < target_cycle {
+                let cycles = if self.jit.enabled && self.jit.available {
+                    self.step_jit()
+                } else {
+                    self.cpu.step(&mut self.bus)
+                };
+                cur_cycle += cycles.max(1);
+
+                if self.bus.hw.active_dma.is_some()
+                    || self.bus.hw.halt_requested
+                    || self.bus.hw.stop_requested
+                    || (self.bus.hw.ime != 0
+                        && (self.bus.hw.ie & self.bus.hw.if_flag) != 0
+                        && !self.cpu.is_irq_disabled())
+                {
+                    break;
+                }
+            }
+            self.bus.scheduler.current_cycle = cur_cycle;
+            return InternalStep::Continue;
+        }
+
         if self.bus.watchpoint_active {
             self.bus.debug_pc = exec_pc;
             self.bus.watchpoint_hit = None;
         }
-        let cycles = self.cpu.step(&mut self.bus);
+        let cycles = if self.jit.enabled && self.jit.available && breakpoints.is_empty() && !self.bus.watchpoint_active {
+            self.step_jit()
+        } else {
+            self.cpu.step(&mut self.bus)
+        };
         self.bus.scheduler.current_cycle += cycles.max(1);
 
         if allow_idle_skip {
@@ -712,6 +857,164 @@ impl GbaCore {
         let _ = self.run_frame_debug(frontend, &DebugControl::default());
     }
 
+    #[cfg(feature = "std")]
+    pub fn run_frame_bench<F: HostFrontend + ?Sized>(
+        &mut self,
+        frontend: &mut F,
+    ) -> (SubsystemTiming, FunctionProfile) {
+        let keypad = frontend.poll_keypad() & 0x03FF;
+        self.bus.hw.update_keypad(keypad);
+
+        // Reset bench telemetry
+        self.bus.bench_active = true;
+        self.bus.ppu_bench_time = core::time::Duration::ZERO;
+        self.bus.apu_bench_time = core::time::Duration::ZERO;
+        self.bus.dma_bench_time = core::time::Duration::ZERO;
+        self.bus.fetch_bench_cycles = 0;
+        self.bus.read_bench_cycles = 0;
+        self.bus.write_bench_cycles = 0;
+        self.bus.dma_bench_cycles = 0;
+
+        let mut branch_flushes = 0u64;
+        let mut total_step_cycles = 0u64;
+
+        let frame_start = std::time::Instant::now();
+        let end_cycle = self.bus.scheduler.current_cycle + CYCLES_PER_FRAME;
+
+        while self.bus.scheduler.current_cycle < end_cycle {
+            while let Some((ev_cycle, kind)) = self.bus.scheduler.pop_due() {
+                self.bus.dispatch_event(ev_cycle, kind);
+            }
+
+            if self.bus.hw.stop_requested {
+                self.cpu.stopped = true;
+                self.cpu.halted = false;
+                self.bus.hw.stop_requested = false;
+            }
+            if self.bus.hw.halt_requested {
+                if !self.cpu.stopped {
+                    self.cpu.halted = true;
+                }
+                self.bus.hw.halt_requested = false;
+            }
+
+            if self.cpu.stopped {
+                if (self.bus.hw.ie & self.bus.hw.if_flag & hw::IRQ_STOP_WAKE_MASK) != 0 {
+                    self.cpu.stopped = false;
+                } else {
+                    let delta = end_cycle.saturating_sub(self.bus.scheduler.current_cycle).max(1);
+                    self.bus.apu.flush(self.bus.scheduler.current_cycle);
+                    self.bus.scheduler.shift_by(delta);
+                    self.bus.hw.shift_timers_by(delta);
+                    self.bus.apu.on_stop_shift(self.bus.scheduler.current_cycle);
+                    self.bus.ppu.framebuffer.fill(0x7FFF);
+                    frontend.present_frame(&self.bus.ppu.framebuffer);
+                    break;
+                }
+            }
+
+            if self.bus.hw.active_dma.is_some() {
+                let cycles = self.bus.step_active_dma();
+                self.bus.scheduler.current_cycle += cycles.max(1);
+                continue;
+            }
+
+            if self.cpu.halted {
+                if (self.bus.hw.ie & self.bus.hw.if_flag) != 0 {
+                    self.cpu.halted = false;
+                } else {
+                    let next = self.bus.scheduler.next_event_cycle.min(end_cycle);
+                    if next != u64::MAX && next > self.bus.scheduler.current_cycle {
+                        self.bus.scheduler.current_cycle = next;
+                    } else {
+                        self.bus.scheduler.current_cycle += 4;
+                    }
+                    continue;
+                }
+            }
+
+            if self.bus.hw.ime != 0
+                && (self.bus.hw.ie & self.bus.hw.if_flag) != 0
+                && !self.cpu.is_irq_disabled()
+                && self.bus.irq_sync_delay == 0
+            {
+                self.pending_idle_check_pc = None;
+                self.cpu.trigger_irq(&mut self.bus);
+                self.bus.scheduler.current_cycle += 3;
+                continue;
+            }
+
+            if self.bus.irq_sync_delay > 0 {
+                self.bus.irq_sync_delay = self.bus.irq_sync_delay.saturating_sub(1);
+            }
+
+            let target_cycle = self.bus.scheduler.next_event_cycle.min(end_cycle);
+            let mut cur_cycle = self.bus.scheduler.current_cycle;
+
+            while cur_cycle < target_cycle {
+                let prev_flush = self.cpu.flush_cycles;
+                let cycles = self.cpu.step(&mut self.bus);
+                total_step_cycles += cycles;
+                branch_flushes += self.cpu.flush_cycles.saturating_sub(prev_flush);
+                cur_cycle += cycles.max(1);
+
+                if self.bus.hw.active_dma.is_some()
+                    || self.bus.hw.halt_requested
+                    || self.bus.hw.stop_requested
+                    || (self.bus.hw.ime != 0
+                        && (self.bus.hw.ie & self.bus.hw.if_flag) != 0
+                        && !self.cpu.is_irq_disabled())
+                {
+                    break;
+                }
+            }
+            self.bus.scheduler.current_cycle = cur_cycle;
+
+            if self.bus.ppu.frame_ready {
+                frontend.present_frame(&self.bus.ppu.framebuffer);
+                self.bus.ppu.frame_ready = false;
+            }
+        }
+
+        let total_time = frame_start.elapsed();
+        self.bus.bench_active = false;
+
+        let ppu_time = self.bus.ppu_bench_time;
+        let apu_time = self.bus.apu_bench_time;
+        let dma_time = self.bus.dma_bench_time;
+
+        let other_time = total_time.saturating_sub(ppu_time + apu_time + dma_time);
+        let bus_cycles = self.bus.fetch_bench_cycles + self.bus.read_bench_cycles + self.bus.write_bench_cycles;
+        let cpu_cycles = total_step_cycles.saturating_sub(bus_cycles);
+        let cpu_bus_total_cycles = (bus_cycles + cpu_cycles).max(1);
+
+        let bus_fraction = bus_cycles as f64 / cpu_bus_total_cycles as f64;
+        let bus_time = other_time.mul_f64(bus_fraction);
+        let cpu_time = other_time.saturating_sub(bus_time);
+
+        let timing = SubsystemTiming {
+            total_time,
+            cpu_time,
+            ppu_time,
+            apu_time,
+            dma_time,
+            bus_time,
+        };
+
+        let profile = FunctionProfile {
+            fetch_cycles: self.bus.fetch_bench_cycles,
+            decode_exec_cycles: cpu_cycles,
+            mem_read_cycles: self.bus.read_bench_cycles,
+            mem_write_cycles: self.bus.write_bench_cycles,
+            branch_flush_cycles: branch_flushes,
+            ppu_cycles: 160 * 960,
+            apu_cycles: 228 * 256,
+            dma_cycles: self.bus.dma_bench_cycles,
+        };
+
+        (timing, profile)
+    }
+
     /// Runs a single GBA frame with breakpoint and memory watchpoint support.
     pub fn run_frame_debug<F: HostFrontend + ?Sized>(
         &mut self,
@@ -802,15 +1105,37 @@ impl GbaCore {
         }
     }
 
-    pub fn save_state(&self) -> Result<Vec<u8>, SaveStateError> {
-        let mut bus_clone = self.bus.clone();
-        // Avoid duplicating multi-megabyte immutable ROM inside save state files.
-        bus_clone.cart.rom.clear();
-        let payload = SaveStatePayload {
-            cpu: self.cpu.clone(),
-            bus: bus_clone,
+    /// Serializes the uncompressed state payload (no header) by borrowing the live core.
+    ///
+    /// `Cartridge::rom` is `#[serde(skip)]`, so the ROM is never copied or encoded; the output is
+    /// byte-identical to the payload previously produced from a cloned bus.
+    fn serialize_payload(&self) -> Result<Vec<u8>, SaveStateError> {
+        let payload = SaveStatePayloadRef {
+            cpu: &self.cpu,
+            bus: &self.bus,
         };
-        let raw = postcard::to_allocvec(&payload).map_err(|_| SaveStateError::Corrupt)?;
+        postcard::to_allocvec(&payload).map_err(|_| SaveStateError::Corrupt)
+    }
+
+    /// Uncompressed, header-less state snapshot intended for in-memory rewind buffers.
+    ///
+    /// Consecutive raw snapshots differ only in the bytes that actually changed, so XOR deltas
+    /// between them compress extremely well (unlike LZ4-compressed [`Self::save_state`] blobs).
+    /// Restore with [`Self::load_state_raw`]; not intended for persistence across builds.
+    pub fn save_state_raw(&self) -> Result<Vec<u8>, SaveStateError> {
+        self.serialize_payload()
+    }
+
+    /// Restores a snapshot produced by [`Self::save_state_raw`].
+    pub fn load_state_raw(&mut self, raw: &[u8]) -> Result<(), SaveStateError> {
+        if raw.is_empty() || raw.len() > MAX_STATE_PAYLOAD_LEN {
+            return Err(SaveStateError::Corrupt);
+        }
+        self.apply_payload(raw)
+    }
+
+    pub fn save_state(&self) -> Result<Vec<u8>, SaveStateError> {
+        let raw = self.serialize_payload()?;
         let payload_len = u32::try_from(raw.len()).map_err(|_| SaveStateError::Corrupt)?;
         let compressed = lz4_flex::block::compress(&raw);
 
@@ -850,15 +1175,19 @@ impl GbaCore {
         if uncompressed.len() != payload_len {
             return Err(SaveStateError::Corrupt);
         }
+        self.apply_payload(&uncompressed)
+    }
 
+    fn apply_payload(&mut self, uncompressed: &[u8]) -> Result<(), SaveStateError> {
         let (mut payload, remaining): (SaveStatePayload, &[u8]) =
-            postcard::take_from_bytes(&uncompressed).map_err(|_| SaveStateError::Corrupt)?;
+            postcard::take_from_bytes(uncompressed).map_err(|_| SaveStateError::Corrupt)?;
         if !remaining.is_empty() {
             return Err(SaveStateError::Corrupt);
         }
 
         let rom = core::mem::take(&mut self.bus.cart.rom);
         payload.bus.cart.rom = rom;
+        core::mem::swap(&mut payload.bus.cart.sram, &mut self.bus.cart.sram);
         payload.bus.rebuild_fastmem();
         payload.bus.clear_watchpoints();
         self.cpu = payload.cpu;

@@ -80,6 +80,10 @@ pub struct Ppu {
     pub dot_x: u16,
     #[serde(default = "default_layer_enable_mask")]
     pub layer_enable_mask: u8,
+    #[serde(skip, default)]
+    pub skip_rendering: bool,
+    #[serde(skip, default)]
+    pub skipped_frames: u64,
 
     // Scratch scanline buffers (heap-less inline fixed 240 elements)
     #[serde(skip, default = "default_bg_line")]
@@ -143,6 +147,8 @@ impl Ppu {
             dot_accurate_mode: false,
             dot_x: 0,
             layer_enable_mask: 0x1F,
+            skip_rendering: false,
+            skipped_frames: 0,
             bg_lines: default_bg_line(),
             bg_opaque: default_bg_opaque(),
             obj_line: default_obj_line(),
@@ -235,6 +241,9 @@ impl Ppu {
             return;
         }
         self.dot_x = 0;
+        if self.skip_rendering {
+            return;
+        }
         for bg in 0..4 {
             self.bg_opaque[bg].fill(false);
         }
@@ -248,6 +257,9 @@ impl Ppu {
     }
 
     pub fn render_dot_range(&mut self, y: usize, x_start: usize, x_end: usize) {
+        if self.skip_rendering {
+            return;
+        }
         let x0 = x_start.min(LCD_WIDTH);
         let x1 = x_end.min(LCD_WIDTH);
         if y >= LCD_HEIGHT || x0 >= x1 {
@@ -323,6 +335,68 @@ impl Ppu {
         if y >= LCD_HEIGHT {
             return;
         }
+        if self.skip_rendering {
+            if y == 159 {
+                self.skipped_frames = self.skipped_frames.saturating_add(1);
+            }
+            self.end_scanline();
+            return;
+        }
+
+        // Mode 4 Fast Path:
+        // Active only when ALL of the following conditions hold:
+        // 1. Mode 4 (bitmap 240x160 8bpp)
+        // 2. BG2 enabled in DISPCNT and layer_enable_mask
+        // 3. Forced blank is OFF
+        // 4. Sprites and windows disabled: (dispcnt & 0xF000) == 0
+        // 5. Special color effects disabled: (bldcnt & 0x00C0) == 0
+        // 6. Mosaic disabled for BG2: (bgcnt[2] & 0x0040) == 0
+        // 7. BG2 affine transform is identity: PA=0x0100, PB=0, PC=0, PD=0x0100, RefX=0, RefY/256 == y
+        let mode = self.dispcnt & 0x07;
+        let mode4_fast_path = mode == 4
+            && (self.dispcnt & 0x0400) != 0
+            && (self.layer_enable_mask & 0x04) != 0
+            && (self.dispcnt & 0x0080) == 0
+            && (self.dispcnt & 0xF000) == 0
+            && (self.bldcnt & 0x00C0) == 0
+            && (self.bgcnt[2] & 0x0040) == 0
+            && self.bgp_a[0] == 0x0100
+            && self.bgp_b[0] == 0
+            && self.bgp_c[0] == 0
+            && self.bgp_d[0] == 0x0100
+            && self.ref_x[0] == 0
+            && (self.ref_y[0] >> 8) == (y as i32);
+
+        if mode4_fast_path {
+            let row_start = y * LCD_WIDTH;
+            let page_base = if (self.dispcnt & 0x0010) != 0 { 0xA000 } else { 0 };
+            let backdrop = self.read_pram_u16(0);
+            let vram_row = &self.vram[page_base + row_start..page_base + row_start + LCD_WIDTH];
+            for x in 0..LCD_WIDTH {
+                let col = vram_row[x] as usize;
+                self.framebuffer[row_start + x] = if col != 0 {
+                    self.read_pram_u16(col)
+                } else {
+                    backdrop
+                };
+            }
+            if (self.greenswap & 1) != 0 {
+                let mut i = row_start;
+                let end = row_start + LCD_WIDTH;
+                while i + 1 < end {
+                    let p0 = self.framebuffer[i];
+                    let p1 = self.framebuffer[i + 1];
+                    let g0 = (p0 >> 5) & 0x1F;
+                    let g1 = (p1 >> 5) & 0x1F;
+                    self.framebuffer[i] = (p0 & !0x03E0) | (g1 << 5);
+                    self.framebuffer[i + 1] = (p1 & !0x03E0) | (g0 << 5);
+                    i += 2;
+                }
+            }
+            self.end_scanline();
+            return;
+        }
+
         self.begin_scanline(y);
         self.render_dot_range(y, 0, LCD_WIDTH);
         if (self.greenswap & 1) != 0 {
@@ -364,27 +438,36 @@ impl Ppu {
         let tile_y = bg_y >> 3;
         let fine_y = bg_y & 7;
 
+        let block_y_offset = if tile_y >= 32 {
+            if (size_mode & 1) != 0 { 2048 } else { 1024 }
+        } else {
+            0
+        };
+        let y_entry_offset = block_y_offset + (tile_y & 31) * 32;
+
+        let mut cached_entry_idx = usize::MAX;
+        let mut tile_num = 0;
+        let mut h_flip = false;
+        let mut v_flip = false;
+        let mut pal_bank = 0;
+
         for x in x_start..x_end {
             let eff_x = if mos_h > 1 { x - (x % mos_h) } else { x };
             let bg_x = (eff_x + scroll_x) & (width_px - 1);
             let tile_x = bg_x >> 3;
             let fine_x = bg_x & 7;
 
-            let mut block = 0usize;
-            if tile_x >= 32 {
-                block += 1;
-            }
-            if tile_y >= 32 {
-                block += if (size_mode & 1) != 0 { 2 } else { 1 };
-            }
+            let block_x_offset = if tile_x >= 32 { 1024 } else { 0 };
+            let entry_idx = y_entry_offset + block_x_offset + (tile_x & 31);
 
-            let entry_idx = block * 1024 + (tile_y & 31) * 32 + (tile_x & 31);
-            let entry = self.read_vram_u16(screen_base + entry_idx * 2);
-
-            let tile_num = (entry & 0x03FF) as usize;
-            let h_flip = (entry & 0x0400) != 0;
-            let v_flip = (entry & 0x0800) != 0;
-            let pal_bank = ((entry >> 12) & 0x0F) as usize;
+            if entry_idx != cached_entry_idx {
+                cached_entry_idx = entry_idx;
+                let entry = self.read_vram_u16(screen_base + entry_idx * 2);
+                tile_num = (entry & 0x03FF) as usize;
+                h_flip = (entry & 0x0400) != 0;
+                v_flip = (entry & 0x0800) != 0;
+                pal_bank = ((entry >> 12) & 0x0F) as usize;
+            }
 
             let tx = if h_flip { 7 - fine_x } else { fine_x };
             let ty = if v_flip { 7 - fine_y } else { fine_y };
@@ -757,6 +840,15 @@ impl Ppu {
             (self.bgcnt[3] & 3) as u8,
         ];
 
+        let mut sorted_bgs = [0usize, 1, 2, 3];
+        for i in 1..4 {
+            let mut j = i;
+            while j > 0 && bg_prios[sorted_bgs[j]] < bg_prios[sorted_bgs[j - 1]] {
+                sorted_bgs.swap(j, j - 1);
+                j -= 1;
+            }
+        }
+
         let layer_mask = self.layer_enable_mask;
 
         for x in x_start..x_end {
@@ -783,8 +875,11 @@ impl Ppu {
             let obj_visible =
                 obj.present && (win_mask & (1 << LAYER_OBJ)) != 0 && (layer_mask & 0x10) != 0;
 
-            'outer: for prio in 0u8..4 {
-                if obj_visible && obj.prio == prio {
+            let mut obj_placed = false;
+
+            for &bg in &sorted_bgs {
+                if obj_visible && !obj_placed && obj.prio <= bg_prios[bg] {
+                    obj_placed = true;
                     if top_layer == LAYER_BD {
                         top_layer = LAYER_OBJ;
                         top_col = obj.color;
@@ -792,24 +887,33 @@ impl Ppu {
                     } else {
                         bot_layer = LAYER_OBJ;
                         bot_col = obj.color;
-                        break 'outer;
+                        break;
                     }
                 }
-                for bg in 0..4 {
-                    if self.bg_opaque[bg][x]
-                        && (win_mask & (1 << bg)) != 0
-                        && (layer_mask & (1 << bg)) != 0
-                        && bg_prios[bg] == prio
-                    {
-                        if top_layer == LAYER_BD {
-                            top_layer = bg;
-                            top_col = self.bg_lines[bg][x];
-                        } else {
-                            bot_layer = bg;
-                            bot_col = self.bg_lines[bg][x];
-                            break 'outer;
-                        }
+
+                if self.bg_opaque[bg][x]
+                    && (win_mask & (1 << bg)) != 0
+                    && (layer_mask & (1 << bg)) != 0
+                {
+                    if top_layer == LAYER_BD {
+                        top_layer = bg;
+                        top_col = self.bg_lines[bg][x];
+                    } else {
+                        bot_layer = bg;
+                        bot_col = self.bg_lines[bg][x];
+                        break;
                     }
+                }
+            }
+
+            if obj_visible && !obj_placed && bot_layer == LAYER_BD {
+                if top_layer == LAYER_BD {
+                    top_layer = LAYER_OBJ;
+                    top_col = obj.color;
+                    top_semi = obj.semi_transparent;
+                } else {
+                    bot_layer = LAYER_OBJ;
+                    bot_col = obj.color;
                 }
             }
 

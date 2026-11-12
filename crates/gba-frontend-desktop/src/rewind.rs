@@ -408,7 +408,9 @@ impl RustboyApp {
     }
 
     fn apply_rewind_snapshot(&mut self, bytes: &[u8], toast_msg: Option<&str>) {
-        if self.load_active_core_state(bytes).is_ok() {
+        if self.load_active_core_state_raw(bytes).is_ok()
+            || self.load_active_core_state(bytes).is_ok()
+        {
             self.show_pause_overlay = false;
             if let Some(msg) = toast_msg {
                 self.notify(msg);

@@ -7,7 +7,7 @@ use crate::cartridge::{Cartridge, SaveType};
 use crate::hw::{HardwareControl, IRQ_HBLANK, IRQ_SERIAL, IRQ_VBLANK, IRQ_VCOUNT, SioResponse};
 use crate::ppu::Ppu;
 use crate::serde_helpers::{alloc_boxed_array, box_bytes};
-use crate::{APU_FRAME_SEQ_INTERVAL, EventType, Scheduler};
+use crate::{EventType, Scheduler};
 
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
 pub enum WatchpointKind {
@@ -125,7 +125,11 @@ pub struct SysBus {
 
     // 16 KiB fastmem page pointers across 0x0000_0000..0x0FFF_FFFF (rebuilt on new/load_state).
     #[serde(skip, default = "empty_fastmem")]
-    fastmem_read: Box<[Option<NonNull<u8>>; 16384]>,
+    pub(crate) fastmem_read: Box<[Option<NonNull<u8>>; 16384]>,
+    #[serde(skip, default = "empty_fastmem")]
+    pub(crate) fastmem_write: Box<[Option<NonNull<u8>>; 16384]>,
+    #[serde(default)]
+    pub rtc_cycles: u64,
     // Track last opcode access cycles cleanly for CPU stepping.
     pub last_cycles: u64,
 
@@ -138,6 +142,38 @@ pub struct SysBus {
     pub watchpoint_hit: Option<WatchpointHit>,
     #[serde(skip)]
     pub watchpoints: Vec<Watchpoint>,
+
+    // Headless benchmark / telemetry instrumentation
+    #[serde(skip)]
+    pub bench_active: bool,
+    #[serde(skip)]
+    pub ppu_bench_time: core::time::Duration,
+    #[serde(skip)]
+    pub apu_bench_time: core::time::Duration,
+    #[serde(skip)]
+    pub dma_bench_time: core::time::Duration,
+    #[serde(skip)]
+    pub fetch_bench_cycles: u64,
+    #[serde(skip)]
+    pub read_bench_cycles: u64,
+    #[serde(skip)]
+    pub write_bench_cycles: u64,
+    #[serde(skip)]
+    pub dma_bench_cycles: u64,
+
+    // Precomputed waitstate table: [region (0..16)][width (0=8bit, 1=16bit, 2=32bit)][access (0=NonSequential, 1=Sequential)]
+    #[serde(skip)]
+    pub waitstate_table: [[[u8; 2]; 3]; 16],
+
+    // Cached instruction code page (IWRAM, EWRAM, or ROM)
+    #[serde(skip)]
+    pub code_page_ptr: Option<NonNull<u8>>,
+    #[serde(skip)]
+    pub code_page_tag: u32,
+    #[serde(skip)]
+    pub code_page_region: u8,
+    #[serde(skip)]
+    pub code_page_invalidated: Option<u32>,
 }
 
 fn empty_fastmem() -> Box<[Option<NonNull<u8>>; 16384]> {
@@ -161,7 +197,6 @@ impl SysBus {
 
         let mut scheduler = Scheduler::new();
         scheduler.schedule(960, EventType::PpuHDrawEnd);
-        scheduler.schedule(APU_FRAME_SEQ_INTERVAL, EventType::ApuSampleTick);
 
         let mut bus = Self {
             bios: bios_buf,
@@ -183,11 +218,26 @@ impl SysBus {
             last_access_was_dma: false,
             irq_sync_delay: 0,
             fastmem_read: empty_fastmem(),
+            fastmem_write: empty_fastmem(),
+            rtc_cycles: 0,
             last_cycles: 0,
             watchpoint_active: false,
             debug_pc: 0,
             watchpoint_hit: None,
             watchpoints: Vec::new(),
+            bench_active: false,
+            ppu_bench_time: core::time::Duration::ZERO,
+            apu_bench_time: core::time::Duration::ZERO,
+            dma_bench_time: core::time::Duration::ZERO,
+            fetch_bench_cycles: 0,
+            read_bench_cycles: 0,
+            write_bench_cycles: 0,
+            dma_bench_cycles: 0,
+            waitstate_table: [[[1; 2]; 3]; 16],
+            code_page_ptr: None,
+            code_page_tag: u32::MAX,
+            code_page_region: 0,
+            code_page_invalidated: None,
         };
         bus.update_waitcnt(0x0000);
         bus.rebuild_fastmem();
@@ -216,26 +266,29 @@ impl SysBus {
 
     pub fn rebuild_fastmem(&mut self) {
         self.fastmem_read.fill(None);
+        self.fastmem_write.fill(None);
         for page in 0..16384usize {
             let addr = (page as u32) << 14;
             let region = (addr >> 24) & 0x0F;
-            let ptr: Option<*const u8> = match region {
+            let (r_ptr, w_ptr): (Option<*const u8>, Option<*mut u8>) = match region {
                 0x02 => {
                     let off = (addr as usize) & 0x3FFFF;
-                    Some(unsafe { self.ewram.as_ptr().add(off) })
+                    let p = unsafe { self.ewram.as_mut_ptr().add(off) };
+                    (Some(p as *const u8), Some(p))
                 }
                 0x03 => {
                     let off = (addr as usize) & 0x7FFF;
-                    Some(unsafe { self.iwram.as_ptr().add(off) })
+                    let p = unsafe { self.iwram.as_mut_ptr().add(off) };
+                    (Some(p as *const u8), Some(p))
                 }
                 0x05 => {
                     // Palette RAM is 1 KiB -> mirrors every 1 KiB inside a 16 KiB page, so don't fastmem PRAM.
-                    None
+                    (None, None)
                 }
                 0x06 => {
                     // VRAM mirroring depends dynamically on DISPCNT mode (Modes 0-2 vs 3-5),
                     // so do not map to fastmem; route through Ppu::mirror_vram.
-                    None
+                    (None, None)
                 }
                 0x08..=0x0D => {
                     let off = (addr as usize) & 0x01FF_FFFF;
@@ -246,14 +299,15 @@ impl SysBus {
                         && (matches!(self.cart.save_type, SaveType::Eeprom512B | SaveType::Eeprom8K)
                             || self.cart.rom.len() <= 0x0100_0000);
                     if !is_gpio_page && !is_eeprom_page && off + 0x4000 <= self.cart.rom.len() {
-                        Some(unsafe { self.cart.rom.as_ptr().add(off) })
+                        (Some(unsafe { self.cart.rom.as_ptr().add(off) }), None)
                     } else {
-                        None
+                        (None, None)
                     }
                 }
-                _ => None,
+                _ => (None, None),
             };
-            self.fastmem_read[page] = ptr.and_then(|p| NonNull::new(p as *mut u8));
+            self.fastmem_read[page] = r_ptr.and_then(|p| NonNull::new(p as *mut u8));
+            self.fastmem_write[page] = w_ptr.and_then(NonNull::new);
         }
     }
 
@@ -275,6 +329,65 @@ impl SysBus {
             self.prefetch.invalidate();
         }
         self.prefetch.enabled = pref_en;
+
+        self.rebuild_waitstate_table();
+    }
+
+    pub fn rebuild_waitstate_table(&mut self) {
+        // Clear all to 1 cycle default
+        self.waitstate_table = [[[1; 2]; 3]; 16];
+
+        // Region 0x02: EWRAM (16-bit bus, 3 waitstates per halfword access)
+        // 8-bit & 16-bit: 3 cycles; 32-bit: 6 cycles
+        self.waitstate_table[0x02][0] = [3, 3];
+        self.waitstate_table[0x02][1] = [3, 3];
+        self.waitstate_table[0x02][2] = [6, 6];
+
+        // Region 0x03: IWRAM (32-bit bus, 1 cycle)
+        self.waitstate_table[0x03] = [[1; 2]; 3];
+
+        // Region 0x05 (PRAM) & 0x06 (VRAM): 16-bit bus, 1 cycle for 8/16-bit, 2 cycles for 32-bit
+        for reg in [0x05, 0x06] {
+            self.waitstate_table[reg][0] = [1, 1];
+            self.waitstate_table[reg][1] = [1, 1];
+            self.waitstate_table[reg][2] = [2, 2];
+        }
+
+        // Region 0x07 (OAM): 32-bit bus, 1 cycle
+        self.waitstate_table[0x07] = [[1; 2]; 3];
+
+        // Region 0x08..=0x0D: GamePak ROM (16-bit bus)
+        let pairs: [&[usize]; 3] = [&[0x08, 0x09], &[0x0A, 0x0B], &[0x0C, 0x0D]];
+        for (idx, &reg_pair) in pairs.iter().enumerate() {
+            let n = self.rom_n_wait[idx] as u8;
+            let s = self.rom_s_wait[idx] as u8;
+            for &r in reg_pair {
+                // 8-bit
+                self.waitstate_table[r][0][0] = n;
+                self.waitstate_table[r][0][1] = s;
+                // 16-bit
+                self.waitstate_table[r][1][0] = n;
+                self.waitstate_table[r][1][1] = s;
+                // 32-bit: 1 NonSeq/Seq halfword + 1 Seq halfword
+                self.waitstate_table[r][2][0] = n.saturating_add(s);
+                self.waitstate_table[r][2][1] = s.saturating_add(s);
+            }
+        }
+
+        // Region 0x0E & 0x0F: SRAM
+        let sram_w = self.sram_wait as u8;
+        for r in [0x0E, 0x0F] {
+            self.waitstate_table[r] = [[sram_w; 2]; 3];
+        }
+    }
+
+    #[inline(always)]
+    pub fn invalidate_code_page(&mut self) {
+        if self.code_page_tag != u32::MAX {
+            self.code_page_invalidated = Some(self.code_page_tag);
+        }
+        self.code_page_tag = u32::MAX;
+        self.code_page_ptr = None;
     }
 
     #[inline]
@@ -311,10 +424,12 @@ impl SysBus {
         let ws = Self::rom_waitstate_idx(self.prefetch.tail_addr);
         let s_cyc = self.rom_s_wait[ws];
         self.prefetch.cycle_acc += cycles;
-        while self.prefetch.cycle_acc >= s_cyc && self.prefetch.count < 8 {
-            self.prefetch.cycle_acc -= s_cyc;
-            self.prefetch.count += 1;
-            self.prefetch.tail_addr = self.prefetch.tail_addr.wrapping_add(2);
+        let max_steps = (8 - self.prefetch.count) as u64;
+        let steps = (self.prefetch.cycle_acc / s_cyc).min(max_steps);
+        if steps > 0 {
+            self.prefetch.cycle_acc -= steps * s_cyc;
+            self.prefetch.count += steps as u8;
+            self.prefetch.tail_addr = self.prefetch.tail_addr.wrapping_add((steps * 2) as u32);
         }
         if self.prefetch.count >= 8 {
             self.prefetch.cycle_acc = 0;
@@ -326,6 +441,9 @@ impl SysBus {
             EventType::PpuHDrawEnd => {
                 self.ppu.dispstat |= 0x0002; // Enter HBlank
                 if self.ppu.vcount < 160 {
+                    #[cfg(feature = "std")]
+                    let t0 = if self.bench_active { Some(std::time::Instant::now()) } else { None };
+
                     if self.ppu.dot_accurate_mode {
                         if (self.ppu.dot_x as usize) < 240 {
                             self.ppu.render_dot_range(
@@ -338,6 +456,12 @@ impl SysBus {
                     } else {
                         self.ppu.render_scanline(self.ppu.vcount as usize);
                     }
+
+                    #[cfg(feature = "std")]
+                    if let Some(t) = t0 {
+                        self.ppu_bench_time += t.elapsed();
+                    }
+
                     self.trigger_dma_by_timing(2);
                 }
                 if (self.ppu.dispstat & 0x0010) != 0 {
@@ -349,9 +473,27 @@ impl SysBus {
                 self.ppu.dispstat &= !0x0002; // Exit HBlank
                 self.ppu.vcount = (self.ppu.vcount + 1) % 228;
 
+                #[cfg(feature = "std")]
+                let t0 = if self.bench_active { Some(std::time::Instant::now()) } else { None };
+
+                // Advance APU once per scanline in HBlank (removes periodic 256-cycle ApuSampleTick wakeups)
+                self.apu.advance_scanline(ev_cycle);
+
+                #[cfg(feature = "std")]
+                if let Some(t) = t0 {
+                    self.apu_bench_time += t.elapsed();
+                }
+
                 if self.ppu.vcount == 0 {
                     self.ppu.dispstat &= !0x0001;
                     self.ppu.reload_affine_refs();
+                    if self.cart.has_rtc {
+                        self.rtc_cycles = self.rtc_cycles.saturating_add(crate::CYCLES_PER_FRAME);
+                        if self.rtc_cycles >= u64::from(crate::CPU_CLOCK_HZ) {
+                            self.cart.rtc.advance_second();
+                            self.rtc_cycles -= u64::from(crate::CPU_CLOCK_HZ);
+                        }
+                    }
                 } else if self.ppu.vcount == 160 {
                     self.ppu.dispstat |= 0x0001;
                     self.ppu.frame_ready = true;
@@ -410,9 +552,7 @@ impl SysBus {
                 }
             }
             EventType::ApuSampleTick => {
-                self.apu.on_frame_sequencer_tick(ev_cycle);
-                self.scheduler
-                    .schedule(ev_cycle + APU_FRAME_SEQ_INTERVAL, EventType::ApuSampleTick);
+                // Periodic APU event retired in favor of scanline batching in EventType::PpuHBlank.
             }
             EventType::SioTransferComplete => {
                 self.complete_sio_no_cable();
@@ -499,11 +639,47 @@ impl SysBus {
         ((word >> ((addr & 3) * 8)) & 0xFF) as u8
     }
 
+    #[inline(always)]
+    pub fn fetch_16_fast(&mut self, addr: u32) -> (u16, u64) {
+        let aligned = addr & !1;
+        let page_tag = (aligned >> 14) & 0x3FFF;
+        if page_tag == self.code_page_tag && let Some(ptr) = self.code_page_ptr {
+            let off = (aligned & 0x3FFE) as usize;
+            // SAFETY: `ptr` points to a valid 16 KiB page allocation. `off` is at most 0x3FFE.
+            // Reading 2 bytes accesses `0x3FFE..0x4000`, strictly within the page allocation.
+            let val = unsafe { (ptr.as_ptr().add(off) as *const u16).read_unaligned().to_le() };
+            let region = self.code_page_region as usize;
+            let cyc = if (0x08..=0x0D).contains(&region) {
+                if self.prefetch.enabled && self.prefetch.active && self.prefetch.count > 0 && self.prefetch.head_addr == aligned {
+                    self.prefetch.count -= 1;
+                    self.prefetch.head_addr = self.prefetch.head_addr.wrapping_add(2);
+                    1
+                } else {
+                    self.waitstate_table[region][1][1] as u64
+                }
+            } else {
+                let c = self.waitstate_table[region][1][1] as u64;
+                self.step_prefetch(c);
+                c
+            };
+            self.open_bus_latch = (val as u32) | ((val as u32) << 16);
+            if self.bench_active {
+                self.fetch_bench_cycles += cyc;
+            }
+            return (val, cyc);
+        }
+        self.fetch_16(addr, AccessType::Sequential)
+    }
+
     /// Instruction pipeline fetch for Thumb 16-bit halfword.
     /// Updates `open_bus_latch` and accounts for GamePak prefetch without altering `last_access_was_dma`.
     pub fn fetch_16(&mut self, addr: u32, access: AccessType) -> (u16, u64) {
         let aligned = addr & !1;
         let region = (aligned >> 24) & 0x0F;
+        let page_tag = (aligned >> 14) & 0x3FFF;
+        self.code_page_tag = page_tag;
+        self.code_page_ptr = self.fastmem_read[page_tag as usize];
+        self.code_page_region = region as u8;
 
         if (0x08..=0x0D).contains(&region) {
             let val = self.read_rom_half_raw(aligned);
@@ -525,13 +701,52 @@ impl SysBus {
             } else {
                 self.rom_fetch_cycles(aligned, access)
             };
-            return (val, cyc);
+            let res = (val, cyc);
+            if self.bench_active {
+                self.fetch_bench_cycles += cyc;
+            }
+            return res;
         }
 
         let (val, cyc) = self.read_16_non_rom_raw(aligned, aligned, true);
         self.step_prefetch(cyc);
         self.open_bus_latch = (val as u32) | ((val as u32) << 16);
+        if self.bench_active {
+            self.fetch_bench_cycles += cyc;
+        }
         (val, cyc)
+    }
+
+    #[inline(always)]
+    pub fn fetch_32_fast(&mut self, addr: u32) -> (u32, u64) {
+        let aligned = addr & !3;
+        let page_tag = (aligned >> 14) & 0x3FFF;
+        if page_tag == self.code_page_tag && let Some(ptr) = self.code_page_ptr {
+            let off = (aligned & 0x3FFC) as usize;
+            // SAFETY: `ptr` points to a valid 16 KiB page allocation. `off` is at most 0x3FFC.
+            // Reading 4 bytes accesses `0x3FFC..0x4000`, strictly within the page allocation.
+            let val = unsafe { (ptr.as_ptr().add(off) as *const u32).read_unaligned().to_le() };
+            let region = self.code_page_region as usize;
+            let cyc = if (0x08..=0x0D).contains(&region) {
+                if self.prefetch.enabled && self.prefetch.active && self.prefetch.count >= 2 && self.prefetch.head_addr == aligned {
+                    self.prefetch.count -= 2;
+                    self.prefetch.head_addr = self.prefetch.head_addr.wrapping_add(4);
+                    2
+                } else {
+                    self.waitstate_table[region][2][1] as u64
+                }
+            } else {
+                let c = self.waitstate_table[region][2][1] as u64;
+                self.step_prefetch(c);
+                c
+            };
+            self.open_bus_latch = val;
+            if self.bench_active {
+                self.fetch_bench_cycles += cyc;
+            }
+            return (val, cyc);
+        }
+        self.fetch_32(addr, AccessType::Sequential)
     }
 
     /// Instruction pipeline fetch for ARM 32-bit word.
@@ -539,6 +754,10 @@ impl SysBus {
     pub fn fetch_32(&mut self, addr: u32, access: AccessType) -> (u32, u64) {
         let aligned = addr & !3;
         let region = (aligned >> 24) & 0x0F;
+        let page_tag = (aligned >> 14) & 0x3FFF;
+        self.code_page_tag = page_tag;
+        self.code_page_ptr = self.fastmem_read[page_tag as usize];
+        self.code_page_region = region as u8;
 
         if (0x08..=0x0D).contains(&region) {
             let val = self.read_rom_word_raw(aligned);
@@ -569,12 +788,19 @@ impl SysBus {
                 self.rom_fetch_cycles(aligned, access)
                     + self.rom_fetch_cycles(aligned + 2, AccessType::Sequential)
             };
-            return (val, cyc);
+            let res = (val, cyc);
+            if self.bench_active {
+                self.fetch_bench_cycles += cyc;
+            }
+            return res;
         }
 
         let (val, cyc) = self.read_32_non_rom_raw(aligned, aligned, false);
         self.step_prefetch(cyc);
         self.open_bus_latch = val;
+        if self.bench_active {
+            self.fetch_bench_cycles += cyc;
+        }
         (val, cyc)
     }
 
@@ -585,8 +811,7 @@ impl SysBus {
             && let Some(ptr) = self.fastmem_read[page]
         {
             let off = (aligned & 0x3FFE) as usize;
-            let bytes = unsafe { core::slice::from_raw_parts(ptr.as_ptr().add(off), 2) };
-            return u16::from_le_bytes([bytes[0], bytes[1]]);
+            return unsafe { (ptr.as_ptr().add(off) as *const u16).read_unaligned().to_le() };
         }
         self.cart.read_rom_16(aligned)
     }
@@ -598,8 +823,7 @@ impl SysBus {
             && let Some(ptr) = self.fastmem_read[page]
         {
             let off = (aligned & 0x3FFC) as usize;
-            let bytes = unsafe { core::slice::from_raw_parts(ptr.as_ptr().add(off), 4) };
-            return u32::from_le_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]);
+            return unsafe { (ptr.as_ptr().add(off) as *const u32).read_unaligned().to_le() };
         }
         self.cart.read_rom_32(aligned)
     }
@@ -643,6 +867,9 @@ impl SysBus {
         if self.watchpoint_active {
             self.check_watchpoint(addr, 1, false, val as u32);
         }
+        if self.bench_active {
+            self.read_bench_cycles += self.last_cycles;
+        }
         val
     }
 
@@ -667,6 +894,9 @@ impl SysBus {
                 }
                 self.last_cycles = cyc;
                 self.last_access_was_dma = false;
+                // SAFETY: `page` has an active `fastmem_read` pointer only if `off + 0x4000` is within the
+                // backing allocation (EWRAM, IWRAM, or ROM). `addr & 0x3FFF` is in `0..0x4000`, so adding
+                // this offset is strictly within the allocated 16 KiB page boundary.
                 return unsafe { *ptr.as_ptr().add((addr & 0x3FFF) as usize) };
             }
         }
@@ -739,6 +969,9 @@ impl SysBus {
         if self.watchpoint_active {
             self.check_watchpoint(addr & !1, 2, false, val as u32);
         }
+        if self.bench_active {
+            self.read_bench_cycles += self.last_cycles;
+        }
         val
     }
 
@@ -764,8 +997,10 @@ impl SysBus {
                 self.last_cycles = cyc;
                 self.last_access_was_dma = false;
                 let off = (aligned & 0x3FFE) as usize;
-                let bytes = unsafe { core::slice::from_raw_parts(ptr.as_ptr().add(off), 2) };
-                return u16::from_le_bytes([bytes[0], bytes[1]]);
+                // SAFETY: `ptr` points to a valid 16 KiB page. `off` is `aligned & 0x3FFE`, which is at most
+                // 0x3FFE. Reading 2 bytes accesses `0x3FFE..0x4000`, staying strictly inside the page.
+                // We use `read_unaligned` to avoid any alignment assumptions on host architectures.
+                return unsafe { (ptr.as_ptr().add(off) as *const u16).read_unaligned().to_le() };
             }
         }
 
@@ -868,6 +1103,9 @@ impl SysBus {
         if self.watchpoint_active {
             self.check_watchpoint(addr & !3, 4, false, val);
         }
+        if self.bench_active {
+            self.read_bench_cycles += self.last_cycles;
+        }
         val
     }
 
@@ -894,8 +1132,10 @@ impl SysBus {
                 self.last_cycles = cyc;
                 self.last_access_was_dma = false;
                 let off = (aligned & 0x3FFC) as usize;
-                let bytes = unsafe { core::slice::from_raw_parts(ptr.as_ptr().add(off), 4) };
-                return u32::from_le_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]);
+                // SAFETY: `ptr` points to a valid 16 KiB page. `off` is `aligned & 0x3FFC`, which is at most
+                // 0x3FFC. Reading 4 bytes accesses `0x3FFC..0x4000`, staying strictly inside the page.
+                // We use `read_unaligned` to avoid any alignment assumptions on host architectures.
+                return unsafe { (ptr.as_ptr().add(off) as *const u32).read_unaligned().to_le() };
             }
         }
 
@@ -1043,10 +1283,35 @@ impl SysBus {
         if self.watchpoint_active {
             self.check_watchpoint(addr, 1, true, val as u32);
         }
+        if self.bench_active {
+            self.write_bench_cycles += cyc;
+        }
         cyc
     }
 
     fn write_8_inner(&mut self, addr: u32, val: u8, _access: AccessType) -> u64 {
+        if addr < 0x1000_0000 {
+            let page = (addr >> 14) as usize;
+            if let Some(ptr) = self.fastmem_write[page] {
+                let region = (addr >> 24) & 0x0F;
+                let cyc = if region == 0x02 { 3 } else { 1 };
+                self.step_prefetch(cyc);
+                self.last_cycles = cyc;
+                self.last_access_was_dma = false;
+                // SAFETY: `page` has an active `fastmem_write` pointer only for EWRAM or IWRAM.
+                // `addr & 0x3FFF` is within `0..0x4000`, strictly within the 16 KiB page.
+                unsafe {
+                    *ptr.as_ptr().add((addr & 0x3FFF) as usize) = val;
+                }
+                self.code_page_invalidated = Some(page as u32);
+                if (page as u32) == self.code_page_tag {
+                    self.code_page_tag = u32::MAX;
+                    self.code_page_ptr = None;
+                }
+                return cyc;
+            }
+        }
+
         let region = (addr >> 24) & 0x0F;
         let cyc = match addr >> 24 {
             0x02 => {
@@ -1109,22 +1374,52 @@ impl SysBus {
         if self.watchpoint_active {
             self.check_watchpoint(addr & !1, 2, true, val as u32);
         }
+        if self.bench_active {
+            self.write_bench_cycles += cyc;
+        }
         cyc
     }
 
     fn write_16_inner(&mut self, addr: u32, val: u16, access: AccessType) -> u64 {
         let aligned = addr & !1;
-        let bytes = val.to_le_bytes();
+        if aligned < 0x1000_0000 {
+            let page = (aligned >> 14) as usize;
+            if let Some(ptr) = self.fastmem_write[page] {
+                let region = (aligned >> 24) & 0x0F;
+                let cyc = if region == 0x02 { 3 } else { 1 };
+                self.step_prefetch(cyc);
+                self.last_cycles = cyc;
+                self.last_access_was_dma = false;
+                // SAFETY: `ptr` points to a mutable 16 KiB page for EWRAM or IWRAM.
+                // `aligned & 0x3FFF` is at most 0x3FFE. Writing 2 bytes via `write_unaligned` stays within
+                // the page boundary.
+                unsafe {
+                    let dest = ptr.as_ptr().add((aligned & 0x3FFF) as usize) as *mut u16;
+                    dest.write_unaligned(val.to_le());
+                }
+                self.code_page_invalidated = Some(page as u32);
+                if (page as u32) == self.code_page_tag {
+                    self.code_page_tag = u32::MAX;
+                    self.code_page_ptr = None;
+                }
+                return cyc;
+            }
+        }
+
         let region = (aligned >> 24) & 0x0F;
         let cyc = match aligned >> 24 {
             0x02 => {
                 let off = (aligned as usize) & 0x3FFFE;
-                self.ewram[off..off + 2].copy_from_slice(&bytes);
+                unsafe {
+                    (self.ewram.as_mut_ptr().add(off) as *mut u16).write_unaligned(val.to_le());
+                }
                 3
             }
             0x03 => {
                 let off = (aligned as usize) & 0x7FFE;
-                self.iwram[off..off + 2].copy_from_slice(&bytes);
+                unsafe {
+                    (self.iwram.as_mut_ptr().add(off) as *mut u16).write_unaligned(val.to_le());
+                }
                 1
             }
             0x04 => {
@@ -1133,19 +1428,25 @@ impl SysBus {
             }
             0x05 => {
                 let off = (aligned as usize) & 0x3FE;
-                self.ppu.pram[off..off + 2].copy_from_slice(&bytes);
+                unsafe {
+                    (self.ppu.pram.as_mut_ptr().add(off) as *mut u16).write_unaligned(val.to_le());
+                }
                 1
             }
             0x06 => {
                 if let Some(off) = Ppu::mirror_vram(aligned as usize, self.ppu.dispcnt) {
                     let off = off & !1;
-                    self.ppu.vram[off..off + 2].copy_from_slice(&bytes);
+                    unsafe {
+                        (self.ppu.vram.as_mut_ptr().add(off) as *mut u16).write_unaligned(val.to_le());
+                    }
                 }
                 1
             }
             0x07 => {
                 let off = (aligned as usize) & 0x3FE;
-                self.ppu.oam[off..off + 2].copy_from_slice(&bytes);
+                unsafe {
+                    (self.ppu.oam.as_mut_ptr().add(off) as *mut u16).write_unaligned(val.to_le());
+                }
                 1
             }
             0x08..=0x0D => {
@@ -1175,22 +1476,52 @@ impl SysBus {
         if self.watchpoint_active {
             self.check_watchpoint(addr & !3, 4, true, val);
         }
+        if self.bench_active {
+            self.write_bench_cycles += cyc;
+        }
         cyc
     }
 
     fn write_32_inner(&mut self, addr: u32, val: u32, access: AccessType) -> u64 {
         let aligned = addr & !3;
-        let bytes = val.to_le_bytes();
+        if aligned < 0x1000_0000 {
+            let page = (aligned >> 14) as usize;
+            if let Some(ptr) = self.fastmem_write[page] {
+                let region = (aligned >> 24) & 0x0F;
+                let cyc = if region == 0x02 { 6 } else { 1 };
+                self.step_prefetch(cyc);
+                self.last_cycles = cyc;
+                self.last_access_was_dma = false;
+                // SAFETY: `ptr` points to a mutable 16 KiB page for EWRAM or IWRAM.
+                // `aligned & 0x3FFF` is at most 0x3FFC. Writing 4 bytes via `write_unaligned` stays within
+                // the page boundary.
+                unsafe {
+                    let dest = ptr.as_ptr().add((aligned & 0x3FFF) as usize) as *mut u32;
+                    dest.write_unaligned(val.to_le());
+                }
+                self.code_page_invalidated = Some(page as u32);
+                if (page as u32) == self.code_page_tag {
+                    self.code_page_tag = u32::MAX;
+                    self.code_page_ptr = None;
+                }
+                return cyc;
+            }
+        }
+
         let region = (aligned >> 24) & 0x0F;
         let cyc = match aligned >> 24 {
             0x02 => {
                 let off = (aligned as usize) & 0x3FFFC;
-                self.ewram[off..off + 4].copy_from_slice(&bytes);
+                unsafe {
+                    (self.ewram.as_mut_ptr().add(off) as *mut u32).write_unaligned(val.to_le());
+                }
                 6
             }
             0x03 => {
                 let off = (aligned as usize) & 0x7FFC;
-                self.iwram[off..off + 4].copy_from_slice(&bytes);
+                unsafe {
+                    (self.iwram.as_mut_ptr().add(off) as *mut u32).write_unaligned(val.to_le());
+                }
                 1
             }
             0x04 => {
@@ -1207,19 +1538,25 @@ impl SysBus {
             }
             0x05 => {
                 let off = (aligned as usize) & 0x3FC;
-                self.ppu.pram[off..off + 4].copy_from_slice(&bytes);
+                unsafe {
+                    (self.ppu.pram.as_mut_ptr().add(off) as *mut u32).write_unaligned(val.to_le());
+                }
                 2
             }
             0x06 => {
                 if let Some(off) = Ppu::mirror_vram(aligned as usize, self.ppu.dispcnt) {
                     let off = off & !3;
-                    self.ppu.vram[off..off + 4].copy_from_slice(&bytes);
+                    unsafe {
+                        (self.ppu.vram.as_mut_ptr().add(off) as *mut u32).write_unaligned(val.to_le());
+                    }
                 }
                 2
             }
             0x07 => {
                 let off = (aligned as usize) & 0x3FC;
-                self.ppu.oam[off..off + 4].copy_from_slice(&bytes);
+                unsafe {
+                    (self.ppu.oam.as_mut_ptr().add(off) as *mut u32).write_unaligned(val.to_le());
+                }
                 1
             }
             0x08..=0x0D => {

@@ -23,6 +23,9 @@ postcard = { version = "1.0", default-features = false, features = ["alloc"] }
 log = "0.4"
 lz4_flex = { version = "0.14", default-features = false, features = ["alloc", "safe-encode", "safe-decode", "checked-decode"] }
 
+[profile.dev]
+opt-level = 2
+
 [profile.release]
 opt-level = 3
 lto = "fat"

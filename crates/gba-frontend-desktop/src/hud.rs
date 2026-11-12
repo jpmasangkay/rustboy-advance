@@ -11,7 +11,7 @@ use crate::config::{BezelStyle, ShaderPreset, ViewportScale};
 use crate::gb_bridge::{GB_VIEW_OFFSET_X, GB_VIEW_OFFSET_Y};
 use crate::rom_loader::RomPlatform;
 use crate::shaders::{
-    color_profile_uniform, create_viewport_paint_callback, ShaderRenderParams,
+    color_profile_uniform, ShaderRenderParams,
 };
 
 impl RustboyApp {
@@ -66,6 +66,58 @@ impl RustboyApp {
                         ui.monospace(
                             RichText::new(fps_text).color(crate::theme::COLOR_TEXT_SECONDARY),
                         );
+                        ui.add_space(8.0);
+                        let underruns = self.sink.audio.underruns();
+                        let occ = self.sink.audio.occupancy_percent();
+                        ui.label(
+                            RichText::new(format!("DRC: {occ:.1}% (Underruns: {underruns})"))
+                                .small()
+                                .color(if underruns > 0 { Color32::from_rgb(239, 68, 68) } else { crate::theme::COLOR_TEXT_SECONDARY }),
+                        );
+                        ui.add_space(8.0);
+                        ui.label(
+                            RichText::new(format!("{:.1} kHz", self.host_audio_rate as f32 / 1000.0))
+                                .small()
+                                .color(crate::theme::COLOR_TEXT_SECONDARY),
+                        );
+
+                        if let Some(core) = &mut self.core {
+                            if core.bus.cart.solar_enabled {
+                                ui.add_space(12.0);
+                                if ui.small_button("+").clicked() {
+                                    core.bus.cart.solar_lux = core.bus.cart.solar_lux.saturating_add(25);
+                                }
+                                if ui.small_button("−").clicked() {
+                                    core.bus.cart.solar_lux = core.bus.cart.solar_lux.saturating_sub(25);
+                                }
+                                let lvl = ((core.bus.cart.solar_lux as f32 / 255.0) * 10.0).round() as u8;
+                                ui.label(
+                                    RichText::new(format!("Solar: {lvl}/10"))
+                                        .color(crate::theme::ACCENT_TEAL),
+                                );
+                            }
+                            if self.rumble_in_progress {
+                                ui.add_space(8.0);
+                                ui.label(
+                                    RichText::new("Rumble")
+                                        .color(crate::theme::ACCENT_TEAL),
+                                );
+                            }
+                            if core.bus.cart.tilt_enabled {
+                                ui.add_space(8.0);
+                                ui.label(
+                                    RichText::new("Tilt")
+                                        .color(crate::theme::COLOR_TEXT_SECONDARY),
+                                );
+                            }
+                            if core.bus.cart.gyro_enabled {
+                                ui.add_space(8.0);
+                                ui.label(
+                                    RichText::new("Gyro")
+                                        .color(crate::theme::COLOR_TEXT_SECONDARY),
+                                );
+                            }
+                        }
                     });
                 });
             });
@@ -328,13 +380,13 @@ impl RustboyApp {
         let shader_preset = self.config.effective_shader_preset();
         let frame_blending = self.config.frame_blending;
         let lcd_ghosting = self.config.lcd_ghosting;
-        let use_gl_shader = !self.is_gb_active()
+        let use_shader = !self.is_gb_active()
             && !self.link.split_view_active()
             && self.config.shader_preset == ShaderPreset::CrtScanlines;
-        let mut gl_pipeline_arc = None;
+        let mut shader_pipeline_arc = None;
 
-        if use_gl_shader
-            && let Some(pipeline_arc) = &self.gl_shaders
+        if use_shader
+            && let Some(pipeline_arc) = &self.wgpu_shaders
             && let Ok(mut pipeline) = pipeline_arc.lock()
         {
             if pipeline.is_preset_available(shader_preset) {
@@ -357,16 +409,16 @@ impl RustboyApp {
                     );
                     self.sink.frame_dirty = false;
                 }
-                gl_pipeline_arc = Some(pipeline_arc.clone());
+                shader_pipeline_arc = Some(pipeline_arc.clone());
             } else {
                 pipeline.log_fallback_warning_once(&format!(
-                    "GLSL shader preset {:?} unavailable, falling back to CPU post-processor",
+                    "WGSL shader preset {:?} unavailable, falling back to CPU post-processor",
                     shader_preset
                 ));
             }
         }
 
-        if gl_pipeline_arc.is_none() {
+        if shader_pipeline_arc.is_none() {
             let tex_options = self.config.display_filter.texture_options();
             if self.sink.frame_dirty || self.lcd_tex.is_none() {
                 self.postproc.sync_rgba_for_capture(
@@ -385,7 +437,7 @@ impl RustboyApp {
                     .as_ref()
                     .map(|c| (c.bus.ppu.greenswap & 1) != 0)
                     .unwrap_or(false);
-                let color_img = self.postproc.process_display_filter(
+                let _ = self.postproc.process_display_filter(
                     &self.sink.framebuffer,
                     color_correction,
                     lcd_ghosting,
@@ -393,14 +445,35 @@ impl RustboyApp {
                     green_swap,
                     self.config.lcd_grid_intensity,
                 );
+
+                let target_size = self.postproc.output_image.size;
+                let needed_len = target_size[0] * target_size[1];
+
+                let active_arc = &mut self.upload_arcs[self.upload_arc_idx];
+                let out_img = std::sync::Arc::make_mut(active_arc);
+                if out_img.size != target_size || out_img.pixels.len() != needed_len {
+                    out_img.size = target_size;
+                    out_img.pixels.resize(needed_len, egui::Color32::BLACK);
+                }
+
+                // Zero-allocation buffer reuse: extract newly rendered pixel buffer using std::mem::replace
+                // to reuse the scratch buffer without any per-frame allocations.
+                let new_pixels = std::mem::replace(&mut self.postproc.output_image.pixels, Vec::new());
+                let old_scratch = std::mem::replace(&mut out_img.pixels, new_pixels);
+                self.postproc.output_image.pixels = old_scratch;
+                out_img.size = target_size;
+
+                let arc_to_upload = std::sync::Arc::clone(active_arc);
+                self.upload_arc_idx = (self.upload_arc_idx + 1) % 3;
+
                 if let Some(tex) = &mut self.lcd_tex {
-                    if tex.size() == color_img.size {
-                        tex.set(color_img.clone(), tex_options);
+                    if tex.size() == target_size {
+                        tex.set(arc_to_upload, tex_options);
                     } else {
-                        *tex = ctx.load_texture("gba_lcd", color_img.clone(), tex_options);
+                        *tex = ctx.load_texture("gba_lcd", arc_to_upload, tex_options);
                     }
                 } else {
-                    self.lcd_tex = Some(ctx.load_texture("gba_lcd", color_img.clone(), tex_options));
+                    self.lcd_tex = Some(ctx.load_texture("gba_lcd", arc_to_upload, tex_options));
                 }
                 self.sink.frame_dirty = false;
             }
@@ -588,7 +661,7 @@ impl RustboyApp {
             };
 
             ui.centered_and_justified(|ui| {
-                let has_surface = gl_pipeline_arc.is_some() || self.lcd_tex.is_some();
+                let has_surface = shader_pipeline_arc.is_some() || self.lcd_tex.is_some();
                 if has_surface {
                     let (rect, resp) = ui.allocate_exact_size(disp_size, Sense::click());
 
@@ -598,8 +671,10 @@ impl RustboyApp {
 
                     self.draw_bezel_frame(ui, rect, avail);
 
-                    if let Some(pipeline_arc) = gl_pipeline_arc.take() {
-                        let cb = create_viewport_paint_callback(pipeline_arc, rect, render_params);
+                    if let Some(pipeline_arc) = shader_pipeline_arc.take()
+                        && let Ok(mut pipeline) = pipeline_arc.lock()
+                    {
+                        let cb = pipeline.create_viewport_paint_callback(rect, render_params);
                         ui.painter().add(egui::Shape::Callback(cb));
                     } else if let Some(tex) = &self.lcd_tex {
                         ui.painter().image(tex.id(), rect, uv, Color32::WHITE);

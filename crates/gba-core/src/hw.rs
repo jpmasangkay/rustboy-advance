@@ -350,6 +350,9 @@ impl SysBus {
     }
 
     pub fn step_active_dma(&mut self) -> u64 {
+        #[cfg(feature = "std")]
+        let t0 = if self.bench_active { Some(std::time::Instant::now()) } else { None };
+
         let Some(ch_u8) = self.hw.active_dma else {
             return 1;
         };
@@ -471,6 +474,12 @@ impl SysBus {
                 self.hw.dma[ch].int_dad = self.hw.dma[ch].dad;
             }
             self.hw.recompute_active_dma();
+        }
+
+        #[cfg(feature = "std")]
+        if let Some(t) = t0 {
+            self.dma_bench_time += t.elapsed();
+            self.dma_bench_cycles += cycles;
         }
 
         cycles
@@ -1448,6 +1457,32 @@ impl SysBus {
                 self.hle_diff_unfilter(cpu.gpr[0], cpu.gpr[1], comment);
                 cpu.return_from_swi(self);
             }
+            0x19 => {
+                // SoundBias: level in r0 (bits 1-9)
+                let bias_level = (cpu.gpr[0] & 0x03FE) as u16;
+                let cur = self.apu.soundbias & !0x03FE;
+                self.write_io_16(0x0400_0088, cur | bias_level);
+                cpu.return_from_swi(self);
+            }
+            0x1F => {
+                // MidiKey2Freq(waveData, key, finePitch)
+                let wave_ptr = cpu.gpr[0];
+                let wave_freq = self.read_32(wave_ptr.wrapping_add(4), AccessType::NonSequential, 0);
+                let key = (cpu.gpr[1] & 0xFF) as u8;
+                let pitch = (cpu.gpr[2] & 0xFF) as u8;
+                cpu.gpr[0] = hle_midi_key_to_freq(wave_freq, key, pitch);
+                cpu.return_from_swi(self);
+            }
+            0x1A..=0x1E | 0x20..=0x29 => {
+                // SoundDriverInit, SoundDriverMode, SoundDriverMain, SoundDriverVSync,
+                // SoundChannelClear, SoundDriverVSyncOff, SoundDriverVSyncOn, etc.
+                cpu.return_from_swi(self);
+            }
+            0x2A => {
+                // CustomHalt
+                cpu.halted = true;
+                cpu.return_from_swi(self);
+            }
             _ => {
                 log::debug!("Unhandled HLE SWI {:#04x}", comment);
                 cpu.return_from_swi(self);
@@ -1733,4 +1768,46 @@ fn hle_sin_cos(alpha: u16) -> (i32, i32) {
         if q >= 2 { -val } else { val }
     }
     (quad_sin(alpha), quad_sin(alpha.wrapping_add(0x4000)))
+}
+
+const SEMITONE_LUT: [u32; 13] = [
+    65536,  // 2^(0/12)
+    69433,  // 2^(1/12)
+    73562,  // 2^(2/12)
+    77936,  // 2^(3/12)
+    82570,  // 2^(4/12)
+    87480,  // 2^(5/12)
+    92682,  // 2^(6/12)
+    98194,  // 2^(7/12)
+    104034, // 2^(8/12)
+    110221, // 2^(9/12)
+    116776, // 2^(10/12)
+    123721, // 2^(11/12)
+    131072, // 2^(12/12)
+];
+
+fn hle_midi_key_to_freq(wave_freq: u32, key: u8, pitch: u8) -> u32 {
+    let total = (key as i32 - 180) * 256 + (pitch as i32);
+    let octaves = total.div_euclid(3072);
+    let step = total.rem_euclid(3072) as usize;
+    let semitone = step / 256;
+    let fine = (step % 256) as u32;
+    let diff = SEMITONE_LUT[semitone + 1] - SEMITONE_LUT[semitone];
+    let mult = SEMITONE_LUT[semitone] + ((diff * fine) >> 8);
+    let mut val = ((wave_freq as u64) * (mult as u64)) >> 16;
+    if octaves >= 0 {
+        if octaves >= 32 {
+            u32::MAX
+        } else {
+            val <<= octaves;
+            val.min(u32::MAX as u64) as u32
+        }
+    } else {
+        let neg_octaves = (-octaves) as u32;
+        if neg_octaves >= 32 {
+            0
+        } else {
+            (val >> neg_octaves) as u32
+        }
+    }
 }

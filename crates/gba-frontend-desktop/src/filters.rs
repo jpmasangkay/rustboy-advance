@@ -226,7 +226,7 @@ impl VideoPostProcessor {
             base_rgb: vec![[0u8; 3]; LCD_WIDTH * LCD_HEIGHT],
             prev_rgb: vec![[0u8; 3]; LCD_WIDTH * LCD_HEIGHT],
             output_image: egui::ColorImage::new([LCD_WIDTH * 3, LCD_HEIGHT * 3], egui::Color32::BLACK),
-            filter: DisplayFilter::XbrSmooth3x,
+            filter: DisplayFilter::MyBoySmooth,
             lcd_grid_intensity: 0.08,
         }
     }
@@ -493,7 +493,7 @@ impl VideoPostProcessor {
             DisplayFilter::XbrSmooth3x => {
                 render_xbr_smooth_3x(&self.base_rgb, &mut self.output_image);
             }
-            DisplayFilter::RawNearest => {
+            DisplayFilter::MyBoySmooth | DisplayFilter::Sharp1x | DisplayFilter::RawNearest => {
                 if self.output_image.size != [LCD_WIDTH, LCD_HEIGHT] {
                     self.output_image =
                         egui::ColorImage::new([LCD_WIDTH, LCD_HEIGHT], egui::Color32::BLACK);
@@ -772,6 +772,10 @@ pub struct FrontendBridge {
     pub audio_prod: ringbuf::HeapProd<i16>,
     pub audio_muted: bool,
     pub volume: f32,
+    pub host_sample_rate: u32,
+    pub resample_phase: f64,
+    pub prev_audio_l: i16,
+    pub prev_audio_r: i16,
 }
 
 impl FrontendBridge {
@@ -813,7 +817,7 @@ impl FrontendBridge {
             base_rgb: vec![[0u8; 3]; LCD_WIDTH * LCD_HEIGHT],
             prev_rgb: vec![[0u8; 3]; LCD_WIDTH * LCD_HEIGHT],
             output_image: egui::ColorImage::new([LCD_WIDTH * 3, LCD_HEIGHT * 3], egui::Color32::BLACK),
-            filter: DisplayFilter::XbrSmooth3x,
+            filter: DisplayFilter::MyBoySmooth,
             lcd_grid_intensity: 0.08,
             color_correction: true,
             lcd_ghosting: true,
@@ -822,6 +826,10 @@ impl FrontendBridge {
             audio_prod,
             audio_muted: false,
             volume: 0.85,
+            host_sample_rate: 48_000,
+            resample_phase: 0.0,
+            prev_audio_l: 0,
+            prev_audio_r: 0,
         }
     }
 
@@ -862,7 +870,7 @@ impl HostFrontend for FrontendBridge {
             DisplayFilter::XbrSmooth3x => {
                 render_xbr_smooth_3x(&self.base_rgb, &mut self.output_image);
             }
-            DisplayFilter::RawNearest => {
+            DisplayFilter::MyBoySmooth | DisplayFilter::Sharp1x | DisplayFilter::RawNearest => {
                 if self.output_image.size != [LCD_WIDTH, LCD_HEIGHT] {
                     self.output_image =
                         egui::ColorImage::new([LCD_WIDTH, LCD_HEIGHT], egui::Color32::BLACK);
@@ -1023,13 +1031,41 @@ impl HostFrontend for FrontendBridge {
     }
 
     fn push_audio_samples(&mut self, samples_interleaved_i16: &[i16]) {
-        use ringbuf::traits::Producer;
-        if self.audio_muted {
+        use ringbuf::traits::{Observer, Producer};
+        if self.audio_muted || samples_interleaved_i16.is_empty() {
             return;
         }
-        for &s in samples_interleaved_i16 {
-            let scaled = ((s as f32) * self.volume).clamp(i16::MIN as f32, i16::MAX as f32) as i16;
-            let _ = self.audio_prod.try_push(scaled);
+
+        // Dynamic Rate Control (DRC): Keep the 8192-sample buffer centered at 50% (4096 samples)
+        let capacity = 8192.0;
+        let target_fill = capacity * 0.5;
+        let current_fill = self.audio_prod.occupied_len() as f64;
+        let fill_delta = (target_fill - current_fill) / target_fill;
+        let drc_adjust = (fill_delta * 0.005).clamp(-0.005, 0.005);
+
+        // Base ratio from GBA 48kHz output to actual host soundcard rate + DRC adjustment
+        let out_rate = (self.host_sample_rate as f64) * (1.0 + drc_adjust);
+        let step = (gba_core::SAMPLE_RATE_HZ as f64) / out_rate.max(8000.0);
+
+        let frames = samples_interleaved_i16.len() / 2;
+        for i in 0..frames {
+            let cur_l = samples_interleaved_i16[i * 2];
+            let cur_r = samples_interleaved_i16[i * 2 + 1];
+
+            while self.resample_phase < 1.0 {
+                let frac = self.resample_phase as f32;
+                let l = (self.prev_audio_l as f32 + (cur_l as f32 - self.prev_audio_l as f32) * frac)
+                    * self.volume;
+                let r = (self.prev_audio_r as f32 + (cur_r as f32 - self.prev_audio_r as f32) * frac)
+                    * self.volume;
+
+                let _ = self.audio_prod.try_push(l.clamp(-32768.0, 32767.0) as i16);
+                let _ = self.audio_prod.try_push(r.clamp(-32768.0, 32767.0) as i16);
+                self.resample_phase += step;
+            }
+            self.resample_phase -= 1.0;
+            self.prev_audio_l = cur_l;
+            self.prev_audio_r = cur_r;
         }
     }
 

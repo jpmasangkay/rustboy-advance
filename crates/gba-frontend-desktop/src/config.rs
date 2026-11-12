@@ -737,70 +737,80 @@ impl ViewportScale {
 #[derive(Copy, Clone, PartialEq, Eq, Debug, Serialize, Deserialize, Default)]
 pub enum DisplayFilter {
     #[default]
+    MyBoySmooth,     // 1x (240x160) Native Linear ("MyBoy Smooth")
+    Sharp1x,         // 1x (240x160) Native Nearest ("Sharp 1x")
     XbrSmooth3x,     // 3x (720x480) xBR 3x edge smoothing (Laptop HD)
     AuthenticGbaLcd, // 3x (720x480) LCD Subpixel Dot-Matrix
     SoftHandheld,    // 2x (480x320) Sharp-Bilinear
     SmoothScale2x,   // 2x (480x320) EPX / Scale2x diagonal smoothing
-    RawNearest,      // 1x (240x160) Raw square pixels
+    RawNearest,      // Backward compatibility alias for Sharp 1x
 }
 
 impl DisplayFilter {
-    pub const ALL: [Self; 5] = [
+    pub const ALL: [Self; 6] = [
+        Self::MyBoySmooth,
+        Self::Sharp1x,
         Self::XbrSmooth3x,
         Self::AuthenticGbaLcd,
         Self::SoftHandheld,
         Self::SmoothScale2x,
-        Self::RawNearest,
     ];
 
     pub fn label(self) -> &'static str {
         match self {
+            Self::MyBoySmooth => "MyBoy Smooth",
+            Self::Sharp1x | Self::RawNearest => "Sharp 1x",
             Self::XbrSmooth3x => "xBR 3x",
             Self::AuthenticGbaLcd => "LCD Matrix",
             Self::SoftHandheld => "Soft LCD",
             Self::SmoothScale2x => "Scale2x",
-            Self::RawNearest => "Raw 1x",
         }
     }
 
     pub fn description(self) -> &'static str {
         match self {
+            Self::MyBoySmooth => "MyBoy Smooth (240x160 native linear)",
+            Self::Sharp1x | Self::RawNearest => "Sharp 1x (240x160 native nearest)",
             Self::XbrSmooth3x => "xBR 3x (Laptop HD)",
-            Self::AuthenticGbaLcd => "Authentic GBA LCD (3x subpixel grid)",
+            Self::AuthenticGbaLcd => "LCD Matrix (3x subpixel grid)",
             Self::SoftHandheld => "Soft Handheld (2x sharp-bilinear)",
             Self::SmoothScale2x => "Smooth Pixel Art (Scale2x / EPX)",
-            Self::RawNearest => "Raw Pixelated (1x nearest-neighbor)",
         }
     }
 
     pub fn next(self) -> Self {
         match self {
+            Self::MyBoySmooth => Self::Sharp1x,
+            Self::Sharp1x | Self::RawNearest => Self::XbrSmooth3x,
             Self::XbrSmooth3x => Self::AuthenticGbaLcd,
             Self::AuthenticGbaLcd => Self::SoftHandheld,
             Self::SoftHandheld => Self::SmoothScale2x,
-            Self::SmoothScale2x => Self::RawNearest,
-            Self::RawNearest => Self::XbrSmooth3x,
+            Self::SmoothScale2x => Self::MyBoySmooth,
         }
     }
 
     pub fn texture_options(self) -> egui::TextureOptions {
         match self {
+            Self::MyBoySmooth => egui::TextureOptions::LINEAR,
+            Self::Sharp1x | Self::RawNearest => egui::TextureOptions::NEAREST,
             Self::XbrSmooth3x | Self::AuthenticGbaLcd | Self::SoftHandheld => {
                 egui::TextureOptions::LINEAR
             }
-            Self::SmoothScale2x | Self::RawNearest => egui::TextureOptions::NEAREST,
+            Self::SmoothScale2x => egui::TextureOptions::NEAREST,
         }
     }
 
     pub fn target_dimensions(self) -> (usize, usize) {
         match self {
+            Self::MyBoySmooth | Self::Sharp1x | Self::RawNearest => {
+                (gba_core::LCD_WIDTH, gba_core::LCD_HEIGHT)
+            }
             Self::XbrSmooth3x | Self::AuthenticGbaLcd => {
                 (gba_core::LCD_WIDTH * 3, gba_core::LCD_HEIGHT * 3)
             }
             Self::SoftHandheld | Self::SmoothScale2x => {
                 (gba_core::LCD_WIDTH * 2, gba_core::LCD_HEIGHT * 2)
             }
-            Self::RawNearest => (gba_core::LCD_WIDTH, gba_core::LCD_HEIGHT),
         }
     }
 }
@@ -997,7 +1007,7 @@ pub fn game_settings_key(code: &str, rom_crc32: u32) -> String {
 }
 
 fn default_rewind_enabled() -> bool {
-    true
+    false
 }
 
 fn default_rewind_budget_mb() -> u32 {
@@ -1028,6 +1038,14 @@ fn default_lcd_grid_intensity() -> f32 {
     0.08
 }
 
+fn default_auto_frameskip() -> bool {
+    false
+}
+
+fn default_max_frameskip() -> u8 {
+    3
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(default)]
 pub struct AppConfig {
@@ -1051,6 +1069,10 @@ pub struct AppConfig {
     #[serde(default)]
     pub frame_blending: bool,
     pub dot_accurate_ppu: bool,
+    #[serde(default = "default_auto_frameskip")]
+    pub auto_frameskip: bool,
+    #[serde(default = "default_max_frameskip")]
+    pub max_frameskip: u8,
     #[serde(default)]
     pub dmg_palette: DmgPaletteChoice,
     pub master_volume: u8,
@@ -1102,10 +1124,12 @@ impl Default for AppConfig {
             scanline_grid: false,
             lcd_grid_intensity: 0.08,
             viewport_scale: ViewportScale::FitWindow,
-            display_filter: DisplayFilter::XbrSmooth3x,
+            display_filter: DisplayFilter::MyBoySmooth,
             shader_preset: ShaderPreset::Nearest,
             frame_blending: false,
             dot_accurate_ppu: false,
+            auto_frameskip: default_auto_frameskip(),
+            max_frameskip: default_max_frameskip(),
             dmg_palette: DmgPaletteChoice::default(),
             master_volume: 100,
             muted: false,
@@ -1303,7 +1327,7 @@ mod tests {
         assert_eq!(parsed.keybindings.autofire_interval_frames, 4);
         assert_eq!(parsed.keybindings.gamepad, GamepadBindings::default());
         assert_eq!(parsed.keybindings.hotkeys, HotkeyBindings::default());
-        assert!(parsed.rewind_enabled);
+        assert!(!parsed.rewind_enabled);
         assert_eq!(parsed.rewind_budget_mb, 64);
         assert_eq!(parsed.rewind_interval, 1);
         assert_eq!(parsed.rewind_speed, 1);
@@ -1315,7 +1339,11 @@ mod tests {
         for filter in DisplayFilter::ALL {
             assert!(!filter.label().is_empty());
             assert!(!filter.description().is_empty());
-            assert_eq!(filter.next().next().next().next().next(), filter);
+            let mut cycled = filter;
+            for _ in 0..DisplayFilter::ALL.len() {
+                cycled = cycled.next();
+            }
+            assert_eq!(cycled, filter);
             let json = serde_json::to_string(&filter).expect("serialize filter");
             let back: DisplayFilter = serde_json::from_str(&json).expect("deserialize filter");
             assert_eq!(back, filter);
@@ -1346,7 +1374,7 @@ mod tests {
         assert!((modern.lcd_grid_intensity - 0.08).abs() < 1e-4);
 
         let default_cfg = AppConfig::from_json_str("{}");
-        assert_eq!(default_cfg.display_filter, DisplayFilter::XbrSmooth3x);
+        assert_eq!(default_cfg.display_filter, DisplayFilter::MyBoySmooth);
         assert_eq!(default_cfg.viewport_scale, ViewportScale::FitWindow);
         assert!((default_cfg.lcd_grid_intensity - 0.08).abs() < 1e-4);
     }

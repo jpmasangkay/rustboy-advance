@@ -286,6 +286,17 @@ impl RustboyApp {
                                 }
                             }
                         });
+                        if !self.is_ra_hardcore_active() {
+                            let mut rewind = self.config.rewind_enabled;
+                            if ui.checkbox(&mut rewind, "Enable Real-Time Rewind").changed() {
+                                self.config.rewind_enabled = rewind;
+                                if !rewind {
+                                    self.rewind_buffer.clear();
+                                    self.rewind_movie_frames.clear();
+                                }
+                                self.config.save();
+                            }
+                        }
                         if ui
                             .add_enabled(
                                 !self.is_ra_hardcore_active(),
@@ -323,6 +334,12 @@ impl RustboyApp {
                                 ui.close_menu();
                             }
                         });
+                        if ui
+                            .checkbox(&mut self.config.auto_frameskip, "Auto Frame-Skip (Low-End Devices)")
+                            .clicked()
+                        {
+                            self.config.save();
+                        }
                     });
 
                     ui.menu_button("Audio/Video", |ui| {
@@ -411,11 +428,12 @@ impl RustboyApp {
                                         {
                                             self.config.display_filter = filter;
                                             self.config.shader_preset = match filter {
+                                                DisplayFilter::MyBoySmooth => ShaderPreset::SharpBilinear,
+                                                DisplayFilter::Sharp1x | DisplayFilter::RawNearest => ShaderPreset::Nearest,
                                                 DisplayFilter::XbrSmooth3x => ShaderPreset::Nearest,
                                                 DisplayFilter::AuthenticGbaLcd => ShaderPreset::LcdGrid,
                                                 DisplayFilter::SoftHandheld => ShaderPreset::SharpBilinear,
                                                 DisplayFilter::SmoothScale2x => ShaderPreset::ScaleEdge,
-                                                DisplayFilter::RawNearest => ShaderPreset::Nearest,
                                             };
                                             self.config.scanline_grid = filter == DisplayFilter::AuthenticGbaLcd;
                                             self.config.save();
@@ -759,8 +777,18 @@ impl RustboyApp {
                         if ui.button("Open Screenshots / Captures Folder").clicked() {
                             let dir = AppConfig::screenshots_dir();
                             let _ = fs::create_dir_all(&dir);
-                            #[cfg(target_os = "windows")]
-                            let _ = std::process::Command::new("explorer").arg(&dir).spawn();
+                            #[cfg(windows)]
+                            {
+                                use std::os::windows::process::CommandExt;
+                                let _ = std::process::Command::new("explorer")
+                                    .arg(&dir)
+                                    .creation_flags(0x08000000)
+                                    .spawn();
+                            }
+                            #[cfg(not(windows))]
+                            {
+                                let _ = std::process::Command::new("xdg-open").arg(&dir).spawn();
+                            }
                             ui.close_menu();
                         }
                     });
@@ -933,11 +961,12 @@ impl RustboyApp {
                     if filter_resp.clicked() {
                         self.config.display_filter = self.config.display_filter.next();
                         self.config.shader_preset = match self.config.display_filter {
+                            DisplayFilter::MyBoySmooth => ShaderPreset::SharpBilinear,
+                            DisplayFilter::Sharp1x | DisplayFilter::RawNearest => ShaderPreset::Nearest,
                             DisplayFilter::XbrSmooth3x => ShaderPreset::Nearest,
                             DisplayFilter::AuthenticGbaLcd => ShaderPreset::LcdGrid,
                             DisplayFilter::SoftHandheld => ShaderPreset::SharpBilinear,
                             DisplayFilter::SmoothScale2x => ShaderPreset::ScaleEdge,
-                            DisplayFilter::RawNearest => ShaderPreset::Nearest,
                         };
                         self.config.scanline_grid =
                             self.config.display_filter == DisplayFilter::AuthenticGbaLcd;
@@ -957,11 +986,12 @@ impl RustboyApp {
                             {
                                 self.config.display_filter = f;
                                 self.config.shader_preset = match f {
+                                    DisplayFilter::MyBoySmooth => ShaderPreset::SharpBilinear,
+                                    DisplayFilter::Sharp1x | DisplayFilter::RawNearest => ShaderPreset::Nearest,
                                     DisplayFilter::XbrSmooth3x => ShaderPreset::Nearest,
                                     DisplayFilter::AuthenticGbaLcd => ShaderPreset::LcdGrid,
                                     DisplayFilter::SoftHandheld => ShaderPreset::SharpBilinear,
                                     DisplayFilter::SmoothScale2x => ShaderPreset::ScaleEdge,
-                                    DisplayFilter::RawNearest => ShaderPreset::Nearest,
                                 };
                                 self.config.scanline_grid = f == DisplayFilter::AuthenticGbaLcd;
                                 self.config.save();

@@ -996,10 +996,20 @@ impl RustboyApp {
                                 }
                                 if ui.button("📁 Open Save Folder").clicked() {
                                     if let Some(parent) = entry.path.parent() {
-                                        #[cfg(target_os = "windows")]
-                                        let _ = std::process::Command::new("explorer")
-                                            .arg(parent)
-                                            .spawn();
+                                        #[cfg(windows)]
+                                        {
+                                            use std::os::windows::process::CommandExt;
+                                            let _ = std::process::Command::new("explorer")
+                                                .arg(parent)
+                                                .creation_flags(0x08000000)
+                                                .spawn();
+                                        }
+                                        #[cfg(not(windows))]
+                                        {
+                                            let _ = std::process::Command::new("xdg-open")
+                                                .arg(parent)
+                                                .spawn();
+                                        }
                                     }
                                     ui.close_menu();
                                 }
@@ -1207,10 +1217,20 @@ impl RustboyApp {
                                                     }
                                                     if ui.button("📁 Open Save Folder").clicked() {
                                                         if let Some(parent) = entry.path.parent() {
-                                                            #[cfg(target_os = "windows")]
-                                                            let _ = std::process::Command::new("explorer")
-                                                                .arg(parent)
-                                                                .spawn();
+                                                            #[cfg(windows)]
+                                                            {
+                                                                use std::os::windows::process::CommandExt;
+                                                                let _ = std::process::Command::new("explorer")
+                                                                    .arg(parent)
+                                                                    .creation_flags(0x08000000)
+                                                                    .spawn();
+                                                            }
+                                                            #[cfg(not(windows))]
+                                                            {
+                                                                let _ = std::process::Command::new("xdg-open")
+                                                                    .arg(parent)
+                                                                    .spawn();
+                                                            }
                                                         }
                                                         ui.close_menu();
                                                     }

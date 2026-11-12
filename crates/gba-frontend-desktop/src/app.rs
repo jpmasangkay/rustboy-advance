@@ -30,7 +30,7 @@ use crate::rom_loader::{
     load_rom_bytes, RomPlatform,
 };
 use crate::savestates::SlotMetaEntry;
-use crate::shaders::GlShaderPipeline;
+use crate::shaders::WgpuShaderPipeline;
 
 pub(crate) const CONFIG_FILE: &str = "rustboy_library.cfg";
 pub(crate) const GBA_FRAME_SECS: f64 = 280_896.0 / 16_777_216.0; // Exact GBA refresh ~16.7427ms (~59.7275 Hz)
@@ -125,7 +125,7 @@ pub(crate) struct RustboyApp {
     pub(crate) sink: CoreSink,
     pub(crate) postproc: VideoPostProcessor,
     pub(crate) lcd_tex: Option<TextureHandle>,
-    pub(crate) gl_shaders: Option<Arc<Mutex<GlShaderPipeline>>>,
+    pub(crate) wgpu_shaders: Option<Arc<Mutex<WgpuShaderPipeline>>>,
     pub(crate) debugger: DebuggerWindows,
     pub(crate) gdb_stub: gba_debugger::GdbStub,
     pub(crate) temp_step_bp: Option<u32>,
@@ -177,6 +177,11 @@ pub(crate) struct RustboyApp {
     pub(crate) base_pressed_mask: u16,
     pub(crate) active_turbo_buttons: (bool, bool),
     pub(crate) next_frame_due: Instant,
+    pub(crate) last_step_time: Instant,
+    pub(crate) time_accumulator: f64,
+    pub(crate) upload_arcs: [std::sync::Arc<egui::ColorImage>; 3],
+    pub(crate) upload_arc_idx: usize,
+    pub(crate) host_audio_rate: u32,
     pub(crate) last_save_flush: Instant,
     pub(crate) last_fps_sample: Instant,
     pub(crate) frames_in_window: u32,
@@ -196,6 +201,7 @@ pub(crate) struct RustboyApp {
     pub(crate) state_manager_error: Option<String>,
     pub(crate) playtime_timer: Instant,
     pub(crate) rumble_in_progress: bool,
+    pub(crate) gilrs_rumble_effect: Option<gilrs::ff::Effect>,
 
     // TAS Input Movies & Media Capture
     pub(crate) movie: MovieController,
@@ -206,6 +212,7 @@ pub(crate) struct RustboyApp {
     // Lua Scripting & RetroAchievements
     pub(crate) lua: crate::lua_engine::LuaEngine,
     pub(crate) ra: crate::retroachievements::RetroAchievementsManager,
+    pub(crate) emu_error_rx: Option<std::sync::mpsc::Receiver<String>>,
 }
 
 impl RustboyApp {
@@ -214,8 +221,14 @@ impl RustboyApp {
         let rewind_budget_mb = config.rewind_budget_mb;
         let audio = AudioOutput::start();
         audio.set_muted(config.muted);
+        let host_audio_rate = audio.host_sample_rate();
         let sink = CoreSink::new(audio);
         let ra = crate::retroachievements::RetroAchievementsManager::new(&config);
+
+        let blank_img = std::sync::Arc::new(egui::ColorImage::new(
+            [LCD_WIDTH * 3, LCD_HEIGHT * 3],
+            egui::Color32::BLACK,
+        ));
 
         let bios_bytes = cli
             .bios_path
@@ -231,7 +244,7 @@ impl RustboyApp {
             sink,
             postproc: VideoPostProcessor::new(),
             lcd_tex: None,
-            gl_shaders: None,
+            wgpu_shaders: None,
             debugger: DebuggerWindows::default(),
             gdb_stub: gba_debugger::GdbStub::new(),
             temp_step_bp: None,
@@ -277,6 +290,11 @@ impl RustboyApp {
             base_pressed_mask: 0,
             active_turbo_buttons: (false, false),
             next_frame_due: Instant::now(),
+            last_step_time: Instant::now(),
+            time_accumulator: 0.0,
+            upload_arcs: [blank_img.clone(), blank_img.clone(), blank_img],
+            upload_arc_idx: 0,
+            host_audio_rate,
             last_save_flush: Instant::now(),
             last_fps_sample: Instant::now(),
             frames_in_window: 0,
@@ -294,12 +312,14 @@ impl RustboyApp {
             state_manager_error: None,
             playtime_timer: Instant::now(),
             rumble_in_progress: false,
+            gilrs_rumble_effect: None,
             movie: MovieController::new(),
             capture: CaptureController::new(),
             show_movies: false,
             rewind_movie_frames: VecDeque::new(),
             lua: crate::lua_engine::LuaEngine::new(),
             ra,
+            emu_error_rx: None,
         };
 
         app.load_persistent_config();
@@ -560,6 +580,8 @@ impl RustboyApp {
         self.base_pressed_mask = 0;
         self.active_turbo_buttons = (false, false);
         self.next_frame_due = Instant::now();
+        self.last_step_time = Instant::now();
+        self.time_accumulator = 0.0;
         self.frames_in_window = 0;
         self.last_fps_sample = Instant::now();
         self.postproc.reset();
@@ -619,6 +641,8 @@ impl RustboyApp {
         self.autofire_state.clear_latches();
         self.base_pressed_mask = 0;
         self.active_turbo_buttons = (false, false);
+        self.last_step_time = Instant::now();
+        self.time_accumulator = 0.0;
         self.lcd_tex = None;
         self.postproc.reset();
         self.sink.clear_frames();
@@ -664,9 +688,13 @@ impl RustboyApp {
         if !core.bus.cart.save_dirty {
             return;
         }
-        let data = core.bus.cart.export_save_data();
-        if !data.is_empty() && fs::write(sav_path, data).is_ok() {
+        let data = core.bus.cart.export_save_data().to_vec();
+        if !data.is_empty() {
             core.bus.cart.save_dirty = false;
+            let path = sav_path.clone();
+            std::thread::spawn(move || {
+                let _ = fs::write(path, data);
+            });
         }
     }
 
@@ -845,6 +873,8 @@ impl RustboyApp {
             self.rewind_movie_frames.clear();
             self.frame_counter = 0;
             self.rewinding = false;
+            self.last_step_time = Instant::now();
+            self.time_accumulator = 0.0;
             self.next_frame_due = Instant::now();
             if self.movie.is_active() {
                 self.movie.stop();
@@ -863,6 +893,8 @@ impl RustboyApp {
             self.rewind_movie_frames.clear();
             self.frame_counter = 0;
             self.rewinding = false;
+            self.last_step_time = Instant::now();
+            self.time_accumulator = 0.0;
             self.next_frame_due = Instant::now();
             if self.movie.is_active() {
                 self.movie.stop();
@@ -889,6 +921,8 @@ impl RustboyApp {
             self.rewinding = false;
             self.postproc.reset();
             self.sink.clear_frames();
+            self.last_step_time = Instant::now();
+            self.time_accumulator = 0.0;
             self.next_frame_due = Instant::now();
             self.apply_active_game_settings_to_core();
             if self.movie.is_active() {
@@ -908,6 +942,8 @@ impl RustboyApp {
             self.rewind_movie_frames.clear();
             self.frame_counter = 0;
             self.rewinding = false;
+            self.last_step_time = Instant::now();
+            self.time_accumulator = 0.0;
             self.next_frame_due = Instant::now();
             if self.movie.is_active() {
                 self.movie.stop();
@@ -931,6 +967,8 @@ impl RustboyApp {
                     self.debugger.call_stack.step_one_with_tracker(core, &ctrl);
                 }
             }
+            self.last_step_time = Instant::now();
+            self.time_accumulator = 0.0;
             self.next_frame_due = Instant::now();
         }
     }
@@ -958,7 +996,7 @@ impl RustboyApp {
         if self.config.rewind_enabled {
             let interval = self.config.rewind_interval.clamp(1, 4) as u64;
             if self.frame_counter.is_multiple_of(interval)
-                && let Ok(state) = self.save_active_core_state()
+                && let Ok(state) = self.save_active_core_state_raw()
             {
                 record_rewind_snapshot(
                     &mut self.rewind_buffer,
@@ -1150,7 +1188,9 @@ impl RustboyApp {
                         self.debugger.call_stack.step_one_with_tracker(core, &merged);
                     }
                     self.paused = false;
-                    self.next_frame_due = Instant::now();
+                    self.last_step_time = Instant::now();
+            self.time_accumulator = 0.0;
+            self.next_frame_due = Instant::now();
                 }
             }
             if let Some(reason) = outcome.stop_reason {
@@ -1263,12 +1303,16 @@ impl RustboyApp {
             return;
         }
 
+        let now = Instant::now();
+        let dt = now.duration_since(self.last_step_time).as_secs_f64().min(0.05);
+        self.last_step_time = now;
+
         // Handle active real-time rewind paced at GBA frame cadence
         if self.rewinding {
             self.sink.suppress_audio = true;
             self.sink.capture_audio = false;
             self.sink.captured_audio.clear();
-            let now = Instant::now();
+            self.time_accumulator = 0.0;
             if now >= self.next_frame_due {
                 let prev_len = self.rewind_buffer.len();
                 self.step_rewind_frame();
@@ -1280,6 +1324,7 @@ impl RustboyApp {
         }
 
         if self.paused {
+            self.time_accumulator = 0.0;
             return;
         }
 
@@ -1291,25 +1336,58 @@ impl RustboyApp {
         };
         let speed = self.effective_speed_multiplier();
         let turbo = speed <= 0.0;
-        let frame_interval = if turbo {
-            Duration::from_millis(0)
+        let is_normal_speed = !turbo && (speed - 1.0).abs() < 0.01;
+        let target_frame_time = if turbo {
+            0.0
         } else {
-            Duration::from_secs_f64(GBA_FRAME_SECS / (speed as f64))
+            1.0 / (59.72750057 * (speed as f64).max(0.1))
         };
 
-        let now = Instant::now();
+        if !turbo {
+            self.time_accumulator += dt;
+            // Bound accumulator to prevent multi-frame catchup burst after window moves/menus
+            if self.time_accumulator > target_frame_time * 2.0 {
+                self.time_accumulator = target_frame_time * 1.5;
+            }
+        }
+
         let max_catchup = if turbo {
             16
+        } else if is_normal_speed {
+            2
         } else {
-            (speed.ceil() as usize + 1).clamp(2, 16)
+            (speed.ceil() as usize + 1).clamp(2, 8)
         };
         let mut executed = 0usize;
 
-        while executed < max_catchup && (turbo || now >= self.next_frame_due) {
+        // Display vsync snapping: at standard 1.0x speed, snap small cadence phase drifts
+        // between ~60 Hz display refresh (~16.67ms) and GBA cadence (~16.74ms) so exactly 1 frame
+        // executes per display vsync without cyclic beat-frequency judder.
+        let execution_threshold = if is_normal_speed {
+            target_frame_time - 0.0025
+        } else {
+            target_frame_time
+        };
+
+        while executed < max_catchup && (turbo || self.time_accumulator >= execution_threshold) {
             if turbo && executed > 0 && now.elapsed() > Duration::from_millis(12) {
                 break;
             }
+            if !turbo {
+                self.time_accumulator -= target_frame_time;
+                if is_normal_speed && self.time_accumulator.abs() < 0.003 {
+                    self.time_accumulator = 0.0;
+                }
+            }
             let start_t = Instant::now();
+            let max_skip = (self.config.max_frameskip as usize).clamp(1, 8);
+            let should_skip_render = (turbo && executed + 1 < max_catchup)
+                || (self.config.auto_frameskip && executed < max_skip && self.time_accumulator > target_frame_time);
+
+            if let Some(core) = &mut self.core {
+                core.bus.ppu.skip_rendering = should_skip_render;
+            }
+
             let live_keypad = self.effective_live_keypad_for_frame();
             self.sink.keypad = self.movie.step_frame(live_keypad);
             self.sink.capture_audio = self.capture.is_wav_recording();
@@ -1326,7 +1404,7 @@ impl RustboyApp {
             if self.config.rewind_enabled {
                 let interval = self.config.rewind_interval.clamp(1, 4) as u64;
                 if self.frame_counter.is_multiple_of(interval)
-                    && let Ok(state) = self.save_active_core_state()
+                    && let Ok(state) = self.save_active_core_state_raw()
                 {
                     record_rewind_snapshot(
                         &mut self.rewind_buffer,
@@ -1382,13 +1460,15 @@ impl RustboyApp {
             }
 
             if turbo {
+                self.last_step_time = Instant::now();
+                self.time_accumulator = 0.0;
                 self.next_frame_due = Instant::now();
             } else {
-                self.next_frame_due += frame_interval;
-                if now.saturating_duration_since(self.next_frame_due) > Duration::from_millis(60) {
-                    self.next_frame_due = now + frame_interval;
-                }
+                self.next_frame_due = now + Duration::from_secs_f64(target_frame_time);
             }
+        }
+        if let Some(core) = &mut self.core {
+            core.bus.ppu.skip_rendering = false;
         }
         self.sink.suppress_audio = false;
         self.sink.capture_audio = false;
@@ -1421,31 +1501,76 @@ impl RustboyApp {
         }
 
         if self.effective_rumble_enabled() {
-            if let Some(core) = &self.core {
-                self.rumble_in_progress = core.bus.cart.rumble_active;
+            let active = if let Some(core) = &self.core {
+                core.bus.cart.rumble_active
             } else if let Some(gb) = &self.gb {
-                self.rumble_in_progress = gb.core.is_rumble_active();
+                gb.core.is_rumble_active()
+            } else {
+                false
+            };
+            if active != self.rumble_in_progress {
+                self.rumble_in_progress = active;
+                if let Some(gilrs) = &mut self.gilrs {
+                    if active {
+                        if self.gilrs_rumble_effect.is_none() {
+                            let support_ff = gilrs
+                                .gamepads()
+                                .filter_map(|(id, gp)| if gp.is_ff_supported() { Some(id) } else { None })
+                                .collect::<Vec<_>>();
+                            if !support_ff.is_empty() {
+                                let duration = gilrs::ff::Ticks::from_ms(120);
+                                if let Ok(eff) = gilrs::ff::EffectBuilder::new()
+                                    .add_effect(gilrs::ff::BaseEffect {
+                                        kind: gilrs::ff::BaseEffectType::Strong { magnitude: 45_000 },
+                                        scheduling: gilrs::ff::Replay {
+                                            play_for: duration,
+                                            with_delay: duration,
+                                            ..Default::default()
+                                        },
+                                        envelope: Default::default(),
+                                    })
+                                    .gamepads(&support_ff)
+                                    .finish(gilrs)
+                                {
+                                    let _ = eff.play();
+                                    self.gilrs_rumble_effect = Some(eff);
+                                }
+                            }
+                        } else if let Some(eff) = &self.gilrs_rumble_effect {
+                            let _ = eff.play();
+                        }
+                    } else if let Some(eff) = &self.gilrs_rumble_effect {
+                        let _ = eff.stop();
+                    }
+                }
             }
-        } else {
+        } else if self.rumble_in_progress {
             self.rumble_in_progress = false;
+            if let Some(eff) = &self.gilrs_rumble_effect {
+                let _ = eff.stop();
+            }
         }
 
         if !self.paused {
-            if turbo {
-                ctx.request_repaint();
-            } else {
-                let wait = self
-                    .next_frame_due
-                    .saturating_duration_since(Instant::now())
-                    .min(Duration::from_millis(16));
-                ctx.request_repaint_after(wait);
-            }
+            ctx.request_repaint();
         }
     }
 }
 
 impl RustboyApp {
     pub fn update(&mut self, ctx: &egui::Context) {
+        let emu_errors: Vec<String> = if let Some(rx) = &self.emu_error_rx {
+            let mut errs = Vec::new();
+            while let Ok(err) = rx.try_recv() {
+                errs.push(err);
+            }
+            errs
+        } else {
+            Vec::new()
+        };
+        for err in emu_errors {
+            self.notify_error(&err);
+        }
         self.poll_library_scan(ctx);
         self.pump_gamepad_events(ctx);
         self.poll_gdb_server();
@@ -1594,28 +1719,24 @@ impl RustboyApp {
         }
     }
 
-    pub fn init_gl(&mut self, gl: Arc<glow::Context>) {
-        match GlShaderPipeline::new(gl) {
+    pub fn init_wgpu(&mut self, rs: &eframe::egui_wgpu::RenderState) {
+        match WgpuShaderPipeline::new(
+            Arc::new(rs.device.clone()),
+            Arc::new(rs.queue.clone()),
+            rs.target_format,
+        ) {
             Ok(pipeline) => {
-                self.gl_shaders = Some(Arc::new(Mutex::new(pipeline)));
+                log::info!("WGPU/WGSL post-processing shader pipeline initialized successfully");
+                self.wgpu_shaders = Some(Arc::new(Mutex::new(pipeline)));
             }
             Err(err) => {
-                log::warn!("GLSL shader pipeline unavailable, using CPU fallback: {err}");
-                self.gl_shaders = None;
+                log::warn!("WGPU/WGSL shader pipeline unavailable, using CPU fallback: {err}");
+                self.wgpu_shaders = None;
             }
-        }
-    }
-
-    pub fn destroy_gl(&mut self) {
-        if let Some(pipeline) = self.gl_shaders.take()
-            && let Ok(mut guard) = pipeline.lock()
-        {
-            guard.destroy();
         }
     }
 
     pub fn on_exit(&mut self) {
-        self.destroy_gl();
         self.stop_all_captures(false);
         self.ra.on_rom_closed();
         self.lua.on_rom_changed("", "");

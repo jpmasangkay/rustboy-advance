@@ -32,12 +32,54 @@ pub enum FlashStage {
     BankSwitch,
 }
 
+#[derive(Copy, Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct FlashChipId {
+    pub manufacturer: u8,
+    pub device: u8,
+}
+
+impl FlashChipId {
+    pub const PANASONIC_64K: Self = Self {
+        manufacturer: 0x32,
+        device: 0x1B,
+    };
+    pub const SANYO_128K: Self = Self {
+        manufacturer: 0x62,
+        device: 0x13,
+    };
+    pub const SST_64K: Self = Self {
+        manufacturer: 0xBF,
+        device: 0xD4,
+    };
+    pub const MACRONIX_64K: Self = Self {
+        manufacturer: 0xC2,
+        device: 0x1C,
+    };
+    pub const MACRONIX_128K: Self = Self {
+        manufacturer: 0xC2,
+        device: 0x09,
+    };
+    pub const ATMEL_64K: Self = Self {
+        manufacturer: 0x1F,
+        device: 0x3D,
+    };
+
+    pub const fn new(manufacturer: u8, device: u8) -> Self {
+        Self {
+            manufacturer,
+            device,
+        }
+    }
+}
+
 #[derive(Clone, Serialize, Deserialize)]
 pub struct FlashState {
     pub stage: FlashStage,
     pub id_mode: bool,
     pub bank: u8,
     pub is_128k: bool,
+    #[serde(default)]
+    pub id_override: Option<FlashChipId>,
 }
 
 impl FlashState {
@@ -47,26 +89,32 @@ impl FlashState {
             id_mode: false,
             bank: 0,
             is_128k,
+            id_override: None,
         }
+    }
+
+    #[inline]
+    pub fn chip_id(&self) -> FlashChipId {
+        if let Some(id) = self.id_override {
+            id
+        } else if self.is_128k {
+            FlashChipId::SANYO_128K
+        } else {
+            FlashChipId::PANASONIC_64K
+        }
+    }
+
+    #[inline]
+    pub fn set_id_override(&mut self, id: Option<FlashChipId>) {
+        self.id_override = id;
     }
 
     pub fn read(&self, sram: &[u8; 0x20000], addr_16: u16) -> u8 {
         if self.id_mode {
+            let id = self.chip_id();
             return match addr_16 {
-                0x0000 => {
-                    if self.is_128k {
-                        0x62 // Sanyo LE26FV10N1TS (or 0xC2 Macronix)
-                    } else {
-                        0xBF // SST 39VF512 (or 0xC2 Macronix)
-                    }
-                }
-                0x0001 => {
-                    if self.is_128k {
-                        0x13 // Sanyo 128KB (0x09 Macronix)
-                    } else {
-                        0xD4 // SST 64KB
-                    }
-                }
+                0x0000 => id.manufacturer,
+                0x0001 => id.device,
                 _ => 0xFF,
             };
         }
@@ -534,11 +582,44 @@ fn default_gyro_center() -> u16 {
     0x06C0
 }
 
+const CRC32_TABLE: [u32; 256] = {
+    let mut table = [0u32; 256];
+    let mut i = 0usize;
+    while i < 256 {
+        let mut crc = i as u32;
+        let mut bit = 0;
+        while bit < 8 {
+            if (crc & 1) != 0 {
+                crc = (crc >> 1) ^ 0xEDB8_8320;
+            } else {
+                crc >>= 1;
+            }
+            bit += 1;
+        }
+        table[i] = crc;
+        i += 1;
+    }
+    table
+};
+
+#[inline]
+pub fn crc32_ieee(data: &[u8]) -> u32 {
+    let mut crc = 0xFFFF_FFFFu32;
+    for &b in data {
+        crc = (crc >> 8) ^ CRC32_TABLE[((crc as u8) ^ b) as usize];
+    }
+    !crc
+}
+
 #[derive(Clone, Serialize, Deserialize)]
 pub struct Cartridge {
     #[serde(skip)]
     pub rom: Vec<u8>,
     pub rom_size_mask: usize,
+    #[serde(default)]
+    pub rom_crc32: u32,
+    #[serde(default)]
+    pub idle_loop_addr: Option<u32>,
     #[serde(with = "box_bytes")]
     pub sram: Box<[u8; 0x20000]>,
     pub save_type: SaveType,
@@ -588,25 +669,49 @@ impl Cartridge {
     pub fn new(mut rom: Vec<u8>) -> Self {
         let orig_len = rom.len();
         let mapper = Self::detect_mapper(&rom);
-        let save_type = Self::detect_save_type(&rom);
-        let code3 = if orig_len >= 0xB0 { &rom[0xAC..0xAF] } else { b"---" };
-        let solar_enabled = matches!(code3, b"U3I" | b"U32" | b"U33");
-        let tilt_enabled = code3 == b"KYG";
-        let gyro_enabled = code3 == b"RZW";
-        let rumble_enabled = code3 == b"RZW" || code3 == b"V49";
+        let db_entry = if orig_len >= 0xB0 {
+            crate::gamedb::lookup_bytes(&rom[0xAC..0xB0])
+        } else {
+            None
+        };
+        let (save_type, has_rtc, solar_enabled, tilt_enabled, gyro_enabled, rumble_enabled, idle_loop_addr) =
+            if let Some(entry) = db_entry {
+                (
+                    entry.save_type,
+                    entry.has_rtc,
+                    entry.solar,
+                    entry.tilt,
+                    entry.gyro,
+                    entry.rumble,
+                    entry.idle_loop_addr,
+                )
+            } else {
+                let code3 = if orig_len >= 0xB0 { &rom[0xAC..0xAF] } else { b"---" };
+                (
+                    Self::detect_save_type(&rom),
+                    Self::detect_rtc(&rom),
+                    matches!(code3, b"U3I" | b"U32" | b"U33"),
+                    code3 == b"KYG",
+                    code3 == b"RZW",
+                    code3 == b"RZW" || code3 == b"V49",
+                    None,
+                )
+            };
 
         // Pad non-power-of-two small test ROMs cleanly up to >= 16KB or next power/multiple if tiny,
         // preserving exact ROM bounds behavior for open-bus / mirrored reads.
         if rom.is_empty() {
             rom.resize(4, 0);
         }
+        let rom_crc32 = crc32_ieee(&rom);
 
         let is_128k = save_type == SaveType::Flash128K;
         let is_eeprom_8k = save_type == SaveType::Eeprom8K;
-        let has_rtc = Self::detect_rtc(&rom);
 
         Self {
             rom_size_mask: orig_len,
+            rom_crc32,
+            idle_loop_addr,
             rom,
             sram: alloc_boxed_array(0xFFu8),
             save_type,
@@ -688,6 +793,10 @@ impl Cartridge {
         let eff = self.effective_save_type();
         self.flash.is_128k = eff == SaveType::Flash128K;
         self.eeprom.detected_8k = eff == SaveType::Eeprom8K;
+    }
+
+    pub fn set_flash_id_override(&mut self, id: Option<FlashChipId>) {
+        self.flash.set_id_override(id);
     }
 
     pub fn load_save_data(&mut self, data: &[u8]) {

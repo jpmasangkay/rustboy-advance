@@ -11,6 +11,7 @@ pub mod apu;
 pub mod bus;
 pub mod cartridge;
 pub mod cpu;
+pub mod gamedb;
 pub mod hw;
 pub mod ppu;
 pub mod serde_helpers;
@@ -211,6 +212,8 @@ impl GbaCore {
         let rom = core::mem::take(&mut self.bus.cart.rom);
         let save_type = self.bus.cart.save_type;
         let save_type_override = self.bus.cart.save_type_override;
+        let flash_id_override = self.bus.cart.flash.id_override;
+        let idle_loop_addr = self.bus.cart.idle_loop_addr;
         let rtc_override = self.bus.cart.rtc_override;
         let solar_lux = self.bus.cart.solar_lux;
         let solar_enabled = self.bus.cart.solar_enabled;
@@ -230,6 +233,8 @@ impl GbaCore {
         *self = Self::new(bios, rom);
         self.bus.cart.save_type = save_type;
         self.bus.cart.set_save_type_override(save_type_override);
+        self.bus.cart.set_flash_id_override(flash_id_override);
+        self.bus.cart.idle_loop_addr = idle_loop_addr;
         self.bus.cart.rtc_override = rtc_override;
         self.bus.cart.solar_lux = solar_lux;
         self.bus.cart.solar_enabled = solar_enabled;

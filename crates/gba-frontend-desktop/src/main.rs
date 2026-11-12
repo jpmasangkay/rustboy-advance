@@ -13,6 +13,7 @@ mod input;
 mod library;
 mod lua_engine;
 mod menus;
+mod retroachievements;
 mod rewind;
 mod rom_loader;
 mod savestates;

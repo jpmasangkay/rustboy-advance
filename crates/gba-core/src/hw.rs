@@ -18,6 +18,7 @@ pub const IRQ_DMA2: u16 = 1 << 10;
 pub const IRQ_DMA3: u16 = 1 << 11;
 pub const IRQ_KEYPAD: u16 = 1 << 12;
 pub const IRQ_GAMEPAK: u16 = 1 << 13;
+pub const IRQ_STOP_WAKE_MASK: u16 = IRQ_KEYPAD | IRQ_GAMEPAK | IRQ_SERIAL;
 
 const TIMER_PRESCALERS: [u64; 4] = [1, 64, 256, 1024];
 
@@ -129,6 +130,8 @@ pub struct HardwareControl {
     pub waitcnt: u16,
     pub postflg: u8,
     pub halt_requested: bool,
+    #[serde(default)]
+    pub stop_requested: bool,
 
     pub keyinput: u16,
     pub keycnt: u16,
@@ -152,6 +155,7 @@ impl HardwareControl {
             waitcnt: 0x0000,
             postflg: 0,
             halt_requested: false,
+            stop_requested: false,
             keyinput: 0x03FF,
             keycnt: 0,
             key_irq_latch: false,
@@ -199,6 +203,14 @@ impl HardwareControl {
 
     pub fn recompute_active_dma(&mut self) {
         self.active_dma = (0u8..4).find(|&ch| self.dma[ch as usize].active);
+    }
+
+    pub fn shift_timers_by(&mut self, delta: u64) {
+        for t in self.timers.iter_mut() {
+            if t.running_non_cascade {
+                t.start_cycle = t.start_cycle.saturating_add(delta);
+            }
+        }
     }
 
     pub fn current_timer_counter(&self, ch: usize, current_cycle: u64) -> u16 {
@@ -565,6 +577,8 @@ impl SysBus {
         if off == 0x0400_0301 {
             if (val & 0x80) == 0 {
                 self.hw.halt_requested = true;
+            } else {
+                self.hw.stop_requested = true;
             }
             return;
         }
@@ -1025,7 +1039,8 @@ impl SysBus {
             }
             0x03 => {
                 // Stop
-                cpu.halted = true;
+                cpu.stopped = true;
+                cpu.halted = false;
                 cpu.return_from_swi(self);
             }
             0x04 | 0x05 => {

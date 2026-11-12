@@ -68,6 +68,8 @@ pub struct Arm7tdmi {
     pub spsr_banked: [u32; 6],
     pub pipeline: [u32; 2],
     pub halted: bool,
+    #[serde(default)]
+    pub stopped: bool,
     pub intr_wait: Option<u16>,
     #[serde(default)]
     pub pipeline_flushed: bool,
@@ -87,6 +89,7 @@ impl Arm7tdmi {
             spsr_banked: [0; 6],
             pipeline: [0; 2],
             halted: false,
+            stopped: false,
             intr_wait: None,
             pipeline_flushed: false,
             flush_cycles: 0,
@@ -251,6 +254,7 @@ impl Arm7tdmi {
 
     pub fn trigger_irq(&mut self, bus: &mut SysBus) {
         self.halted = false;
+        self.stopped = false;
         let lr_irq = if self.is_thumb() {
             self.gpr[15] // A + 4
         } else {

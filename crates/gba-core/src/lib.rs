@@ -176,6 +176,18 @@ impl Scheduler {
         }
         self.next_event_cycle = min_cycle;
     }
+
+    pub fn shift_by(&mut self, delta: u64) {
+        self.current_cycle = self.current_cycle.saturating_add(delta);
+        if self.next_event_cycle != u64::MAX {
+            self.next_event_cycle = self.next_event_cycle.saturating_add(delta);
+        }
+        for ev in self.events.iter_mut() {
+            if ev.active && ev.cycle != u64::MAX {
+                ev.cycle = ev.cycle.saturating_add(delta);
+            }
+        }
+    }
 }
 
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
@@ -277,6 +289,9 @@ impl GbaCore {
         let boot_ewram = self.bus.iwram[0x7FFA] != 0;
         self.bus.iwram[0x7E00..0x8000].fill(0);
         self.cpu.halted = false;
+        self.cpu.stopped = false;
+        self.bus.hw.halt_requested = false;
+        self.bus.hw.stop_requested = false;
         self.bus.hw.ime = 0;
         self.bus.hw.ie = 0;
         self.bus.hw.if_flag = 0;
@@ -307,9 +322,27 @@ impl GbaCore {
             self.bus.dispatch_event(ev_cycle, kind);
         }
 
+        if self.bus.hw.stop_requested {
+            self.cpu.stopped = true;
+            self.cpu.halted = false;
+            self.bus.hw.stop_requested = false;
+        }
         if self.bus.hw.halt_requested {
-            self.cpu.halted = true;
+            if !self.cpu.stopped {
+                self.cpu.halted = true;
+            }
             self.bus.hw.halt_requested = false;
+        }
+
+        if self.cpu.stopped {
+            if (self.bus.hw.ie & self.bus.hw.if_flag & hw::IRQ_STOP_WAKE_MASK) != 0 {
+                self.cpu.stopped = false;
+            } else {
+                self.bus.scheduler.shift_by(4);
+                self.bus.hw.shift_timers_by(4);
+                self.bus.ppu.framebuffer.fill(0x7FFF);
+                return;
+            }
         }
 
         if self.bus.hw.active_dma.is_some() {
@@ -375,9 +408,37 @@ impl GbaCore {
                 self.bus.ppu.frame_ready = false;
             }
 
+            if self.bus.hw.stop_requested {
+                self.cpu.stopped = true;
+                self.cpu.halted = false;
+                self.bus.hw.stop_requested = false;
+            }
             if self.bus.hw.halt_requested {
-                self.cpu.halted = true;
+                if !self.cpu.stopped {
+                    self.cpu.halted = true;
+                }
                 self.bus.hw.halt_requested = false;
+            }
+
+            if self.cpu.stopped {
+                if (self.bus.hw.ie & self.bus.hw.if_flag & hw::IRQ_STOP_WAKE_MASK) != 0 {
+                    self.cpu.stopped = false;
+                } else {
+                    let delta = end_cycle.saturating_sub(self.bus.scheduler.current_cycle).max(1);
+                    self.bus.scheduler.shift_by(delta);
+                    self.bus.hw.shift_timers_by(delta);
+                    self.bus.ppu.framebuffer.fill(0x7FFF);
+                    self.bus.ppu.frame_ready = false;
+                    frontend.present_frame(&self.bus.ppu.framebuffer);
+                    if !self.bus.apu.output_buffer.is_empty() {
+                        frontend.push_audio_samples(&self.bus.apu.output_buffer);
+                        self.bus.apu.output_buffer.clear();
+                    }
+                    let silence_samples = ((delta / APU_SAMPLE_INTERVAL).max(1) as usize) * 2;
+                    let silence = alloc::vec![0i16; silence_samples];
+                    frontend.push_audio_samples(&silence);
+                    return None;
+                }
             }
 
             if self.bus.hw.active_dma.is_some() {

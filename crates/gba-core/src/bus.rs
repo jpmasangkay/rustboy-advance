@@ -586,12 +586,12 @@ impl SysBus {
     #[inline]
     fn read_rom_half_raw(&self, aligned: u32) -> u16 {
         let page = (aligned >> 14) as usize;
-        if page < 16384 {
-            if let Some(ptr) = self.fastmem_read[page] {
-                let off = (aligned & 0x3FFE) as usize;
-                let bytes = unsafe { core::slice::from_raw_parts(ptr.as_ptr().add(off), 2) };
-                return u16::from_le_bytes([bytes[0], bytes[1]]);
-            }
+        if page < 16384
+            && let Some(ptr) = self.fastmem_read[page]
+        {
+            let off = (aligned & 0x3FFE) as usize;
+            let bytes = unsafe { core::slice::from_raw_parts(ptr.as_ptr().add(off), 2) };
+            return u16::from_le_bytes([bytes[0], bytes[1]]);
         }
         self.cart.read_rom_16(aligned)
     }
@@ -599,12 +599,12 @@ impl SysBus {
     #[inline]
     fn read_rom_word_raw(&self, aligned: u32) -> u32 {
         let page = (aligned >> 14) as usize;
-        if page < 16384 {
-            if let Some(ptr) = self.fastmem_read[page] {
-                let off = (aligned & 0x3FFC) as usize;
-                let bytes = unsafe { core::slice::from_raw_parts(ptr.as_ptr().add(off), 4) };
-                return u32::from_le_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]);
-            }
+        if page < 16384
+            && let Some(ptr) = self.fastmem_read[page]
+        {
+            let off = (aligned & 0x3FFC) as usize;
+            let bytes = unsafe { core::slice::from_raw_parts(ptr.as_ptr().add(off), 4) };
+            return u32::from_le_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]);
         }
         self.cart.read_rom_32(aligned)
     }

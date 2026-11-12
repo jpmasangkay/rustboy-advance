@@ -282,10 +282,8 @@ impl Ppu {
                     self.render_mode4_bg(x0, x1);
                 }
             }
-            5 => {
-                if (self.dispcnt & 0x0400) != 0 {
-                    self.render_mode5_bg(x0, x1);
-                }
+            5 if (self.dispcnt & 0x0400) != 0 => {
+                self.render_mode5_bg(x0, x1);
             }
             _ => {}
         }
@@ -713,9 +711,9 @@ impl Ppu {
         let any_win = win0_en || win1_en || objwin_en;
 
         let bld_mode = (self.bldcnt >> 6) & 0x03;
-        let eva = (self.bldalpha & 0x1F).min(16) as u16;
-        let evb = ((self.bldalpha >> 8) & 0x1F).min(16) as u16;
-        let evy = (self.bldy & 0x1F).min(16) as u16;
+        let eva = (self.bldalpha & 0x1F).min(16);
+        let evb = ((self.bldalpha >> 8) & 0x1F).min(16);
+        let evy = (self.bldy & 0x1F).min(16);
 
         let bg_prios = [
             (self.bgcnt[0] & 3) as u8,

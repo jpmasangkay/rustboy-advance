@@ -871,10 +871,10 @@ impl Cartridge {
                 || self.solar_enabled
                 || self.gyro_enabled
                 || self.rumble_enabled;
-            if gpio_allowed {
-                if let Some(gpio_val) = self.rtc.read(addr) {
-                    return gpio_val;
-                }
+            if gpio_allowed
+                && let Some(gpio_val) = self.rtc.read(addr)
+            {
+                return gpio_val;
             }
         }
         let offset = (addr as usize) & 0x01FF_FFFE;

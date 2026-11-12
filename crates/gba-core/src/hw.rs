@@ -312,26 +312,26 @@ impl SysBus {
         let mut changed = false;
         for ch in 0..4 {
             let dma = &mut self.hw.dma[ch];
-            if dma.enabled() && dma.timing() == timing {
-                if !dma.active {
-                    dma.int_count = if dma.count == 0 {
-                        if ch == 3 { 0x10000 } else { 0x4000 }
-                    } else if ch < 3 {
-                        (dma.count as u32) & 0x3FFF
-                    } else {
-                        dma.count as u32
-                    };
-                    if ch < 3 && dma.int_count == 0 {
-                        dma.int_count = 0x4000;
-                    }
-                    let dest_ctrl = (dma.cnt >> 5) & 0x03;
-                    if dest_ctrl == 3 {
-                        dma.int_dad = dma.dad;
-                    }
-                    dma.active = true;
-                    dma.first_unit = true;
-                    changed = true;
+            if dma.enabled() && dma.timing() == timing
+                && !dma.active
+            {
+                dma.int_count = if dma.count == 0 {
+                    if ch == 3 { 0x10000 } else { 0x4000 }
+                } else if ch < 3 {
+                    (dma.count as u32) & 0x3FFF
+                } else {
+                    dma.count as u32
+                };
+                if ch < 3 && dma.int_count == 0 {
+                    dma.int_count = 0x4000;
                 }
+                let dest_ctrl = (dma.cnt >> 5) & 0x03;
+                if dest_ctrl == 3 {
+                    dma.int_dad = dma.dad;
+                }
+                dma.active = true;
+                dma.first_unit = true;
+                changed = true;
             }
         }
         if changed {
@@ -993,10 +993,7 @@ impl SysBus {
                         self.hw.timers[ch].counter = self.hw.timers[ch].reload;
                         // 2-cycle startup latency on 0->1 enable transition
                         self.reschedule_timer(ch, now_cycle + 2);
-                    } else if was_en && now_en {
-                        self.hw.timers[ch].counter = cur;
-                        self.reschedule_timer(ch, now_cycle);
-                    } else if !now_en {
+                    } else {
                         self.hw.timers[ch].counter = cur;
                         self.reschedule_timer(ch, now_cycle);
                     }
@@ -1019,24 +1016,23 @@ impl SysBus {
 
                 let start_requested =
                     !was_busy && (cleaned & 0x0080) != 0 && (self.hw.rcnt & 0x8000) == 0;
-                if start_requested {
-                    if let Some((mode, duration)) = HardwareControl::sio_transfer_duration(cleaned)
-                    {
-                        if self.hw.link_connected {
-                            self.hw.pending_sio_transfer = Some(SioTransfer {
-                                mode,
-                                siocnt: cleaned,
-                                data8_or_send: self.hw.siodata8,
-                                data32: u32::from(self.hw.siomulti[0])
-                                    | (u32::from(self.hw.siomulti[1]) << 16),
-                                duration_cycles: duration,
-                            });
-                        } else if duration > 0 {
-                            self.scheduler.schedule(
-                                self.scheduler.current_cycle + duration,
-                                EventType::SioTransferComplete,
-                            );
-                        }
+                if start_requested
+                    && let Some((mode, duration)) = HardwareControl::sio_transfer_duration(cleaned)
+                {
+                    if self.hw.link_connected {
+                        self.hw.pending_sio_transfer = Some(SioTransfer {
+                            mode,
+                            siocnt: cleaned,
+                            data8_or_send: self.hw.siodata8,
+                            data32: u32::from(self.hw.siomulti[0])
+                                | (u32::from(self.hw.siomulti[1]) << 16),
+                            duration_cycles: duration,
+                        });
+                    } else if duration > 0 {
+                        self.scheduler.schedule(
+                            self.scheduler.current_cycle + duration,
+                            EventType::SioTransferComplete,
+                        );
                     }
                 }
             }
@@ -1422,7 +1418,7 @@ impl SysBus {
                 self.hle_rl_uncomp(cpu.gpr[0], cpu.gpr[1], is_vram);
                 cpu.return_from_swi(self);
             }
-            0x16 | 0x17 | 0x18 => {
+            0x16..=0x18 => {
                 // Diff8bitUnFilterWram / Diff8bitUnFilterVram / Diff16bitUnFilter
                 self.hle_diff_unfilter(cpu.gpr[0], cpu.gpr[1], comment);
                 cpu.return_from_swi(self);

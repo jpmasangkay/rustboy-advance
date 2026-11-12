@@ -508,7 +508,7 @@ impl SysBus {
 
         // Audio FIFO sampling on Timer 0 or 1
         if ch <= 1 {
-            let (req_a, req_b) = self.apu.on_timer_overflow(ch as u8);
+            let (req_a, req_b) = self.apu.on_timer_overflow(ch as u8, ev_cycle);
             if req_a {
                 for dma_ch in 1..=2 {
                     if (self.hw.dma[dma_ch].dad & !3) == 0x0400_00A0 {
@@ -588,7 +588,10 @@ impl SysBus {
             0x0400_007C => self.apu.noise.reg_h & 0x40FF,
             0x0400_0080 => self.apu.soundcnt_l,
             0x0400_0082 => self.apu.soundcnt_h,
-            0x0400_0084 => self.apu.read_soundcnt_x(),
+            0x0400_0084 => {
+                self.apu.sync(self.scheduler.current_cycle);
+                self.apu.read_soundcnt_x()
+            }
             0x0400_0088 => self.apu.soundbias,
             0x0400_0090..=0x0400_009E => {
                 let idx = (off - 0x0400_0090) as usize;
@@ -660,7 +663,10 @@ impl SysBus {
             return;
         }
         if (0x0400_0090..=0x0400_009F).contains(&off) {
+            let cycle = self.scheduler.current_cycle;
+            self.apu.sync(cycle);
             self.apu.wave.write_wave_ram((off - 0x0400_0090) as usize, val);
+            self.apu.commit_mix(cycle);
             return;
         }
         if (0x0400_00A0..=0x0400_00A3).contains(&off) {
@@ -674,6 +680,10 @@ impl SysBus {
 
         // Read-modify-write for 16-bit register byte writes
         let aligned = off & !1;
+        let is_apu_byte = (0x0400_0060..=0x0400_0088).contains(&aligned);
+        if is_apu_byte {
+            self.apu.sync(self.scheduler.current_cycle);
+        }
         let cur = self.read_io_16_for_rmw(aligned);
         let new_val = if (off & 1) == 0 {
             (cur & 0xFF00) | (val as u16)
@@ -726,6 +736,9 @@ impl SysBus {
                 self.hw.if_flag &= !clear_mask;
             }
             _ => self.write_io_16(aligned, new_val),
+        }
+        if is_apu_byte {
+            self.apu.commit_mix(self.scheduler.current_cycle);
         }
     }
 
@@ -794,6 +807,11 @@ impl SysBus {
                 self.hw.memcnt = (self.hw.memcnt & 0x0000_FFFF) | ((val as u32) << 16);
             }
             return;
+        }
+
+        let is_apu = (0x0400_0060..=0x0400_009E).contains(&off);
+        if is_apu {
+            self.apu.sync(self.scheduler.current_cycle);
         }
 
         match off {
@@ -1068,6 +1086,9 @@ impl SysBus {
             }
             _ => {}
         }
+        if is_apu {
+            self.apu.commit_mix(self.scheduler.current_cycle);
+        }
     }
 
     pub fn hle_swi(&mut self, cpu: &mut Arm7tdmi, comment: u8) {
@@ -1137,7 +1158,10 @@ impl SysBus {
                     self.hw.rcnt = 0x8000;
                 }
                 if (flags & 0x40) != 0 {
+                    let cycle = self.scheduler.current_cycle;
+                    self.apu.sync(cycle);
                     self.apu.write_soundcnt_x(0);
+                    self.apu.commit_mix(cycle);
                 }
                 if (flags & 0x80) != 0 {
                     self.ppu.dispcnt = 0;

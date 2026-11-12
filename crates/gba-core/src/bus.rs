@@ -7,7 +7,7 @@ use crate::cartridge::{Cartridge, SaveType};
 use crate::hw::{HardwareControl, IRQ_HBLANK, IRQ_SERIAL, IRQ_VBLANK, IRQ_VCOUNT, SioResponse};
 use crate::ppu::Ppu;
 use crate::serde_helpers::{alloc_boxed_array, box_bytes};
-use crate::{APU_SAMPLE_INTERVAL, EventType, Scheduler};
+use crate::{APU_FRAME_SEQ_INTERVAL, EventType, Scheduler};
 
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
 pub enum WatchpointKind {
@@ -161,7 +161,7 @@ impl SysBus {
 
         let mut scheduler = Scheduler::new();
         scheduler.schedule(960, EventType::PpuHDrawEnd);
-        scheduler.schedule(APU_SAMPLE_INTERVAL, EventType::ApuSampleTick);
+        scheduler.schedule(APU_FRAME_SEQ_INTERVAL, EventType::ApuSampleTick);
 
         let mut bus = Self {
             bios: bios_buf,
@@ -415,9 +415,9 @@ impl SysBus {
                 }
             }
             EventType::ApuSampleTick => {
-                self.apu.step_sample_tick();
+                self.apu.on_frame_sequencer_tick(ev_cycle);
                 self.scheduler
-                    .schedule(ev_cycle + APU_SAMPLE_INTERVAL, EventType::ApuSampleTick);
+                    .schedule(ev_cycle + APU_FRAME_SEQ_INTERVAL, EventType::ApuSampleTick);
             }
             EventType::SioTransferComplete => {
                 self.complete_sio_no_cable();

@@ -8,6 +8,7 @@
 extern crate alloc;
 
 pub mod apu;
+pub mod blip;
 pub mod bus;
 pub mod cartridge;
 pub mod cpu;
@@ -29,8 +30,9 @@ pub const CYCLES_PER_SCANLINE: u64 = 1_232;
 pub const CYCLES_PER_FRAME: u64 = 280_896;
 pub const LCD_WIDTH: usize = 240;
 pub const LCD_HEIGHT: usize = 160;
-pub const SAMPLE_RATE_HZ: u32 = 32_768;
+pub const SAMPLE_RATE_HZ: u32 = 48_000;
 pub const APU_SAMPLE_INTERVAL: u64 = 512; // 16_777_216 / 32_768
+pub const APU_FRAME_SEQ_INTERVAL: u64 = 32_768; // 512 Hz PSG frame sequencer
 
 // Active-high masks to construct active-low KEYINPUT register via `encode_keyinput`.
 pub const KEY_A: u16 = 1 << 0;
@@ -307,6 +309,7 @@ impl GbaCore {
         let chan_mask = self.bus.apu.channel_enable_mask;
         let master_vol = self.bus.apu.master_volume_pct;
         let idle_skip_enabled = self.idle_skip_enabled;
+        let fifo_interp = self.bus.apu.fifo_interpolation;
 
         *self = Self::new(bios, rom);
         self.idle_skip_enabled = idle_skip_enabled;
@@ -329,6 +332,7 @@ impl GbaCore {
         self.bus.ppu.layer_enable_mask = layer_mask;
         self.bus.apu.channel_enable_mask = chan_mask;
         self.bus.apu.master_volume_pct = master_vol;
+        self.bus.apu.fifo_interpolation = fifo_interp;
     }
 
     /// Mimics GBA SWI 0x00 SoftReset: resets stacks, clears top 0x200 bytes of IWRAM, and restarts entry.
@@ -413,8 +417,10 @@ impl GbaCore {
                 let delta = halt_end_cycle
                     .map(|end| end.saturating_sub(self.bus.scheduler.current_cycle).max(1))
                     .unwrap_or(4);
+                self.bus.apu.flush(self.bus.scheduler.current_cycle);
                 self.bus.scheduler.shift_by(delta);
                 self.bus.hw.shift_timers_by(delta);
+                self.bus.apu.on_stop_shift(self.bus.scheduler.current_cycle);
                 self.bus.ppu.framebuffer.fill(0x7FFF);
                 if halt_end_cycle.is_some() {
                     return InternalStep::StoppedFrame(delta);
@@ -737,7 +743,10 @@ impl GbaCore {
                         frontend.push_audio_samples(&self.bus.apu.output_buffer);
                         self.bus.apu.output_buffer.clear();
                     }
-                    let silence_samples = ((delta / APU_SAMPLE_INTERVAL).max(1) as usize) * 2;
+                    let silence_samples = ((delta * u64::from(SAMPLE_RATE_HZ))
+                        / u64::from(CPU_CLOCK_HZ))
+                    .max(1) as usize
+                        * 2;
                     let silence = alloc::vec![0i16; silence_samples];
                     frontend.push_audio_samples(&silence);
                     if has_watchpoints {
@@ -746,6 +755,7 @@ impl GbaCore {
                     return StopReason::FrameComplete;
                 }
                 InternalStep::DebugStop(reason) => {
+                    self.bus.apu.flush(self.bus.scheduler.current_cycle);
                     if !self.bus.apu.output_buffer.is_empty() {
                         frontend.push_audio_samples(&self.bus.apu.output_buffer);
                         self.bus.apu.output_buffer.clear();
@@ -767,6 +777,7 @@ impl GbaCore {
             self.bus.ppu.frame_ready = false;
         }
 
+        self.bus.apu.flush(self.bus.scheduler.current_cycle);
         if !self.bus.apu.output_buffer.is_empty() {
             frontend.push_audio_samples(&self.bus.apu.output_buffer);
             self.bus.apu.output_buffer.clear();

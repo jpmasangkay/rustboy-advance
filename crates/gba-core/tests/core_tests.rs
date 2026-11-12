@@ -404,3 +404,355 @@ fn cartridge_save_override_and_boktai_yoshi_warioware_peripherals() {
     }
     assert_eq!(shifted, 0x0A53);
 }
+
+fn setup_dma1_fifo_a_sine(core: &mut GbaCore, ewram_bytes: usize, amplitude: f64, period_samples: f64) {
+    for i in 0..ewram_bytes {
+        let angle = core::f64::consts::TAU * (i as f64) / period_samples;
+        let sample = (angle.sin() * amplitude).round().clamp(-127.0, 127.0) as i8;
+        core.bus
+            .write_8(0x0200_0000 + i as u32, sample as u8, AccessType::NonSequential);
+    }
+
+    // Master enable, FIFO A 100% vol + L/R enabled + Timer 0 selected, PSG 100%
+    core.bus.write_io_16(0x0400_0084, 0x0080);
+    core.bus.write_io_16(0x0400_0080, 0x0000);
+    core.bus.write_io_16(0x0400_0082, 0x0306); // DMA A 100% (bit 2), L/R (bits 8-9), Timer 0 (bit 10=0)
+
+    // DMA1: SAD=0x0200_0000, DAD=0x0400_00A0 (FIFO_A), repeat + 32-bit + FIFO timing + enable
+    core.bus.write_io_16(0x0400_00BC, 0x0000);
+    core.bus.write_io_16(0x0400_00BE, 0x0200);
+    core.bus.write_io_16(0x0400_00C0, 0x00A0);
+    core.bus.write_io_16(0x0400_00C2, 0x0400);
+    core.bus.write_io_16(0x0400_00C4, 0x0004);
+    core.bus.write_io_16(0x0400_00C6, 0xB640);
+
+    // Timer 0 at ~18,157 Hz: 16,777,216 / 924 = 18,157.16 Hz -> reload = 65536 - 924 = 0xFC64
+    core.bus.write_io_16(0x0400_0100, 0xFC64);
+    core.bus.write_io_16(0x0400_0102, 0x0080);
+}
+
+fn dft_spectrum_power_bh(samples: &[f64]) -> Vec<f64> {
+    let n = samples.len();
+    let nf = n as f64;
+    let denom = (n - 1) as f64;
+    let tau = core::f64::consts::TAU;
+    let windowed: Vec<f64> = samples
+        .iter()
+        .enumerate()
+        .map(|(i, &x)| {
+            let p = tau * (i as f64) / denom;
+            let w = 0.35875 - 0.48829 * p.cos() + 0.14128 * (2.0 * p).cos() - 0.01168 * (3.0 * p).cos();
+            x * w
+        })
+        .collect();
+
+    let mut powers = vec![0.0f64; n / 2 + 1];
+    for (k, power_out) in powers.iter_mut().enumerate() {
+        let mut re = 0.0f64;
+        let mut im = 0.0f64;
+        let d_angle = tau * (k as f64) / nf;
+        let (ds, dc) = d_angle.sin_cos();
+        let mut c = 1.0f64;
+        let mut s = 0.0f64;
+        for &xw in &windowed {
+            re += xw * c;
+            im -= xw * s;
+            let next_c = c * dc - s * ds;
+            let next_s = s * dc + c * ds;
+            c = next_c;
+            s = next_s;
+        }
+        *power_out = re * re + im * im;
+    }
+    powers
+}
+
+#[test]
+fn apu_high_freq_square_wave_suppresses_aliasing() {
+    let rom = rom_from_arm_words(&[0xEAFF_FFFE]);
+    let mut core = GbaCore::new(None, rom);
+
+    // SQ1 at 10,922.67 Hz (freq = 2048 - 12 = 2036 = 0x7F4):
+    // Odd harmonics >= 3 (32,768 Hz, 54,613 Hz, ...) exceed 24 kHz Nyquist.
+    core.bus.write_io_16(0x0400_0084, 0x0080);
+    core.bus.write_io_16(0x0400_0080, 0x1177);
+    core.bus.write_io_16(0x0400_0082, 0x0002);
+    core.bus.write_io_16(0x0400_0060, 0x0000);
+    core.bus.write_io_16(0x0400_0062, 0xF080); // vol=15, 50% duty
+    core.bus.write_io_16(0x0400_0064, 0x87F4);
+
+    let mut fe = AudioCaptureFrontend::new();
+    for _ in 0..4 {
+        fe.samples.clear();
+        core.run_frame(&mut fe);
+    }
+
+    let mut mono = Vec::with_capacity(2048);
+    while mono.len() < 2048 {
+        fe.samples.clear();
+        core.run_frame(&mut fe);
+        for &s in fe.samples.iter().step_by(2) {
+            if mono.len() < 2048 {
+                mono.push(s as f64);
+            }
+        }
+    }
+
+    let spectrum = dft_spectrum_power_bh(&mono);
+    // Fundamental bin: 10922.667 * 2048 / 48000 = 466.034 (4-term BH lobe +-4 bins)
+    let fund_power: f64 = spectrum[462..=470].iter().sum();
+    let alias_power: f64 = spectrum[5..=1024]
+        .iter()
+        .enumerate()
+        .filter(|&(idx, _)| !(462..=470).contains(&(idx + 5)))
+        .map(|(_, &p)| p)
+        .sum();
+
+    assert!(fund_power > 1e10, "expected strong 10.92 kHz fundamental, got {fund_power}");
+    let alias_ratio = alias_power / fund_power;
+    assert!(
+        alias_ratio < 1e-4,
+        "expected >40 dB suppression of above-Nyquist aliases, got ratio={alias_ratio:.6e} (fund={fund_power:.3e}, alias={alias_power:.3e})"
+    );
+
+    // Also test an ultrasonic 26,214.4 Hz square wave (freq = 2048 - 5 = 2043 = 0x7FB)
+    // which lies entirely above 24 kHz Nyquist and must attenuate strongly.
+    core.bus.write_io_16(0x0400_0064, 0x87FB);
+    for _ in 0..4 {
+        fe.samples.clear();
+        core.run_frame(&mut fe);
+    }
+    fe.samples.clear();
+    core.run_frame(&mut fe);
+    let inband_rms = (mono.iter().map(|x| x * x).sum::<f64>() / mono.len() as f64).sqrt();
+    let ultra_rms = (fe
+        .samples
+        .iter()
+        .step_by(2)
+        .map(|&s| (s as f64) * (s as f64))
+        .sum::<f64>()
+        / (fe.samples.len() / 2) as f64)
+        .sqrt();
+    assert!(
+        ultra_rms < inband_rms * 0.05,
+        "expected ultrasonic 26.2 kHz square wave to be suppressed, ultra_rms={ultra_rms:.2}, inband_rms={inband_rms:.2}"
+    );
+}
+
+#[test]
+fn apu_fifo_18khz_steady_frame_output_and_interpolation() {
+    let rom = rom_from_arm_words(&[0xEAFF_FFFE]);
+
+    // 1. Non-interpolated 18,157 Hz FIFO playback
+    let mut core_raw = GbaCore::new(None, rom.clone());
+    setup_dma1_fifo_a_sine(&mut core_raw, 16_384, 64.0, 32.0); // ~567.4 Hz sine
+
+    let expected_pairs =
+        (gba_core::CYCLES_PER_FRAME as f64) * (gba_core::SAMPLE_RATE_HZ as f64)
+            / (gba_core::CPU_CLOCK_HZ as f64);
+    let mut fe = AudioCaptureFrontend::new();
+    let mut raw_mono = Vec::new();
+    for frame in 0..24 {
+        fe.samples.clear();
+        core_raw.run_frame(&mut fe);
+        assert_eq!(fe.samples.len() % 2, 0);
+        let pairs = fe.samples.len() / 2;
+        assert!(
+            (pairs as f64 - expected_pairs).abs() <= 1.0,
+            "frame {frame}: stereo pairs {pairs} drifted from expected {expected_pairs:.2}"
+        );
+        if frame >= 4 {
+            for &s in fe.samples.iter().step_by(2) {
+                raw_mono.push(s as f64);
+            }
+        }
+    }
+    assert!(
+        raw_mono.iter().any(|&s| s.abs() > 100.0),
+        "expected non-zero 18,157 Hz FIFO A output"
+    );
+
+    // 2. Interpolated 18,157 Hz FIFO playback reduces high-frequency sample-hold imaging
+    let mut core_interp = GbaCore::new(None, rom);
+    core_interp.bus.apu.fifo_interpolation = true;
+    setup_dma1_fifo_a_sine(&mut core_interp, 16_384, 64.0, 32.0);
+    let mut interp_mono = Vec::new();
+    for frame in 0..24 {
+        fe.samples.clear();
+        core_interp.run_frame(&mut fe);
+        if frame >= 4 {
+            for &s in fe.samples.iter().step_by(2) {
+                interp_mono.push(s as f64);
+            }
+        }
+    }
+
+    let raw_spec = dft_spectrum_power_bh(&raw_mono[..2048]);
+    let interp_spec = dft_spectrum_power_bh(&interp_mono[..2048]);
+    // Carrier imaging around f_s_fifo +- f0 (18,157 +- 567 Hz -> ~17.5..18.8 kHz -> bins 740..810)
+    let raw_img: f64 = raw_spec[740..=810].iter().sum();
+    let interp_img: f64 = interp_spec[740..=810].iter().sum();
+    assert!(
+        interp_img < raw_img * 0.25,
+        "expected fifo_interpolation to attenuate 18 kHz imaging spurs, raw_img={raw_img:.3e}, interp_img={interp_img:.3e}"
+    );
+}
+
+#[test]
+fn apu_silence_settles_to_zero_after_dc_blocker() {
+    let rom = rom_from_arm_words(&[0xEAFF_FFFE]);
+    let mut core = GbaCore::new(None, rom);
+
+    core.bus.write_io_16(0x0400_0084, 0x0080);
+    core.bus.write_io_16(0x0400_0080, 0x1177);
+    core.bus.write_io_16(0x0400_0082, 0x0002);
+    core.bus.write_io_16(0x0400_0060, 0x0000);
+    core.bus.write_io_16(0x0400_0062, 0xF080);
+    core.bus.write_io_16(0x0400_0064, 0x8500);
+
+    let mut fe = AudioCaptureFrontend::new();
+    for _ in 0..6 {
+        fe.samples.clear();
+        core.run_frame(&mut fe);
+    }
+    assert!(fe.samples.iter().any(|&s| s.abs() > 1000));
+
+    // Disable APU master sound -> hardware capacitor discharges smoothly to exact 0
+    core.bus.write_io_16(0x0400_0084, 0x0000);
+    for _ in 0..30 {
+        fe.samples.clear();
+        core.run_frame(&mut fe);
+    }
+    assert!(
+        !fe.samples.is_empty() && fe.samples.iter().all(|&s| s == 0),
+        "expected exact zero output after DC blocker settles, peak={}",
+        fe.samples.iter().map(|s| s.abs()).max().unwrap_or(0)
+    );
+}
+
+#[test]
+fn apu_individual_channel_masks_and_soundcnt_h_ratios() {
+    let rom = rom_from_arm_words(&[0xEAFF_FFFE]);
+    let mut core = GbaCore::new(None, rom);
+    setup_dma1_fifo_a_sine(&mut core, 32_768, 64.0, 32.0);
+    // Also trigger SQ1 so both FIFO A (bit 4) and SQ1 (bit 0) produce audio
+    core.bus.write_io_16(0x0400_0080, 0x1177);
+    core.bus.write_io_16(0x0400_0062, 0xF080);
+    core.bus.write_io_16(0x0400_0064, 0x8600);
+
+    let mut fe = AudioCaptureFrontend::new();
+    core.run_frame(&mut fe);
+    assert!(fe.samples.iter().any(|&s| s != 0));
+
+    // Mask out both active channels (bits 0 and 4) while keeping unused bits 1,2,3,5 enabled
+    core.bus.apu.channel_enable_mask = 0b10_1110;
+    for _ in 0..30 {
+        fe.samples.clear();
+        core.run_frame(&mut fe);
+    }
+    assert!(
+        fe.samples.iter().all(|&s| s == 0),
+        "expected silence when only active channels (SQ1 + FIFO A) are masked off"
+    );
+
+    // Unmask FIFO A only, verify SOUNDCNT_H 50% DMA ratio reduces energy vs 100%
+    core.bus.apu.channel_enable_mask = 0b01_0000;
+    core.bus.write_io_16(0x0400_0082, 0x0306); // DMA A = 100% (bit 2 = 1)
+    for _ in 0..4 {
+        fe.samples.clear();
+        core.run_frame(&mut fe);
+    }
+    let peak_100 = fe.samples.iter().map(|s| s.unsigned_abs()).max().unwrap_or(0);
+
+    core.bus.write_io_16(0x0400_0082, 0x0302); // DMA A = 50% (bit 2 = 0)
+    for _ in 0..4 {
+        fe.samples.clear();
+        core.run_frame(&mut fe);
+    }
+    let peak_50 = fe.samples.iter().map(|s| s.unsigned_abs()).max().unwrap_or(0);
+    assert!(
+        peak_100 > peak_50 && peak_50 > 0 && peak_50 * 2 <= peak_100 + 200,
+        "expected 50% DMA A ratio (~half of 100%), peak_100={peak_100}, peak_50={peak_50}"
+    );
+}
+
+#[test]
+fn apu_save_state_roundtrip_does_not_panic() {
+    let rom = rom_from_arm_words(&[0xEAFF_FFFE]);
+    let mut core = GbaCore::new(None, rom);
+    core.bus.apu.fifo_interpolation = true;
+    setup_dma1_fifo_a_sine(&mut core, 16_384, 64.0, 32.0);
+    core.bus.write_io_16(0x0400_0080, 0x1177);
+    core.bus.write_io_16(0x0400_0062, 0xF080);
+    core.bus.write_io_16(0x0400_0064, 0x8600);
+
+    let mut fe = AudioCaptureFrontend::new();
+    for _ in 0..4 {
+        fe.samples.clear();
+        core.run_frame(&mut fe);
+    }
+
+    let saved = core.save_state().expect("serialize GBA state with active APU");
+
+    // Mutate state significantly before restoring
+    core.bus.write_io_16(0x0400_0084, 0x0000);
+    core.bus.apu.fifo_interpolation = false;
+    for _ in 0..4 {
+        fe.samples.clear();
+        core.run_frame(&mut fe);
+    }
+
+    core.load_state(&saved).expect("deserialize GBA state with active APU");
+    assert!(
+        core.bus.apu.fifo_interpolation,
+        "fifo_interpolation flag should persist across save state roundtrip"
+    );
+
+    fe.samples.clear();
+    core.run_frame(&mut fe);
+    let expected_pairs =
+        (gba_core::CYCLES_PER_FRAME as f64) * (gba_core::SAMPLE_RATE_HZ as f64)
+            / (gba_core::CPU_CLOCK_HZ as f64);
+    let pairs = fe.samples.len() / 2;
+    assert!((pairs as f64 - expected_pairs).abs() <= 1.0);
+    assert!(
+        fe.samples.iter().any(|&s| s.abs() > 100),
+        "expected restored APU to continue emitting valid audio without panic or silence"
+    );
+}
+
+#[test]
+fn apu_soundbias_clamp_and_resolution() {
+    let rom = rom_from_arm_words(&[0xEAFF_FFFE]);
+    let mut core = GbaCore::new(None, rom);
+
+    // Enable loud SQ1 50% duty square wave (+-120 around center at PSG 100%, L/R vol 7)
+    core.bus.write_io_16(0x0400_0084, 0x0080);
+    core.bus.write_io_16(0x0400_0080, 0x1177);
+    core.bus.write_io_16(0x0400_0082, 0x0002);
+    core.bus.write_io_16(0x0400_0060, 0x0000);
+    core.bus.write_io_16(0x0400_0062, 0xF080);
+    core.bus.write_io_16(0x0400_0064, 0x8600);
+
+    let mut fe = AudioCaptureFrontend::new();
+    core.bus.write_io_16(0x0400_0088, 0x0200); // Default mid-bias 512, 9-bit resolution
+    for _ in 0..4 {
+        fe.samples.clear();
+        core.run_frame(&mut fe);
+    }
+    let peak_mid_bias = fe.samples.iter().map(|s| s.unsigned_abs()).max().unwrap_or(0);
+
+    // Raise SOUNDBIAS level to near top (0x03F0 = 1008): positive half-cycle clips heavily at 1023
+    core.bus.write_io_16(0x0400_0088, 0x03F0);
+    for _ in 0..4 {
+        fe.samples.clear();
+        core.run_frame(&mut fe);
+    }
+    let peak_clipped_bias = fe.samples.iter().map(|s| s.unsigned_abs()).max().unwrap_or(0);
+    assert!(
+        peak_mid_bias > peak_clipped_bias * 13 / 10 && peak_clipped_bias > 0,
+        "expected 10-bit saturation clamp at high SOUNDBIAS to reduce swing: mid={peak_mid_bias}, clipped={peak_clipped_bias}"
+    );
+}
+
+

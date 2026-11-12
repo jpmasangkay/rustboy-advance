@@ -1,7 +1,8 @@
 use alloc::vec::Vec;
 use serde::{Deserialize, Serialize};
 
-use crate::APU_SAMPLE_INTERVAL;
+use crate::blip::BlipBuf;
+use crate::{CPU_CLOCK_HZ, SAMPLE_RATE_HZ};
 
 const DUTY_TABLE: [[u8; 8]; 4] = [
     [0, 0, 0, 0, 0, 0, 0, 1], // 12.5%
@@ -9,6 +10,9 @@ const DUTY_TABLE: [[u8; 8]; 4] = [
     [1, 0, 0, 0, 0, 1, 1, 1], // 50%
     [0, 1, 1, 1, 1, 1, 1, 0], // 75%
 ];
+
+const SCOPE_INTERVAL_CYCLES: u64 = 512; // 32_768 Hz oscilloscope capture cadence
+const FIFO_INTERP_STEP_CYCLES: u64 = 128; // 131_072 Hz sub-stepping for smooth interpolated ramps
 
 #[derive(Clone, Serialize, Deserialize)]
 pub struct DmaAudioFifo {
@@ -19,6 +23,12 @@ pub struct DmaAudioFifo {
     pub active_latch: u32,
     pub latch_bytes_left: u8,
     pub current_sample: i8,
+    #[serde(default)]
+    pub prev_sample: i8,
+    #[serde(default)]
+    pub last_pop_cycle: u64,
+    #[serde(default)]
+    pub ramp_period: u64,
 }
 
 impl DmaAudioFifo {
@@ -31,6 +41,9 @@ impl DmaAudioFifo {
             active_latch: 0,
             latch_bytes_left: 0,
             current_sample: 0,
+            prev_sample: 0,
+            last_pop_cycle: 0,
+            ramp_period: 0,
         }
     }
 
@@ -42,6 +55,9 @@ impl DmaAudioFifo {
         self.active_latch = 0;
         self.latch_bytes_left = 0;
         self.current_sample = 0;
+        self.prev_sample = 0;
+        self.last_pop_cycle = 0;
+        self.ramp_period = 0;
     }
 
     pub fn push_word(&mut self, val: u32) {
@@ -70,6 +86,12 @@ impl DmaAudioFifo {
     /// Consumes 1 signed byte from active latch (or pops next 32-bit word).
     /// Returns `true` if remaining buffered words <= 4 (meaning <= 16 bytes -> DMA refill request).
     pub fn pop_sample(&mut self) -> bool {
+        self.pop_sample_at(self.last_pop_cycle)
+    }
+
+    /// Consumes 1 signed byte at exact CPU `cycle`, updating interpolation ramp state.
+    pub fn pop_sample_at(&mut self, cycle: u64) -> bool {
+        let prev_val = self.interpolated_sample(cycle).clamp(-128, 127) as i8;
         if self.latch_bytes_left == 0 {
             if self.count > 0 {
                 self.active_latch = self.buffer[self.read_idx as usize];
@@ -77,14 +99,47 @@ impl DmaAudioFifo {
                 self.count -= 1;
                 self.latch_bytes_left = 4;
             } else {
-                // FIFO empty: keep outputting last sample or 0.
+                // FIFO empty: keep holding last sample without ramping.
+                self.prev_sample = self.current_sample;
+                self.ramp_period = 0;
+                self.last_pop_cycle = cycle;
                 return true;
             }
         }
-        self.current_sample = (self.active_latch & 0xFF) as i8;
+
+        let new_sample = (self.active_latch & 0xFF) as i8;
         self.active_latch >>= 8;
         self.latch_bytes_left -= 1;
+
+        if self.last_pop_cycle > 0 && cycle > self.last_pop_cycle {
+            let dt = cycle - self.last_pop_cycle;
+            self.ramp_period = if (16..=16_384).contains(&dt) { dt } else { 0 };
+        } else {
+            self.ramp_period = 0;
+        }
+        self.prev_sample = prev_val;
+        self.current_sample = new_sample;
+        self.last_pop_cycle = cycle;
+
         self.count <= 4
+    }
+
+    #[inline]
+    pub fn is_ramping(&self, cycle: u64) -> bool {
+        self.ramp_period > 0
+            && self.current_sample != self.prev_sample
+            && cycle < self.last_pop_cycle.saturating_add(self.ramp_period)
+    }
+
+    #[inline]
+    pub fn interpolated_sample(&self, cycle: u64) -> i32 {
+        if self.ramp_period == 0 || cycle >= self.last_pop_cycle.saturating_add(self.ramp_period) {
+            return self.current_sample as i32;
+        }
+        let elapsed = cycle.saturating_sub(self.last_pop_cycle) as i64;
+        let p = self.ramp_period as i64;
+        let diff = (self.current_sample as i32 - self.prev_sample as i32) as i64;
+        self.prev_sample as i32 + ((diff * elapsed) / p) as i32
     }
 }
 
@@ -178,12 +233,17 @@ impl PsgSquare {
         }
     }
 
+    #[inline]
+    fn period_cycles(&self) -> i32 {
+        ((2048 - self.freq as i32) * 16).max(16)
+    }
+
     fn trigger(&mut self) {
         self.enabled = self.dac_enabled;
         if self.length_counter == 0 {
             self.length_counter = 64;
         }
-        self.timer_cycles = ((2048 - self.freq as i32) * 16).max(16);
+        self.timer_cycles = self.period_cycles();
         self.current_vol = self.env_init_vol;
         self.env_timer = if self.env_period == 0 { 8 } else { self.env_period };
 
@@ -264,15 +324,36 @@ impl PsgSquare {
         }
     }
 
-    pub fn step_cycles(&mut self, cycles: i32) {
+    #[inline]
+    pub fn next_step_cycles(&self) -> Option<u64> {
         if !self.enabled {
+            None
+        } else {
+            Some(self.timer_cycles.max(1) as u64)
+        }
+    }
+
+    #[inline]
+    pub fn advance(&mut self, cycles: u64) {
+        if !self.enabled || cycles == 0 {
             return;
         }
-        self.timer_cycles -= cycles;
-        let period = ((2048 - self.freq as i32) * 16).max(16);
-        while self.timer_cycles <= 0 {
-            self.timer_cycles += period;
-            self.duty_pos = (self.duty_pos + 1) & 7;
+        let cyc = cycles as i64;
+        if cyc < self.timer_cycles as i64 {
+            self.timer_cycles -= cyc as i32;
+            return;
+        }
+        let period = self.period_cycles() as i64;
+        let rem = cyc - (self.timer_cycles.max(0) as i64);
+        let steps = 1 + rem / period;
+        let rem_mod = rem % period;
+        self.duty_pos = ((self.duty_pos as i64 + steps) & 7) as u8;
+        self.timer_cycles = (period - rem_mod) as i32;
+    }
+
+    pub fn step_cycles(&mut self, cycles: i32) {
+        if cycles > 0 {
+            self.advance(cycles as u64);
         }
     }
 
@@ -357,8 +438,13 @@ impl PsgWave {
                 self.length_counter = 256;
             }
             self.sample_pos = 0;
-            self.timer_cycles = ((2048 - self.freq as i32) * 8).max(8);
+            self.timer_cycles = self.period_cycles();
         }
+    }
+
+    #[inline]
+    fn period_cycles(&self) -> i32 {
+        ((2048 - self.freq as i32) * 8).max(8)
     }
 
     pub fn read_wave_ram(&self, offset: usize) -> u8 {
@@ -381,19 +467,37 @@ impl PsgWave {
         }
     }
 
-    pub fn step_cycles(&mut self, cycles: i32) {
+    #[inline]
+    pub fn next_step_cycles(&self) -> Option<u64> {
         if !self.enabled {
+            None
+        } else {
+            Some(self.timer_cycles.max(1) as u64)
+        }
+    }
+
+    #[inline]
+    pub fn advance(&mut self, cycles: u64) {
+        if !self.enabled || cycles == 0 {
             return;
         }
-        self.timer_cycles -= cycles;
-        let period = ((2048 - self.freq as i32) * 8).max(8);
-        while self.timer_cycles <= 0 {
-            self.timer_cycles += period;
-            if self.dimension_64 {
-                self.sample_pos = (self.sample_pos + 1) & 63;
-            } else {
-                self.sample_pos = (self.sample_pos + 1) & 31;
-            }
+        let cyc = cycles as i64;
+        if cyc < self.timer_cycles as i64 {
+            self.timer_cycles -= cyc as i32;
+            return;
+        }
+        let period = self.period_cycles() as i64;
+        let rem = cyc - (self.timer_cycles.max(0) as i64);
+        let steps = 1 + rem / period;
+        let rem_mod = rem % period;
+        let mask = if self.dimension_64 { 63 } else { 31 };
+        self.sample_pos = ((self.sample_pos as i64 + steps) & mask) as u8;
+        self.timer_cycles = (period - rem_mod) as i32;
+    }
+
+    pub fn step_cycles(&mut self, cycles: i32) {
+        if cycles > 0 {
+            self.advance(cycles as u64);
         }
     }
 
@@ -535,19 +639,52 @@ impl PsgNoise {
         }
     }
 
-    pub fn step_cycles(&mut self, cycles: i32) {
+    #[inline]
+    pub fn next_step_cycles(&self) -> Option<u64> {
         if !self.enabled || self.shift_clock >= 14 {
+            None
+        } else {
+            Some(self.timer_cycles.max(1) as u64)
+        }
+    }
+
+    #[inline]
+    pub fn advance(&mut self, cycles: u64) {
+        if !self.enabled || self.shift_clock >= 14 || cycles == 0 {
             return;
         }
-        self.timer_cycles -= cycles;
-        let period = self.calc_period().max(32);
-        while self.timer_cycles <= 0 {
-            self.timer_cycles += period;
+        let cyc = cycles as i64;
+        if cyc < self.timer_cycles as i64 {
+            self.timer_cycles -= cyc as i32;
+            return;
+        }
+        let period = self.calc_period().max(32) as i64;
+        let rem = cyc - (self.timer_cycles.max(0) as i64);
+        let steps = 1 + rem / period;
+        let rem_mod = rem % period;
+        self.timer_cycles = (period - rem_mod) as i32;
+
+        // If volume is permanently 0 until retrigger, skip LFSR stepping in O(1).
+        if self.current_vol == 0 && (!self.env_add || self.env_period == 0) {
+            return;
+        }
+
+        let mask14 = !(1u16 << 14);
+        let mask6 = !(1u16 << 6);
+        let max_period_bits = if self.width_7 { 127 } else { 32767 };
+        let lfsr_steps = steps.min(max_period_bits);
+        for _ in 0..lfsr_steps {
             let bit = (self.lfsr ^ (self.lfsr >> 1)) & 1;
-            self.lfsr = (self.lfsr >> 1) | (bit << 14);
+            self.lfsr = ((self.lfsr >> 1) & mask14) | (bit << 14);
             if self.width_7 {
-                self.lfsr = (self.lfsr & !(1 << 6)) | (bit << 6);
+                self.lfsr = (self.lfsr & mask6) | (bit << 6);
             }
+        }
+    }
+
+    pub fn step_cycles(&mut self, cycles: i32) {
+        if cycles > 0 {
+            self.advance(cycles as u64);
         }
     }
 
@@ -580,6 +717,25 @@ fn default_scopes() -> [[i16; 128]; 6] {
     [[0; 128]; 6]
 }
 
+#[derive(Clone)]
+struct ApuDspState {
+    blip: BlipBuf,
+    last_mix_l: i32,
+    last_mix_r: i32,
+    next_scope_cycle: u64,
+    initialized: bool,
+}
+
+fn default_dsp_state() -> ApuDspState {
+    ApuDspState {
+        blip: BlipBuf::new(CPU_CLOCK_HZ, SAMPLE_RATE_HZ, 4096),
+        last_mix_l: 0,
+        last_mix_r: 0,
+        next_scope_cycle: SCOPE_INTERVAL_CYCLES,
+        initialized: false,
+    }
+}
+
 #[derive(Clone, Serialize, Deserialize)]
 pub struct Apu {
     pub fifo_a: DmaAudioFifo,
@@ -598,6 +754,10 @@ pub struct Apu {
     pub sample_tick_count: u8,
     pub output_buffer: Vec<i16>,
 
+    /// Optional per-sample linear interpolation for DirectSound FIFOs to smooth 8-bit PWM crunch.
+    #[serde(default)]
+    pub fifo_interpolation: bool,
+
     /// Bitmask of enabled audio channels:
     /// 0: Sq1, 1: Sq2, 2: Wave, 3: Noise, 4: FIFO A, 5: FIFO B.
     #[serde(default = "default_channel_mask")]
@@ -610,10 +770,19 @@ pub struct Apu {
     pub chan_scopes: [[i16; 128]; 6],
     #[serde(skip)]
     pub scope_cursor: usize,
+
+    /// Current CPU cycle timestamp to which PSG and mixer state are synchronized.
+    #[serde(default)]
+    pub last_cycle: u64,
+
+    #[serde(skip, default = "default_dsp_state")]
+    dsp: ApuDspState,
 }
 
 impl Apu {
     pub fn new() -> Self {
+        let mut dsp = default_dsp_state();
+        dsp.initialized = true;
         Self {
             fifo_a: DmaAudioFifo::new(),
             fifo_b: DmaAudioFifo::new(),
@@ -628,10 +797,24 @@ impl Apu {
             frame_seq_step: 0,
             sample_tick_count: 0,
             output_buffer: Vec::with_capacity(2048),
+            fifo_interpolation: false,
             channel_enable_mask: 0x3F,
             master_volume_pct: 100,
             chan_scopes: [[0; 128]; 6],
             scope_cursor: 0,
+            last_cycle: 0,
+            dsp,
+        }
+    }
+
+    #[inline]
+    fn ensure_dsp_initialized(&mut self) {
+        if !self.dsp.initialized {
+            self.dsp.blip.reset(self.last_cycle);
+            self.dsp.last_mix_l = 0;
+            self.dsp.last_mix_r = 0;
+            self.dsp.next_scope_cycle = (self.last_cycle & !(SCOPE_INTERVAL_CYCLES - 1)) + SCOPE_INTERVAL_CYCLES;
+            self.dsp.initialized = true;
         }
     }
 
@@ -684,8 +867,40 @@ impl Apu {
         self.soundcnt_h = val & 0x770F;
     }
 
-    /// Returns `(dma1_refill_needed, dma2_refill_needed)` for timer overflow `timer_idx` (0 or 1).
-    pub fn on_timer_overflow(&mut self, timer_idx: u8) -> (bool, bool) {
+    /// Synchronizes all PSG and interpolated FIFO states up to exact CPU `target_cycle`.
+    pub fn sync(&mut self, target_cycle: u64) {
+        self.ensure_dsp_initialized();
+        if target_cycle <= self.last_cycle {
+            return;
+        }
+        let max_chunk = self.dsp.blip.max_chunk_cycles();
+        while self.last_cycle < target_cycle {
+            let chunk_end = target_cycle.min(self.last_cycle + max_chunk);
+            self.step_to(chunk_end);
+            if self.last_cycle < target_cycle {
+                self.drain_blip(self.last_cycle);
+            }
+        }
+    }
+
+    /// Commits any amplitude delta at `cycle` (after register writes or FIFO pops) into `BlipBuf`.
+    #[inline]
+    pub fn commit_mix(&mut self, cycle: u64) {
+        self.ensure_dsp_initialized();
+        let c = cycle.max(self.last_cycle);
+        let (mix_l, mix_r) = self.compute_mixed_levels(c);
+        let dl = mix_l - self.dsp.last_mix_l;
+        let dr = mix_r - self.dsp.last_mix_r;
+        if dl != 0 || dr != 0 {
+            self.dsp.blip.add_delta(c, dl, dr);
+            self.dsp.last_mix_l = mix_l;
+            self.dsp.last_mix_r = mix_r;
+        }
+    }
+
+    /// Returns `(dma1_refill_needed, dma2_refill_needed)` for timer overflow `timer_idx` (0 or 1) at `cycle`.
+    pub fn on_timer_overflow(&mut self, timer_idx: u8, cycle: u64) -> (bool, bool) {
+        self.sync(cycle);
         if !self.master_enabled() {
             return (false, false);
         }
@@ -695,41 +910,145 @@ impl Apu {
         let mut req_b = false;
 
         if timer_a == timer_idx {
-            req_a = self.fifo_a.pop_sample();
+            req_a = self.fifo_a.pop_sample_at(cycle);
         }
         if timer_b == timer_idx {
-            req_b = self.fifo_b.pop_sample();
+            req_b = self.fifo_b.pop_sample_at(cycle);
         }
+        self.commit_mix(cycle);
         (req_a, req_b)
     }
 
-    pub fn step_sample_tick(&mut self) {
+    /// Advances audio to `cycle`, ticks the 512 Hz PSG frame sequencer, and drains ready samples.
+    pub fn on_frame_sequencer_tick(&mut self, cycle: u64) {
+        self.sync(cycle);
+        if self.master_enabled() {
+            self.tick_frame_sequencer();
+            self.commit_mix(cycle);
+        }
+        self.drain_blip(cycle);
+    }
+
+    /// Re-anchors internal DSP state across a STOP mode cycle jump without losing pre-STOP samples.
+    pub fn on_stop_shift(&mut self, new_cycle: u64) {
+        self.last_cycle = new_cycle;
+        self.dsp.blip.reset(new_cycle);
+        self.dsp.last_mix_l = 0;
+        self.dsp.last_mix_r = 0;
+        self.dsp.next_scope_cycle =
+            (new_cycle & !(SCOPE_INTERVAL_CYCLES - 1)) + SCOPE_INTERVAL_CYCLES;
+        self.dsp.initialized = true;
+    }
+
+    /// Flushes all audio up to `cycle` into `output_buffer` (called at end of frame or breakpoint).
+    pub fn flush(&mut self, cycle: u64) {
+        self.sync(cycle);
+        self.commit_mix(cycle);
+        self.drain_blip(cycle);
+    }
+
+    #[inline]
+    fn sq_wakes_edges(sq: &PsgSquare, route_mask: u16, soundcnt_l: u16) -> bool {
+        sq.enabled && sq.dac_enabled && sq.current_vol > 0 && (soundcnt_l & route_mask) != 0
+    }
+
+    fn step_to(&mut self, target_cycle: u64) {
         if !self.master_enabled() {
-            for ch in &mut self.chan_scopes {
-                ch[self.scope_cursor] = 0;
+            while self.dsp.next_scope_cycle <= target_cycle {
+                let cur = self.scope_cursor;
+                for ch in &mut self.chan_scopes {
+                    ch[cur] = 0;
+                }
+                self.scope_cursor = (cur + 1) & 127;
+                self.dsp.next_scope_cycle += SCOPE_INTERVAL_CYCLES;
             }
-            self.scope_cursor = (self.scope_cursor + 1) & 127;
-            self.output_buffer.push(0);
-            self.output_buffer.push(0);
+            self.last_cycle = target_cycle;
+            self.commit_mix(target_cycle);
             return;
         }
 
-        // Frame sequencer clocks at 512 Hz -> 32_768 / 512 = every 64 ticks of 512 CPU cycles.
-        self.sample_tick_count = self.sample_tick_count.wrapping_add(1);
-        if self.sample_tick_count >= 64 {
-            self.sample_tick_count = 0;
-            self.tick_frame_sequencer();
+        let mask = self.channel_enable_mask;
+        let cnt_l = self.soundcnt_l;
+
+        while self.last_cycle < target_cycle {
+            let mut next_cycle = target_cycle;
+
+            if (mask & 0x01) != 0
+                && Self::sq_wakes_edges(&self.sq1, 0x1100, cnt_l)
+                && let Some(dt) = self.sq1.next_step_cycles()
+            {
+                next_cycle = next_cycle.min(self.last_cycle + dt);
+            }
+            if (mask & 0x02) != 0
+                && Self::sq_wakes_edges(&self.sq2, 0x2200, cnt_l)
+                && let Some(dt) = self.sq2.next_step_cycles()
+            {
+                next_cycle = next_cycle.min(self.last_cycle + dt);
+            }
+            if (mask & 0x04) != 0
+                && self.wave.enabled
+                && self.wave.dac_enabled
+                && (self.wave.volume_code != 0 || self.wave.force_75)
+                && (cnt_l & 0x4400) != 0
+                && let Some(dt) = self.wave.next_step_cycles()
+            {
+                next_cycle = next_cycle.min(self.last_cycle + dt);
+            }
+            if (mask & 0x08) != 0
+                && self.noise.enabled
+                && self.noise.dac_enabled
+                && self.noise.current_vol > 0
+                && (cnt_l & 0x8800) != 0
+                && let Some(dt) = self.noise.next_step_cycles()
+            {
+                next_cycle = next_cycle.min(self.last_cycle + dt);
+            }
+
+            if self.fifo_interpolation
+                && (((mask & 0x10) != 0 && self.fifo_a.is_ramping(self.last_cycle))
+                    || ((mask & 0x20) != 0 && self.fifo_b.is_ramping(self.last_cycle)))
+            {
+                let next_interp =
+                    (self.last_cycle & !(FIFO_INTERP_STEP_CYCLES - 1)) + FIFO_INTERP_STEP_CYCLES;
+                next_cycle = next_cycle.min(next_interp);
+            }
+
+            if self.dsp.next_scope_cycle <= target_cycle {
+                next_cycle = next_cycle.min(self.dsp.next_scope_cycle);
+            }
+
+            let dt = next_cycle - self.last_cycle;
+            if dt > 0 {
+                self.sq1.advance(dt);
+                self.sq2.advance(dt);
+                self.wave.advance(dt);
+                self.noise.advance(dt);
+                self.last_cycle = next_cycle;
+            }
+
+            if self.last_cycle == self.dsp.next_scope_cycle {
+                self.record_scopes(self.last_cycle);
+                self.dsp.next_scope_cycle += SCOPE_INTERVAL_CYCLES;
+            }
+
+            self.commit_mix(self.last_cycle);
         }
+    }
 
-        let cycles = APU_SAMPLE_INTERVAL as i32;
-        self.sq1.step_cycles(cycles);
-        self.sq2.step_cycles(cycles);
-        self.wave.step_cycles(cycles);
-        self.noise.step_cycles(cycles);
-
-        let (left, right) = self.mix_and_record();
-        self.output_buffer.push(left);
-        self.output_buffer.push(right);
+    fn drain_blip(&mut self, end_cycle: u64) {
+        let start = self.output_buffer.len();
+        let vol = if self.channel_enable_mask == 0 {
+            0
+        } else {
+            self.master_volume_pct.min(100)
+        };
+        let gain_per_unit = 48.0 * (vol as f64) / 100.0;
+        self.dsp
+            .blip
+            .end_frame_and_read(end_cycle, gain_per_unit, &mut self.output_buffer);
+        if self.channel_enable_mask == 0 {
+            self.output_buffer[start..].fill(0);
+        }
     }
 
     fn tick_frame_sequencer(&mut self) {
@@ -770,18 +1089,59 @@ impl Apu {
         self.frame_seq_step = (self.frame_seq_step + 1) & 7;
     }
 
-    fn mix_and_record(&mut self) -> (i16, i16) {
+    #[inline]
+    fn fifo_samples(&self, cycle: u64) -> (i32, i32) {
+        let mask = self.channel_enable_mask;
+        let raw_a = if (mask & 0x10) != 0 {
+            if self.fifo_interpolation {
+                self.fifo_a.interpolated_sample(cycle)
+            } else {
+                self.fifo_a.current_sample as i32
+            }
+        } else {
+            0
+        };
+        let raw_b = if (mask & 0x20) != 0 {
+            if self.fifo_interpolation {
+                self.fifo_b.interpolated_sample(cycle)
+            } else {
+                self.fifo_b.current_sample as i32
+            }
+        } else {
+            0
+        };
+        (raw_a, raw_b)
+    }
+
+    fn record_scopes(&mut self, cycle: u64) {
         let mask = self.channel_enable_mask;
         let s1 = if (mask & 0x01) != 0 { self.sq1.sample() } else { 0 };
         let s2 = if (mask & 0x02) != 0 { self.sq2.sample() } else { 0 };
         let s3 = if (mask & 0x04) != 0 { self.wave.sample() } else { 0 };
         let s4 = if (mask & 0x08) != 0 { self.noise.sample() } else { 0 };
+        let (raw_a, raw_b) = self.fifo_samples(cycle);
 
         let cur = self.scope_cursor;
         self.chan_scopes[0][cur] = (s1 as i32 * 2048).clamp(-32768, 32767) as i16;
         self.chan_scopes[1][cur] = (s2 as i32 * 2048).clamp(-32768, 32767) as i16;
         self.chan_scopes[2][cur] = (s3 as i32 * 2048).clamp(-32768, 32767) as i16;
         self.chan_scopes[3][cur] = (s4 as i32 * 2048).clamp(-32768, 32767) as i16;
+        self.chan_scopes[4][cur] = (raw_a * 256).clamp(-32768, 32767) as i16;
+        self.chan_scopes[5][cur] = (raw_b * 256).clamp(-32768, 32767) as i16;
+        self.scope_cursor = (cur + 1) & 127;
+    }
+
+    #[inline]
+    fn compute_mixed_levels(&self, cycle: u64) -> (i32, i32) {
+        if !self.master_enabled() || self.channel_enable_mask == 0 {
+            return (0, 0);
+        }
+
+        let mask = self.channel_enable_mask;
+        let s1 = if (mask & 0x01) != 0 { self.sq1.sample() } else { 0 };
+        let s2 = if (mask & 0x02) != 0 { self.sq2.sample() } else { 0 };
+        let s3 = if (mask & 0x04) != 0 { self.wave.sample() } else { 0 };
+        let s4 = if (mask & 0x08) != 0 { self.noise.sample() } else { 0 };
 
         let mut psg_r = 0i32;
         let mut psg_l = 0i32;
@@ -829,11 +1189,7 @@ impl Apu {
             _ => {}
         }
 
-        let raw_a = if (mask & 0x10) != 0 { self.fifo_a.current_sample as i32 } else { 0 };
-        let raw_b = if (mask & 0x20) != 0 { self.fifo_b.current_sample as i32 } else { 0 };
-        self.chan_scopes[4][cur] = (raw_a * 256).clamp(-32768, 32767) as i16;
-        self.chan_scopes[5][cur] = (raw_b * 256).clamp(-32768, 32767) as i16;
-        self.scope_cursor = (cur + 1) & 127;
+        let (raw_a, raw_b) = self.fifo_samples(cycle);
 
         let mut fifo_a = raw_a * 4;
         if (self.soundcnt_h & 0x04) == 0 {
@@ -869,10 +1225,6 @@ impl Apu {
         let clamped_l = (raw_l & quant_mask) - (bias & quant_mask);
         let clamped_r = (raw_r & quant_mask) - (bias & quant_mask);
 
-        let vol_scale = self.master_volume_pct.min(100) as i32;
-        let out_l = ((clamped_l * 48 * vol_scale) / 100).clamp(-32768, 32767) as i16;
-        let out_r = ((clamped_r * 48 * vol_scale) / 100).clamp(-32768, 32767) as i16;
-        (out_l, out_r)
+        (clamped_l, clamped_r)
     }
 }
-

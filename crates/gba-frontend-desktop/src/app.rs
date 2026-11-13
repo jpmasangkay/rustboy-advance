@@ -230,6 +230,7 @@ pub(crate) struct RustboyApp {
     pub(crate) cli_loop_replay: bool,
     pub(crate) cli_replay_frame: usize,
     pub(crate) sync_60hz: bool,
+    pub(crate) display_refresh_hz: Option<f64>,
     pub(crate) pacing_deadline: Option<Instant>,
     pub(crate) last_step_frames: u32,
     pub(crate) last_step_emu_ms: f64,
@@ -260,7 +261,11 @@ impl RustboyApp {
         let cli_perf_log_path = cli.perf_log;
         let cli_perf_seconds = cli.perf_seconds;
         let cli_loop_replay = cli.loop_replay;
-        let cli_sync_60hz = cli.sync_60hz.unwrap_or(true);
+        let sync_decision =
+            crate::display_timing::resolve_sync_decision(cli.sync_60hz, cli.simulate_refresh_hz);
+        println!("[sync] {}", sync_decision.reason);
+        let cli_sync_60hz = sync_decision.sync_60hz;
+        let cli_display_refresh_hz = sync_decision.effective_refresh_hz;
         let cli_fullscreen = cli.fullscreen;
         let rewind_budget_mb = config.rewind_budget_mb;
         let audio = AudioOutput::start();
@@ -383,6 +388,7 @@ impl RustboyApp {
             cli_loop_replay,
             cli_replay_frame: 0,
             sync_60hz: cli_sync_60hz,
+            display_refresh_hz: cli_display_refresh_hz,
             pacing_deadline: None,
             last_step_frames: 0,
             last_step_emu_ms: 0.0,
@@ -467,6 +473,8 @@ impl RustboyApp {
             let verb = match tr.kind {
                 crate::filters::GovernorTransitionKind::StepDown => "switched",
                 crate::filters::GovernorTransitionKind::StepUp => "recovered",
+                crate::filters::GovernorTransitionKind::CapResolution => "capped output to 720x480",
+                crate::filters::GovernorTransitionKind::UncapResolution => "uncapped output resolution",
             };
             self.notify_warn(&format!(
                 "Quality Governor: {verb} {} -> {} (p95 {:.1} ms)",
@@ -1777,7 +1785,13 @@ impl RustboyApp {
             } else {
                 "eframe-fallback-nosync60"
             };
-            self.perf_logger = crate::bench::DesktopPerfLogger::create(&path, tag).ok();
+            self.perf_logger = crate::bench::DesktopPerfLogger::create_with_timing(
+                &path,
+                tag,
+                self.display_refresh_hz,
+                self.sync_60hz,
+            )
+            .ok();
             self.perf_start_wall = Instant::now();
         }
         let vp_size = ctx.screen_rect().size();
@@ -2002,7 +2016,13 @@ impl RustboyApp {
                     "-nosync60"
                 }
             );
-            self.perf_logger = crate::bench::DesktopPerfLogger::create(&path, &tag).ok();
+            self.perf_logger = crate::bench::DesktopPerfLogger::create_with_timing(
+                &path,
+                &tag,
+                self.display_refresh_hz,
+                self.sync_60hz,
+            )
+            .ok();
             self.perf_start_wall = Instant::now();
         } else {
             self.perf_start_wall = Instant::now();

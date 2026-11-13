@@ -137,11 +137,16 @@ pub struct CliConfig {
     pub perf_seconds: Option<f64>,
     pub fullscreen: bool,
     pub sync_60hz: Option<bool>,
+    pub simulate_refresh_hz: Option<f64>,
+    pub gpu_probe: bool,
+    pub retry_gpu: bool,
+    pub probe_fail_stage: Option<crate::gpu_probe::ProbeFailStage>,
+    pub gpu_probe_timeout_ms: Option<u64>,
 }
 
-impl CliConfig {
-    pub fn parse() -> Result<Self, String> {
-        let mut cfg = Self {
+impl Default for CliConfig {
+    fn default() -> Self {
+        Self {
             rom_path: None,
             bios_path: None,
             sav_path: None,
@@ -182,7 +187,18 @@ impl CliConfig {
             perf_seconds: None,
             fullscreen: false,
             sync_60hz: None,
-        };
+            simulate_refresh_hz: None,
+            gpu_probe: false,
+            retry_gpu: false,
+            probe_fail_stage: None,
+            gpu_probe_timeout_ms: None,
+        }
+    }
+}
+
+impl CliConfig {
+    pub fn parse() -> Result<Self, String> {
+        let mut cfg = Self::default();
 
         let mut args = std::env::args().skip(1);
         while let Some(arg) = args.next() {
@@ -294,6 +310,28 @@ impl CliConfig {
                 "--fullscreen" => cfg.fullscreen = true,
                 "--sync-60hz" => cfg.sync_60hz = Some(true),
                 "--no-sync-60hz" => cfg.sync_60hz = Some(false),
+                "--simulate-refresh-hz" => {
+                    let v = args.next().ok_or("missing value for --simulate-refresh-hz")?;
+                    let hz: f64 = v.parse().map_err(|_| "invalid --simulate-refresh-hz value")?;
+                    if !hz.is_finite() || hz <= 1.0 {
+                        return Err("--simulate-refresh-hz must be > 1.0".to_string());
+                    }
+                    cfg.simulate_refresh_hz = Some(hz);
+                }
+                "--gpu-probe" => {
+                    cfg.gpu_probe = true;
+                    cfg.headless = true;
+                }
+                "--retry-gpu" => cfg.retry_gpu = true,
+                "--probe-fail-stage" => {
+                    let v = args.next().ok_or("missing value for --probe-fail-stage")?;
+                    cfg.probe_fail_stage = Some(crate::gpu_probe::ProbeFailStage::parse(&v)?);
+                }
+                "--gpu-probe-timeout-ms" => {
+                    let v = args.next().ok_or("missing value for --gpu-probe-timeout-ms")?;
+                    let ms: u64 = v.parse().map_err(|_| "invalid --gpu-probe-timeout-ms number")?;
+                    cfg.gpu_probe_timeout_ms = Some(ms.max(200));
+                }
                 "--governor" => cfg.governor = Some(true),
                 "--no-governor" => cfg.governor = Some(false),
                 "--no-emu-priority" => cfg.no_emu_priority = true,
@@ -354,6 +392,10 @@ impl CliConfig {
                          \t--perf-seconds <N>       Automatically close desktop window after N seconds (for timed perf runs)\n\
                          \t--fullscreen             Launch desktop window in fullscreen mode\n\
                          \t--sync-60hz / --no-sync-60hz  Toggle 60 Hz display vsync snapping / audio DRC cadence lock\n\
+                         \t--simulate-refresh-hz <N> Override detected display refresh rate (Hz) for sync-rule testing\n\
+                         \t--retry-gpu              Clear recorded GPU startup failures and re-probe GPU adapter\n\
+                         \t--probe-fail-stage <st>  Inject GPU probe failure at device, surface, or hang stage\n\
+                         \t--gpu-probe-timeout-ms <N> Timeout (ms) for child GPU startup probe (default: 7000)\n\
                          \t--governor / --no-governor  Enable or override the automatic filter quality governor\n\
                          \t--no-emu-priority        Disable MMCSS/ABOVE_NORMAL priority boost on emulation thread\n\
                          \t--loop-replay            Loop --input-replay schedule modulo replay duration\n\
@@ -767,6 +809,10 @@ pub fn run_headless(cfg: &CliConfig) -> Result<(), String> {
 
     if cfg.selftest {
         return bench::run_selftest(cfg);
+    }
+
+    if cfg.gpu_probe {
+        return crate::gpu_probe::run_gpu_probe_child(cfg);
     }
 
     if cfg.profile_sw {

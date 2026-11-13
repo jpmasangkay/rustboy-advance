@@ -1748,6 +1748,42 @@ mod tests {
             );
         }
     }
+
+    #[test]
+    fn quality_governor_caps_large_output_to_720x480_before_dropping_filter() {
+        let large_costs = vec![
+            FilterCost { filter: DisplayFilter::Sharp1x, cost_ms: 9.0 },
+            FilterCost { filter: DisplayFilter::MyBoySmooth, cost_ms: 12.0 },
+            FilterCost { filter: DisplayFilter::XbrSmooth3x, cost_ms: 20.0 },
+        ];
+        let capped_costs = vec![
+            FilterCost { filter: DisplayFilter::Sharp1x, cost_ms: 0.4 },
+            FilterCost { filter: DisplayFilter::MyBoySmooth, cost_ms: 1.5 },
+            FilterCost { filter: DisplayFilter::XbrSmooth3x, cost_ms: 7.0 },
+        ];
+        let mut gov =
+            QualityGovernor::with_measured_costs(DisplayFilter::MyBoySmooth, true, large_costs);
+        gov.set_resolution_cap_support(true, Some(capped_costs));
+        assert!(!gov.is_resolution_capped());
+
+        // Under large window (e.g. 2560x1600 @ slowdown 8), rolling p95=15 ms triggers 720x480 cap
+        // while keeping MyBoySmooth (since 15 - 12 + 1.5 = 4.5 ms <= 8.37 ms target).
+        let cap_tr = (0..(GOVERNOR_WINDOW_FRAMES + GOVERNOR_DOWN_SUSTAIN_FRAMES))
+            .find_map(|_| gov.record_frame(15.0))
+            .expect("sustained large-window overload should cap output resolution");
+        assert_eq!(cap_tr.kind, GovernorTransitionKind::CapResolution);
+        assert_eq!(cap_tr.to, DisplayFilter::MyBoySmooth);
+        assert!(gov.is_resolution_capped());
+        assert_eq!(
+            gov.max_output_size(),
+            Some((GOVERNOR_MAX_CAP_WIDTH, GOVERNOR_MAX_CAP_HEIGHT))
+        );
+
+        // If user switches filter manually, user target resets cleanly without lingering cap.
+        gov.set_user_target(DisplayFilter::Sharp1x);
+        assert!(!gov.is_resolution_capped());
+        assert_eq!(gov.max_output_size(), None);
+    }
 }
 
 pub const GOVERNOR_BUDGET_MS: f64 = 1000.0 * 280_896.0 / 16_777_216.0;
@@ -1760,11 +1796,15 @@ pub const GOVERNOR_COOLDOWN_FRAMES: usize = 180;
 pub const GOVERNOR_BASE_LOCKOUT_FRAMES: usize = 18_000; // ~5 minutes at 59.73 Hz
 pub const GOVERNOR_RECOVERY_SUSTAIN_FRAMES: usize = 3_600; // ~60 seconds at 59.73 Hz
 pub const GOVERNOR_FLAP_WINDOW_FRAMES: usize = 1_800; // ~30 seconds at 59.73 Hz
+pub const GOVERNOR_MAX_CAP_WIDTH: usize = 720;
+pub const GOVERNOR_MAX_CAP_HEIGHT: usize = 480;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum GovernorTransitionKind {
     StepDown,
     StepUp,
+    CapResolution,
+    UncapResolution,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -1847,6 +1887,9 @@ pub struct QualityGovernor {
     user_target: DisplayFilter,
     active: DisplayFilter,
     costs: Vec<FilterCost>,
+    capped_costs: Option<Vec<FilterCost>>,
+    can_cap_resolution: bool,
+    resolution_capped: bool,
     window: VecDeque<f64>,
     scratch: Vec<f64>,
     high_streak: usize,
@@ -1912,6 +1955,9 @@ impl QualityGovernor {
             user_target: norm,
             active: norm,
             costs,
+            capped_costs: None,
+            can_cap_resolution: false,
+            resolution_capped: false,
             window: VecDeque::with_capacity(GOVERNOR_WINDOW_FRAMES),
             scratch: Vec::with_capacity(GOVERNOR_WINDOW_FRAMES),
             high_streak: 0,
@@ -1927,6 +1973,43 @@ impl QualityGovernor {
         sort_filter_costs(&mut costs);
         if !costs.is_empty() {
             self.costs = costs;
+        }
+    }
+
+    pub fn set_resolution_cap_support(
+        &mut self,
+        window_exceeds_cap: bool,
+        mut capped_costs: Option<Vec<FilterCost>>,
+    ) {
+        self.can_cap_resolution = window_exceeds_cap;
+        if let Some(ref mut cc) = capped_costs {
+            sort_filter_costs(cc);
+            if cc.is_empty() {
+                self.capped_costs = None;
+            } else {
+                self.capped_costs = capped_costs;
+            }
+        } else {
+            self.capped_costs = None;
+        }
+        if !window_exceeds_cap && self.resolution_capped {
+            self.resolution_capped = false;
+            self.window.clear();
+            self.high_streak = 0;
+            self.low_streak = 0;
+        }
+    }
+
+    pub fn is_resolution_capped(&self) -> bool {
+        self.can_cap_resolution && self.resolution_capped
+    }
+
+    #[cfg(test)]
+    pub fn max_output_size(&self) -> Option<(usize, usize)> {
+        if self.is_resolution_capped() {
+            Some((GOVERNOR_MAX_CAP_WIDTH, GOVERNOR_MAX_CAP_HEIGHT))
+        } else {
+            None
         }
     }
 
@@ -1983,6 +2066,7 @@ impl QualityGovernor {
         let norm = canonical_governor_filter(filter);
         self.user_target = norm;
         self.active = norm;
+        self.resolution_capped = false;
         self.high_streak = 0;
         self.low_streak = 0;
         self.cooldown = 0;
@@ -1999,6 +2083,16 @@ impl QualityGovernor {
         }
     }
 
+    fn active_cost_table(&self) -> &[FilterCost] {
+        if self.is_resolution_capped()
+            && let Some(ref capped) = self.capped_costs
+            && !capped.is_empty()
+        {
+            return capped;
+        }
+        &self.costs
+    }
+
     fn rolling_p95(&mut self) -> Option<f64> {
         if self.window.len() < GOVERNOR_WINDOW_FRAMES / 2 {
             return None;
@@ -2013,22 +2107,23 @@ impl QualityGovernor {
     /// Selects the most expensive strictly cheaper filter predicted to keep total work time
     /// under ~50% of budget, or the cheapest measured filter when none fits under 50%.
     fn select_target_under_budget(&self, rolling_p95_ms: f64) -> Option<DisplayFilter> {
+        let table = self.active_cost_table();
         let active_norm = canonical_governor_filter(self.active);
-        let cur_idx = self.costs.iter().position(|c| c.filter == active_norm)?;
+        let cur_idx = table.iter().position(|c| c.filter == active_norm)?;
         if cur_idx == 0 {
             return None;
         }
-        let cur_cost_ms = self.costs[cur_idx].cost_ms;
+        let cur_cost_ms = table[cur_idx].cost_ms;
         let est_base_ms = (rolling_p95_ms - cur_cost_ms).max(0.0);
         let target_budget_ms = GOVERNOR_BUDGET_MS * GOVERNOR_TARGET_PCT;
 
-        for cand in self.costs[..cur_idx].iter().rev() {
+        for cand in table[..cur_idx].iter().rev() {
             if cand.cost_ms <= cur_cost_ms && est_base_ms + cand.cost_ms <= target_budget_ms {
                 return Some(cand.filter);
             }
         }
         // Fallback: jump straight to the cheapest measured filter (never a costlier filter).
-        let cheapest = self.costs[0];
+        let cheapest = table[0];
         if cheapest.filter != active_norm && cheapest.cost_ms <= cur_cost_ms {
             Some(cheapest.filter)
         } else {
@@ -2036,21 +2131,54 @@ impl QualityGovernor {
         }
     }
 
+    /// Selects the filter to run immediately upon enabling `720x480` OS-scaled cap:
+    /// preserves the current active filter if it fits under 50% of budget (e.g. `MyBoySmooth`),
+    /// otherwise jumps to the best filter in `capped_costs` under 50%.
+    fn select_filter_when_capping(&self, rolling_p95_ms: f64) -> DisplayFilter {
+        let active_norm = canonical_governor_filter(self.active);
+        let uncapped_cost = self
+            .costs
+            .iter()
+            .find(|c| c.filter == active_norm)
+            .map(|c| c.cost_ms)
+            .unwrap_or(0.0);
+        let est_emu_base_ms = (rolling_p95_ms - uncapped_cost).max(0.0);
+        let target_budget_ms = GOVERNOR_BUDGET_MS * GOVERNOR_TARGET_PCT;
+        let table = self.capped_costs.as_deref().unwrap_or(&self.costs);
+        if let Some(cur_capped) = table.iter().find(|c| c.filter == active_norm)
+            && est_emu_base_ms + cur_capped.cost_ms <= target_budget_ms
+        {
+            return active_norm;
+        }
+        // Check if active_norm is still <= target or pick highest filter <= cur tier fitting budget.
+        let active_tier_pos = table
+            .iter()
+            .position(|c| c.filter == active_norm)
+            .unwrap_or(table.len().saturating_sub(1));
+        for cand in table[..=active_tier_pos].iter().rev() {
+            if est_emu_base_ms + cand.cost_ms <= target_budget_ms {
+                return cand.filter;
+            }
+        }
+        active_norm
+    }
+
     /// Selects the next costlier filter one tier above `active` (capped at `user_target`)
     /// only when its measured cost predicts total frame work below ~50% of budget.
     fn select_next_step_up(&self, rolling_p95_ms: f64) -> Option<DisplayFilter> {
+        let table = self.active_cost_table();
         let active_norm = canonical_governor_filter(self.active);
         let target_norm = canonical_governor_filter(self.user_target);
         if active_norm == target_norm {
             return None;
         }
-        let cur_idx = self.costs.iter().position(|c| c.filter == active_norm)?;
-        let target_idx = self.costs.iter().position(|c| c.filter == target_norm)?;
-        if cur_idx >= target_idx || cur_idx + 1 >= self.costs.len() {
+        let cur_idx = table.iter().position(|c| c.filter == active_norm)?;
+        let target_idx = table.iter().position(|c| c.filter == target_norm)?;
+        if cur_idx >= target_idx || cur_idx + 1 >= table.len() {
             return None;
         }
-        let cur_cost_ms = self.costs[cur_idx].cost_ms;
-        let next = self.costs[cur_idx + 1];
+        let cur_cost_ms = table[cur_idx].cost_ms;
+        let next = table[cur_idx + 1];
         let est_base_ms = (rolling_p95_ms - cur_cost_ms).max(0.0);
         let target_budget_ms = GOVERNOR_BUDGET_MS * GOVERNOR_TARGET_PCT;
         if est_base_ms + next.cost_ms < target_budget_ms {
@@ -2060,7 +2188,7 @@ impl QualityGovernor {
         }
     }
 
-    /// Feeds one completed frame's work time (`ms`) and returns any filter transition.
+    /// Feeds one completed frame's work time (`ms`) and returns any filter or resolution-cap transition.
     pub fn record_frame(&mut self, work_ms: f64) -> Option<GovernorTransition> {
         if !self.enabled {
             return None;
@@ -2103,29 +2231,57 @@ impl QualityGovernor {
             }
             let in_flap_probation = self.frames_since_step_up.is_some();
             let sustain_met = in_flap_probation || self.high_streak >= GOVERNOR_DOWN_SUSTAIN_FRAMES;
-            if sustain_met && let Some(next) = self.select_target_under_budget(p95) {
-                let prev = self.active;
-                self.active = next;
-                self.high_streak = 0;
-                self.low_streak = 0;
-                self.cooldown = GOVERNOR_COOLDOWN_FRAMES;
-                let next_lockout = if in_flap_probation {
-                    self.current_lockout_frames
-                        .saturating_mul(2)
-                        .max(GOVERNOR_BASE_LOCKOUT_FRAMES * 2)
-                } else {
-                    GOVERNOR_BASE_LOCKOUT_FRAMES
-                };
-                self.current_lockout_frames = next_lockout;
-                self.up_lockout_remaining = next_lockout;
-                self.frames_since_step_up = None;
-                self.window.clear();
-                return Some(GovernorTransition {
-                    kind: GovernorTransitionKind::StepDown,
-                    from: prev,
-                    to: next,
-                    rolling_p95_ms: p95,
-                });
+            if sustain_met {
+                if self.can_cap_resolution && !self.resolution_capped {
+                    let prev = self.active;
+                    let next = self.select_filter_when_capping(p95);
+                    self.resolution_capped = true;
+                    self.active = next;
+                    self.high_streak = 0;
+                    self.low_streak = 0;
+                    self.cooldown = GOVERNOR_COOLDOWN_FRAMES;
+                    let next_lockout = if in_flap_probation {
+                        self.current_lockout_frames
+                            .saturating_mul(2)
+                            .max(GOVERNOR_BASE_LOCKOUT_FRAMES * 2)
+                    } else {
+                        GOVERNOR_BASE_LOCKOUT_FRAMES
+                    };
+                    self.current_lockout_frames = next_lockout;
+                    self.up_lockout_remaining = next_lockout;
+                    self.frames_since_step_up = None;
+                    self.window.clear();
+                    return Some(GovernorTransition {
+                        kind: GovernorTransitionKind::CapResolution,
+                        from: prev,
+                        to: next,
+                        rolling_p95_ms: p95,
+                    });
+                }
+                if let Some(next) = self.select_target_under_budget(p95) {
+                    let prev = self.active;
+                    self.active = next;
+                    self.high_streak = 0;
+                    self.low_streak = 0;
+                    self.cooldown = GOVERNOR_COOLDOWN_FRAMES;
+                    let next_lockout = if in_flap_probation {
+                        self.current_lockout_frames
+                            .saturating_mul(2)
+                            .max(GOVERNOR_BASE_LOCKOUT_FRAMES * 2)
+                    } else {
+                        GOVERNOR_BASE_LOCKOUT_FRAMES
+                    };
+                    self.current_lockout_frames = next_lockout;
+                    self.up_lockout_remaining = next_lockout;
+                    self.frames_since_step_up = None;
+                    self.window.clear();
+                    return Some(GovernorTransition {
+                        kind: GovernorTransitionKind::StepDown,
+                        from: prev,
+                        to: next,
+                        rolling_p95_ms: p95,
+                    });
+                }
             }
             return None;
         }
@@ -2148,6 +2304,41 @@ impl QualityGovernor {
                         to: next_up,
                         rolling_p95_ms: p95,
                     });
+                }
+            } else if self.is_resolution_capped() {
+                let active_norm = canonical_governor_filter(self.active);
+                let capped_cost = self
+                    .active_cost_table()
+                    .iter()
+                    .find(|c| c.filter == active_norm)
+                    .map(|c| c.cost_ms)
+                    .unwrap_or(0.0);
+                let uncapped_cost = self
+                    .costs
+                    .iter()
+                    .find(|c| c.filter == active_norm)
+                    .map(|c| c.cost_ms)
+                    .unwrap_or(capped_cost);
+                let est_emu_base = (p95 - capped_cost).max(0.0);
+                let target_budget_ms = GOVERNOR_BUDGET_MS * GOVERNOR_TARGET_PCT;
+                if est_emu_base + uncapped_cost < target_budget_ms {
+                    self.low_streak += 1;
+                    if self.low_streak >= GOVERNOR_RECOVERY_SUSTAIN_FRAMES {
+                        self.resolution_capped = false;
+                        self.low_streak = 0;
+                        self.high_streak = 0;
+                        self.cooldown = 0;
+                        self.frames_since_step_up = Some(0);
+                        self.window.clear();
+                        return Some(GovernorTransition {
+                            kind: GovernorTransitionKind::UncapResolution,
+                            from: active_norm,
+                            to: active_norm,
+                            rolling_p95_ms: p95,
+                        });
+                    }
+                } else {
+                    self.low_streak = 0;
                 }
             } else {
                 self.low_streak = 0;

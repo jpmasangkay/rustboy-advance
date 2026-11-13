@@ -1072,6 +1072,20 @@ fn default_auto_quality_governor() -> bool {
     true
 }
 
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct BlockedGpuAdapterEntry {
+    pub adapter_name: String,
+    pub backend: String,
+    pub device_type: String,
+    pub vendor: u32,
+    pub device: u32,
+    pub driver: String,
+    pub driver_info: String,
+    pub failed_stage: String,
+    pub reason: String,
+    pub recorded_utc: String,
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(default)]
 pub struct AppConfig {
@@ -1094,6 +1108,8 @@ pub struct AppConfig {
     pub auto_quality_governor: bool,
     #[serde(default)]
     pub governor_settled_filters: BTreeMap<String, DisplayFilter>,
+    #[serde(default)]
+    pub blocked_gpu_adapters: BTreeMap<String, BlockedGpuAdapterEntry>,
     #[serde(default)]
     pub shader_preset: ShaderPreset,
     #[serde(default)]
@@ -1159,6 +1175,7 @@ impl Default for AppConfig {
             display_filter: DisplayFilter::MyBoySmooth,
             auto_quality_governor: default_auto_quality_governor(),
             governor_settled_filters: BTreeMap::new(),
+            blocked_gpu_adapters: BTreeMap::new(),
             shader_preset: ShaderPreset::Nearest,
             frame_blending: false,
             dot_accurate_ppu: false,
@@ -1336,6 +1353,35 @@ impl AppConfig {
 
     pub fn set_settled_filter(&mut self, key: String, filter: DisplayFilter) {
         self.governor_settled_filters.insert(key, filter);
+    }
+
+    pub fn gpu_adapter_block_key(
+        adapter_name: &str,
+        backend: &str,
+        vendor: u32,
+        device: u32,
+    ) -> String {
+        format!(
+            "{}|{}|{vendor:#06x}|{device:#06x}",
+            backend.trim(),
+            adapter_name.trim()
+        )
+    }
+
+    pub fn blocked_gpu_adapter(&self, key: &str) -> Option<&BlockedGpuAdapterEntry> {
+        self.blocked_gpu_adapters
+            .get(key)
+            .or_else(|| self.blocked_gpu_adapters.get("adapter-enum"))
+    }
+
+    pub fn record_blocked_gpu_adapter(&mut self, key: String, entry: BlockedGpuAdapterEntry) {
+        self.blocked_gpu_adapters.insert(key, entry);
+    }
+
+    pub fn clear_blocked_gpu_adapters(&mut self) -> usize {
+        let n = self.blocked_gpu_adapters.len();
+        self.blocked_gpu_adapters.clear();
+        n
     }
 }
 

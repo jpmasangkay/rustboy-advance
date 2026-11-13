@@ -15,13 +15,17 @@ use winit::window::{Window, WindowId};
 
 use crate::audio::AudioOutput;
 use crate::config::{AppConfig, DisplayFilter, KeyBindings};
-use crate::filters::{FilterCost, QualityGovernor, VideoPostProcessor, sort_filter_costs};
+use crate::filters::{
+    FilterCost, GOVERNOR_MAX_CAP_HEIGHT, GOVERNOR_MAX_CAP_WIDTH, QualityGovernor,
+    VideoPostProcessor, sort_filter_costs,
+};
 use crate::headless::CliConfig;
 
 const GBA_FRAME_DURATION: Duration = Duration::from_nanos(16_742_706);
 
 #[derive(Clone, Debug, serde::Serialize)]
 pub struct SoftbufferSizeBenchRow {
+    pub present_mode: String,
     pub resolution_label: String,
     pub width: u32,
     pub height: u32,
@@ -36,6 +40,212 @@ pub struct SoftbufferSizeBenchRow {
     pub total_work_worst_ms: f64,
     pub over_budget_pct: f64,
     pub fits_budget: bool,
+}
+
+#[inline]
+pub fn compute_aspect_rect(
+    src_w: usize,
+    src_h: usize,
+    dst_w: usize,
+    dst_h: usize,
+) -> (usize, usize, usize, usize) {
+    if src_w == 0 || src_h == 0 || dst_w == 0 || dst_h == 0 {
+        return (0, 0, dst_w, dst_h);
+    }
+    let scale_w = dst_w as f64 / src_w as f64;
+    let scale_h = dst_h as f64 / src_h as f64;
+    let scale = scale_w.min(scale_h);
+    let draw_w = ((src_w as f64 * scale).round() as usize).clamp(1, dst_w);
+    let draw_h = ((src_h as f64 * scale).round() as usize).clamp(1, dst_h);
+    let off_x = (dst_w - draw_w) / 2;
+    let off_y = (dst_h - draw_h) / 2;
+    (off_x, off_y, draw_w, draw_h)
+}
+
+#[inline]
+pub fn capped_source_dims(src_w: usize, src_h: usize) -> (usize, usize) {
+    if src_w <= GOVERNOR_MAX_CAP_WIDTH && src_h <= GOVERNOR_MAX_CAP_HEIGHT {
+        return (src_w.max(1), src_h.max(1));
+    }
+    let (_, _, draw_w, draw_h) = compute_aspect_rect(
+        src_w,
+        src_h,
+        GOVERNOR_MAX_CAP_WIDTH,
+        GOVERNOR_MAX_CAP_HEIGHT,
+    );
+    (draw_w.max(1), draw_h.max(1))
+}
+
+#[cfg(target_os = "windows")]
+mod win32_gdi {
+    use super::compute_aspect_rect;
+    use winit::raw_window_handle::{HasWindowHandle, RawWindowHandle};
+    use winit::window::Window;
+
+    const BI_RGB: u32 = 0;
+    const DIB_RGB_COLORS: u32 = 0;
+    const SRCCOPY: u32 = 0x00CC_0020;
+    const BLACKNESS: u32 = 0x0000_0042;
+    pub(super) const COLORONCOLOR: i32 = 3;
+    pub(super) const HALFTONE: i32 = 4;
+
+    #[repr(C)]
+    struct BitmapInfoHeader {
+        bi_size: u32,
+        bi_width: i32,
+        bi_height: i32,
+        bi_planes: u16,
+        bi_bit_count: u16,
+        bi_compression: u32,
+        bi_size_image: u32,
+        bi_x_pels_per_meter: i32,
+        bi_y_pels_per_meter: i32,
+        bi_clr_used: u32,
+        bi_clr_important: u32,
+    }
+
+    #[repr(C)]
+    struct BitmapInfo {
+        bmi_header: BitmapInfoHeader,
+        bmi_colors: [u32; 1],
+    }
+
+    #[link(name = "user32")]
+    unsafe extern "system" {
+        fn GetDC(hwnd: isize) -> isize;
+        fn ReleaseDC(hwnd: isize, hdc: isize) -> i32;
+    }
+
+    #[link(name = "gdi32")]
+    unsafe extern "system" {
+        fn SetStretchBltMode(hdc: isize, mode: i32) -> i32;
+        fn SetBrushOrgEx(hdc: isize, x: i32, y: i32, lppt: *mut [i32; 2]) -> i32;
+        fn PatBlt(hdc: isize, x: i32, y: i32, w: i32, h: i32, rop: u32) -> i32;
+        fn StretchDIBits(
+            hdc: isize,
+            x_dest: i32,
+            y_dest: i32,
+            dest_width: i32,
+            dest_height: i32,
+            x_src: i32,
+            y_src: i32,
+            src_width: i32,
+            src_height: i32,
+            lp_bits: *const core::ffi::c_void,
+            lpbmi: *const BitmapInfo,
+            i_usage: u32,
+            rop: u32,
+        ) -> i32;
+    }
+
+    /// Presents a compact top-down `0x00RRGGBB` bitmap (at most `720x480`) to a Win32 window via
+    /// `StretchDIBits`, painting clean black letterbox margins outside the 3:2 viewport.
+    #[allow(clippy::too_many_arguments)]
+    pub(super) fn present_stretch_dibits(
+        window: &Window,
+        xrgb: &[u32],
+        src_w: usize,
+        src_h: usize,
+        dst_w: usize,
+        dst_h: usize,
+        halftone: bool,
+    ) -> bool {
+        if src_w == 0 || src_h == 0 || dst_w == 0 || dst_h == 0 || xrgb.len() < src_w * src_h {
+            return false;
+        }
+        let Ok(handle) = window.window_handle() else {
+            return false;
+        };
+        let hwnd = match handle.as_raw() {
+            RawWindowHandle::Win32(h) => h.hwnd.get(),
+            _ => return false,
+        };
+        let hdc = unsafe { GetDC(hwnd) };
+        if hdc == 0 {
+            return false;
+        }
+
+        let (off_x, off_y, draw_w, draw_h) = compute_aspect_rect(src_w, src_h, dst_w, dst_h);
+        if off_x > 0 {
+            unsafe {
+                PatBlt(hdc, 0, 0, off_x as i32, dst_h as i32, BLACKNESS);
+                let right_x = off_x + draw_w;
+                if dst_w > right_x {
+                    PatBlt(
+                        hdc,
+                        right_x as i32,
+                        0,
+                        (dst_w - right_x) as i32,
+                        dst_h as i32,
+                        BLACKNESS,
+                    );
+                }
+            }
+        }
+        if off_y > 0 {
+            unsafe {
+                PatBlt(hdc, 0, 0, dst_w as i32, off_y as i32, BLACKNESS);
+                let bottom_y = off_y + draw_h;
+                if dst_h > bottom_y {
+                    PatBlt(
+                        hdc,
+                        0,
+                        bottom_y as i32,
+                        dst_w as i32,
+                        (dst_h - bottom_y) as i32,
+                        BLACKNESS,
+                    );
+                }
+            }
+        }
+
+        let mode = if halftone { HALFTONE } else { COLORONCOLOR };
+        unsafe {
+            SetStretchBltMode(hdc, mode);
+            if halftone {
+                SetBrushOrgEx(hdc, 0, 0, std::ptr::null_mut());
+            }
+        }
+
+        let bmi = BitmapInfo {
+            bmi_header: BitmapInfoHeader {
+                bi_size: std::mem::size_of::<BitmapInfoHeader>() as u32,
+                bi_width: src_w as i32,
+                bi_height: -(src_h as i32), // top-down DIB
+                bi_planes: 1,
+                bi_bit_count: 32,
+                bi_compression: BI_RGB,
+                bi_size_image: 0,
+                bi_x_pels_per_meter: 0,
+                bi_y_pels_per_meter: 0,
+                bi_clr_used: 0,
+                bi_clr_important: 0,
+            },
+            bmi_colors: [0],
+        };
+
+        let copied = unsafe {
+            StretchDIBits(
+                hdc,
+                off_x as i32,
+                off_y as i32,
+                draw_w as i32,
+                draw_h as i32,
+                0,
+                0,
+                src_w as i32,
+                src_h as i32,
+                xrgb.as_ptr().cast(),
+                &bmi,
+                DIB_RGB_COLORS,
+                SRCCOPY,
+            )
+        };
+        unsafe {
+            ReleaseDC(hwnd, hdc);
+        }
+        copied > 0
+    }
 }
 
 #[derive(Clone, Copy)]
@@ -208,13 +418,7 @@ impl NoGpuCpuPresenter {
         }
 
         // Preserve GBA 3:2 aspect ratio centered inside arbitrary window dimensions.
-        let scale_w = dst_w as f64 / src_w as f64;
-        let scale_h = dst_h as f64 / src_h as f64;
-        let scale = scale_w.min(scale_h);
-        let draw_w = ((src_w as f64 * scale).round() as usize).clamp(1, dst_w);
-        let draw_h = ((src_h as f64 * scale).round() as usize).clamp(1, dst_h);
-        let off_x = (dst_w - draw_w) / 2;
-        let off_y = (dst_h - draw_h) / 2;
+        let (off_x, off_y, draw_w, draw_h) = compute_aspect_rect(src_w, src_h, dst_w, dst_h);
 
         if off_x > 0 || off_y > 0 {
             Self::fill_letterbox_borders(dst, dst_w, dst_h, off_x, off_y, draw_w, draw_h);
@@ -398,6 +602,112 @@ impl NoGpuCpuPresenter {
         sort_filter_costs(&mut costs);
         costs
     }
+
+    /// Presents `img` capped at most `720x480` via Win32 `StretchDIBits` (`None` on non-Windows).
+    #[allow(unused_variables)]
+    pub fn present_capped_os_stretch(
+        &mut self,
+        window: &Window,
+        src: &[egui::Color32],
+        src_w: usize,
+        src_h: usize,
+        dst_w: usize,
+        dst_h: usize,
+        halftone: bool,
+    ) -> bool {
+        let (cap_w, cap_h) = capped_source_dims(src_w, src_h);
+        let xrgb_len = cap_w.saturating_mul(cap_h);
+        self.present_rgba_to_xrgb(src, src_w, src_h, cap_w, cap_h, halftone);
+        #[cfg(target_os = "windows")]
+        {
+            return win32_gdi::present_stretch_dibits(
+                window,
+                &self.scratch_xrgb[..xrgb_len],
+                cap_w,
+                cap_h,
+                dst_w,
+                dst_h,
+                halftone,
+            );
+        }
+        #[cfg(not(target_os = "windows"))]
+        {
+            false
+        }
+    }
+
+    pub fn measure_capped_filter_costs(
+        &mut self,
+        postproc: &mut VideoPostProcessor,
+        color_correction: bool,
+        lcd_ghosting: bool,
+        grid_intensity: f32,
+        dst_w: usize,
+        dst_h: usize,
+        window: Option<&Window>,
+    ) -> Vec<FilterCost> {
+        let pattern = crate::filters::test_filter_pattern_fb();
+        let mut costs = Vec::with_capacity(DisplayFilter::ALL.len());
+        for &filter in &DisplayFilter::ALL {
+            postproc.prewarm(color_correction, lcd_ghosting, filter, false, grid_intensity);
+            let linear = filter.texture_options() == egui::TextureOptions::LINEAR;
+            for _ in 0..2 {
+                let img = postproc.process_display_filter(
+                    &pattern,
+                    color_correction,
+                    lcd_ghosting,
+                    filter,
+                    false,
+                    grid_intensity,
+                );
+                let (cw, ch) = capped_source_dims(img.size[0], img.size[1]);
+                self.present_rgba_to_xrgb(&img.pixels, img.size[0], img.size[1], cw, ch, linear);
+            }
+            let mut samples = [0.0f64; 3];
+            for slot in &mut samples {
+                let t0 = Instant::now();
+                for _ in 0..4 {
+                    let img = postproc.process_display_filter(
+                        &pattern,
+                        color_correction,
+                        lcd_ghosting,
+                        filter,
+                        false,
+                        grid_intensity,
+                    );
+                    if let Some(w) = window {
+                        let _ = self.present_capped_os_stretch(
+                            w,
+                            &img.pixels,
+                            img.size[0],
+                            img.size[1],
+                            dst_w,
+                            dst_h,
+                            false,
+                        );
+                    } else {
+                        let (cw, ch) = capped_source_dims(img.size[0], img.size[1]);
+                        self.present_rgba_to_xrgb(
+                            &img.pixels,
+                            img.size[0],
+                            img.size[1],
+                            cw,
+                            ch,
+                            linear,
+                        );
+                    }
+                }
+                *slot = t0.elapsed().as_secs_f64() * 1000.0 / 4.0;
+            }
+            samples.sort_by(f64::total_cmp);
+            costs.push(FilterCost {
+                filter,
+                cost_ms: samples[1],
+            });
+        }
+        sort_filter_costs(&mut costs);
+        costs
+    }
 }
 
 struct NoGpuSink {
@@ -558,6 +868,7 @@ struct NoGpuApp {
     fullscreen_on_start: bool,
     is_fullscreen: bool,
     sync_60hz: bool,
+    slowdown: usize,
     drc_pacer: crate::emu_thread::DrcPacer,
     #[cfg(windows)]
     #[allow(dead_code)]
@@ -595,7 +906,11 @@ impl NoGpuApp {
         let audio = AudioOutput::start();
         audio.set_muted(config.muted);
         let audio_cap = audio.capacity();
-        let sync_60hz = cli.sync_60hz.unwrap_or(true);
+        let sync_decision =
+            crate::display_timing::resolve_sync_decision(cli.sync_60hz, cli.simulate_refresh_hz);
+        println!("[sync] {}", sync_decision.reason);
+        let sync_60hz = sync_decision.sync_60hz;
+        let display_refresh_hz = sync_decision.effective_refresh_hz;
         let mut drc_pacer = crate::emu_thread::DrcPacer::new(audio_cap);
         if sync_60hz {
             drc_pacer.set_base_fps(60.0);
@@ -616,7 +931,13 @@ impl NoGpuApp {
             } else {
                 "no-gpu-softbuffer"
             };
-            crate::bench::DesktopPerfLogger::create(p, tag).ok()
+            crate::bench::DesktopPerfLogger::create_with_timing(
+                p,
+                tag,
+                display_refresh_hz,
+                sync_60hz,
+            )
+            .ok()
         });
         let mut sink = NoGpuSink::new(audio);
         let mut postproc = VideoPostProcessor::new();
@@ -630,10 +951,23 @@ impl NoGpuApp {
             init_w as usize,
             init_h as usize,
         );
+        let capped_costs = blitter.measure_capped_filter_costs(
+            &mut postproc,
+            config.color_correction,
+            config.lcd_ghosting,
+            config.lcd_grid_intensity,
+            init_w as usize,
+            init_h as usize,
+            None,
+        );
         let mut governor = QualityGovernor::with_measured_costs(
             config.display_filter,
             config.auto_quality_governor,
             costs,
+        );
+        governor.set_resolution_cap_support(
+            init_w as usize > GOVERNOR_MAX_CAP_WIDTH || init_h as usize > GOVERNOR_MAX_CAP_HEIGHT,
+            Some(capped_costs),
         );
         let profile_key = AppConfig::governor_profile_key(
             "winit+softbuffer",
@@ -728,6 +1062,7 @@ impl NoGpuApp {
             fullscreen_on_start: cli.fullscreen,
             is_fullscreen: cli.fullscreen,
             sync_60hz,
+            slowdown: cli.slowdown.max(1),
             drc_pacer,
             #[cfg(windows)]
             high_res_timer,
@@ -776,7 +1111,7 @@ impl NoGpuApp {
     }
 
     fn present_current_frame(&mut self) {
-        let Some(surface) = self.surface.as_mut() else {
+        let Some(window) = self.window.as_ref() else {
             return;
         };
         let (dst_w, dst_h) = (self.size.0 as usize, self.size.1 as usize);
@@ -797,19 +1132,37 @@ impl NoGpuApp {
             self.config.lcd_grid_intensity,
         );
         let linear = self.config.display_filter.texture_options() == egui::TextureOptions::LINEAR;
-        let Ok(mut buf) = surface.buffer_mut() else {
-            return;
+        let used_os_stretch = if self.governor.is_resolution_capped() {
+            self.blitter.present_capped_os_stretch(
+                window,
+                &img.pixels,
+                img.size[0],
+                img.size[1],
+                dst_w,
+                dst_h,
+                false,
+            )
+        } else {
+            false
         };
-        self.blitter.blit_rgba_to_slice(
-            &img.pixels,
-            img.size[0],
-            img.size[1],
-            &mut buf,
-            dst_w,
-            dst_h,
-            linear,
-        );
-        let _ = buf.present();
+        if !used_os_stretch {
+            let Some(surface) = self.surface.as_mut() else {
+                return;
+            };
+            let Ok(mut buf) = surface.buffer_mut() else {
+                return;
+            };
+            self.blitter.blit_rgba_to_slice(
+                &img.pixels,
+                img.size[0],
+                img.size[1],
+                &mut buf,
+                dst_w,
+                dst_h,
+                linear,
+            );
+            let _ = buf.present();
+        }
         self.last_present_ms = t0.elapsed().as_secs_f64() * 1000.0;
         self.sink.frame_dirty = false;
     }
@@ -855,6 +1208,36 @@ impl ApplicationHandler for NoGpuApp {
         if let (Some(w), Some(h)) = (NonZeroU32::new(self.size.0), NonZeroU32::new(self.size.1)) {
             let _ = surface.resize(w, h);
         }
+        self.profile_key = AppConfig::governor_profile_key(
+            "winit+softbuffer",
+            "NoGpu",
+            self.size.0,
+            self.size.1,
+            self.config.window_scale,
+        );
+        let capped_costs = self.blitter.measure_capped_filter_costs(
+            &mut self.postproc,
+            self.config.color_correction,
+            self.config.lcd_ghosting,
+            self.config.lcd_grid_intensity,
+            self.size.0 as usize,
+            self.size.1 as usize,
+            Some(&window),
+        );
+        let costs = self.blitter.measure_filter_costs(
+            &mut self.postproc,
+            self.config.color_correction,
+            self.config.lcd_ghosting,
+            self.config.lcd_grid_intensity,
+            self.size.0 as usize,
+            self.size.1 as usize,
+        );
+        self.governor.set_measured_costs(costs);
+        self.governor.set_resolution_cap_support(
+            self.size.0 as usize > GOVERNOR_MAX_CAP_WIDTH
+                || self.size.1 as usize > GOVERNOR_MAX_CAP_HEIGHT,
+            Some(capped_costs),
+        );
         self.window = Some(window);
         self.context = Some(context);
         self.surface = Some(surface);
@@ -904,7 +1287,21 @@ impl ApplicationHandler for NoGpuApp {
                     self.size.0 as usize,
                     self.size.1 as usize,
                 );
+                let capped_costs = self.blitter.measure_capped_filter_costs(
+                    &mut self.postproc,
+                    self.config.color_correction,
+                    self.config.lcd_ghosting,
+                    self.config.lcd_grid_intensity,
+                    self.size.0 as usize,
+                    self.size.1 as usize,
+                    self.window.as_deref(),
+                );
                 self.governor.set_measured_costs(costs);
+                self.governor.set_resolution_cap_support(
+                    self.size.0 as usize > GOVERNOR_MAX_CAP_WIDTH
+                        || self.size.1 as usize > GOVERNOR_MAX_CAP_HEIGHT,
+                    Some(capped_costs),
+                );
                 self.sink.frame_dirty = true;
                 if let Some(w) = &self.window {
                     w.request_redraw();
@@ -1016,11 +1413,21 @@ impl ApplicationHandler for NoGpuApp {
                 let t0 = Instant::now();
                 core.run_frame(&mut self.sink);
                 self.last_core_ms = t0.elapsed().as_secs_f64() * 1000.0;
-                self.pending_emu_ms += self.last_core_ms;
+                if self.slowdown > 1 {
+                    let extra_ms =
+                        (self.last_core_ms + self.last_present_ms) * (self.slowdown - 1) as f64;
+                    let spin_until = Instant::now() + Duration::from_secs_f64(extra_ms / 1000.0);
+                    while Instant::now() < spin_until {
+                        std::hint::spin_loop();
+                    }
+                }
+                let scaled_core_ms = self.last_core_ms * self.slowdown as f64;
+                let scaled_present_ms = self.last_present_ms * self.slowdown as f64;
+                self.pending_emu_ms += scaled_core_ms;
                 self.frames_stepped_since_present += 1;
                 self.frames_in_window += 1;
 
-                let work_ms = self.last_core_ms + self.last_present_ms;
+                let work_ms = scaled_core_ms + scaled_present_ms;
                 if let Some(tr) = self.governor.record_frame(work_ms) {
                     self.config.display_filter = tr.to;
                     self.config.shader_preset = tr.to.default_shader_preset();
@@ -1028,6 +1435,14 @@ impl ApplicationHandler for NoGpuApp {
                         .set_settled_filter(self.profile_key.clone(), tr.to);
                     self.config.save();
                     self.sink.frame_dirty = true;
+                    println!(
+                        "[governor] No-GPU {:?}: {} -> {} | capped_720x480={} (rolling_p95={:.2} ms)",
+                        tr.kind,
+                        tr.from.label(),
+                        tr.to.label(),
+                        self.governor.is_resolution_capped(),
+                        tr.rolling_p95_ms
+                    );
                 }
             }
             let frame_period = if self.sync_60hz {
@@ -1055,9 +1470,15 @@ impl ApplicationHandler for NoGpuApp {
             self.frames_in_window = 0;
             self.last_title_update = now;
             if let Some(w) = &self.window {
+                let mode_tag = if self.governor.is_resolution_capped() {
+                    "StretchDIBits <=720x480"
+                } else {
+                    "softbuffer"
+                };
                 w.set_title(&format!(
-                    "{} [No-GPU: softbuffer | {} | {:.1} FPS] — {}",
+                    "{} [No-GPU: {} | {} | {:.1} FPS] — {}",
                     self.title,
+                    mode_tag,
                     self.config.display_filter.label(),
                     fps,
                     self.rom_name
@@ -1219,39 +1640,91 @@ pub fn bench_softbuffer_sizes(
             let mut postproc = VideoPostProcessor::new();
             let mut blitter = NoGpuCpuPresenter::new(init_w as usize, init_h as usize);
 
-            for (res_label, w, h) in sizes {
-                let _ = surf.resize(
-                    NonZeroU32::new(w.max(1)).unwrap(),
-                    NonZeroU32::new(h.max(1)).unwrap(),
-                );
+            #[derive(Clone, Copy)]
+            enum SizePresentVariant {
+                SoftbufferUncapped,
+                #[cfg(target_os = "windows")]
+                StretchDibitsColorOnColor,
+                #[cfg(target_os = "windows")]
+                StretchDibitsHalftone,
+            }
+
+            impl SizePresentVariant {
+                fn label(self) -> &'static str {
+                    match self {
+                        Self::SoftbufferUncapped => "softbuffer",
+                        #[cfg(target_os = "windows")]
+                        Self::StretchDibitsColorOnColor => "stretchdibits-coloroncolor",
+                        #[cfg(target_os = "windows")]
+                        Self::StretchDibitsHalftone => "stretchdibits-halftone",
+                    }
+                }
+            }
+
+            let run_variant = |variant: SizePresentVariant,
+                               res_label: &str,
+                               w: u32,
+                               h: u32,
+                               surf: &mut softbuffer::Surface<Arc<Window>, Arc<Window>>,
+                               core: &mut GbaCore,
+                               core_sink: &mut NullSink,
+                               postproc: &mut VideoPostProcessor,
+                               blitter: &mut NoGpuCpuPresenter,
+                               results: &mut Vec<SoftbufferSizeBenchRow>| {
                 for &(slug, filter, cc) in &[
                     ("none", DisplayFilter::Sharp1x, false),
                     ("myboy-smooth", DisplayFilter::MyBoySmooth, false),
                 ] {
                     postproc.prewarm(cc, false, filter, false, 0.08);
                     let linear = filter.texture_options() == egui::TextureOptions::LINEAR;
-                    for _ in 0..8 {
-                        core.run_frame(&mut core_sink);
+                    let mut present_once = |core_fb: &[u16; LCD_WIDTH * LCD_HEIGHT]| {
                         let img = postproc.process_display_filter(
-                            &core_sink.0,
-                            cc,
-                            false,
-                            filter,
-                            false,
-                            0.08,
+                            core_fb, cc, false, filter, false, 0.08,
                         );
-                        if let Ok(mut buf) = surf.buffer_mut() {
-                            blitter.blit_rgba_to_slice(
-                                &img.pixels,
-                                img.size[0],
-                                img.size[1],
-                                &mut buf,
-                                w as usize,
-                                h as usize,
-                                linear,
-                            );
-                            let _ = buf.present();
+                        match variant {
+                            SizePresentVariant::SoftbufferUncapped => {
+                                if let Ok(mut buf) = surf.buffer_mut() {
+                                    blitter.blit_rgba_to_slice(
+                                        &img.pixels,
+                                        img.size[0],
+                                        img.size[1],
+                                        &mut buf,
+                                        w as usize,
+                                        h as usize,
+                                        linear,
+                                    );
+                                    let _ = buf.present();
+                                }
+                            }
+                            #[cfg(target_os = "windows")]
+                            SizePresentVariant::StretchDibitsColorOnColor => {
+                                let _ = blitter.present_capped_os_stretch(
+                                    &win,
+                                    &img.pixels,
+                                    img.size[0],
+                                    img.size[1],
+                                    w as usize,
+                                    h as usize,
+                                    false,
+                                );
+                            }
+                            #[cfg(target_os = "windows")]
+                            SizePresentVariant::StretchDibitsHalftone => {
+                                let _ = blitter.present_capped_os_stretch(
+                                    &win,
+                                    &img.pixels,
+                                    img.size[0],
+                                    img.size[1],
+                                    w as usize,
+                                    h as usize,
+                                    true,
+                                );
+                            }
                         }
+                    };
+                    for _ in 0..8 {
+                        core.run_frame(core_sink);
+                        present_once(&core_sink.0);
                     }
 
                     for &slowdown in slowdowns {
@@ -1260,28 +1733,9 @@ pub fn bench_softbuffer_sizes(
                         let mut over_budget = 0usize;
                         for _ in 0..self.frames {
                             let t_frame = Instant::now();
-                            core.run_frame(&mut core_sink);
+                            core.run_frame(core_sink);
                             let t_pres = Instant::now();
-                            let img = postproc.process_display_filter(
-                                &core_sink.0,
-                                cc,
-                                false,
-                                filter,
-                                false,
-                                0.08,
-                            );
-                            if let Ok(mut buf) = surf.buffer_mut() {
-                                blitter.blit_rgba_to_slice(
-                                    &img.pixels,
-                                    img.size[0],
-                                    img.size[1],
-                                    &mut buf,
-                                    w as usize,
-                                    h as usize,
-                                    linear,
-                                );
-                                let _ = buf.present();
-                            }
+                            present_once(&core_sink.0);
                             let pres_ms = t_pres.elapsed().as_secs_f64() * 1000.0;
                             let raw_dur = t_frame.elapsed();
                             if slowdown > 1 {
@@ -1307,8 +1761,9 @@ pub fn bench_softbuffer_sizes(
                         let tot_p99 = total_samples[((n - 1) * 99) / 100];
                         let tot_worst = *total_samples.last().unwrap_or(&0.0);
                         let over_pct = (over_budget as f64 / n as f64) * 100.0;
-                        self.results.push(SoftbufferSizeBenchRow {
-                            resolution_label: res_label.clone(),
+                        results.push(SoftbufferSizeBenchRow {
+                            present_mode: variant.label().to_string(),
+                            resolution_label: res_label.to_string(),
                             width: w,
                             height: h,
                             filter: slug.to_string(),
@@ -1324,6 +1779,55 @@ pub fn bench_softbuffer_sizes(
                             fits_budget: over_pct < 0.50,
                         });
                     }
+                }
+            };
+
+            for (res_label, w, h) in sizes {
+                let _ = surf.resize(
+                    NonZeroU32::new(w.max(1)).unwrap(),
+                    NonZeroU32::new(h.max(1)).unwrap(),
+                );
+                run_variant(
+                    SizePresentVariant::SoftbufferUncapped,
+                    &res_label,
+                    w,
+                    h,
+                    &mut surf,
+                    &mut core,
+                    &mut core_sink,
+                    &mut postproc,
+                    &mut blitter,
+                    &mut self.results,
+                );
+                #[cfg(target_os = "windows")]
+                if self.include_scaled_slowdowns
+                    && (w as usize > GOVERNOR_MAX_CAP_WIDTH || h as usize > GOVERNOR_MAX_CAP_HEIGHT)
+                {
+                    let _ = win.request_inner_size(LogicalSize::new(w, h));
+                    run_variant(
+                        SizePresentVariant::StretchDibitsColorOnColor,
+                        &res_label,
+                        w,
+                        h,
+                        &mut surf,
+                        &mut core,
+                        &mut core_sink,
+                        &mut postproc,
+                        &mut blitter,
+                        &mut self.results,
+                    );
+                    run_variant(
+                        SizePresentVariant::StretchDibitsHalftone,
+                        &res_label,
+                        w,
+                        h,
+                        &mut surf,
+                        &mut core,
+                        &mut core_sink,
+                        &mut postproc,
+                        &mut blitter,
+                        &mut self.results,
+                    );
                 }
             }
             self.surface = Some(surf);

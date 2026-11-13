@@ -1635,6 +1635,8 @@ pub fn run_bench_realtime(cfg: &CliConfig) -> Result<(), String> {
             let action = match tr.kind {
                 crate::filters::GovernorTransitionKind::StepDown => "GOVERNOR_STEP_DOWN",
                 crate::filters::GovernorTransitionKind::StepUp => "GOVERNOR_STEP_UP",
+                crate::filters::GovernorTransitionKind::CapResolution => "GOVERNOR_CAP_720X480",
+                crate::filters::GovernorTransitionKind::UncapResolution => "GOVERNOR_UNCAP_RES",
             };
             let from_slug = filter_cli_slug(tr.from);
             let to_slug = filter_cli_slug(tr.to);
@@ -4034,12 +4036,18 @@ fn current_exe_sha256() -> String {
 #[derive(Clone, Debug, Serialize)]
 pub struct DesktopPerfSummaryJson {
     pub backend: String,
+    pub display_refresh_hz: f64,
+    pub sync_60hz: bool,
+    pub expected_vblanks_range: [u64; 2],
     pub duration_s: f64,
+    pub steady_duration_s: f64,
     pub total_presented_frames: usize,
     pub steady_presented_frames: usize,
     pub steady_gba_frames: usize,
     pub repeated_frames_steady: usize,
     pub repeat_pct_steady: f64,
+    pub app_repeats_per_min: f64,
+    pub app_drops_per_min: f64,
     pub multi_step_frames_steady: usize,
     pub underruns_session_total: u64,
     pub underruns_steady: u64,
@@ -4054,6 +4062,13 @@ pub struct DesktopPerfSummaryJson {
     pub emu_summary: LatencySummary,
     pub present_summary: LatencySummary,
     pub vsync_hold_histogram: std::collections::BTreeMap<u32, usize>,
+    pub dwm_vblank_span_histogram: std::collections::BTreeMap<u64, usize>,
+    pub dwm_unusual_long_vblanks: usize,
+    pub dwm_short_or_zero_vblanks: usize,
+    pub dwm_frames_dropped_delta: u64,
+    pub dwm_frames_missed_delta: u64,
+    pub dwm_repeats_per_min: f64,
+    pub dwm_drops_per_min: f64,
     pub final_filter: String,
     pub csv_path: String,
 }
@@ -4064,7 +4079,10 @@ pub struct DesktopPerfLogger {
     csv_path: PathBuf,
     writer: BufWriter<File>,
     backend: String,
+    sync_60hz: bool,
+    dwm_tracker: crate::display_timing::DwmScanoutTracker,
     start_wall: Instant,
+    steady_start_wall: Option<Instant>,
     last_wall: Option<Instant>,
     last_gba_step_wall: Option<Instant>,
     frame_idx: usize,
@@ -4086,7 +4104,12 @@ pub struct DesktopPerfLogger {
 }
 
 impl DesktopPerfLogger {
-    pub fn create(path: &Path, backend: &str) -> Result<Self, String> {
+    pub fn create_with_timing(
+        path: &Path,
+        backend: &str,
+        display_refresh_hz: Option<f64>,
+        sync_60hz: bool,
+    ) -> Result<Self, String> {
         if let Some(parent) = path.parent()
             && !parent.as_os_str().is_empty()
         {
@@ -4098,7 +4121,7 @@ impl DesktopPerfLogger {
         let mut writer = BufWriter::new(file);
         writeln!(
             writer,
-            "frame_idx,wall_interval_ms,emu_ms,present_ms,underruns_total,underruns_delta,filter,frames_stepped,frame_repeated,gba_interval_ms,window_w,window_h,fullscreen,backend"
+            "frame_idx,wall_interval_ms,emu_ms,present_ms,underruns_total,underruns_delta,filter,frames_stepped,frame_repeated,gba_interval_ms,dwm_c_refresh,dwm_vblanks_gba,dwm_dropped_delta,dwm_unusual_vblank,window_w,window_h,fullscreen,backend"
         )
         .map_err(|e| format!("failed to write perf log header: {e}"))?;
 
@@ -4106,7 +4129,13 @@ impl DesktopPerfLogger {
             csv_path: path.to_path_buf(),
             writer,
             backend: backend.to_string(),
+            sync_60hz,
+            dwm_tracker: crate::display_timing::DwmScanoutTracker::new(
+                display_refresh_hz,
+                sync_60hz,
+            ),
             start_wall: Instant::now(),
+            steady_start_wall: None,
             last_wall: None,
             last_gba_step_wall: None,
             frame_idx: 0,
@@ -4128,6 +4157,11 @@ impl DesktopPerfLogger {
         })
     }
 
+    #[allow(dead_code)]
+    pub fn create(path: &Path, backend: &str) -> Result<Self, String> {
+        Self::create_with_timing(path, backend, None, false)
+    }
+
     #[allow(clippy::too_many_arguments)]
     pub fn record_present(
         &mut self,
@@ -4143,6 +4177,9 @@ impl DesktopPerfLogger {
         let now = Instant::now();
         let elapsed_s = now.duration_since(self.start_wall).as_secs_f64();
         let steady = elapsed_s >= 2.0 && self.frame_idx >= 10;
+        if steady && self.steady_start_wall.is_none() {
+            self.steady_start_wall = Some(now);
+        }
 
         let wall_interval_ms = self
             .last_wall
@@ -4193,12 +4230,23 @@ impl DesktopPerfLogger {
             0.0
         };
 
+        let dwm = self.dwm_tracker.sample_present(frames_stepped, steady);
+        let (dwm_c_refresh, dwm_vblanks_gba, dwm_dropped_delta, dwm_unusual) = match dwm {
+            Some(d) => (
+                d.c_refresh,
+                d.vblanks_per_gba_frame.unwrap_or(0),
+                d.dropped_delta,
+                if d.unusual_vblank { 1 } else { 0 },
+            ),
+            None => (0, 0, 0, 0),
+        };
+
         self.last_filter.clear();
         self.last_filter.push_str(filter);
 
         let _ = writeln!(
             self.writer,
-            "{},{wall_interval_ms:.4},{emu_ms:.4},{present_ms:.4},{underruns_total},{underruns_delta},\"{}\",{frames_stepped},{},{gba_interval_ms:.4},{window_w},{window_h},{},\"{}\"",
+            "{},{wall_interval_ms:.4},{emu_ms:.4},{present_ms:.4},{underruns_total},{underruns_delta},\"{}\",{frames_stepped},{},{gba_interval_ms:.4},{dwm_c_refresh},{dwm_vblanks_gba},{dwm_dropped_delta},{dwm_unusual},{window_w},{window_h},{},\"{}\"",
             self.frame_idx,
             filter.replace('"', "\"\""),
             if frame_repeated { 1 } else { 0 },
@@ -4277,15 +4325,36 @@ impl DesktopPerfLogger {
             0.0
         };
         let duration_s = self.start_wall.elapsed().as_secs_f64();
+        let steady_duration_s = self
+            .steady_start_wall
+            .map(|t| t.elapsed().as_secs_f64())
+            .unwrap_or((duration_s - 2.0).max(0.0));
+        let steady_mins = (steady_duration_s / 60.0).max(1e-6);
+
+        let dwm_repeats_per_min = self.dwm_tracker.unusual_long_vblank_frames as f64 / steady_mins;
+        let dwm_drops_per_min = (self.dwm_tracker.zero_or_short_vblank_frames as f64
+            + self.dwm_tracker.dwm_dropped_delta_total as f64)
+            / steady_mins;
+        let app_repeats_per_min = self.repeated_frames_steady as f64 / steady_mins;
+        let app_drops_per_min = self.multi_step_frames_steady as f64 / steady_mins;
 
         let summary = DesktopPerfSummaryJson {
             backend: self.backend.clone(),
+            display_refresh_hz: self.dwm_tracker.display_refresh_hz,
+            sync_60hz: self.sync_60hz,
+            expected_vblanks_range: [
+                self.dwm_tracker.expected_min_vblanks,
+                self.dwm_tracker.expected_max_vblanks,
+            ],
             duration_s,
+            steady_duration_s,
             total_presented_frames: self.frame_idx,
             steady_presented_frames: self.steady_presented_frames,
             steady_gba_frames: self.steady_gba_frames,
             repeated_frames_steady: self.repeated_frames_steady,
             repeat_pct_steady,
+            app_repeats_per_min,
+            app_drops_per_min,
             multi_step_frames_steady: self.multi_step_frames_steady,
             underruns_session_total,
             underruns_steady: self.underruns_steady,
@@ -4300,6 +4369,13 @@ impl DesktopPerfLogger {
             emu_summary: emu_summary.clone(),
             present_summary: present_summary.clone(),
             vsync_hold_histogram: self.vsync_hold_hist.clone(),
+            dwm_vblank_span_histogram: self.dwm_tracker.gba_vblank_span_hist.clone(),
+            dwm_unusual_long_vblanks: self.dwm_tracker.unusual_long_vblank_frames,
+            dwm_short_or_zero_vblanks: self.dwm_tracker.zero_or_short_vblank_frames,
+            dwm_frames_dropped_delta: self.dwm_tracker.dwm_dropped_delta_total,
+            dwm_frames_missed_delta: self.dwm_tracker.dwm_missed_delta_total,
+            dwm_repeats_per_min,
+            dwm_drops_per_min,
             final_filter: self.last_filter.clone(),
             csv_path: self.csv_path.display().to_string(),
         };
@@ -4311,6 +4387,13 @@ impl DesktopPerfLogger {
 
         let hist_str = self
             .vsync_hold_hist
+            .iter()
+            .map(|(k, v)| format!("{k}v:{v}"))
+            .collect::<Vec<_>>()
+            .join(", ");
+        let dwm_hist_str = self
+            .dwm_tracker
+            .gba_vblank_span_hist
             .iter()
             .map(|(k, v)| format!("{k}v:{v}"))
             .collect::<Vec<_>>()
@@ -4341,11 +4424,27 @@ impl DesktopPerfLogger {
             gba_jitter_2ms_pct
         );
         println!(
-            "  Repeats & Audio: repeats={}/{} ({:.2}%) | multi_step={} | vsync_holds=[{}] | underruns={} (steady={})",
+            "  DWM Scanout:     refresh={:.2} Hz | sync_60hz={} | nominal=[{}..{}] vblanks | spans=[{}] | unusual_repeats={} ({:.2}/min) | drops={} short={} dwm_dropped={} ({:.2}/min)",
+            self.dwm_tracker.display_refresh_hz,
+            self.sync_60hz,
+            self.dwm_tracker.expected_min_vblanks,
+            self.dwm_tracker.expected_max_vblanks,
+            dwm_hist_str,
+            self.dwm_tracker.unusual_long_vblank_frames,
+            dwm_repeats_per_min,
+            self.multi_step_frames_steady,
+            self.dwm_tracker.zero_or_short_vblank_frames,
+            self.dwm_tracker.dwm_dropped_delta_total,
+            dwm_drops_per_min
+        );
+        println!(
+            "  Repeats & Audio: repeats={}/{} ({:.2}%, {:.2}/min) | multi_step={} ({:.2}/min) | vsync_holds=[{}] | underruns={} (steady={})",
             self.repeated_frames_steady,
             self.steady_presented_frames,
             repeat_pct_steady,
+            app_repeats_per_min,
             self.multi_step_frames_steady,
+            app_drops_per_min,
             hist_str,
             underruns_session_total,
             self.underruns_steady
@@ -4358,7 +4457,11 @@ impl DesktopPerfLogger {
             present_summary.p95_ms,
             self.last_filter
         );
-        println!("  CSV / JSON:      {} / {}", self.csv_path.display(), summary_path.display());
+        println!(
+            "  CSV / JSON:      {} / {}",
+            self.csv_path.display(),
+            summary_path.display()
+        );
     }
 }
 
@@ -4397,7 +4500,8 @@ pub fn run_bench_softbuffer(cfg: &CliConfig) -> Result<(), String> {
     for r in &rows {
         let verdict = if r.fits_budget { "FIT" } else { "EXCEEDS" };
         println!(
-            "  [{:<11} {:>4}x{:<4}] {:<12} {:>2}x | present={:.3} p95={:.3} ms | total avg={:.3} p95={:.3} p99={:.3} worst={:.3} ms | over={:.2}% [{verdict}]",
+            "  [{:<24} {:<11} {:>4}x{:<4}] {:<12} {:>2}x | present={:.3} p95={:.3} ms | total avg={:.3} p95={:.3} p99={:.3} worst={:.3} ms | over={:.2}% [{verdict}]",
+            r.present_mode,
             r.resolution_label,
             r.width,
             r.height,

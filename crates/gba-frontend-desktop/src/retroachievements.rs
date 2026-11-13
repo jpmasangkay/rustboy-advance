@@ -161,7 +161,10 @@ pub enum ArithOp {
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum OperandExpr {
-    Mem { mem: MemRef, history_idx: usize },
+    Mem {
+        mem: MemRef,
+        history_idx: usize,
+    },
     Const(i64),
     UnaryNeg(Box<OperandExpr>),
     Binary {
@@ -419,7 +422,11 @@ impl TriggerProgram {
             return TriggerEvalResult {
                 triggered: false,
                 reset_fired: true,
-                measured_current: if measured_if_ok { measured_current } else { Some(0) },
+                measured_current: if measured_if_ok {
+                    measured_current
+                } else {
+                    Some(0)
+                },
                 measured_target,
             };
         }
@@ -579,14 +586,22 @@ fn evaluate_group(
 
     for (idx, cond) in group.conditions.iter_mut().enumerate() {
         let mut cond_match = raw_matches[idx];
-        if reset_next && !matches!(cond.flag, CondFlag::AddSource | CondFlag::SubSource | CondFlag::AddAddress) {
+        if reset_next
+            && !matches!(
+                cond.flag,
+                CondFlag::AddSource | CondFlag::SubSource | CondFlag::AddAddress
+            )
+        {
             cond.hits = 0;
             cond_match = false;
             reset_next = false;
         }
 
         match cond.flag {
-            CondFlag::AddSource | CondFlag::SubSource | CondFlag::AddAddress | CondFlag::PauseIf => {
+            CondFlag::AddSource
+            | CondFlag::SubSource
+            | CondFlag::AddAddress
+            | CondFlag::PauseIf => {
                 continue;
             }
             CondFlag::ResetNextIf => {
@@ -649,11 +664,17 @@ fn evaluate_group(
             }
             CondFlag::Standard | CondFlag::Trigger | CondFlag::Measured => {
                 let satisfied = if cond.hit_target > 0 {
-                    let effective_now = cond.hits.saturating_add(add_hits_acc).saturating_sub(sub_hits_acc);
+                    let effective_now = cond
+                        .hits
+                        .saturating_add(add_hits_acc)
+                        .saturating_sub(sub_hits_acc);
                     if cond_match && effective_now < cond.hit_target {
                         cond.hits = cond.hits.saturating_add(1);
                     }
-                    let effective_after = cond.hits.saturating_add(add_hits_acc).saturating_sub(sub_hits_acc);
+                    let effective_after = cond
+                        .hits
+                        .saturating_add(add_hits_acc)
+                        .saturating_sub(sub_hits_acc);
                     if cond.flag == CondFlag::Measured {
                         measured_current = Some(i64::from(effective_after.min(cond.hit_target)));
                         measured_target = Some(i64::from(cond.hit_target));
@@ -666,11 +687,7 @@ fn evaluate_group(
                             measured_target = Some(rhs_values[idx]);
                         }
                     }
-                    if cond.cmp.is_some() {
-                        cond_match
-                    } else {
-                        true
-                    }
+                    if cond.cmp.is_some() { cond_match } else { true }
                 };
                 add_hits_acc = 0;
                 sub_hits_acc = 0;
@@ -699,9 +716,8 @@ fn split_alt_groups(input: &str) -> Vec<&str> {
 
     while i < bytes.len() {
         if bytes[i] == b'S' {
-            let preceded_by_0x = i >= 2
-                && bytes[i - 2] == b'0'
-                && (bytes[i - 1] == b'x' || bytes[i - 1] == b'X');
+            let preceded_by_0x =
+                i >= 2 && bytes[i - 2] == b'0' && (bytes[i - 1] == b'x' || bytes[i - 1] == b'X');
             let is_flag_colon = bytes.get(i + 1) == Some(&b':');
             if !preceded_by_0x && !is_flag_colon {
                 parts.push(&input[start..i]);
@@ -1468,7 +1484,8 @@ impl RetroAchievementsManager {
             PatchAchievement {
                 id: 900_001,
                 title: "First Contact".to_string(),
-                description: "Write any non-zero byte to EWRAM 0x02000000 (RA 0x000000).".to_string(),
+                description: "Write any non-zero byte to EWRAM 0x02000000 (RA 0x000000)."
+                    .to_string(),
                 mem_addr: "0xH000000>0".to_string(),
                 points: 5,
                 flags: 3,
@@ -1561,41 +1578,43 @@ impl RetroAchievementsManager {
                     created_at: Instant::now(),
                 });
 
-                if !is_demo && !config.ra_username.is_empty() && !config.ra_token.is_empty() {
-                    if let Some(md5) = &self.current_rom_md5 {
-                        if let Some(tx) = &self.cmd_tx {
-                            let _ = tx.send(WorkerCommand::AwardAchievement {
-                                username: config.ra_username.clone(),
-                                token: config.ra_token.clone(),
-                                achievement_id: ach.id,
-                                hardcore,
-                                md5: md5.clone(),
-                            });
-                        }
-                    }
+                if !is_demo
+                    && !config.ra_username.is_empty()
+                    && !config.ra_token.is_empty()
+                    && let Some(md5) = &self.current_rom_md5
+                    && let Some(tx) = &self.cmd_tx
+                {
+                    let _ = tx.send(WorkerCommand::AwardAchievement {
+                        username: config.ra_username.clone(),
+                        token: config.ra_token.clone(),
+                        achievement_id: ach.id,
+                        hardcore,
+                        md5: md5.clone(),
+                    });
                 }
             }
         }
 
         // Rich Presence ping every ~2 minutes when logged in with a live recognized RA game.
-        if config.ra_rich_presence && self.is_logged_in(config) {
-            if let RaGameState::Ready { game_id, title } = &self.game_state {
-                let due = self
-                    .last_rp_ping
-                    .map(|t| t.elapsed() >= RICH_PRESENCE_INTERVAL)
-                    .unwrap_or(true);
-                if due {
-                    self.last_rp_ping = Some(Instant::now());
-                    let msg = self.rich_presence.format(title, hardcore);
-                    if let Some(md5) = &self.current_rom_md5 {
-                        self.send_cmd(WorkerCommand::PingRichPresence {
-                            username: config.ra_username.clone(),
-                            token: config.ra_token.clone(),
-                            game_id: *game_id,
-                            message: msg,
-                            md5: md5.clone(),
-                        });
-                    }
+        if config.ra_rich_presence
+            && self.is_logged_in(config)
+            && let RaGameState::Ready { game_id, title } = &self.game_state
+        {
+            let due = self
+                .last_rp_ping
+                .map(|t| t.elapsed() >= RICH_PRESENCE_INTERVAL)
+                .unwrap_or(true);
+            if due {
+                self.last_rp_ping = Some(Instant::now());
+                let msg = self.rich_presence.format(title, hardcore);
+                if let Some(md5) = &self.current_rom_md5 {
+                    self.send_cmd(WorkerCommand::PingRichPresence {
+                        username: config.ra_username.clone(),
+                        token: config.ra_token.clone(),
+                        game_id: *game_id,
+                        message: msg,
+                        md5: md5.clone(),
+                    });
                 }
             }
         }
@@ -1684,16 +1703,16 @@ impl RetroAchievementsManager {
         }
 
         // Advance HUD toast queue cleanly.
-        if let Some(active) = &self.active_unlock_banner {
-            if active.progress().is_none() {
-                self.active_unlock_banner = None;
-            }
+        if let Some(active) = &self.active_unlock_banner
+            && active.progress().is_none()
+        {
+            self.active_unlock_banner = None;
         }
-        if self.active_unlock_banner.is_none() {
-            if let Some(mut next) = self.unlock_queue.pop_front() {
-                next.created_at = Instant::now();
-                self.active_unlock_banner = Some(next);
-            }
+        if self.active_unlock_banner.is_none()
+            && let Some(mut next) = self.unlock_queue.pop_front()
+        {
+            next.created_at = Instant::now();
+            self.active_unlock_banner = Some(next);
         }
 
         config_dirty
@@ -1892,7 +1911,8 @@ impl RetroAchievementsManager {
 
                     ui.add_space(4.0);
                     ui.horizontal(|ui| {
-                        let busy = matches!(self.connection_state, RaConnectionState::Authenticating);
+                        let busy =
+                            matches!(self.connection_state, RaConnectionState::Authenticating);
                         let can_submit = !busy
                             && !self.username_input.trim().is_empty()
                             && !self.password_input.is_empty();
@@ -1933,9 +1953,11 @@ impl RetroAchievementsManager {
                     match &self.game_state {
                         RaGameState::NoRom => {
                             ui.label(
-                                RichText::new("No ROM loaded. Open a GBA ROM or test offline below.")
-                                    .small()
-                                    .color(text_muted),
+                                RichText::new(
+                                    "No ROM loaded. Open a GBA ROM or test offline below.",
+                                )
+                                .small()
+                                .color(text_muted),
                             );
                         }
                         RaGameState::LookingUpHash => {
@@ -2145,11 +2167,7 @@ impl RetroAchievementsManager {
 
 /// Draws the slide-in Achievement Unlocked HUD Toast Banner cleanly onto `viewport_rect`
 /// without purple gradients or glowing orbs (obsidian surface + 1px emerald/amber border).
-pub fn draw_unlock_toast_banner(
-    painter: &egui::Painter,
-    viewport_rect: Rect,
-    toast: &UnlockToast,
-) {
+pub fn draw_unlock_toast_banner(painter: &egui::Painter, viewport_rect: Rect, toast: &UnlockToast) {
     let Some(t) = toast.progress() else {
         return;
     };
@@ -2347,7 +2365,7 @@ fn perform_load_game(username: &str, token: &str, md5: &str) -> WorkerEvent {
             return WorkerEvent::GameLoadFailed {
                 md5: md5.to_string(),
                 error: err,
-            }
+            };
         }
     };
     if !game_env.success {
@@ -2378,7 +2396,7 @@ fn perform_load_game(username: &str, token: &str, md5: &str) -> WorkerEvent {
             return WorkerEvent::GameLoadFailed {
                 md5: md5.to_string(),
                 error: err,
-            }
+            };
         }
     };
 
@@ -2495,7 +2513,8 @@ mod tests {
         core.poke16(0x0200_0012, 1024);
         core.poke32(0x0300_0020, 0x1234_5678);
 
-        let mut p_eq = TriggerProgram::parse("0xH000010=165_0x 000012>500_0xX040020=305419896").unwrap();
+        let mut p_eq =
+            TriggerProgram::parse("0xH000010=165_0x 000012>500_0xX040020=305419896").unwrap();
         assert!(p_eq.evaluate_frame(&core).triggered);
 
         let mut p_nib = TriggerProgram::parse("0xL000010=5_0xU000010=10_0xK000010=4").unwrap();
@@ -2573,8 +2592,7 @@ mod tests {
         assert!(!logic_prog.evaluate_frame(&core).triggered);
 
         // AddSource + SubSource + scaling & mask
-        let mut add_prog =
-            TriggerProgram::parse("A:0xH000030*2_B:0xH000031_0xH000032=10").unwrap();
+        let mut add_prog = TriggerProgram::parse("A:0xH000030*2_B:0xH000031_0xH000032=10").unwrap();
         core.poke8(0x0200_0030, 4); // * 2 = 8
         core.poke8(0x0200_0031, 3); // - 3 = 5
         core.poke8(0x0200_0032, 5); // + 5 = 10
@@ -2622,9 +2640,11 @@ mod tests {
 
     #[test]
     fn hardcore_activation_requires_enabled_logged_in_and_active_game() {
-        let mut cfg = AppConfig::default();
-        cfg.ra_enabled = true;
-        cfg.ra_hardcore = true;
+        let mut cfg = AppConfig {
+            ra_enabled: true,
+            ra_hardcore: true,
+            ..Default::default()
+        };
         let mut mgr = RetroAchievementsManager::new(&cfg);
 
         // Not logged in -> not active

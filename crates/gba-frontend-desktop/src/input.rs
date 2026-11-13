@@ -2,13 +2,11 @@ use egui::{self, Color32, CornerRadius, Key, RichText, Stroke};
 use gba_core::encode_keyinput;
 use gilrs::{Axis, Button, EventType};
 
-use crate::app::{
-    RustboyApp, ACCENT_TEAL, ACCENT_TEAL_BG, BG_CARD, BORDER_HAIRLINE, TEXT_MUTED,
-};
+use crate::app::{ACCENT_TEAL, ACCENT_TEAL_BG, BG_CARD, BORDER_HAIRLINE, RustboyApp, TEXT_MUTED};
 use crate::config::{
-    format_key_name, parse_key_name, AutofireMode, ControlTarget, GamepadAxisCode, GamepadBindings,
-    GamepadButtonCode, GamepadInput, GbaButton, HotkeyAction, HotkeyBindings, HotkeyChord,
-    KeyBindings,
+    AutofireMode, ControlTarget, GamepadAxisCode, GamepadBindings, GamepadButtonCode, GamepadInput,
+    GbaButton, HotkeyAction, HotkeyBindings, HotkeyChord, KeyBindings, format_key_name,
+    parse_key_name,
 };
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -294,7 +292,8 @@ impl RustboyApp {
     /// Drains pending `gilrs` events once per UI frame and handles active gamepad bind capture.
     pub(crate) fn pump_gamepad_events(&mut self, ctx: &egui::Context) {
         let mut captured_input: Option<GamepadInput> = None;
-        let awaiting_gamepad = matches!(self.awaiting_input_bind, Some(PendingInputBind::Gamepad(_)));
+        let awaiting_gamepad =
+            matches!(self.awaiting_input_bind, Some(PendingInputBind::Gamepad(_)));
 
         if let Some(gilrs) = &mut self.gilrs {
             while let Some(ev) = gilrs.next_event() {
@@ -352,12 +351,18 @@ impl RustboyApp {
                         mask |= btn.mask();
                     }
                 }
-                if let Some(k) = self.config.keybindings.target_egui_key(ControlTarget::TurboA)
+                if let Some(k) = self
+                    .config
+                    .keybindings
+                    .target_egui_key(ControlTarget::TurboA)
                     && i.key_down(k)
                 {
                     raw_turbo_a = true;
                 }
-                if let Some(k) = self.config.keybindings.target_egui_key(ControlTarget::TurboB)
+                if let Some(k) = self
+                    .config
+                    .keybindings
+                    .target_egui_key(ControlTarget::TurboB)
                     && i.key_down(k)
                 {
                     raw_turbo_b = true;
@@ -429,13 +434,12 @@ impl RustboyApp {
         self.active_turbo_buttons = (active_a, active_b);
 
         let effective_mask = self.lua.apply_joypad_override(
-            mask
-                | autofire_pulse_mask(
-                    active_a,
-                    active_b,
-                    self.frame_counter,
-                    self.config.keybindings.autofire_interval_frames,
-                ),
+            mask | autofire_pulse_mask(
+                active_a,
+                active_b,
+                self.frame_counter,
+                self.config.keybindings.autofire_interval_frames,
+            ),
         );
         self.last_pressed_mask = effective_mask;
         encode_keyinput(effective_mask)
@@ -453,63 +457,63 @@ impl RustboyApp {
     }
 
     pub(crate) fn poll_motion_sensors(&mut self, ctx: &egui::Context) {
-        if let Some(core) = &mut self.core {
-            if core.bus.cart.tilt_enabled || core.bus.cart.gyro_enabled {
-                let mut rx = 0.0f32;
-                let mut ry = 0.0f32;
+        if let Some(core) = &mut self.core
+            && (core.bus.cart.tilt_enabled || core.bus.cart.gyro_enabled)
+        {
+            let mut rx = 0.0f32;
+            let mut ry = 0.0f32;
 
-                // 1. Gamepad Right Stick
-                if let Some(gilrs) = &self.gilrs {
-                    for (_id, gamepad) in gilrs.gamepads() {
-                        if !gamepad.is_connected() {
-                            continue;
-                        }
-                        let stick_x = gamepad
-                            .axis_data(Axis::RightStickX)
-                            .map(|d| d.value())
-                            .unwrap_or(0.0);
-                        let stick_y = gamepad
-                            .axis_data(Axis::RightStickY)
-                            .map(|d| d.value())
-                            .unwrap_or(0.0);
-                        if stick_x.abs() > 0.15 {
-                            rx = stick_x;
-                        }
-                        if stick_y.abs() > 0.15 {
-                            ry = stick_y;
-                        }
+            // 1. Gamepad Right Stick
+            if let Some(gilrs) = &self.gilrs {
+                for (_id, gamepad) in gilrs.gamepads() {
+                    if !gamepad.is_connected() {
+                        continue;
+                    }
+                    let stick_x = gamepad
+                        .axis_data(Axis::RightStickX)
+                        .map(|d| d.value())
+                        .unwrap_or(0.0);
+                    let stick_y = gamepad
+                        .axis_data(Axis::RightStickY)
+                        .map(|d| d.value())
+                        .unwrap_or(0.0);
+                    if stick_x.abs() > 0.15 {
+                        rx = stick_x;
+                    }
+                    if stick_y.abs() > 0.15 {
+                        ry = stick_y;
                     }
                 }
+            }
 
-                // 2. Keyboard Alt + Arrows fallback
-                if rx == 0.0 && ry == 0.0 {
-                    ctx.input(|i| {
-                        if i.key_down(egui::Key::ArrowLeft) && i.modifiers.alt {
-                            rx -= 1.0;
-                        }
-                        if i.key_down(egui::Key::ArrowRight) && i.modifiers.alt {
-                            rx += 1.0;
-                        }
-                        if i.key_down(egui::Key::ArrowUp) && i.modifiers.alt {
-                            ry += 1.0;
-                        }
-                        if i.key_down(egui::Key::ArrowDown) && i.modifiers.alt {
-                            ry -= 1.0;
-                        }
-                    });
-                }
+            // 2. Keyboard Alt + Arrows fallback
+            if rx == 0.0 && ry == 0.0 {
+                ctx.input(|i| {
+                    if i.key_down(egui::Key::ArrowLeft) && i.modifiers.alt {
+                        rx -= 1.0;
+                    }
+                    if i.key_down(egui::Key::ArrowRight) && i.modifiers.alt {
+                        rx += 1.0;
+                    }
+                    if i.key_down(egui::Key::ArrowUp) && i.modifiers.alt {
+                        ry += 1.0;
+                    }
+                    if i.key_down(egui::Key::ArrowDown) && i.modifiers.alt {
+                        ry -= 1.0;
+                    }
+                });
+            }
 
-                if core.bus.cart.tilt_enabled {
-                    let tx = ((0x03A0 as f32) + rx * 380.0).clamp(0x0200 as f32, 0x0540 as f32) as u16;
-                    let ty = ((0x03A0 as f32) - ry * 380.0).clamp(0x0200 as f32, 0x0540 as f32) as u16;
-                    core.bus.cart.tilt_x = tx;
-                    core.bus.cart.tilt_y = ty;
-                }
+            if core.bus.cart.tilt_enabled {
+                let tx = ((0x03A0 as f32) + rx * 380.0).clamp(0x0200 as f32, 0x0540 as f32) as u16;
+                let ty = ((0x03A0 as f32) - ry * 380.0).clamp(0x0200 as f32, 0x0540 as f32) as u16;
+                core.bus.cart.tilt_x = tx;
+                core.bus.cart.tilt_y = ty;
+            }
 
-                if core.bus.cart.gyro_enabled {
-                    let g = ((0x06C0 as f32) + rx * 800.0).clamp(0x0200 as f32, 0x0B00 as f32) as u16;
-                    core.bus.cart.gyro_val = g;
-                }
+            if core.bus.cart.gyro_enabled {
+                let g = ((0x06C0 as f32) + rx * 800.0).clamp(0x0200 as f32, 0x0B00 as f32) as u16;
+                core.bus.cart.gyro_val = g;
             }
         }
     }
@@ -539,10 +543,7 @@ impl RustboyApp {
             && let Some(gilrs) = &self.gilrs
         {
             let gp_cfg = &self.config.keybindings.gamepad;
-            let p2_gp = gilrs
-                .gamepads()
-                .filter(|(_, gp)| gp.is_connected())
-                .nth(1);
+            let p2_gp = gilrs.gamepads().filter(|(_, gp)| gp.is_connected()).nth(1);
             if let Some((_id, gamepad)) = p2_gp {
                 let mut gp_mask = 0u16;
                 for btn in GbaButton::ALL {
@@ -808,12 +809,10 @@ impl RustboyApp {
         match self.controls_tab {
             ControlsTab::Keyboard => {
                 for target in ControlTarget::ALL {
-                    self.config
-                        .keybindings
-                        .set_target_key_name(
-                            target,
-                            def.target_key_name(target).map(str::to_string),
-                        );
+                    self.config.keybindings.set_target_key_name(
+                        target,
+                        def.target_key_name(target).map(str::to_string),
+                    );
                 }
                 self.notify("Keyboard controls reset to defaults");
             }
@@ -894,7 +893,10 @@ impl RustboyApp {
 
                     let bind_lbl = if is_capturing { "Listening..." } else { "Bind" };
                     if ui
-                        .add_sized([92.0, 22.0], egui::Button::new(RichText::new(bind_lbl).small()))
+                        .add_sized(
+                            [92.0, 22.0],
+                            egui::Button::new(RichText::new(bind_lbl).small()),
+                        )
                         .clicked()
                     {
                         self.awaiting_input_bind = if is_capturing {
@@ -1020,7 +1022,10 @@ impl RustboyApp {
 
                     let bind_lbl = if is_capturing { "Listening..." } else { "Bind" };
                     if ui
-                        .add_sized([92.0, 22.0], egui::Button::new(RichText::new(bind_lbl).small()))
+                        .add_sized(
+                            [92.0, 22.0],
+                            egui::Button::new(RichText::new(bind_lbl).small()),
+                        )
                         .clicked()
                     {
                         self.awaiting_input_bind = if is_capturing {
@@ -1076,9 +1081,17 @@ impl RustboyApp {
                 }
 
                 ui.add_space(10.0);
-                ui.label(RichText::new("Pulse Cadence").strong().color(Color32::WHITE));
+                ui.label(
+                    RichText::new("Pulse Cadence")
+                        .strong()
+                        .color(Color32::WHITE),
+                );
                 ui.add_space(4.0);
-                let mut interval = self.config.keybindings.autofire_interval_frames.clamp(2, 16);
+                let mut interval = self
+                    .config
+                    .keybindings
+                    .autofire_interval_frames
+                    .clamp(2, 16);
                 let hz = 59.7275 / (f32::from(interval));
                 ui.horizontal(|ui| {
                     if ui
@@ -1102,8 +1115,14 @@ impl RustboyApp {
 
         ui.add_space(8.0);
 
-        let kbd_a = self.config.keybindings.target_key_name(ControlTarget::TurboA);
-        let kbd_b = self.config.keybindings.target_key_name(ControlTarget::TurboB);
+        let kbd_a = self
+            .config
+            .keybindings
+            .target_key_name(ControlTarget::TurboA);
+        let kbd_b = self
+            .config
+            .keybindings
+            .target_key_name(ControlTarget::TurboB);
         let gp_a = self.config.keybindings.gamepad.get(ControlTarget::TurboA);
         let gp_b = self.config.keybindings.gamepad.get(ControlTarget::TurboB);
 
@@ -1245,7 +1264,10 @@ impl RustboyApp {
 
                     let bind_lbl = if is_capturing { "Listening..." } else { "Bind" };
                     if ui
-                        .add_sized([92.0, 22.0], egui::Button::new(RichText::new(bind_lbl).small()))
+                        .add_sized(
+                            [92.0, 22.0],
+                            egui::Button::new(RichText::new(bind_lbl).small()),
+                        )
                         .clicked()
                     {
                         self.awaiting_input_bind = if is_capturing {
@@ -1392,14 +1414,18 @@ mod tests {
         );
 
         // Gamepad duplicate
-        kb.gamepad
-            .set(ControlTarget::TurboA, kb.gamepad.get(ControlTarget::Button(GbaButton::A)));
+        kb.gamepad.set(
+            ControlTarget::TurboA,
+            kb.gamepad.get(ControlTarget::Button(GbaButton::A)),
+        );
         let gp_conflicts = detect_gamepad_conflicts(&kb.gamepad);
         assert_eq!(gp_conflicts.len(), 1);
 
         // Hotkey chord duplicate
-        kb.hotkeys
-            .set(HotkeyAction::Screenshot, kb.hotkeys.get(HotkeyAction::Pause).cloned());
+        kb.hotkeys.set(
+            HotkeyAction::Screenshot,
+            kb.hotkeys.get(HotkeyAction::Pause).cloned(),
+        );
         let hk_conflicts = detect_hotkey_conflicts(&kb.hotkeys);
         assert_eq!(hk_conflicts.len(), 1);
     }
@@ -1409,14 +1435,32 @@ mod tests {
         let mut state = AutofireState::default();
 
         // Hold mode tracks raw press directly
-        assert_eq!(state.update_latches(true, false, AutofireMode::Hold), (true, false));
-        assert_eq!(state.update_latches(false, false, AutofireMode::Hold), (false, false));
+        assert_eq!(
+            state.update_latches(true, false, AutofireMode::Hold),
+            (true, false)
+        );
+        assert_eq!(
+            state.update_latches(false, false, AutofireMode::Hold),
+            (false, false)
+        );
 
         // Toggle mode flips cleanly on rising edges only
-        assert_eq!(state.update_latches(true, false, AutofireMode::Toggle), (true, false));
-        assert_eq!(state.update_latches(true, false, AutofireMode::Toggle), (true, false));
-        assert_eq!(state.update_latches(false, false, AutofireMode::Toggle), (true, false));
-        assert_eq!(state.update_latches(true, true, AutofireMode::Toggle), (false, true));
+        assert_eq!(
+            state.update_latches(true, false, AutofireMode::Toggle),
+            (true, false)
+        );
+        assert_eq!(
+            state.update_latches(true, false, AutofireMode::Toggle),
+            (true, false)
+        );
+        assert_eq!(
+            state.update_latches(false, false, AutofireMode::Toggle),
+            (true, false)
+        );
+        assert_eq!(
+            state.update_latches(true, true, AutofireMode::Toggle),
+            (false, true)
+        );
 
         // 4-frame cadence -> 2 frames high, 2 frames low
         assert_eq!(autofire_pulse_mask(true, false, 0, 4), gba_core::KEY_A);

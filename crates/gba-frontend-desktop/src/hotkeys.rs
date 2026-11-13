@@ -75,7 +75,9 @@ impl RustboyApp {
         }
 
         // Ctrl+W returns to library when a game is running
-        let stop_game = ctx.input(|i| i.modifiers.ctrl && !i.modifiers.shift && !i.modifiers.alt && i.key_pressed(Key::W));
+        let stop_game = ctx.input(|i| {
+            i.modifiers.ctrl && !i.modifiers.shift && !i.modifiers.alt && i.key_pressed(Key::W)
+        });
         if stop_game && self.has_active_game() {
             self.close_rom(ctx);
             return;
@@ -267,10 +269,26 @@ mod tests {
         let ctrl_r = HotkeyChord::with_ctrl("R");
         let shift_f1 = HotkeyChord::with_shift("F1");
 
-        assert!(chord_matches_key_event(&bare_r, Key::R, egui::Modifiers::NONE));
-        assert!(!chord_matches_key_event(&bare_r, Key::R, egui::Modifiers::CTRL));
-        assert!(chord_matches_key_event(&ctrl_r, Key::R, egui::Modifiers::CTRL));
-        assert!(!chord_matches_key_event(&ctrl_r, Key::R, egui::Modifiers::SHIFT));
+        assert!(chord_matches_key_event(
+            &bare_r,
+            Key::R,
+            egui::Modifiers::NONE
+        ));
+        assert!(!chord_matches_key_event(
+            &bare_r,
+            Key::R,
+            egui::Modifiers::CTRL
+        ));
+        assert!(chord_matches_key_event(
+            &ctrl_r,
+            Key::R,
+            egui::Modifiers::CTRL
+        ));
+        assert!(!chord_matches_key_event(
+            &ctrl_r,
+            Key::R,
+            egui::Modifiers::SHIFT
+        ));
         assert!(chord_matches_key_event(
             &shift_f1,
             Key::F1,

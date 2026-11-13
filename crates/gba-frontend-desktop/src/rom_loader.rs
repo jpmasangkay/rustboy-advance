@@ -267,8 +267,11 @@ pub(crate) fn apply_bps(source: &[u8], patch: &[u8]) -> Result<Vec<u8>, String> 
 
     let footer_start = patch.len() - 12;
     let source_crc = u32::from_le_bytes(patch[footer_start..footer_start + 4].try_into().unwrap());
-    let target_crc =
-        u32::from_le_bytes(patch[footer_start + 4..footer_start + 8].try_into().unwrap());
+    let target_crc = u32::from_le_bytes(
+        patch[footer_start + 4..footer_start + 8]
+            .try_into()
+            .unwrap(),
+    );
     let patch_crc = u32::from_le_bytes(patch[patch.len() - 4..].try_into().unwrap());
 
     let actual_patch_crc = crc32fast::hash(&patch[..patch.len() - 4]);
@@ -400,8 +403,11 @@ pub(crate) fn apply_ups(source: &[u8], patch: &[u8]) -> Result<Vec<u8>, String> 
 
     let footer_start = patch.len() - 12;
     let source_crc = u32::from_le_bytes(patch[footer_start..footer_start + 4].try_into().unwrap());
-    let target_crc =
-        u32::from_le_bytes(patch[footer_start + 4..footer_start + 8].try_into().unwrap());
+    let target_crc = u32::from_le_bytes(
+        patch[footer_start + 4..footer_start + 8]
+            .try_into()
+            .unwrap(),
+    );
     let patch_crc = u32::from_le_bytes(patch[patch.len() - 4..].try_into().unwrap());
 
     let actual_patch_crc = crc32fast::hash(&patch[..patch.len() - 4]);
@@ -516,8 +522,8 @@ pub(crate) fn apply_patch_file(
     patch_path: &Path,
     rom: &mut Vec<u8>,
 ) -> Result<PatchFormat, String> {
-    let patch_bytes =
-        fs::read(patch_path).map_err(|e| format!("Failed reading patch '{}': {e}", patch_path.display()))?;
+    let patch_bytes = fs::read(patch_path)
+        .map_err(|e| format!("Failed reading patch '{}': {e}", patch_path.display()))?;
     let format = detect_patch_format(patch_path, &patch_bytes)
         .ok_or_else(|| "Unsupported patch file (expected .bps, .ups, or .ips)".to_string())?;
     apply_patch_bytes(format, rom, &patch_bytes)?;

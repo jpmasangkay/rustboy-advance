@@ -30,7 +30,11 @@ piccolo = "0.3"
 md-5 = "0.10"
 ureq = { version = "2.12", default-features = false, features = ["native-tls", "json"] }
 mimalloc = "0.1.52"
+pollster = "0.4"
 eframe = { version = "0.31", default-features = false, features = ["wgpu", "default_fonts", "wayland", "x11"] }
+wgpu = { version = "24.0", default-features = false, features = ["dx12", "wgsl"] }
+softbuffer = "0.4"
+winit = { version = "0.30", default-features = false, features = ["rwh_06"] }
 
 [target.'cfg(windows)'.dependencies]
 gilrs = { version = "0.11", default-features = false, features = ["xinput"] }

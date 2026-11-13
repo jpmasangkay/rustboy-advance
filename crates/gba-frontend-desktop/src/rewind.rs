@@ -22,7 +22,11 @@ fn xor_buffers(a: &[u8], b: &[u8], out: &mut [u8]) {
     let (out_chunks, _) = out[..min_len].as_chunks_mut::<8>();
     let chunk_bytes = a_chunks.len() * 8;
 
-    for ((ca, cb), co) in a_chunks.iter().zip(b_chunks.iter()).zip(out_chunks.iter_mut()) {
+    for ((ca, cb), co) in a_chunks
+        .iter()
+        .zip(b_chunks.iter())
+        .zip(out_chunks.iter_mut())
+    {
         let va = u64::from_ne_bytes(*ca);
         let vb = u64::from_ne_bytes(*cb);
         *co = (va ^ vb).to_ne_bytes();
@@ -341,7 +345,8 @@ impl RewindBuffer {
                 let drop_count = rel_kf + 1;
                 for _ in 0..drop_count {
                     if let Some(evicted) = self.entries.pop_front() {
-                        self.total_bytes = self.total_bytes.saturating_sub(evicted.compressed_bytes());
+                        self.total_bytes =
+                            self.total_bytes.saturating_sub(evicted.compressed_bytes());
                     }
                 }
                 if let Some(RewindEntry::Keyframe { back_delta, .. }) = self.entries.front_mut()
@@ -738,7 +743,10 @@ mod tests {
         rb.push(s1);
         let elapsed_ms = t0.elapsed().as_secs_f64() * 1000.0;
         // Smoke sanity check: even in unoptimized debug builds, XOR+LZ4 of 420 KB should complete quickly
-        assert!(elapsed_ms < 50.0, "unexpectedly slow delta encode: {elapsed_ms:.2} ms");
+        assert!(
+            elapsed_ms < 50.0,
+            "unexpectedly slow delta encode: {elapsed_ms:.2} ms"
+        );
         assert!(rb.seconds_available(1) > 0.0);
     }
 }

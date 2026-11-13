@@ -2,12 +2,12 @@ use egui::{
     self, Align2, Color32, ColorImage, CornerRadius, Pos2, Rect, RichText, Sense, Stroke,
     TextureHandle, TextureOptions, Ui, Vec2,
 };
-use gba_core::cpu::{CpuMode, CPSR_C, CPSR_F, CPSR_I, CPSR_N, CPSR_T, CPSR_V, CPSR_Z};
 use gba_core::GbaCore;
+use gba_core::cpu::{CPSR_C, CPSR_F, CPSR_I, CPSR_N, CPSR_T, CPSR_V, CPSR_Z, CpuMode};
 use gba_debugger::disassemble_range;
 
-use crate::cheats::{decode_cheat_lines, CheatEntry, CheatFormat};
-use crate::config::{format_key_name, GbaButton, KeyBindings, SaveOverrideChoice};
+use crate::cheats::{CheatEntry, CheatFormat, decode_cheat_lines};
+use crate::config::{GbaButton, KeyBindings, SaveOverrideChoice, format_key_name};
 use crate::filters::{agb_srgb_lut, linear_lut};
 
 use crate::mem_search::{MemSearchAction, MemSearchWindow};
@@ -81,7 +81,7 @@ impl MemoryRegion {
             Self::Pram => 0x400,
             Self::Vram => 0x1_8000,
             Self::Oam => 0x400,
-            Self::Rom => rom_len.max(0x100).min(0x0200_0000),
+            Self::Rom => rom_len.clamp(0x100, 0x0200_0000),
         }
     }
 }
@@ -294,7 +294,7 @@ fn parse_hex_u32(s: &str) -> Option<u32> {
 }
 
 fn checkerboard_color(x: usize, y: usize) -> Color32 {
-    if ((x / 4) + (y / 4)) % 2 == 0 {
+    if ((x / 4) + (y / 4)).is_multiple_of(2) {
         Color32::from_rgb(28, 32, 40)
     } else {
         Color32::from_rgb(38, 44, 54)
@@ -318,15 +318,11 @@ impl DebuggerWindows {
         if self.show_about {
             self.draw_about_window(ctx);
         }
-        if self.show_controls {
-            if self.draw_controls_window(ctx, keybindings, gamepad_names) {
-                action = DebugAction::ConfigChanged;
-            }
+        if self.show_controls && self.draw_controls_window(ctx, keybindings, gamepad_names) {
+            action = DebugAction::ConfigChanged;
         }
-        if self.show_cheats {
-            if self.draw_cheats_window(ctx, cheats) {
-                action = DebugAction::ConfigChanged;
-            }
+        if self.show_cheats && self.draw_cheats_window(ctx, cheats) {
+            action = DebugAction::ConfigChanged;
         }
 
         if self.mem_search.open {
@@ -355,10 +351,8 @@ impl DebuggerWindows {
             return action;
         };
 
-        if self.show_overrides {
-            if self.draw_overrides_window(ctx, core) {
-                action = DebugAction::ConfigChanged;
-            }
+        if self.show_overrides && self.draw_overrides_window(ctx, core) {
+            action = DebugAction::ConfigChanged;
         }
 
         if self.show_cpu {
@@ -447,13 +441,12 @@ impl DebuggerWindows {
                                 .desired_width(84.0)
                                 .font(egui::TextStyle::Monospace),
                         );
-                        if ui.button("Jump").clicked()
-                            || (resp.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter)))
+                        if (ui.button("Jump").clicked()
+                            || (resp.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter))))
+                            && let Some(a) = parse_hex_u32(&self.disasm_addr_input)
                         {
-                            if let Some(a) = parse_hex_u32(&self.disasm_addr_input) {
-                                self.disasm_view_addr = a;
-                                self.follow_pc = false;
-                            }
+                            self.disasm_view_addr = a;
+                            self.follow_pc = false;
                         }
                         if ui.button("Sync PC").clicked() {
                             self.follow_pc = true;
@@ -467,12 +460,12 @@ impl DebuggerWindows {
                                 .desired_width(84.0)
                                 .font(egui::TextStyle::Monospace),
                         );
-                        if ui.button("Add BP").clicked() {
-                            if let Some(a) = parse_hex_u32(&self.bp_addr_input) {
-                                let aligned = a & if is_thumb { !1 } else { !3 };
-                                if !self.breakpoints.contains(&aligned) {
-                                    self.breakpoints.push(aligned);
-                                }
+                        if ui.button("Add BP").clicked()
+                            && let Some(a) = parse_hex_u32(&self.bp_addr_input)
+                        {
+                            let aligned = a & if is_thumb { !1 } else { !3 };
+                            if !self.breakpoints.contains(&aligned) {
+                                self.breakpoints.push(aligned);
                             }
                         }
                         if ui.button("Clear All").clicked() {
@@ -556,21 +549,27 @@ impl DebuggerWindows {
                         .stroke(Stroke::new(1.0_f32, PANEL_BORDER))
                         .inner_margin(8.0)
                         .show(r_ui, |ui| {
-                            egui::Grid::new("cpu_gpr_grid").num_columns(2).spacing([18.0, 4.0]).show(ui, |ui| {
-                                for r in 0..8 {
-                                    let r_hi = r + 8;
-                                    let name_lo = format!("R{r:<2}");
-                                    let name_hi = match r_hi {
-                                        13 => "SP ".to_string(),
-                                        14 => "LR ".to_string(),
-                                        15 => "PC ".to_string(),
-                                        n => format!("R{n:<2}"),
-                                    };
-                                    ui.monospace(format!("{name_lo}  {:08X}", core.cpu.gpr[r]));
-                                    ui.monospace(format!("{name_hi}  {:08X}", core.cpu.gpr[r_hi]));
-                                    ui.end_row();
-                                }
-                            });
+                            egui::Grid::new("cpu_gpr_grid")
+                                .num_columns(2)
+                                .spacing([18.0, 4.0])
+                                .show(ui, |ui| {
+                                    for r in 0..8 {
+                                        let r_hi = r + 8;
+                                        let name_lo = format!("R{r:<2}");
+                                        let name_hi = match r_hi {
+                                            13 => "SP ".to_string(),
+                                            14 => "LR ".to_string(),
+                                            15 => "PC ".to_string(),
+                                            n => format!("R{n:<2}"),
+                                        };
+                                        ui.monospace(format!("{name_lo}  {:08X}", core.cpu.gpr[r]));
+                                        ui.monospace(format!(
+                                            "{name_hi}  {:08X}",
+                                            core.cpu.gpr[r_hi]
+                                        ));
+                                        ui.end_row();
+                                    }
+                                });
                         });
 
                     r_ui.add_space(6.0);
@@ -591,7 +590,11 @@ impl DebuggerWindows {
                                 CpuMode::System => "SYS",
                             };
                             let flag_badge = |ui: &mut Ui, lbl: &str, active: bool| {
-                                let col = if active { ACCENT_TEAL } else { Color32::from_rgb(72, 80, 96) };
+                                let col = if active {
+                                    ACCENT_TEAL
+                                } else {
+                                    Color32::from_rgb(72, 80, 96)
+                                };
                                 ui.label(RichText::new(lbl).monospace().strong().color(col));
                             };
                             ui.monospace(format!("CPSR: {:08X}  Mode: {mode_name}", cpsr));
@@ -616,7 +619,10 @@ impl DebuggerWindows {
                             ));
                             ui.monospace(format!(
                                 "IME: {}  IE: {:04X}  IF: {:04X}  Halt: {}",
-                                core.bus.hw.ime, core.bus.hw.ie, core.bus.hw.if_flag, core.cpu.halted
+                                core.bus.hw.ime,
+                                core.bus.hw.ie,
+                                core.bus.hw.if_flag,
+                                core.cpu.halted
                             ));
                         });
                 });
@@ -655,26 +661,25 @@ impl DebuggerWindows {
                             .desired_width(78.0)
                             .font(egui::TextStyle::Monospace),
                     );
-                    if ui.button("Jump").clicked()
-                        || (resp.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter)))
+                    if (ui.button("Jump").clicked()
+                        || (resp.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter))))
+                        && let Some(addr) = parse_hex_u32(&self.hex_goto_input)
                     {
-                        if let Some(addr) = parse_hex_u32(&self.hex_goto_input) {
-                            let target_region = match (addr >> 24) & 0xFF {
-                                0x00 => Some(MemoryRegion::Bios),
-                                0x02 => Some(MemoryRegion::Ewram),
-                                0x03 => Some(MemoryRegion::Iwram),
-                                0x04 => Some(MemoryRegion::Io),
-                                0x05 => Some(MemoryRegion::Pram),
-                                0x06 => Some(MemoryRegion::Vram),
-                                0x07 => Some(MemoryRegion::Oam),
-                                0x08..=0x0D => Some(MemoryRegion::Rom),
-                                _ => None,
-                            };
-                            if let Some(tr) = target_region {
-                                self.hex_region = tr;
-                                let off = addr.saturating_sub(tr.base_addr()) as usize;
-                                self.hex_scroll_row = Some(off / 16);
-                            }
+                        let target_region = match (addr >> 24) & 0xFF {
+                            0x00 => Some(MemoryRegion::Bios),
+                            0x02 => Some(MemoryRegion::Ewram),
+                            0x03 => Some(MemoryRegion::Iwram),
+                            0x04 => Some(MemoryRegion::Io),
+                            0x05 => Some(MemoryRegion::Pram),
+                            0x06 => Some(MemoryRegion::Vram),
+                            0x07 => Some(MemoryRegion::Oam),
+                            0x08..=0x0D => Some(MemoryRegion::Rom),
+                            _ => None,
+                        };
+                        if let Some(tr) = target_region {
+                            self.hex_region = tr;
+                            let off = addr.saturating_sub(tr.base_addr()) as usize;
+                            self.hex_scroll_row = Some(off / 16);
                         }
                     }
                 });
@@ -742,8 +747,10 @@ impl DebuggerWindows {
                                     Color32::from_rgb(214, 220, 232)
                                 };
                                 ui.monospace(
-                                    RichText::new(format!("{row_addr:08X} | {hex_part} | {ascii_part}"))
-                                        .color(col),
+                                    RichText::new(format!(
+                                        "{row_addr:08X} | {hex_part} | {ascii_part}"
+                                    ))
+                                    .color(col),
                                 );
                             }
                         });
@@ -761,7 +768,7 @@ impl DebuggerWindows {
                 .chars()
                 .filter(|c| c.is_ascii_hexdigit())
                 .collect();
-            if cleaned.len() < 2 || cleaned.len() % 2 != 0 {
+            if cleaned.len() < 2 || !cleaned.len().is_multiple_of(2) {
                 self.hex_search_status = "Enter even count of hex digits".to_string();
                 return;
             }
@@ -838,8 +845,8 @@ impl DebuggerWindows {
                                 egui::StrokeKind::Outside,
                             );
 
-                            if let Some(pos) = resp.hover_pos() {
-                                if rect.contains(pos) {
+                            if let Some(pos) = resp.hover_pos()
+                                && rect.contains(pos) {
                                     let c = ((pos.x - rect.left()) / cell).floor() as usize;
                                     let r = ((pos.y - rect.top()) / cell).floor() as usize;
                                     if c < 16 && r < 16 && (resp.clicked() || ctx.input(|i| i.pointer.any_down())) {
@@ -857,7 +864,6 @@ impl DebuggerWindows {
                                         ));
                                     }
                                 }
-                            }
                         });
                         ui.add_space(12.0);
                     }
@@ -947,7 +953,8 @@ impl DebuggerWindows {
                                 if b == 0 { None } else { Some(pal_base + b) }
                             } else {
                                 let byte = core.bus.ppu.vram[tile_off + py * 4 + (px / 2)];
-                                let nib = if (px & 1) == 0 { byte & 0xF } else { byte >> 4 } as usize;
+                                let nib =
+                                    if (px & 1) == 0 { byte & 0xF } else { byte >> 4 } as usize;
                                 if nib == 0 {
                                     None
                                 } else {
@@ -976,11 +983,16 @@ impl DebuggerWindows {
                 });
                 tex.set(img, TextureOptions::NEAREST);
 
-                let disp_size = Vec2::new(img_w as f32 * self.tile_zoom, img_h as f32 * self.tile_zoom);
-                egui::ScrollArea::vertical().max_height(380.0).show(ui, |ui| {
-                    let resp = ui.add(egui::Image::new((tex.id(), disp_size)).sense(Sense::click()));
-                    if let Some(pos) = resp.interact_pointer_pos() {
-                        if resp.clicked() {
+                let disp_size =
+                    Vec2::new(img_w as f32 * self.tile_zoom, img_h as f32 * self.tile_zoom);
+                egui::ScrollArea::vertical()
+                    .max_height(380.0)
+                    .show(ui, |ui| {
+                        let resp =
+                            ui.add(egui::Image::new((tex.id(), disp_size)).sense(Sense::click()));
+                        if let Some(pos) = resp.interact_pointer_pos()
+                            && resp.clicked()
+                        {
                             let rel = pos - resp.rect.min;
                             let col = ((rel.x / self.tile_zoom) as usize) / 8;
                             let row = ((rel.y / self.tile_zoom) as usize) / 8;
@@ -989,12 +1001,13 @@ impl DebuggerWindows {
                                 self.selected_tile = Some(tid);
                             }
                         }
-                    }
-                });
+                    });
 
                 if let Some(tid) = self.selected_tile {
                     let vaddr = 0x0600_0000 + cbb_base + tid * tile_bytes;
-                    ui.monospace(format!("Selected Tile #{tid} | VRAM Address: 0x{vaddr:08X}"));
+                    ui.monospace(format!(
+                        "Selected Tile #{tid} | VRAM Address: 0x{vaddr:08X}"
+                    ));
                 }
             });
         self.show_vram = open;
@@ -1170,7 +1183,10 @@ impl DebuggerWindows {
             .resizable(true)
             .show(ctx, |ui| {
                 ui.horizontal(|ui| {
-                    ui.checkbox(&mut self.hide_disabled_sprites, "Hide Disabled/Blank Sprites");
+                    ui.checkbox(
+                        &mut self.hide_disabled_sprites,
+                        "Hide Disabled/Blank Sprites",
+                    );
                     ui.label(
                         RichText::new(if (core.bus.ppu.dispcnt & 0x40) != 0 {
                             "OBJ Mapping: 1D"
@@ -1184,36 +1200,60 @@ impl DebuggerWindows {
 
                 ui.columns(2, |cols| {
                     let list_ui = &mut cols[0];
-                    egui::ScrollArea::vertical().max_height(380.0).show(list_ui, |ui| {
-                        for idx in 0..128usize {
-                            let base = idx * 8;
-                            let a0 = u16::from_le_bytes([core.bus.ppu.oam[base], core.bus.ppu.oam[base + 1]]);
-                            let obj_mode_rot = (a0 >> 8) & 3;
-                            if self.hide_disabled_sprites && obj_mode_rot == 2 {
-                                continue;
+                    egui::ScrollArea::vertical()
+                        .max_height(380.0)
+                        .show(list_ui, |ui| {
+                            for idx in 0..128usize {
+                                let base = idx * 8;
+                                let a0 = u16::from_le_bytes([
+                                    core.bus.ppu.oam[base],
+                                    core.bus.ppu.oam[base + 1],
+                                ]);
+                                let obj_mode_rot = (a0 >> 8) & 3;
+                                if self.hide_disabled_sprites && obj_mode_rot == 2 {
+                                    continue;
+                                }
+                                let a1 = u16::from_le_bytes([
+                                    core.bus.ppu.oam[base + 2],
+                                    core.bus.ppu.oam[base + 3],
+                                ]);
+                                let a2 = u16::from_le_bytes([
+                                    core.bus.ppu.oam[base + 4],
+                                    core.bus.ppu.oam[base + 5],
+                                ]);
+                                let (w, h) = obj_dimensions((a0 >> 14) & 3, (a1 >> 14) & 3);
+                                let x = a1 & 0x1FF;
+                                let y = a0 & 0xFF;
+                                let tile = a2 & 0x03FF;
+                                let lbl = format!(
+                                    "#{idx:03}  ({x:>3},{y:>3})  {w:>2}x{h:<2}  Tile {tile:03X}"
+                                );
+                                if ui
+                                    .selectable_label(
+                                        self.selected_sprite == idx,
+                                        RichText::new(lbl).monospace(),
+                                    )
+                                    .clicked()
+                                {
+                                    self.selected_sprite = idx;
+                                }
                             }
-                            let a1 = u16::from_le_bytes([core.bus.ppu.oam[base + 2], core.bus.ppu.oam[base + 3]]);
-                            let a2 = u16::from_le_bytes([core.bus.ppu.oam[base + 4], core.bus.ppu.oam[base + 5]]);
-                            let (w, h) = obj_dimensions((a0 >> 14) & 3, (a1 >> 14) & 3);
-                            let x = a1 & 0x1FF;
-                            let y = a0 & 0xFF;
-                            let tile = a2 & 0x03FF;
-                            let lbl = format!(
-                                "#{idx:03}  ({x:>3},{y:>3})  {w:>2}x{h:<2}  Tile {tile:03X}"
-                            );
-                            if ui.selectable_label(self.selected_sprite == idx, RichText::new(lbl).monospace()).clicked() {
-                                self.selected_sprite = idx;
-                            }
-                        }
-                    });
+                        });
 
                     // Right column: Sprite Preview & Detailed Flags
                     let det_ui = &mut cols[1];
                     let idx = self.selected_sprite.min(127);
                     let base = idx * 8;
-                    let a0 = u16::from_le_bytes([core.bus.ppu.oam[base], core.bus.ppu.oam[base + 1]]);
-                    let a1 = u16::from_le_bytes([core.bus.ppu.oam[base + 2], core.bus.ppu.oam[base + 3]]);
-                    let a2 = u16::from_le_bytes([core.bus.ppu.oam[base + 4], core.bus.ppu.oam[base + 5]]);
+                    let a0 =
+                        u16::from_le_bytes([core.bus.ppu.oam[base], core.bus.ppu.oam[base + 1]]);
+                    let a1 = u16::from_le_bytes([
+                        core.bus.ppu.oam[base + 2],
+                        core.bus.ppu.oam[base + 3],
+                    ]);
+                    let a2 = u16::from_le_bytes([
+                        core.bus.ppu.oam[base + 4],
+                        core.bus.ppu.oam[base + 5],
+                    ]);
                     let (w, h) = obj_dimensions((a0 >> 14) & 3, (a1 >> 14) & 3);
                     let obj_mode_rot = (a0 >> 8) & 3;
                     let is_8bpp = (a0 & (1 << 13)) != 0;
@@ -1270,9 +1310,11 @@ impl DebuggerWindows {
                                 rgba[dst + 2] = cb.b();
                                 rgba[dst + 3] = 255;
                             } else {
-                                let real_pidx = 256 + if is_8bpp { pidx } else { pal_bank * 16 + pidx };
+                                let real_pidx =
+                                    256 + if is_8bpp { pidx } else { pal_bank * 16 + pidx };
                                 let raw = read_pram_u16(&core.bus.ppu.pram, real_pidx);
-                                rgba[dst..dst + 4].copy_from_slice(&bgr555_to_rgba(raw, color_correction));
+                                rgba[dst..dst + 4]
+                                    .copy_from_slice(&bgr555_to_rgba(raw, color_correction));
                             }
                         }
                     }
@@ -1283,17 +1325,26 @@ impl DebuggerWindows {
                     });
                     tex.set(img, TextureOptions::NEAREST);
 
-                    det_ui.label(RichText::new(format!("Sprite #{idx} Preview ({w}x{h})")).strong());
+                    det_ui
+                        .label(RichText::new(format!("Sprite #{idx} Preview ({w}x{h})")).strong());
                     let scale = (96.0 / (w.max(h) as f32)).clamp(1.5, 4.0);
                     det_ui.image((tex.id(), Vec2::new(w as f32 * scale, h as f32 * scale)));
                     det_ui.separator();
                     let raw_x = a1 & 0x1FF;
-                    let signed_x = if raw_x >= 256 { raw_x as i32 - 512 } else { raw_x as i32 };
+                    let signed_x = if raw_x >= 256 {
+                        raw_x as i32 - 512
+                    } else {
+                        raw_x as i32
+                    };
                     let y = a0 & 0xFF;
                     det_ui.monospace(format!("Coords: ({signed_x}, {y})  Size: {w}x{h}"));
                     det_ui.monospace(format!(
                         "Tile: 0x{tile_id:03X}  Prio: {prio}  Color: {}",
-                        if is_8bpp { "8bpp".to_string() } else { format!("4bpp Pal {pal_bank}") }
+                        if is_8bpp {
+                            "8bpp".to_string()
+                        } else {
+                            format!("4bpp Pal {pal_bank}")
+                        }
                     ));
                     let rot_str = match obj_mode_rot {
                         0 => "Normal",
@@ -1326,8 +1377,14 @@ impl DebuggerWindows {
                     ("PSG Square 2", core.bus.apu.sq2.enabled),
                     ("PSG Wave RAM", core.bus.apu.wave.enabled),
                     ("PSG Noise LFSR", core.bus.apu.noise.enabled),
-                    ("Direct Sound FIFO A", (core.bus.apu.soundcnt_h & 0x0300) != 0),
-                    ("Direct Sound FIFO B", (core.bus.apu.soundcnt_h & 0x3000) != 0),
+                    (
+                        "Direct Sound FIFO A",
+                        (core.bus.apu.soundcnt_h & 0x0300) != 0,
+                    ),
+                    (
+                        "Direct Sound FIFO B",
+                        (core.bus.apu.soundcnt_h & 0x3000) != 0,
+                    ),
                 ];
 
                 let cursor = core.bus.apu.scope_cursor;
@@ -1362,7 +1419,10 @@ impl DebuggerWindows {
                             painter.rect_filled(rect, CornerRadius::same(2), SURFACE_DARK);
                             let mid_y = rect.center().y;
                             painter.line_segment(
-                                [Pos2::new(rect.left(), mid_y), Pos2::new(rect.right(), mid_y)],
+                                [
+                                    Pos2::new(rect.left(), mid_y),
+                                    Pos2::new(rect.right(), mid_y),
+                                ],
                                 Stroke::new(1.0_f32, Color32::from_rgb(35, 41, 52)),
                             );
 
@@ -1376,7 +1436,11 @@ impl DebuggerWindows {
                                 let y = mid_y - s.clamp(-1.0, 1.0) * half_h;
                                 points.push(Pos2::new(x, y));
                             }
-                            let line_col = if ch_enabled { ACCENT_TEAL } else { Color32::from_rgb(70, 76, 90) };
+                            let line_col = if ch_enabled {
+                                ACCENT_TEAL
+                            } else {
+                                Color32::from_rgb(70, 76, 90)
+                            };
                             painter.add(egui::Shape::line(points, Stroke::new(1.5_f32, line_col)));
                         });
                     ui.add_space(4.0);
@@ -1404,7 +1468,7 @@ impl DebuggerWindows {
                     .show_ui(ui, |ui| {
                         for c in SaveOverrideChoice::ALL {
                             if ui.selectable_value(&mut choice, c, c.label()).changed() {
-                                core.bus.cart.set_save_type_override(c.to_core());
+                                core.bus.set_save_type_override(c.to_core());
                                 changed = true;
                             }
                         }
@@ -1413,7 +1477,14 @@ impl DebuggerWindows {
                 ui.separator();
                 ui.label(RichText::new("Real-Time Clock (GPIO RTC)").strong());
                 let rtc_label = match core.bus.cart.rtc_override {
-                    None => format!("Auto ({})", if core.bus.cart.has_rtc { "Enabled" } else { "Disabled" }),
+                    None => format!(
+                        "Auto ({})",
+                        if core.bus.cart.has_rtc {
+                            "Enabled"
+                        } else {
+                            "Disabled"
+                        }
+                    ),
                     Some(true) => "Force Enabled".to_string(),
                     Some(false) => "Force Disabled".to_string(),
                 };
@@ -1437,22 +1508,27 @@ impl DebuggerWindows {
                 ui.separator();
                 ui.label(RichText::new("Cartridge Sensors (Boktai / WarioWare / Yoshi)").strong());
                 if ui
-                    .checkbox(&mut core.bus.cart.solar_enabled, "Enable Boktai Solar Sensor")
-                    .changed()
-                {
-                    changed = true;
-                }
-                if ui
-                    .add(
-                        egui::Slider::new(&mut core.bus.cart.solar_lux, 0..=255)
-                            .text("Solar Lux"),
+                    .checkbox(
+                        &mut core.bus.cart.solar_enabled,
+                        "Enable Boktai Solar Sensor",
                     )
                     .changed()
                 {
                     changed = true;
                 }
+                if ui
+                    .add(egui::Slider::new(&mut core.bus.cart.solar_lux, 0..=255).text("Solar Lux"))
+                    .changed()
+                {
+                    changed = true;
+                }
                 ui.horizontal(|ui| {
-                    for (lbl, v) in [("Dark (0)", 0), ("Shade (96)", 96), ("Sun (224)", 224), ("Max (255)", 255)] {
+                    for (lbl, v) in [
+                        ("Dark (0)", 0),
+                        ("Shade (96)", 96),
+                        ("Sun (224)", 224),
+                        ("Max (255)", 255),
+                    ] {
                         if ui.button(lbl).clicked() {
                             core.bus.cart.solar_lux = v;
                             changed = true;
@@ -1468,8 +1544,12 @@ impl DebuggerWindows {
                     changed = true;
                 }
                 ui.horizontal(|ui| {
-                    ui.add(egui::Slider::new(&mut core.bus.cart.tilt_x, 0x200..=0x540).text("Tilt X"));
-                    ui.add(egui::Slider::new(&mut core.bus.cart.tilt_y, 0x200..=0x540).text("Tilt Y"));
+                    ui.add(
+                        egui::Slider::new(&mut core.bus.cart.tilt_x, 0x200..=0x540).text("Tilt X"),
+                    );
+                    ui.add(
+                        egui::Slider::new(&mut core.bus.cart.tilt_y, 0x200..=0x540).text("Tilt Y"),
+                    );
                     if ui.button("Center").clicked() {
                         core.bus.cart.tilt_x = 0x03A0;
                         core.bus.cart.tilt_y = 0x03A0;
@@ -1484,7 +1564,9 @@ impl DebuggerWindows {
                     changed = true;
                 }
                 ui.horizontal(|ui| {
-                    ui.add(egui::Slider::new(&mut core.bus.cart.gyro_val, 0x100..=0xC80).text("Gyro"));
+                    ui.add(
+                        egui::Slider::new(&mut core.bus.cart.gyro_val, 0x100..=0xC80).text("Gyro"),
+                    );
                     if ui.button("Zero").clicked() {
                         core.bus.cart.gyro_val = 0x06C0;
                     }
@@ -1628,9 +1710,7 @@ impl DebuggerWindows {
             let captured = ctx.input(|i| {
                 for ev in &i.events {
                     if let egui::Event::Key {
-                        key,
-                        pressed: true,
-                        ..
+                        key, pressed: true, ..
                     } = ev
                     {
                         return Some(*key);
@@ -1720,14 +1800,21 @@ impl DebuggerWindows {
             .default_width(360.0)
             .show(ctx, |ui| {
                 ui.heading("Rustboy Advance");
-                ui.label(RichText::new("Version 0.1.0 — Cycle-Aware GBA Emulator & Hardware Debugger").color(TEXT_MUTED));
+                ui.label(
+                    RichText::new("Version 0.1.0 — Cycle-Aware GBA Emulator & Hardware Debugger")
+                        .color(TEXT_MUTED),
+                );
                 ui.separator();
                 ui.label("• CPU: ARM7TDMI (ARMv4T + Thumb, 3-stage pipeline, Prefetch)");
                 ui.label("• PPU: Modes 0–5, Windows, Blending, Scanline & Per-Dot Renderer");
                 ui.label("• APU: 4 PSG + Dual 8-bit DMA FIFOs w/ Dynamic Rate Control");
                 ui.label("• Carts: SRAM, Flash 64/128K, EEPROM, GPIO RTC, Solar, Tilt, Gyro");
                 ui.add_space(6.0);
-                ui.label(RichText::new("Built cleanly in pure safe/minimal Rust 2024.").small().color(TEXT_MUTED));
+                ui.label(
+                    RichText::new("Built cleanly in pure safe/minimal Rust 2024.")
+                        .small()
+                        .color(TEXT_MUTED),
+                );
             });
         self.show_about = open;
     }
@@ -2204,18 +2291,17 @@ impl DebuggerWindows {
                         });
 
                         ui.add_space(8.0);
-                        let (status_lbl, status_color) = if let Some(peer) =
-                            &self.gdb_status.client_addr
-                        {
-                            (format!("Connected: {peer}"), ACCENT_TEAL)
-                        } else if self.gdb_status.listening {
-                            (
-                                format!("Listening on 127.0.0.1:{}", self.gdb_status.port),
-                                ACCENT_AMBER,
-                            )
-                        } else {
-                            (String::from("Stopped"), TEXT_MUTED)
-                        };
+                        let (status_lbl, status_color) =
+                            if let Some(peer) = &self.gdb_status.client_addr {
+                                (format!("Connected: {peer}"), ACCENT_TEAL)
+                            } else if self.gdb_status.listening {
+                                (
+                                    format!("Listening on 127.0.0.1:{}", self.gdb_status.port),
+                                    ACCENT_AMBER,
+                                )
+                            } else {
+                                (String::from("Stopped"), TEXT_MUTED)
+                            };
                         ui.label(RichText::new(status_lbl).color(status_color).strong());
 
                         ui.monospace(format!(
@@ -2239,7 +2325,9 @@ impl DebuggerWindows {
                 } else {
                     self.gdb_port_input.trim().parse::<u16>().unwrap_or(2345)
                 };
-                ui.label(RichText::new("Connect with arm-none-eabi-gdb or Ghidra:").color(TEXT_MUTED));
+                ui.label(
+                    RichText::new("Connect with arm-none-eabi-gdb or Ghidra:").color(TEXT_MUTED),
+                );
                 ui.monospace(format!("target remote 127.0.0.1:{active_port}"));
             });
 

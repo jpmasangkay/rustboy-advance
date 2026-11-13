@@ -750,10 +750,7 @@ mod tests {
     fn parses_signed_unsigned_and_hex_values() {
         assert_eq!(parse_scan_value("42", ScanValueType::U8, false), Ok(42));
         assert!(parse_scan_value("256", ScanValueType::U8, false).is_err());
-        assert_eq!(
-            parse_scan_value("-5", ScanValueType::I8, false),
-            Ok(0xFB)
-        );
+        assert_eq!(parse_scan_value("-5", ScanValueType::I8, false), Ok(0xFB));
         assert_eq!(
             parse_scan_value("0x1A2B", ScanValueType::U16, false),
             Ok(0x1A2B)
@@ -790,8 +787,16 @@ mod tests {
 
         let second = win.run_next_scan(&core).unwrap();
         assert_eq!(second, 2);
-        assert!(win.candidates.iter().any(|c| c.addr == 0x0200_0100 && c.hit_count == 2));
-        assert!(win.candidates.iter().any(|c| c.addr == 0x0300_0040 && c.hit_count == 2));
+        assert!(
+            win.candidates
+                .iter()
+                .any(|c| c.addr == 0x0200_0100 && c.hit_count == 2)
+        );
+        assert!(
+            win.candidates
+                .iter()
+                .any(|c| c.addr == 0x0300_0040 && c.hit_count == 2)
+        );
     }
 
     #[test]

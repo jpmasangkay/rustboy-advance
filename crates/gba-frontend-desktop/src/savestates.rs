@@ -423,9 +423,9 @@ impl RustboyApp {
             self.undo_state_buffer = Some(decoded.core_bytes);
         }
 
-        let res = self
-            .build_current_state_container()
-            .and_then(|container| fs::write(&path, container).map_err(|e| SaveStateError::Io(e.to_string())));
+        let res = self.build_current_state_container().and_then(|container| {
+            fs::write(&path, container).map_err(|e| SaveStateError::Io(e.to_string()))
+        });
 
         match res {
             Ok(()) => {
@@ -560,6 +560,7 @@ impl RustboyApp {
                 self.rewinding = false;
                 self.show_pause_overlay = false;
                 self.state_manager_error = None;
+                self.sink.audio.reset_underruns();
                 if let Some(core) = &self.core {
                     self.movie.on_state_loaded_from_path(core, path);
                 }
@@ -603,13 +604,17 @@ impl RustboyApp {
         match decode_container_meta(&bytes) {
             Ok(meta) => {
                 if !meta.thumbnail_png.is_empty()
-                    && let Ok(img) =
-                        image::load_from_memory_with_format(&meta.thumbnail_png, image::ImageFormat::Png)
+                    && let Ok(img) = image::load_from_memory_with_format(
+                        &meta.thumbnail_png,
+                        image::ImageFormat::Png,
+                    )
                 {
                     let rgba = img.to_rgba8();
                     let (w, h) = rgba.dimensions();
-                    let cimg =
-                        ColorImage::from_rgba_unmultiplied([w as usize, h as usize], &rgba.into_raw());
+                    let cimg = ColorImage::from_rgba_unmultiplied(
+                        [w as usize, h as usize],
+                        &rgba.into_raw(),
+                    );
                     self.slot_thumbnails[idx] = Some(ctx.load_texture(
                         format!("slot_thumb_{slot}"),
                         cimg,
@@ -619,9 +624,8 @@ impl RustboyApp {
                     self.slot_thumbnails[idx] = None;
                 }
 
-                let wrong_crc = self.rom_crc32 != 0
-                    && meta.rom_crc32 != 0
-                    && meta.rom_crc32 != self.rom_crc32;
+                let wrong_crc =
+                    self.rom_crc32 != 0 && meta.rom_crc32 != 0 && meta.rom_crc32 != self.rom_crc32;
                 let wrong_code = !self.rom_code.is_empty()
                     && !meta.game_code.is_empty()
                     && meta.game_code != self.rom_code;
@@ -678,9 +682,12 @@ impl RustboyApp {
             .show(ctx, |ui| {
                 ui.horizontal(|ui| {
                     ui.label(
-                        RichText::new(format!("Active ROM: {} [{}]", self.rom_title, self.rom_code))
-                            .color(TEXT_MUTED)
-                            .small(),
+                        RichText::new(format!(
+                            "Active ROM: {} [{}]",
+                            self.rom_title, self.rom_code
+                        ))
+                        .color(TEXT_MUTED)
+                        .small(),
                     );
                     ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
                         if ui
@@ -763,17 +770,15 @@ impl RustboyApp {
                             .show(ui, |ui| {
                                 ui.set_width(136.0);
                                 ui.vertical(|ui| {
-                                    ui.label(
-                                        RichText::new(format!("Slot {slot}"))
-                                            .strong()
-                                            .color(if has_error {
-                                                Color32::from_rgb(255, 130, 130)
-                                            } else if is_filled {
-                                                ACCENT_TEAL
-                                            } else {
-                                                TEXT_MUTED
-                                            }),
-                                    );
+                                    ui.label(RichText::new(format!("Slot {slot}")).strong().color(
+                                        if has_error {
+                                            Color32::from_rgb(255, 130, 130)
+                                        } else if is_filled {
+                                            ACCENT_TEAL
+                                        } else {
+                                            TEXT_MUTED
+                                        },
+                                    ));
 
                                     let thumb_size = Vec2::new(136.0, 90.0);
                                     let (rect, resp) =
@@ -826,22 +831,18 @@ impl RustboyApp {
                                     }
 
                                     ui.add_space(4.0);
-                                    ui.label(
-                                        RichText::new(status_rel)
-                                            .small()
-                                            .color(if has_error {
-                                                Color32::from_rgb(255, 145, 145)
-                                            } else if is_filled {
-                                                Color32::from_rgb(210, 220, 232)
-                                            } else {
-                                                TEXT_MUTED
-                                            }),
-                                    );
+                                    ui.label(RichText::new(status_rel).small().color(
+                                        if has_error {
+                                            Color32::from_rgb(255, 145, 145)
+                                        } else if is_filled {
+                                            Color32::from_rgb(210, 220, 232)
+                                        } else {
+                                            TEXT_MUTED
+                                        },
+                                    ));
                                     if !status_abs.is_empty() {
                                         ui.label(
-                                            RichText::new(status_abs)
-                                                .size(10.0)
-                                                .color(TEXT_MUTED),
+                                            RichText::new(status_abs).size(10.0).color(TEXT_MUTED),
                                         );
                                     } else {
                                         ui.label(RichText::new(" ").size(10.0));
@@ -881,11 +882,13 @@ impl RustboyApp {
                                         .add_enabled(
                                             is_filled,
                                             egui::Button::new(
-                                                RichText::new("Delete").small().color(if is_filled {
-                                                    Color32::from_rgb(245, 120, 120)
-                                                } else {
-                                                    TEXT_MUTED
-                                                }),
+                                                RichText::new("Delete").small().color(
+                                                    if is_filled {
+                                                        Color32::from_rgb(245, 120, 120)
+                                                    } else {
+                                                        TEXT_MUTED
+                                                    },
+                                                ),
                                             )
                                             .min_size(Vec2::new(136.0, 20.0)),
                                         )

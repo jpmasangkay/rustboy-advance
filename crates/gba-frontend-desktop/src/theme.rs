@@ -1,5 +1,7 @@
+use egui::{
+    Color32, CornerRadius, FontData, FontDefinitions, FontFamily, FontId, Stroke, TextStyle,
+};
 use std::sync::Arc;
-use egui::{Color32, CornerRadius, FontData, FontDefinitions, FontFamily, FontId, Stroke, TextStyle};
 
 // DESIGN TOKENS
 // - bg #121212, surface #181818, tile #1e1e1e, hover/selected #2a2a2a, border #2a2a2a (1px)
@@ -49,14 +51,14 @@ pub fn configure_theme(ctx: &egui::Context) {
     #[cfg(target_os = "windows")]
     {
         let segoe_path = std::path::Path::new(r"C:\Windows\Fonts\segoeui.ttf");
-        if segoe_path.exists() {
-            if let Ok(bytes) = std::fs::read(segoe_path) {
-                fonts
-                    .font_data
-                    .insert("segoe_ui".to_owned(), Arc::new(FontData::from_owned(bytes)));
-                if let Some(family) = fonts.families.get_mut(&FontFamily::Proportional) {
-                    family.insert(0, "segoe_ui".to_owned());
-                }
+        if segoe_path.exists()
+            && let Ok(bytes) = std::fs::read(segoe_path)
+        {
+            fonts
+                .font_data
+                .insert("segoe_ui".to_owned(), Arc::new(FontData::from_owned(bytes)));
+            if let Some(family) = fonts.families.get_mut(&FontFamily::Proportional) {
+                family.insert(0, "segoe_ui".to_owned());
             }
         }
     }
@@ -108,10 +110,9 @@ pub fn configure_theme(ctx: &egui::Context) {
     style.spacing.button_padding = egui::vec2(6.0, 2.0);
     style.spacing.indent = 16.0;
 
-    style.text_styles.insert(
-        TextStyle::Body,
-        FontId::new(12.0, FontFamily::Proportional),
-    );
+    style
+        .text_styles
+        .insert(TextStyle::Body, FontId::new(12.0, FontFamily::Proportional));
     style.text_styles.insert(
         TextStyle::Button,
         FontId::new(12.0, FontFamily::Proportional),

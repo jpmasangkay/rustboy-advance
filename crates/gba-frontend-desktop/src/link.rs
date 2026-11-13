@@ -9,11 +9,11 @@ use std::time::{Duration, Instant};
 
 use egui::{self, Color32, CornerRadius, RichText, Stroke};
 use gba_core::hw::{SioMode, SioResponse, SioTransfer};
-use gba_core::{GbaCore, HostFrontend, CYCLES_PER_FRAME, LCD_HEIGHT, LCD_WIDTH};
+use gba_core::{CYCLES_PER_FRAME, GbaCore, HostFrontend, LCD_HEIGHT, LCD_WIDTH};
 
-use crate::app::{RustboyApp, ACCENT_TEAL, BG_CARD, BG_PANEL, BORDER_HAIRLINE, TEXT_MUTED};
+use crate::app::{ACCENT_TEAL, BG_CARD, BG_PANEL, BORDER_HAIRLINE, RustboyApp, TEXT_MUTED};
 use crate::filters::VideoPostProcessor;
-use crate::rom_loader::{detect_rom_platform, load_rom_bytes, RomPlatform};
+use crate::rom_loader::{RomPlatform, detect_rom_platform, load_rom_bytes};
 
 /// Default TCP port for GBA Netplay Link Cable sessions.
 pub const DEFAULT_NETPLAY_PORT: u16 = 27888;
@@ -109,10 +109,7 @@ fn build_open_bus_timeout_response(xfer: SioTransfer, multi_id: u8) -> SioRespon
     }
 }
 
-fn pair_responses(
-    p1: SioTransfer,
-    p2: SioTransfer,
-) -> Option<(SioResponse, SioResponse, SioMode)> {
+fn pair_responses(p1: SioTransfer, p2: SioTransfer) -> Option<(SioResponse, SioResponse, SioMode)> {
     if p1.mode != p2.mode {
         return None;
     }
@@ -160,10 +157,7 @@ fn flush_core_to_frontend<F: HostFrontend + ?Sized>(core: &mut GbaCore, fe: &mut
     }
 }
 
-fn flush_core_framebuffer_only(
-    core: &mut GbaCore,
-    fb_out: &mut [u16; LCD_WIDTH * LCD_HEIGHT],
-) {
+fn flush_core_framebuffer_only(core: &mut GbaCore, fb_out: &mut [u16; LCD_WIDTH * LCD_HEIGHT]) {
     while let Some((ev_cycle, kind)) = core.bus.scheduler.pop_due() {
         core.bus.dispatch_event(ev_cycle, kind);
     }
@@ -378,7 +372,11 @@ impl LocalLinkSession {
         // Prevent internal-clock probes from hanging indefinitely when peer is not in SIO mode.
         if let Some(l1) = self.pending_p1
             && l1.transfer.duration_cycles > 0
-            && l1.age_cycles >= l1.transfer.duration_cycles.max(LOCAL_SIO_PROBE_TIMEOUT_CYCLES)
+            && l1.age_cycles
+                >= l1
+                    .transfer
+                    .duration_cycles
+                    .max(LOCAL_SIO_PROBE_TIMEOUT_CYCLES)
         {
             p1.complete_sio_transfer(build_open_bus_timeout_response(l1.transfer, 0));
             self.pending_p1 = None;
@@ -386,7 +384,11 @@ impl LocalLinkSession {
         }
         if let Some(l2) = self.pending_p2
             && l2.transfer.duration_cycles > 0
-            && l2.age_cycles >= l2.transfer.duration_cycles.max(LOCAL_SIO_PROBE_TIMEOUT_CYCLES)
+            && l2.age_cycles
+                >= l2
+                    .transfer
+                    .duration_cycles
+                    .max(LOCAL_SIO_PROBE_TIMEOUT_CYCLES)
         {
             self.p2_core
                 .complete_sio_transfer(build_open_bus_timeout_response(l2.transfer, 1));
@@ -406,9 +408,17 @@ pub enum NetplayRole {
 /// Observable connection lifecycle state for TCP Netplay.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum NetplayState {
-    Listening { addr: SocketAddr },
-    Connecting { target: String },
-    Connected { peer_addr: String, peer_title: String, peer_code: String },
+    Listening {
+        addr: SocketAddr,
+    },
+    Connecting {
+        target: String,
+    },
+    Connected {
+        peer_addr: String,
+        peer_title: String,
+        peer_code: String,
+    },
     Error(String),
 }
 
@@ -810,9 +820,9 @@ impl NetplayLink {
                 timestamp_ms,
             } => {
                 self.remote_multi_state = (multi_ready, multi_send);
-                let _ = self.cmd_tx.send(NetWorkerCmd::Send(NetPacket::Pong {
-                    timestamp_ms,
-                }));
+                let _ = self
+                    .cmd_tx
+                    .send(NetWorkerCmd::Send(NetPacket::Pong { timestamp_ms }));
             }
             NetPacket::Pong { timestamp_ms } => {
                 let now_ms = self.started_at.elapsed().as_millis() as u32;
@@ -1250,24 +1260,14 @@ impl LinkManager {
     #[allow(dead_code)]
     pub fn status_badge(&self) -> Option<String> {
         if let Some(local) = &self.local {
-            return Some(format!(
-                "LINK LOCAL 2P • {} xfers",
-                local.stats.total()
-            ));
+            return Some(format!("LINK LOCAL 2P • {} xfers", local.stats.total()));
         }
         if let Some(net) = &self.netplay {
             return match &net.state {
-                NetplayState::Listening { addr } => {
-                    Some(format!("LINK WAIT :{}", addr.port()))
-                }
-                NetplayState::Connecting { target } => {
-                    Some(format!("LINK DIAL {target}"))
-                }
+                NetplayState::Listening { addr } => Some(format!("LINK WAIT :{}", addr.port())),
+                NetplayState::Connecting { target } => Some(format!("LINK DIAL {target}")),
                 NetplayState::Connected { peer_addr, .. } => {
-                    let rtt = net
-                        .rtt_ms
-                        .map(|ms| format!(" {ms}ms"))
-                        .unwrap_or_default();
+                    let rtt = net.rtt_ms.map(|ms| format!(" {ms}ms")).unwrap_or_default();
                     Some(format!("LINK TCP {peer_addr}{rtt}"))
                 }
                 NetplayState::Error(_) => Some("LINK ERR".into()),
@@ -1289,7 +1289,10 @@ impl LinkManager {
 
 impl RustboyApp {
     /// Launches a local Player 2 `GbaCore` from the given ROM path and attaches it as Slave.
-    pub(crate) fn start_local_link_with_rom_path(&mut self, p2_rom_path: &Path) -> Result<(), String> {
+    pub(crate) fn start_local_link_with_rom_path(
+        &mut self,
+        p2_rom_path: &Path,
+    ) -> Result<(), String> {
         if self.core.is_none() {
             return Err("Load a GBA ROM for Player 1 before connecting Player 2".into());
         }
@@ -1298,20 +1301,14 @@ impl RustboyApp {
         }
 
         let loaded = load_rom_bytes(p2_rom_path)?;
-        if detect_rom_platform(
-            p2_rom_path,
-            loaded.inner_name.as_deref(),
-            &loaded.bytes,
-        ) != RomPlatform::Gba
+        if detect_rom_platform(p2_rom_path, loaded.inner_name.as_deref(), &loaded.bytes)
+            != RomPlatform::Gba
         {
             return Err("Player 2 Link Cable requires a .gba ROM".into());
         }
 
         let sav_path = p2_rom_path.with_extension("sav");
-        let same_path_as_p1 = self
-            .rom_path
-            .as_ref()
-            .is_some_and(|p1p| p1p == p2_rom_path);
+        let same_path_as_p1 = self.rom_path.as_ref().is_some_and(|p1p| p1p == p2_rom_path);
 
         let mut p2_core = GbaCore::new(self.bios_bytes.as_deref(), loaded.bytes);
         if let Ok(sav) = std::fs::read(&sav_path) {
@@ -1466,19 +1463,16 @@ impl RustboyApp {
                                 .strong()
                                 .color(ACCENT_TEAL),
                         );
-                        ui.with_layout(
-                            egui::Layout::right_to_left(egui::Align::Center),
-                            |ui| {
-                                ui.monospace(
-                                    RichText::new(format!(
-                                        "P1 Master / P2 Slave [{}]",
-                                        local.p2_rom_code
-                                    ))
-                                    .small()
-                                    .color(TEXT_MUTED),
-                                );
-                            },
-                        );
+                        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                            ui.monospace(
+                                RichText::new(format!(
+                                    "P1 Master / P2 Slave [{}]",
+                                    local.p2_rom_code
+                                ))
+                                .small()
+                                .color(TEXT_MUTED),
+                            );
+                        });
                     });
                     ui.add_space(4.0);
                     let cart_lbl = ui.label(
@@ -1630,9 +1624,7 @@ impl RustboyApp {
                     peer_title,
                     peer_code,
                 } => {
-                    let rtt_str = rtt
-                        .map(|ms| format!(" • RTT {ms} ms"))
-                        .unwrap_or_default();
+                    let rtt_str = rtt.map(|ms| format!(" • RTT {ms} ms")).unwrap_or_default();
                     (
                         format!(
                             "CONNECTED ({}){rtt_str}",
@@ -1737,11 +1729,8 @@ impl RustboyApp {
             match self.link.host_port_input.trim().parse::<u16>() {
                 Ok(port) => {
                     let code = game_code_bytes(&self.rom_code);
-                    self.link.netplay = Some(NetplayLink::start_host(
-                        port,
-                        self.rom_title.clone(),
-                        code,
-                    ));
+                    self.link.netplay =
+                        Some(NetplayLink::start_host(port, self.rom_title.clone(), code));
                     self.link.ui_error = None;
                     self.notify(&format!("Hosting TCP Link Cable on port {port}"));
                 }
@@ -1852,8 +1841,7 @@ mod tests {
         }
 
         fn mov_imm(&mut self, rd: u32, imm8: u8) {
-            self.words
-                .push(0xE3A0_0000 | (rd << 12) | u32::from(imm8));
+            self.words.push(0xE3A0_0000 | (rd << 12) | u32::from(imm8));
         }
 
         fn add_imm(&mut self, rd: u32, rn: u32, imm8: u8) {
@@ -1902,8 +1890,7 @@ mod tests {
         }
 
         fn tst_imm(&mut self, rn: u32, imm8: u8) {
-            self.words
-                .push(0xE310_0000 | (rn << 16) | u32::from(imm8));
+            self.words.push(0xE310_0000 | (rn << 16) | u32::from(imm8));
         }
 
         fn beq(&mut self, target: usize) {
@@ -2050,7 +2037,8 @@ mod tests {
         }
         let port = host.bound_addr().expect("host bound addr").port();
 
-        let mut join = NetplayLink::start_join(format!("127.0.0.1:{port}"), "JOINROM".into(), *b"TST1");
+        let mut join =
+            NetplayLink::start_join(format!("127.0.0.1:{port}"), "JOINROM".into(), *b"TST1");
 
         let wait_conn = Instant::now();
         while (!host.is_connected() || !join.is_connected())

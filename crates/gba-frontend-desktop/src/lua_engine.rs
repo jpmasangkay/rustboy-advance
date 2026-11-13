@@ -16,8 +16,8 @@ use gba_core::{
     KEY_UP,
 };
 use piccolo::{
-    Callback, CallbackReturn, Closure, Context, Executor, ExecutorMode, Fuel, Function,
-    IntoValue, Lua, StashedFunction, Table, TypeError, Value,
+    Callback, CallbackReturn, Closure, Context, Executor, ExecutorMode, Fuel, Function, IntoValue,
+    Lua, StashedFunction, Table, TypeError, Value,
 };
 
 /// Maximum console lines kept in the Lua console output ring buffer.
@@ -196,6 +196,7 @@ struct ScopedCoreSlot {
 }
 
 thread_local! {
+    #[allow(clippy::missing_const_for_thread_local)]
     static CORE_SCOPE: RefCell<ScopedCoreSlot> = const { RefCell::new(ScopedCoreSlot { core: None, in_use: false }) };
 }
 
@@ -609,15 +610,13 @@ impl LuaEngine {
             .inner_margin(egui::Margin::symmetric(8, 6))
             .show(ui, |ui| {
                 ui.horizontal_wrapped(|ui| {
-                    if ui.button("Load .lua...").clicked() {
-                        if let Some(path) = rfd::FileDialog::new()
+                    if ui.button("Load .lua...").clicked()
+                        && let Some(path) = rfd::FileDialog::new()
                             .add_filter("Lua scripts", &["lua", "txt"])
                             .pick_file()
-                        {
-                            if let Err(err) = self.load_file(&path) {
-                                self.last_error = Some(err);
-                            }
-                        }
+                        && let Err(err) = self.load_file(&path)
+                    {
+                        self.last_error = Some(err);
                     }
 
                     ui.separator();
@@ -757,7 +756,12 @@ impl LuaEngine {
         }
 
         // Script Editor
-        ui.label(RichText::new("Script Editor").small().strong().color(text_muted));
+        ui.label(
+            RichText::new("Script Editor")
+                .small()
+                .strong()
+                .color(text_muted),
+        );
         egui::Frame::new()
             .fill(card_bg)
             .stroke(Stroke::new(1.0_f32, hairline))
@@ -1157,7 +1161,7 @@ fn register_callbacks_table<'gc>(ctx: Context<'gc>, shared: Rc<RefCell<LuaShared
                             expected: "string",
                             found: other.type_name(),
                         }
-                        .into())
+                        .into());
                     }
                 };
                 if kind != "frame" {
@@ -1269,52 +1273,54 @@ fn format_lua_string(pattern: &str, args: &[Value<'_>]) -> Result<String, String
             .ok_or_else(|| format!("missing argument #{} for string.format", arg_idx + 1))?;
         arg_idx += 1;
 
-        let formatted = match spec {
-            'd' | 'i' => {
-                let n = arg
-                    .to_integer()
-                    .ok_or_else(|| format!("bad argument #{} to '%{spec}': expected integer", arg_idx))?;
-                pad_numeric(format!("{n}"), width, zero_pad)
-            }
-            'u' => {
-                let n = arg
-                    .to_integer()
-                    .ok_or_else(|| format!("bad argument #{} to '%u': expected integer", arg_idx))?
-                    as u64;
-                pad_numeric(format!("{n}"), width, zero_pad)
-            }
-            'x' => {
-                let n = arg
-                    .to_integer()
-                    .ok_or_else(|| format!("bad argument #{} to '%x': expected integer", arg_idx))?
-                    as u64;
-                pad_numeric(format!("{n:x}"), width, zero_pad)
-            }
-            'X' => {
-                let n = arg
-                    .to_integer()
-                    .ok_or_else(|| format!("bad argument #{} to '%X': expected integer", arg_idx))?
-                    as u64;
-                pad_numeric(format!("{n:X}"), width, zero_pad)
-            }
-            'f' => {
-                let f = arg
-                    .to_number()
-                    .ok_or_else(|| format!("bad argument #{} to '%f': expected number", arg_idx))?;
-                let prec = precision.unwrap_or(6);
-                format!("{f:.prec$}")
-            }
-            's' => format_lua_value(arg),
-            'c' => {
-                let code = arg
-                    .to_integer()
-                    .ok_or_else(|| format!("bad argument #{} to '%c': expected integer", arg_idx))?;
-                char::from_u32(code as u32)
-                    .map(|c| c.to_string())
-                    .unwrap_or_default()
-            }
-            other => return Err(format!("unsupported format specifier '%{other}' in string.format")),
-        };
+        let formatted =
+            match spec {
+                'd' | 'i' => {
+                    let n = arg.to_integer().ok_or_else(|| {
+                        format!("bad argument #{} to '%{spec}': expected integer", arg_idx)
+                    })?;
+                    pad_numeric(format!("{n}"), width, zero_pad)
+                }
+                'u' => {
+                    let n = arg.to_integer().ok_or_else(|| {
+                        format!("bad argument #{} to '%u': expected integer", arg_idx)
+                    })? as u64;
+                    pad_numeric(format!("{n}"), width, zero_pad)
+                }
+                'x' => {
+                    let n = arg.to_integer().ok_or_else(|| {
+                        format!("bad argument #{} to '%x': expected integer", arg_idx)
+                    })? as u64;
+                    pad_numeric(format!("{n:x}"), width, zero_pad)
+                }
+                'X' => {
+                    let n = arg.to_integer().ok_or_else(|| {
+                        format!("bad argument #{} to '%X': expected integer", arg_idx)
+                    })? as u64;
+                    pad_numeric(format!("{n:X}"), width, zero_pad)
+                }
+                'f' => {
+                    let f = arg.to_number().ok_or_else(|| {
+                        format!("bad argument #{} to '%f': expected number", arg_idx)
+                    })?;
+                    let prec = precision.unwrap_or(6);
+                    format!("{f:.prec$}")
+                }
+                's' => format_lua_value(arg),
+                'c' => {
+                    let code = arg.to_integer().ok_or_else(|| {
+                        format!("bad argument #{} to '%c': expected integer", arg_idx)
+                    })?;
+                    char::from_u32(code as u32)
+                        .map(|c| c.to_string())
+                        .unwrap_or_default()
+                }
+                other => {
+                    return Err(format!(
+                        "unsupported format specifier '%{other}' in string.format"
+                    ));
+                }
+            };
         out.push_str(&formatted);
     }
 
@@ -1599,7 +1605,12 @@ mod tests {
                 .unwrap_or_else(|e| panic!("{} failed start: {e}", sample.label()));
             engine.run_frame(&mut core, 1, "LUATESTROM", "ALTE", KEY_A, false);
             engine.run_frame(&mut core, 2, "LUATESTROM", "ALTE", 0, false);
-            assert!(engine.running, "{} stopped unexpectedly: {:?}", sample.label(), engine.last_error);
+            assert!(
+                engine.running,
+                "{} stopped unexpectedly: {:?}",
+                sample.label(),
+                engine.last_error
+            );
             assert!(engine.last_error.is_none());
             assert!(!engine.overlay_commands().is_empty());
         }

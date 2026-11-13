@@ -5,11 +5,11 @@ use std::sync::mpsc;
 use egui::{self, Align, Color32, CornerRadius, Layout, RichText, Sense, Stroke};
 
 use crate::app::RustboyApp;
-use crate::theme::*;
 use crate::rom_loader::{
-    detect_rom_platform, gb_cart_type_label, gb_short_game_code,
-    is_supported_rom_or_archive_extension, read_rom_header_summary, RomPlatform, RomSourceKind,
+    RomPlatform, RomSourceKind, detect_rom_platform, gb_cart_type_label, gb_short_game_code,
+    is_supported_rom_or_archive_extension, read_rom_header_summary,
 };
+use crate::theme::*;
 
 #[derive(Clone, Debug)]
 pub struct RomLibraryEntry {
@@ -115,14 +115,14 @@ pub(crate) fn find_cover_image(entry: &RomLibraryEntry) -> Option<PathBuf> {
     let mut search_dirs = Vec::new();
     search_dirs.push(PathBuf::from("covers"));
     search_dirs.push(crate::config::AppConfig::app_data_dir().join("covers"));
-    if let Ok(exe) = std::env::current_exe() {
-        if let Some(exe_dir) = exe.parent() {
-            search_dirs.push(exe_dir.join("covers"));
-            if let Some(target_dir) = exe_dir.parent() {
-                search_dirs.push(target_dir.join("covers"));
-                if let Some(proj_root) = target_dir.parent() {
-                    search_dirs.push(proj_root.join("covers"));
-                }
+    if let Ok(exe) = std::env::current_exe()
+        && let Some(exe_dir) = exe.parent()
+    {
+        search_dirs.push(exe_dir.join("covers"));
+        if let Some(target_dir) = exe_dir.parent() {
+            search_dirs.push(target_dir.join("covers"));
+            if let Some(proj_root) = target_dir.parent() {
+                search_dirs.push(proj_root.join("covers"));
             }
         }
     }
@@ -202,14 +202,16 @@ pub(crate) fn trigger_cover_download(entry: &RomLibraryEntry) {
             let url = format!(
                 "https://raw.githubusercontent.com/libretro-thumbnails/{repo_folder}/master/Named_Boxarts/{encoded}.png"
             );
-            if let Ok(resp) = ureq::get(&url).timeout(std::time::Duration::from_secs(6)).call() {
-                if resp.status() == 200 {
-                    let mut bytes = Vec::new();
-                    use std::io::Read;
-                    if resp.into_reader().read_to_end(&mut bytes).is_ok() && !bytes.is_empty() {
-                        downloaded_bytes = Some(bytes);
-                        break;
-                    }
+            if let Ok(resp) = ureq::get(&url)
+                .timeout(std::time::Duration::from_secs(6))
+                .call()
+                && resp.status() == 200
+            {
+                let mut bytes = Vec::new();
+                use std::io::Read;
+                if resp.into_reader().read_to_end(&mut bytes).is_ok() && !bytes.is_empty() {
+                    downloaded_bytes = Some(bytes);
+                    break;
                 }
             }
         }
@@ -223,16 +225,22 @@ pub(crate) fn trigger_cover_download(entry: &RomLibraryEntry) {
             let _ = std::fs::create_dir_all(&cwd_covers);
             let _ = std::fs::write(cwd_covers.join(format!("{display_name}.png")), &bytes);
 
-            if let Ok(exe) = std::env::current_exe() {
-                if let Some(exe_dir) = exe.parent() {
-                    let _ = std::fs::create_dir_all(exe_dir.join("covers"));
-                    let _ = std::fs::write(exe_dir.join("covers").join(format!("{display_name}.png")), &bytes);
-                    if let Some(target_dir) = exe_dir.parent() {
-                        if let Some(proj) = target_dir.parent() {
-                            let _ = std::fs::create_dir_all(proj.join("covers"));
-                            let _ = std::fs::write(proj.join("covers").join(format!("{display_name}.png")), &bytes);
-                        }
-                    }
+            if let Ok(exe) = std::env::current_exe()
+                && let Some(exe_dir) = exe.parent()
+            {
+                let _ = std::fs::create_dir_all(exe_dir.join("covers"));
+                let _ = std::fs::write(
+                    exe_dir.join("covers").join(format!("{display_name}.png")),
+                    &bytes,
+                );
+                if let Some(target_dir) = exe_dir.parent()
+                    && let Some(proj) = target_dir.parent()
+                {
+                    let _ = std::fs::create_dir_all(proj.join("covers"));
+                    let _ = std::fs::write(
+                        proj.join("covers").join(format!("{display_name}.png")),
+                        &bytes,
+                    );
                 }
             }
         }
@@ -243,7 +251,17 @@ fn url_encode_name(s: &str) -> String {
     let mut out = String::new();
     for b in s.bytes() {
         match b {
-            b'a'..=b'z' | b'A'..=b'Z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' | b'(' | b')' | b'!' | b'\'' => {
+            b'a'..=b'z'
+            | b'A'..=b'Z'
+            | b'0'..=b'9'
+            | b'-'
+            | b'_'
+            | b'.'
+            | b'~'
+            | b'('
+            | b')'
+            | b'!'
+            | b'\'' => {
                 out.push(b as char);
             }
             b' ' => out.push_str("%20"),
@@ -289,11 +307,8 @@ impl RustboyApp {
             .unwrap_or("Unknown")
             .to_string();
 
-        let platform = detect_rom_platform(
-            path,
-            summary.inner_name.as_deref(),
-            &header[..bytes_read],
-        );
+        let platform =
+            detect_rom_platform(path, summary.inner_name.as_deref(), &header[..bytes_read]);
 
         let (internal_title, game_code, region, cart_type_label) = match platform {
             RomPlatform::Gb | RomPlatform::Gbc => {
@@ -510,12 +525,11 @@ impl RustboyApp {
                     ui.add_space(8.0);
 
                     // Add ROM Folder... button (26px height, neutral gray folder icon)
-                    let add_btn = egui::Button::new(
-                        RichText::new("📁 Add ROM Folder...").color(COLOR_TEXT),
-                    )
-                    .corner_radius(RADIUS_DEFAULT)
-                    .stroke(STROKE_BORDER)
-                    .min_size(egui::vec2(0.0, 26.0));
+                    let add_btn =
+                        egui::Button::new(RichText::new("📁 Add ROM Folder...").color(COLOR_TEXT))
+                            .corner_radius(RADIUS_DEFAULT)
+                            .stroke(STROKE_BORDER)
+                            .min_size(egui::vec2(0.0, 26.0));
                     if ui.add(add_btn).clicked() {
                         self.add_rom_folder_dialog();
                     }
@@ -527,10 +541,11 @@ impl RustboyApp {
                     } else {
                         COLOR_TEXT_DISABLED
                     };
-                    let refresh_btn = egui::Button::new(RichText::new("🔄 Refresh").color(refresh_color))
-                        .corner_radius(RADIUS_DEFAULT)
-                        .stroke(STROKE_BORDER)
-                        .min_size(egui::vec2(0.0, 26.0));
+                    let refresh_btn =
+                        egui::Button::new(RichText::new("🔄 Refresh").color(refresh_color))
+                            .corner_radius(RADIUS_DEFAULT)
+                            .stroke(STROKE_BORDER)
+                            .min_size(egui::vec2(0.0, 26.0));
                     if ui.add_enabled(refresh_enabled, refresh_btn).clicked() {
                         self.rescan_rom_folders();
                     }
@@ -540,11 +555,7 @@ impl RustboyApp {
                         let is_grid = self.library_view_mode == LibraryViewMode::Grid;
                         let is_table = self.library_view_mode == LibraryViewMode::Table;
 
-                        let grid_stroke = if is_grid {
-                            STROKE_TEAL
-                        } else {
-                            STROKE_BORDER
-                        };
+                        let grid_stroke = if is_grid { STROKE_TEAL } else { STROKE_BORDER };
                         let grid_color = if is_grid {
                             ACCENT_TEAL
                         } else {
@@ -559,11 +570,7 @@ impl RustboyApp {
                             self.save_persistent_config();
                         }
 
-                        let table_stroke = if is_table {
-                            STROKE_TEAL
-                        } else {
-                            STROKE_BORDER
-                        };
+                        let table_stroke = if is_table { STROKE_TEAL } else { STROKE_BORDER };
                         let table_color = if is_table {
                             ACCENT_TEAL
                         } else {
@@ -716,8 +723,10 @@ impl RustboyApp {
                     ui.heading(RichText::new("Scanning ROM Library...").size(18.0).strong());
                     ui.add_space(6.0);
                     ui.label(
-                        RichText::new("Indexing .gba, .agb, .bin, .gb, .gbc, .zip, and .7z ROM headers")
-                            .color(TEXT_MUTED),
+                        RichText::new(
+                            "Indexing .gba, .agb, .bin, .gb, .gbc, .zip, and .7z ROM headers",
+                        )
+                        .color(TEXT_MUTED),
                     );
                 });
             });
@@ -766,15 +775,13 @@ impl RustboyApp {
             ui.centered_and_justified(|ui| {
                 ui.vertical_centered(|ui| {
                     ui.add_space(ui.available_height() * 0.22);
-                    ui.heading(
-                        RichText::new("No Matching ROMs Found")
-                            .size(20.0)
-                            .strong(),
-                    );
+                    ui.heading(RichText::new("No Matching ROMs Found").size(20.0).strong());
                     ui.add_space(8.0);
                     ui.label(
-                        RichText::new("No games match the current search query or favorites filter.")
-                            .color(TEXT_MUTED),
+                        RichText::new(
+                            "No games match the current search query or favorites filter.",
+                        )
+                        .color(TEXT_MUTED),
                     );
                     ui.add_space(16.0);
                     if ui.button("Clear Search & Filters").clicked() {
@@ -798,14 +805,16 @@ impl RustboyApp {
                 let size_w = 90.0_f32;
                 let last_played_w = 130.0_f32;
                 let play_time_w = 100.0_f32;
-                let title_w = (avail_w - region_w - size_w - last_played_w - play_time_w - 40.0).max(180.0);
+                let title_w =
+                    (avail_w - region_w - size_w - last_played_w - play_time_w - 40.0).max(180.0);
 
                 let mut sorted_entries = filtered;
                 sorted_entries.sort_by(|a, b| {
                     let ord = match self.table_sort_column {
-                        TableSortColumn::Title => {
-                            a.display_name.to_lowercase().cmp(&b.display_name.to_lowercase())
-                        }
+                        TableSortColumn::Title => a
+                            .display_name
+                            .to_lowercase()
+                            .cmp(&b.display_name.to_lowercase()),
                         TableSortColumn::Region => a.region.cmp(b.region),
                         TableSortColumn::Size => a
                             .size_mb
@@ -1045,9 +1054,7 @@ impl RustboyApp {
                                 }
                             });
 
-                            let bg_color = if is_selected {
-                                COLOR_HOVER_SELECTED
-                            } else if row_resp.hovered() {
+                            let bg_color = if is_selected || row_resp.hovered() {
                                 COLOR_HOVER_SELECTED
                             } else if row_idx % 2 == 1 {
                                 Color32::from_rgb(0x14, 0x14, 0x14)

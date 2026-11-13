@@ -78,7 +78,9 @@ impl RbmMovie {
             ));
         }
         if self.frames.len() > MAX_MOVIE_FRAMES {
-            return Err(MovieError::Corrupt("Movie frame count exceeds limit".into()));
+            return Err(MovieError::Corrupt(
+                "Movie frame count exceeds limit".into(),
+            ));
         }
 
         let frame_count = u32::try_from(self.frames.len())
@@ -146,7 +148,9 @@ impl RbmMovie {
         let init_len = u32::from_le_bytes([data[19], data[20], data[21], data[22]]) as usize;
 
         if frame_count > MAX_MOVIE_FRAMES {
-            return Err(MovieError::Corrupt("Movie frame count exceeds limit".into()));
+            return Err(MovieError::Corrupt(
+                "Movie frame count exceeds limit".into(),
+            ));
         }
         if init_len > MAX_INITIAL_STATE_LEN {
             return Err(MovieError::Corrupt(
@@ -464,7 +468,9 @@ impl MovieController {
 
     pub(crate) fn replay_last(&mut self, core: &mut GbaCore) -> Result<(), MovieError> {
         let Some(movie) = self.last_movie.clone() else {
-            return Err(MovieError::InvalidState("No previous movie to replay".into()));
+            return Err(MovieError::InvalidState(
+                "No previous movie to replay".into(),
+            ));
         };
         let path = self.active_path.clone();
         self.start_playback_movie(movie, core)?;
@@ -507,9 +513,8 @@ impl MovieController {
                                 movie: owned_movie,
                                 anchor_cycle: anchor,
                             };
-                            self.pending_notice = Some(
-                                "Reached end of movie — switched to Recording (R+W)".into(),
-                            );
+                            self.pending_notice =
+                                Some("Reached end of movie — switched to Recording (R+W)".into());
                         }
                     }
                     recorded
@@ -550,7 +555,11 @@ impl MovieController {
     pub(crate) fn on_state_loaded_at(&mut self, core: &GbaCore, frame_hint: Option<usize>) {
         let estimate_frame = |anchor_cycle: u64, max_len: usize| -> usize {
             let raw = frame_hint.unwrap_or_else(|| {
-                let delta = core.bus.scheduler.current_cycle.saturating_sub(anchor_cycle);
+                let delta = core
+                    .bus
+                    .scheduler
+                    .current_cycle
+                    .saturating_sub(anchor_cycle);
                 (delta / CYCLES_PER_FRAME) as usize
             });
             raw.min(max_len)
@@ -577,11 +586,11 @@ impl MovieController {
                     *cursor = target;
                 } else {
                     let anchor = *anchor_cycle;
-                    let mut owned_movie =
-                        match std::mem::replace(&mut self.state, MovieState::Idle) {
-                            MovieState::Playing { movie, .. } => movie,
-                            _ => unreachable!(),
-                        };
+                    let mut owned_movie = match std::mem::replace(&mut self.state, MovieState::Idle)
+                    {
+                        MovieState::Playing { movie, .. } => movie,
+                        _ => unreachable!(),
+                    };
                     owned_movie.frames.truncate(target);
                     owned_movie.rerecord_count = owned_movie.rerecord_count.saturating_add(1);
                     self.state = MovieState::Recording {
@@ -1107,7 +1116,9 @@ impl RustboyApp {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use gba_core::{HostFrontend, KEY_A, KEY_B, KEY_RIGHT, KEY_START, LCD_HEIGHT, LCD_WIDTH, encode_keyinput};
+    use gba_core::{
+        HostFrontend, KEY_A, KEY_B, KEY_RIGHT, KEY_START, LCD_HEIGHT, LCD_WIDTH, encode_keyinput,
+    };
 
     struct TestFrontend(u16);
     impl HostFrontend for TestFrontend {

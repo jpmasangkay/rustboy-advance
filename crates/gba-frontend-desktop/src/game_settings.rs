@@ -2,11 +2,9 @@ use std::path::PathBuf;
 
 use egui::{self, Color32, CornerRadius, RichText, Stroke};
 
-use crate::app::{
-    RustboyApp, ACCENT_TEAL, ACCENT_TEAL_BG, BG_CARD, BORDER_HAIRLINE, TEXT_MUTED,
-};
+use crate::app::{ACCENT_TEAL, ACCENT_TEAL_BG, BG_CARD, BORDER_HAIRLINE, RustboyApp, TEXT_MUTED};
 use crate::config::{
-    game_settings_key, AppConfig, ColorProfileChoice, RomSpecificSettings, SaveOverrideChoice,
+    AppConfig, ColorProfileChoice, RomSpecificSettings, SaveOverrideChoice, game_settings_key,
 };
 use crate::library::RomLibraryEntry;
 use crate::rom_loader::load_rom_bytes;
@@ -80,11 +78,7 @@ pub(crate) fn save_game_settings_entry(
     config.save();
 }
 
-pub(crate) fn clear_game_override_fields_in_memory(
-    config: &mut AppConfig,
-    code: &str,
-    crc32: u32,
-) {
+pub(crate) fn clear_game_override_fields_in_memory(config: &mut AppConfig, code: &str, crc32: u32) {
     if code.is_empty() {
         return;
     }
@@ -127,7 +121,8 @@ impl RustboyApp {
         if self.rom_code.is_empty() {
             return None;
         }
-        self.config.get_game_settings(&self.rom_code, self.rom_crc32)
+        self.config
+            .get_game_settings(&self.rom_code, self.rom_crc32)
     }
 
     pub(crate) fn has_per_game_speed_override(&self) -> bool {
@@ -147,7 +142,10 @@ impl RustboyApp {
             return self.config.fast_forward_speed;
         }
         self.session_speed_override
-            .or_else(|| self.active_game_settings().and_then(|ov| ov.speed_multiplier))
+            .or_else(|| {
+                self.active_game_settings()
+                    .and_then(|ov| ov.speed_multiplier)
+            })
             .unwrap_or(self.config.speed_multiplier)
     }
 
@@ -167,7 +165,7 @@ impl RustboyApp {
             core.bus.apu.master_volume_pct = self.config.master_volume;
 
             let save_ov = ov.save_override.and_then(SaveOverrideChoice::to_core);
-            core.bus.cart.set_save_type_override(save_ov);
+            core.bus.set_save_type_override(save_ov);
             core.bus.cart.rtc_override = ov.rtc_override;
             core.bus.cart.solar_enabled = ov.solar_enabled.unwrap_or(hw.solar_enabled);
             if let Some(lux) = ov.solar_lux {
@@ -234,7 +232,9 @@ impl RustboyApp {
             return;
         }
 
-        if self.game_settings_target.is_none() && self.has_active_game() && !self.rom_code.is_empty()
+        if self.game_settings_target.is_none()
+            && self.has_active_game()
+            && !self.rom_code.is_empty()
         {
             self.open_game_settings_for_active_rom();
         }
@@ -726,7 +726,10 @@ mod tests {
             ..RomSpecificSettings::default()
         };
         cfg.per_rom.insert("U3IE".to_string(), legacy_ov);
-        assert_eq!(load_effective_settings(&cfg, "U3IE", 0x11223344).solar_lux, Some(200));
+        assert_eq!(
+            load_effective_settings(&cfg, "U3IE", 0x11223344).solar_lux,
+            Some(200)
+        );
 
         // Exact code+CRC entry isolates ROM revisions/hacks with same game code
         let rev_a = RomSpecificSettings {
@@ -748,7 +751,10 @@ mod tests {
         let loaded_a = load_effective_settings(&cfg, "BPEE", 0xAABBCCDD);
         let loaded_b = load_effective_settings(&cfg, "BPEE", 0x99887766);
         assert_eq!(loaded_a.speed_multiplier, Some(2.0));
-        assert_eq!(loaded_a.custom_color_profile, Some(ColorProfileChoice::Ags101));
+        assert_eq!(
+            loaded_a.custom_color_profile,
+            Some(ColorProfileChoice::Ags101)
+        );
         assert_eq!(loaded_b.speed_multiplier, Some(1.0));
         assert_eq!(loaded_b.rumble_enabled, Some(false));
 

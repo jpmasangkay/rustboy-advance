@@ -10,15 +10,15 @@ use gilrs::Gilrs;
 
 use crate::audio::AudioOutput;
 use crate::capture::CaptureController;
-use crate::cheats::{apply_cheats_to_core, CheatEntry};
-use crate::config::{AppConfig, SaveOverrideChoice};
+use crate::cheats::{CheatEntry, apply_cheats_to_core};
+use crate::config::{AppConfig, DisplayFilter, SaveOverrideChoice};
 use crate::debugger_ui::{DebugAction, DebuggerWindows};
-use crate::filters::VideoPostProcessor;
+use crate::filters::{QualityGovernor, VideoPostProcessor};
 use crate::game_settings::{
-    load_effective_settings, save_game_settings_entry, CartridgeHardwareDefaults,
-    GameSettingsTarget,
+    CartridgeHardwareDefaults, GameSettingsTarget, load_effective_settings,
+    save_game_settings_entry,
 };
-use crate::gb_bridge::{blit_gb_to_gba_fb, crop_gb_rgba_from_240x160, GbSession};
+use crate::gb_bridge::{GbSession, blit_gb_to_gba_fb, crop_gb_rgba_from_240x160};
 use crate::headless::CliConfig;
 use crate::input::{AutofireState, ControlsTab, PendingInputBind};
 use crate::library::{LibraryScanResult, LibraryViewMode, RomLibraryEntry};
@@ -26,8 +26,8 @@ use crate::link::LinkManager;
 use crate::movies::MovieController;
 use crate::rewind::RewindBuffer;
 use crate::rom_loader::{
-    apply_auto_patch_if_present, apply_patch_file, detect_rom_platform, is_patch_extension,
-    load_rom_bytes, RomPlatform,
+    RomPlatform, apply_auto_patch_if_present, apply_patch_file, detect_rom_platform,
+    is_patch_extension, load_rom_bytes,
 };
 use crate::savestates::SlotMetaEntry;
 use crate::shaders::WgpuShaderPipeline;
@@ -187,6 +187,13 @@ pub(crate) struct RustboyApp {
     pub(crate) frames_in_window: u32,
     pub(crate) measured_fps: f32,
     pub(crate) last_core_ms: f32,
+    pub(crate) last_present_ms: f32,
+    pub(crate) quality_governor: QualityGovernor,
+    pub(crate) governor_adapter_name: String,
+    pub(crate) governor_adapter_backend: String,
+    pub(crate) governor_viewport_px: (u32, u32),
+    pub(crate) governor_user_target: DisplayFilter,
+    pub(crate) governor_cli_filter: bool,
     pub(crate) toast: Option<ToastMessage>,
     pub(crate) title_dirty: bool,
     pub(crate) quit_requested: bool,
@@ -213,11 +220,48 @@ pub(crate) struct RustboyApp {
     pub(crate) lua: crate::lua_engine::LuaEngine,
     pub(crate) ra: crate::retroachievements::RetroAchievementsManager,
     pub(crate) emu_error_rx: Option<std::sync::mpsc::Receiver<String>>,
+
+    // Real-Window Perf Telemetry (--perf-log, --perf-seconds, --input-replay, --sync-60hz)
+    pub(crate) perf_log_path: Option<PathBuf>,
+    pub(crate) perf_logger: Option<crate::bench::DesktopPerfLogger>,
+    pub(crate) perf_seconds: Option<f64>,
+    pub(crate) perf_start_wall: Instant,
+    pub(crate) cli_replay: Option<crate::bench::InputReplay>,
+    pub(crate) cli_loop_replay: bool,
+    pub(crate) cli_replay_frame: usize,
+    pub(crate) sync_60hz: bool,
+    pub(crate) pacing_deadline: Option<Instant>,
+    pub(crate) last_step_frames: u32,
+    pub(crate) last_step_emu_ms: f64,
 }
 
 impl RustboyApp {
     pub(crate) fn new(cli: CliConfig) -> Self {
-        let config = AppConfig::load();
+        let mut config = AppConfig::load();
+        if let Some(gov_flag) = cli.governor {
+            config.auto_quality_governor = gov_flag;
+        }
+        let cli_filter_set = cli.filter.is_some();
+        if let Some(f) = cli.filter {
+            config.display_filter = f;
+            config.shader_preset = f.default_shader_preset();
+            config.scanline_grid = f == DisplayFilter::AuthenticGbaLcd;
+        }
+        let cli_replay = cli
+            .input_replay
+            .as_deref()
+            .and_then(|p| match crate::bench::InputReplay::load(p) {
+                Ok(r) => Some(r),
+                Err(e) => {
+                    log::error!("Failed to load CLI --input-replay: {e}");
+                    None
+                }
+            });
+        let cli_perf_log_path = cli.perf_log;
+        let cli_perf_seconds = cli.perf_seconds;
+        let cli_loop_replay = cli.loop_replay;
+        let cli_sync_60hz = cli.sync_60hz.unwrap_or(true);
+        let cli_fullscreen = cli.fullscreen;
         let rewind_budget_mb = config.rewind_budget_mb;
         let audio = AudioOutput::start();
         audio.set_muted(config.muted);
@@ -236,6 +280,10 @@ impl RustboyApp {
             .and_then(|p| fs::read(p).ok())
             .or_else(|| config.bios_path.as_deref().and_then(|p| fs::read(p).ok()));
 
+        let scale_u32 = config.window_scale.clamp(1, 5) as u32;
+        let governor_user_target = config.display_filter;
+        let quality_governor =
+            QualityGovernor::new(config.display_filter, config.auto_quality_governor);
         let mut app = Self {
             config,
             core: None,
@@ -281,7 +329,7 @@ impl RustboyApp {
             show_rewind_settings: false,
             paused: false,
             tab_fast_forward: false,
-            is_fullscreen: false,
+            is_fullscreen: cli_fullscreen,
             last_pressed_mask: 0,
             show_controls_dialog: false,
             controls_tab: ControlsTab::Keyboard,
@@ -300,6 +348,13 @@ impl RustboyApp {
             frames_in_window: 0,
             measured_fps: 0.0,
             last_core_ms: 0.0,
+            last_present_ms: 0.0,
+            quality_governor,
+            governor_adapter_name: String::from("Unknown"),
+            governor_adapter_backend: String::from("Unknown"),
+            governor_viewport_px: (LCD_WIDTH as u32 * scale_u32, LCD_HEIGHT as u32 * scale_u32),
+            governor_user_target,
+            governor_cli_filter: cli_filter_set,
             toast: None,
             title_dirty: true,
             quit_requested: false,
@@ -320,9 +375,28 @@ impl RustboyApp {
             lua: crate::lua_engine::LuaEngine::new(),
             ra,
             emu_error_rx: None,
+            perf_log_path: cli_perf_log_path,
+            perf_logger: None,
+            perf_seconds: cli_perf_seconds,
+            perf_start_wall: Instant::now(),
+            cli_replay,
+            cli_loop_replay,
+            cli_replay_frame: 0,
+            sync_60hz: cli_sync_60hz,
+            pacing_deadline: None,
+            last_step_frames: 0,
+            last_step_emu_ms: 0.0,
         };
 
         app.load_persistent_config();
+        app.config.run_ahead_frames = app.config.run_ahead_frames.min(1);
+        let measured_costs = app.postproc.measure_filter_costs(
+            app.config.color_correction,
+            app.config.lcd_ghosting,
+            false,
+            app.config.lcd_grid_intensity,
+        );
+        app.quality_governor.set_measured_costs(measured_costs);
         app.rescan_rom_folders();
 
         if let Some(rom_path) = cli.rom_path
@@ -345,13 +419,62 @@ impl RustboyApp {
         });
     }
 
-    #[allow(dead_code)]
     pub(crate) fn notify_warn(&mut self, msg: &str) {
         self.toast = Some(ToastMessage {
             text: msg.to_string(),
             level: ToastLevel::Warning,
             expires_at: Instant::now() + Duration::from_millis(3800),
         });
+    }
+
+    pub(crate) fn current_governor_profile_key(&self) -> String {
+        AppConfig::governor_profile_key(
+            &self.governor_adapter_name,
+            &self.governor_adapter_backend,
+            self.governor_viewport_px.0,
+            self.governor_viewport_px.1,
+            self.config.window_scale,
+        )
+    }
+
+    pub(crate) fn set_display_filter_from_user(&mut self, filter: DisplayFilter) {
+        self.config.display_filter = filter;
+        self.config.shader_preset = filter.default_shader_preset();
+        self.config.scanline_grid = filter == DisplayFilter::AuthenticGbaLcd;
+        self.governor_user_target = filter;
+        self.quality_governor.set_user_target(filter);
+        let key = self.current_governor_profile_key();
+        self.config.set_settled_filter(key, filter);
+        self.config.save();
+        self.sink.frame_dirty = true;
+        self.lcd_tex = None;
+    }
+
+    pub(crate) fn apply_quality_governor_sample(&mut self, work_ms: f64) {
+        self.quality_governor
+            .set_enabled(self.config.auto_quality_governor);
+        self.quality_governor
+            .sync_external_filter(self.config.display_filter);
+        if let Some(tr) = self.quality_governor.record_frame(work_ms) {
+            self.config.display_filter = tr.to;
+            self.config.shader_preset = tr.to.default_shader_preset();
+            self.config.scanline_grid = tr.to == DisplayFilter::AuthenticGbaLcd;
+            let key = self.current_governor_profile_key();
+            self.config.set_settled_filter(key, tr.to);
+            self.config.save();
+            self.sink.frame_dirty = true;
+            self.lcd_tex = None;
+            let verb = match tr.kind {
+                crate::filters::GovernorTransitionKind::StepDown => "switched",
+                crate::filters::GovernorTransitionKind::StepUp => "recovered",
+            };
+            self.notify_warn(&format!(
+                "Quality Governor: {verb} {} -> {} (p95 {:.1} ms)",
+                tr.from.label(),
+                tr.to.label(),
+                tr.rolling_p95_ms
+            ));
+        }
     }
 
     pub(crate) fn notify_error(&mut self, msg: &str) {
@@ -571,7 +694,8 @@ impl RustboyApp {
         self.paused = false;
         self.show_pause_overlay = false;
         self.show_state_manager = false;
-        self.rewind_buffer.set_budget_mb(self.config.rewind_budget_mb);
+        self.rewind_buffer
+            .set_budget_mb(self.config.rewind_budget_mb);
         self.rewind_buffer.clear();
         self.rewind_movie_frames.clear();
         self.frame_counter = 0;
@@ -586,6 +710,7 @@ impl RustboyApp {
         self.last_fps_sample = Instant::now();
         self.postproc.reset();
         self.sink.clear_frames();
+        self.sink.audio.reset_underruns();
         self.slot_thumbnails = [None, None, None, None, None];
         self.slot_meta = [None, None, None, None, None];
         self.state_manager_error = None;
@@ -633,7 +758,8 @@ impl RustboyApp {
         self.paused = false;
         self.show_pause_overlay = false;
         self.show_state_manager = false;
-        self.rewind_buffer.set_budget_mb(self.config.rewind_budget_mb);
+        self.rewind_buffer
+            .set_budget_mb(self.config.rewind_budget_mb);
         self.rewind_buffer.clear();
         self.rewind_movie_frames.clear();
         self.frame_counter = 0;
@@ -807,7 +933,9 @@ impl RustboyApp {
         let color_profile = self.effective_color_profile();
         self.postproc.sync_rgba_for_capture(
             &self.sink.framebuffer,
-            self.sink.has_prev_frame.then_some(&self.sink.prev_framebuffer),
+            self.sink
+                .has_prev_frame
+                .then_some(&self.sink.prev_framebuffer),
             self.sink.frame_seq,
             self.config.color_correction,
             color_profile,
@@ -908,11 +1036,7 @@ impl RustboyApp {
     pub(crate) fn hard_reset(&mut self) {
         if let Some(core) = &mut self.core {
             let link_on = self.link.local_is_active()
-                || self
-                    .link
-                    .netplay
-                    .as_ref()
-                    .is_some_and(|n| n.is_connected());
+                || self.link.netplay.as_ref().is_some_and(|n| n.is_connected());
             core.reset();
             core.set_link_connected(link_on);
             self.rewind_buffer.clear();
@@ -970,6 +1094,7 @@ impl RustboyApp {
             self.last_step_time = Instant::now();
             self.time_accumulator = 0.0;
             self.next_frame_due = Instant::now();
+            self.sink.audio.reset_underruns();
         }
     }
 
@@ -1185,12 +1310,14 @@ impl RustboyApp {
                     self.gdb_stub.merged_debug_control(&user_ctrl, &mut merged);
                     let pc = core.cpu.current_exec_pc();
                     if merged.breakpoints.contains(&pc) {
-                        self.debugger.call_stack.step_one_with_tracker(core, &merged);
+                        self.debugger
+                            .call_stack
+                            .step_one_with_tracker(core, &merged);
                     }
                     self.paused = false;
                     self.last_step_time = Instant::now();
-            self.time_accumulator = 0.0;
-            self.next_frame_due = Instant::now();
+                    self.time_accumulator = 0.0;
+                    self.next_frame_due = Instant::now();
                 }
             }
             if let Some(reason) = outcome.stop_reason {
@@ -1277,7 +1404,8 @@ impl RustboyApp {
                 self.load_state_from_path(&path, "Loaded dropped Save State");
             } else if is_patch_extension(&path) {
                 if let Some(base_rom) = self.rom_path.clone() {
-                    if let Err(e) = self.open_rom_with_patch(&base_rom, None, Some(&path), Some(ctx))
+                    if let Err(e) =
+                        self.open_rom_with_patch(&base_rom, None, Some(&path), Some(ctx))
                     {
                         self.notify_error(&e);
                     }
@@ -1304,7 +1432,10 @@ impl RustboyApp {
         }
 
         let now = Instant::now();
-        let dt = now.duration_since(self.last_step_time).as_secs_f64().min(0.05);
+        let dt = now
+            .duration_since(self.last_step_time)
+            .as_secs_f64()
+            .min(0.05);
         self.last_step_time = now;
 
         // Handle active real-time rewind paced at GBA frame cadence
@@ -1325,6 +1456,7 @@ impl RustboyApp {
 
         if self.paused {
             self.time_accumulator = 0.0;
+            self.pacing_deadline = None;
             return;
         }
 
@@ -1339,56 +1471,89 @@ impl RustboyApp {
         let is_normal_speed = !turbo && (speed - 1.0).abs() < 0.01;
         let target_frame_time = if turbo {
             0.0
+        } else if is_normal_speed && self.sync_60hz {
+            // Audio DRC (+/-1.0%) absorbs +0.456% (59.7275 -> 60.0 Hz) so frames
+            // align cleanly with 60/120/240 Hz display refresh intervals.
+            1.0 / 60.0
         } else {
             1.0 / (59.72750057 * (speed as f64).max(0.1))
         };
 
-        if !turbo {
-            self.time_accumulator += dt;
-            // Bound accumulator to prevent multi-frame catchup burst after window moves/menus
-            if self.time_accumulator > target_frame_time * 2.0 {
-                self.time_accumulator = target_frame_time * 1.5;
-            }
-        }
-
-        let max_catchup = if turbo {
+        let mut max_catchup = if turbo {
             16
         } else if is_normal_speed {
-            2
+            1
         } else {
             (speed.ceil() as usize + 1).clamp(2, 8)
         };
+        let mut paced_wake_at: Option<Instant> = None;
+
+        if !turbo && is_normal_speed && self.core.is_some() {
+            let step_now = Instant::now();
+            let step_period = Duration::from_secs_f64(target_frame_time);
+            let early_margin = Duration::from_micros(3200);
+            let wake_lead = Duration::from_micros(2000);
+            let mut deadline = *self.pacing_deadline.get_or_insert(step_now);
+            if step_now > deadline + step_period.saturating_mul(2) {
+                deadline = step_now;
+            }
+            let next_deadline = if step_now + early_margin >= deadline {
+                self.time_accumulator = target_frame_time;
+                let min_dl = step_now + step_period + Duration::from_micros(500);
+                let max_dl = step_now + step_period + Duration::from_micros(2500);
+                let clamped = (deadline + step_period).clamp(min_dl, max_dl);
+                self.pacing_deadline = Some(clamped);
+                clamped
+            } else {
+                self.time_accumulator = 0.0;
+                max_catchup = 0;
+                deadline
+            };
+            paced_wake_at = Some(
+                next_deadline
+                    .checked_sub(wake_lead)
+                    .unwrap_or(next_deadline),
+            );
+        } else {
+            self.pacing_deadline = None;
+            if !turbo {
+                self.time_accumulator += dt;
+                // Bound accumulator to prevent multi-frame catchup burst after window moves/menus
+                if self.time_accumulator > target_frame_time * 2.0 {
+                    self.time_accumulator = target_frame_time * 1.5;
+                }
+            }
+        }
+
         let mut executed = 0usize;
 
-        // Display vsync snapping: at standard 1.0x speed, snap small cadence phase drifts
-        // between ~60 Hz display refresh (~16.67ms) and GBA cadence (~16.74ms) so exactly 1 frame
-        // executes per display vsync without cyclic beat-frequency judder.
-        let execution_threshold = if is_normal_speed {
-            target_frame_time - 0.0025
-        } else {
-            target_frame_time
-        };
+        let execution_threshold = target_frame_time;
 
         while executed < max_catchup && (turbo || self.time_accumulator >= execution_threshold) {
             if turbo && executed > 0 && now.elapsed() > Duration::from_millis(12) {
                 break;
             }
             if !turbo {
-                self.time_accumulator -= target_frame_time;
-                if is_normal_speed && self.time_accumulator.abs() < 0.003 {
-                    self.time_accumulator = 0.0;
-                }
+                self.time_accumulator = (self.time_accumulator - target_frame_time).max(0.0);
             }
             let start_t = Instant::now();
             let max_skip = (self.config.max_frameskip as usize).clamp(1, 8);
             let should_skip_render = (turbo && executed + 1 < max_catchup)
-                || (self.config.auto_frameskip && executed < max_skip && self.time_accumulator > target_frame_time);
+                || (self.config.auto_frameskip
+                    && executed < max_skip
+                    && self.time_accumulator > target_frame_time);
 
             if let Some(core) = &mut self.core {
                 core.bus.ppu.skip_rendering = should_skip_render;
             }
 
-            let live_keypad = self.effective_live_keypad_for_frame();
+            let live_keypad = if let Some(ref replay) = self.cli_replay {
+                let eff = replay.effective_frame(self.cli_replay_frame, self.cli_loop_replay);
+                self.cli_replay_frame += 1;
+                replay.keyinput_at(eff)
+            } else {
+                self.effective_live_keypad_for_frame()
+            };
             self.sink.keypad = self.movie.step_frame(live_keypad);
             self.sink.capture_audio = self.capture.is_wav_recording();
             self.sink.captured_audio.clear();
@@ -1420,6 +1585,18 @@ impl RustboyApp {
             let mut stop_reason = gba_core::StopReason::FrameComplete;
             let ctrl = self.build_debug_control();
             let hardcore = self.is_ra_hardcore_active();
+            let run_ahead_budget_ok =
+                self.last_core_ms <= 6.5 && self.time_accumulator <= target_frame_time * 1.1;
+            let run_ahead_eligible = self.config.run_ahead_frames.min(1) > 0
+                && run_ahead_budget_ok
+                && !turbo
+                && !should_skip_render
+                && self.link.local.is_none()
+                && self.link.netplay.is_none()
+                && ctrl.breakpoints.is_empty()
+                && ctrl.watchpoints.is_empty();
+            let saved_prev_fb = run_ahead_eligible
+                .then(|| (self.sink.framebuffer.to_vec(), self.sink.has_prev_frame));
 
             if let Some(core) = &mut self.core {
                 self.ra.tick_frame(core, &self.config);
@@ -1446,13 +1623,25 @@ impl RustboyApp {
                 self.step_gb_frame(self.sink.keypad, suppress_audio);
             }
 
+            if let Some((prev_fb, had_prev)) = saved_prev_fb
+                && matches!(stop_reason, gba_core::StopReason::FrameComplete)
+            {
+                self.apply_speculative_run_ahead_frame(&prev_fb, had_prev);
+            }
+
             self.last_core_ms = start_t.elapsed().as_secs_f32() * 1000.0;
+            self.last_step_frames += 1;
+            self.last_step_emu_ms += self.last_core_ms as f64;
             executed += 1;
             self.frames_in_window += 1;
             self.frame_counter += 1;
 
             let frame_complete = matches!(stop_reason, gba_core::StopReason::FrameComplete);
             self.flush_frame_captures(frame_complete, color_corr, color_profile);
+            if frame_complete && !turbo && !should_skip_render {
+                let work_ms = self.last_core_ms as f64 + self.last_present_ms as f64;
+                self.apply_quality_governor_sample(work_ms);
+            }
 
             if !matches!(stop_reason, gba_core::StopReason::FrameComplete) {
                 self.handle_stop_reason(stop_reason);
@@ -1494,7 +1683,11 @@ impl RustboyApp {
             && self.playtime_timer.elapsed() >= Duration::from_secs(1)
         {
             if !self.rom_code.is_empty() {
-                let entry = self.config.playtimes.entry(self.rom_code.clone()).or_default();
+                let entry = self
+                    .config
+                    .playtimes
+                    .entry(self.rom_code.clone())
+                    .or_default();
                 entry.total_seconds += self.playtime_timer.elapsed().as_secs();
             }
             self.playtime_timer = Instant::now();
@@ -1515,13 +1708,17 @@ impl RustboyApp {
                         if self.gilrs_rumble_effect.is_none() {
                             let support_ff = gilrs
                                 .gamepads()
-                                .filter_map(|(id, gp)| if gp.is_ff_supported() { Some(id) } else { None })
+                                .filter_map(
+                                    |(id, gp)| if gp.is_ff_supported() { Some(id) } else { None },
+                                )
                                 .collect::<Vec<_>>();
                             if !support_ff.is_empty() {
                                 let duration = gilrs::ff::Ticks::from_ms(120);
                                 if let Ok(eff) = gilrs::ff::EffectBuilder::new()
                                     .add_effect(gilrs::ff::BaseEffect {
-                                        kind: gilrs::ff::BaseEffectType::Strong { magnitude: 45_000 },
+                                        kind: gilrs::ff::BaseEffectType::Strong {
+                                            magnitude: 45_000,
+                                        },
                                         scheduling: gilrs::ff::Replay {
                                             play_for: duration,
                                             with_delay: duration,
@@ -1552,13 +1749,44 @@ impl RustboyApp {
         }
 
         if !self.paused {
-            ctx.request_repaint();
+            match paced_wake_at
+                .map(|wake_at| wake_at.saturating_duration_since(Instant::now()))
+            {
+                Some(delay) if delay >= Duration::from_micros(500) => {
+                    // egui::Context::request_repaint_after subtracts predicted_dt (default 1/60s),
+                    // which clamps delays <= 16.67ms to ZERO; compensate so the requested timer holds.
+                    let pred = Duration::try_from_secs_f32(ctx.input(|i| i.predicted_dt))
+                        .unwrap_or_default();
+                    ctx.request_repaint_after(delay + pred);
+                }
+                _ => ctx.request_repaint(),
+            }
         }
     }
 }
 
 impl RustboyApp {
     pub fn update(&mut self, ctx: &egui::Context) {
+        self.last_step_frames = 0;
+        self.last_step_emu_ms = 0.0;
+        if self.perf_logger.is_none()
+            && let Some(path) = self.perf_log_path.take()
+        {
+            let tag = if self.sync_60hz {
+                "eframe-fallback-sync60"
+            } else {
+                "eframe-fallback-nosync60"
+            };
+            self.perf_logger = crate::bench::DesktopPerfLogger::create(&path, tag).ok();
+            self.perf_start_wall = Instant::now();
+        }
+        let vp_size = ctx.screen_rect().size();
+        let ppp = ctx.pixels_per_point();
+        let vp_w = (vp_size.x * ppp).round() as u32;
+        let vp_h = (vp_size.y * ppp).round() as u32;
+        if vp_w > 0 && vp_h > 0 {
+            self.governor_viewport_px = (vp_w, vp_h);
+        }
         let emu_errors: Vec<String> = if let Some(rx) = &self.emu_error_rx {
             let mut errs = Vec::new();
             while let Ok(err) = rx.try_recv() {
@@ -1630,6 +1858,7 @@ impl RustboyApp {
             }
         }
 
+        let present_t0 = Instant::now();
         egui::CentralPanel::default()
             .frame(egui::Frame::new().fill(BG_APP))
             .show(ctx, |ui| {
@@ -1639,6 +1868,7 @@ impl RustboyApp {
                     self.draw_rom_library_browser(ctx, ui);
                 }
             });
+        let ui_present_ms = present_t0.elapsed().as_secs_f64() * 1000.0;
 
         // Always render floating OSD toast on top so feedback is never lost
         self.draw_floating_osd_toast(ctx);
@@ -1651,7 +1881,8 @@ impl RustboyApp {
         self.draw_movies_panel(ctx);
         self.draw_link_window(ctx);
         let hardcore = self.is_ra_hardcore_active();
-        self.lua.show_lua_console(ctx, self.core.is_some(), hardcore);
+        self.lua
+            .show_lua_console(ctx, self.core.is_some(), hardcore);
         self.ra.show_retroachievements_window(ctx, &mut self.config);
 
         // Present dockable/floating Debugger & Tool windows
@@ -1717,26 +1948,119 @@ impl RustboyApp {
         if self.paused && self.has_active_game() {
             self.sink.frame_dirty = true;
         }
+
+        let has_game = self.has_active_game();
+        let underruns_now = self.sink.audio.underruns();
+        let filter_label = self.config.display_filter.label();
+        let (vw, vh) = self.governor_viewport_px;
+        let is_fs = self.is_fullscreen;
+        let emu_ms = self.last_step_emu_ms;
+        let step_frames = self.last_step_frames;
+        let logged_present_ms = if step_frames > 0 && self.last_present_ms > 0.0 {
+            self.last_present_ms as f64
+        } else {
+            ui_present_ms
+        };
+        if has_game && let Some(ref mut logger) = self.perf_logger {
+            logger.record_present(
+                emu_ms,
+                logged_present_ms,
+                underruns_now,
+                filter_label,
+                step_frames,
+                vw,
+                vh,
+                is_fs,
+            );
+        }
+        if let Some(limit_s) = self.perf_seconds
+            && self.perf_start_wall.elapsed().as_secs_f64() >= limit_s
+        {
+            if let Some(ref mut logger) = self.perf_logger {
+                logger.finish_and_print();
+            }
+            self.quit_requested = true;
+        }
     }
 
     pub fn init_wgpu(&mut self, rs: &eframe::egui_wgpu::RenderState) {
-        match WgpuShaderPipeline::new(
-            Arc::new(rs.device.clone()),
-            Arc::new(rs.queue.clone()),
-            rs.target_format,
-        ) {
-            Ok(pipeline) => {
-                log::info!("WGPU/WGSL post-processing shader pipeline initialized successfully");
-                self.wgpu_shaders = Some(Arc::new(Mutex::new(pipeline)));
+        let info = rs.adapter.get_info();
+        self.governor_adapter_name = info.name.clone();
+        self.governor_adapter_backend = format!("{:?}", info.backend);
+        if let Some(path) = self.perf_log_path.take() {
+            let tag = format!(
+                "eframe-wgpu-{:?}{}{}",
+                info.backend,
+                if info.device_type == eframe::egui_wgpu::wgpu::DeviceType::Cpu {
+                    "-cpu"
+                } else {
+                    ""
+                },
+                if self.sync_60hz {
+                    "-sync60"
+                } else {
+                    "-nosync60"
+                }
+            );
+            self.perf_logger = crate::bench::DesktopPerfLogger::create(&path, &tag).ok();
+            self.perf_start_wall = Instant::now();
+        } else {
+            self.perf_start_wall = Instant::now();
+        }
+        if info.device_type == eframe::egui_wgpu::wgpu::DeviceType::Cpu {
+            log::info!(
+                "Software CPU wgpu adapter detected ({} / {:?}); running filters on CPU post-processor with plain texture upload",
+                info.name,
+                info.backend
+            );
+            let measured_costs = crate::shaders::measure_cpu_adapter_filter_costs(
+                &rs.device,
+                &rs.queue,
+                &mut self.postproc,
+                self.config.color_correction,
+                self.config.lcd_ghosting,
+                self.config.lcd_grid_intensity,
+            );
+            self.quality_governor.set_measured_costs(measured_costs);
+            self.wgpu_shaders = None;
+        } else {
+            match WgpuShaderPipeline::new(
+                Arc::new(rs.device.clone()),
+                Arc::new(rs.queue.clone()),
+                rs.target_format,
+            ) {
+                Ok(pipeline) => {
+                    log::info!("WGPU/WGSL post-processing shader pipeline initialized successfully");
+                    self.wgpu_shaders = Some(Arc::new(Mutex::new(pipeline)));
+                }
+                Err(err) => {
+                    log::warn!("WGPU/WGSL shader pipeline unavailable, using CPU fallback: {err}");
+                    self.wgpu_shaders = None;
+                }
             }
-            Err(err) => {
-                log::warn!("WGPU/WGSL shader pipeline unavailable, using CPU fallback: {err}");
-                self.wgpu_shaders = None;
-            }
+        }
+
+        let key = self.current_governor_profile_key();
+        if !self.governor_cli_filter
+            && self.config.auto_quality_governor
+            && let Some(settled) = self.config.settled_filter_for(&key)
+        {
+            self.quality_governor.set_active_from_persisted(settled);
+            let active = self.quality_governor.active_filter();
+            self.config.display_filter = active;
+            self.config.shader_preset = active.default_shader_preset();
+            self.config.scanline_grid = active == DisplayFilter::AuthenticGbaLcd;
+            log::info!(
+                "Restored settled governor filter `{}` for profile `{key}`",
+                active.label()
+            );
         }
     }
 
     pub fn on_exit(&mut self) {
+        if let Some(ref mut logger) = self.perf_logger {
+            logger.finish_and_print();
+        }
         self.stop_all_captures(false);
         self.ra.on_rom_closed();
         self.lua.on_rom_changed("", "");
@@ -1745,6 +2069,10 @@ impl RustboyApp {
         self.save_rom_specific_settings();
         self.link.disconnect_all();
         self.save_persistent_config();
+        let key = self.current_governor_profile_key();
+        self.config
+            .set_settled_filter(key, self.quality_governor.active_filter());
+        self.config.display_filter = self.governor_user_target;
         self.config.save();
     }
 
@@ -1862,9 +2190,11 @@ impl RustboyApp {
         }
         if video_ready
             && self.capture.is_gif_recording()
-            && let Err(err) =
-                self.capture
-                    .push_video_frame(&self.sink.framebuffer, color_correction, color_profile)
+            && let Err(err) = self.capture.push_video_frame(
+                &self.sink.framebuffer,
+                color_correction,
+                color_profile,
+            )
         {
             let _ = self.capture.stop_gif();
             self.notify(&format!("GIF recording error: {err}"));
@@ -1913,6 +2243,42 @@ impl RustboyApp {
             }
         }
     }
+
+    /// Executes 1 speculative frame ahead to shave 1 frame of internal game input latency,
+    /// presenting the speculative video frame while keeping audio and persistent state at the
+    /// true end-of-frame boundary.
+    pub(crate) fn apply_speculative_run_ahead_frame(
+        &mut self,
+        prev_displayed_fb: &[u16],
+        prev_has_frame: bool,
+    ) {
+        let prev_suppress = self.sink.suppress_audio;
+        let prev_capture = self.sink.capture_audio;
+        self.sink.suppress_audio = true;
+        self.sink.capture_audio = false;
+
+        if let Some(core) = &mut self.core {
+            let _ = core.speculate_run_ahead_frame(&mut self.sink);
+            core.bus.ppu.dot_accurate_mode = self.config.dot_accurate_ppu;
+            core.bus.ppu.layer_enable_mask = self.config.layer_mask;
+            core.bus.apu.channel_enable_mask = self.config.audio_channel_mask;
+            core.bus.apu.master_volume_pct = self.config.master_volume;
+        } else if self.gb.is_some()
+            && let Ok(snapshot) = self.save_active_core_state_raw()
+        {
+            self.step_gb_frame(self.sink.keypad, true);
+            let _ = self.restore_active_core_state_raw(&snapshot, false);
+        }
+
+        self.sink.suppress_audio = prev_suppress;
+        self.sink.capture_audio = prev_capture;
+        if prev_displayed_fb.len() == self.sink.prev_framebuffer.len() {
+            self.sink
+                .prev_framebuffer
+                .copy_from_slice(prev_displayed_fb);
+        }
+        self.sink.has_prev_frame = prev_has_frame;
+    }
 }
 
 fn capture_path_name<'a>(path: Option<&'a Path>, fallback: &'a str) -> &'a str {
@@ -1936,4 +2302,113 @@ fn record_rewind_snapshot(
 
 pub(crate) fn configure_obsidian_style(ctx: &egui::Context) {
     crate::theme::configure_theme(ctx);
+}
+
+#[cfg(test)]
+fn step_gba_frame_with_optional_run_ahead(
+    core: &mut GbaCore,
+    sink: &mut CoreSink,
+    run_ahead_frames: u8,
+) {
+    let saved_prev_fb = sink.framebuffer;
+    let saved_has_prev = sink.has_prev_frame;
+
+    let _ = core.run_frame_debug(sink, &gba_core::DebugControl::default());
+
+    if run_ahead_frames > 0 {
+        let prev_suppress = sink.suppress_audio;
+        let prev_capture = sink.capture_audio;
+        sink.suppress_audio = true;
+        sink.capture_audio = false;
+
+        let _ = core.speculate_run_ahead_frame(sink);
+
+        sink.suppress_audio = prev_suppress;
+        sink.capture_audio = prev_capture;
+        sink.prev_framebuffer.copy_from_slice(&saved_prev_fb);
+        sink.has_prev_frame = saved_has_prev;
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn rom_from_words(words: &[u32]) -> Vec<u8> {
+        let mut rom = Vec::with_capacity(words.len() * 4);
+        for &w in words {
+            rom.extend_from_slice(&w.to_le_bytes());
+        }
+        rom
+    }
+
+    #[test]
+    fn test_run_ahead_shaves_one_frame_latency_without_duplicating_audio() {
+        // Mode 3 ROM with 1-frame internal input latency:
+        // R7 = 0x001F (red) initially; once per frame at VCOUNT == 100 (before scanline 120),
+        // writes R7 to VRAM pixel (0, 120) at 0x0600_E100, reads KEYINPUT, and updates R7 for the
+        // NEXT frame (green 0x03E0 if KEY_A pressed else red).
+        let rom = rom_from_words(&[
+            0xE3A0_0301, // 0x00: MOV R0, #0x04000000
+            0xE3A0_1B01, // 0x04: MOV R1, #0x0400
+            0xE381_1003, // 0x08: ORR R1, R1, #3 -> 0x0403 (Mode 3, BG2)
+            0xE1C0_10B0, // 0x0C: STRH R1, [R0]
+            0xE3A0_4406, // 0x10: MOV R4, #0x06000000 (VRAM)
+            0xE284_4CE1, // 0x14: ADD R4, R4, #0xE100 (pixel (0, 120))
+            0xE280_5C01, // 0x18: ADD R5, R0, #0x100
+            0xE285_5030, // 0x1C: ADD R5, R5, #0x30 (0x04000130 KEYINPUT)
+            0xE280_6006, // 0x20: ADD R6, R0, #6 (0x04000006 VCOUNT)
+            0xE3A0_701F, // 0x24: MOV R7, #0x001F (red)
+            // wait_line (0x28):
+            0xE1D6_80B0, // 0x28: LDRH R8, [R6]
+            0xE358_0064, // 0x2C: CMP R8, #100
+            0x1AFF_FFFC, // 0x30: BNE wait_line
+            0xE1C4_70B0, // 0x34: STRH R7, [R4] (draw latched color)
+            0xE1D5_80B0, // 0x38: LDRH R8, [R5] (poll KEYINPUT for NEXT frame)
+            0xE318_0001, // 0x3C: TST R8, #1 (KEY_A active-low)
+            0x03A0_7E3E, // 0x40: MOVEQ R7, #0x03E0 (green)
+            0x13A0_701F, // 0x44: MOVNE R7, #0x001F (red)
+            // leave_line (0x48):
+            0xE1D6_80B0, // 0x48: LDRH R8, [R6]
+            0xE358_0064, // 0x4C: CMP R8, #100
+            0x0AFF_FFFC, // 0x50: BEQ leave_line
+            0xEAFF_FFF3, // 0x54: B wait_line (0x54 + 8 - 13*4 = 0x28)
+        ]);
+        let pixel_idx = 120 * LCD_WIDTH;
+
+        // 1) Baseline without run-ahead: pressing KEY_A on frame 2 still draws RED on frame 2.
+        let mut core_off = GbaCore::new(None, rom.clone());
+        let mut sink_off = CoreSink::new(AudioOutput::dummy_for_tests());
+        sink_off.capture_audio = true;
+        sink_off.keypad = 0x03FF;
+        step_gba_frame_with_optional_run_ahead(&mut core_off, &mut sink_off, 0);
+        assert_eq!(sink_off.framebuffer[pixel_idx], 0x001F);
+
+        sink_off.captured_audio.clear();
+        sink_off.keypad = gba_core::encode_keyinput(gba_core::KEY_A);
+        step_gba_frame_with_optional_run_ahead(&mut core_off, &mut sink_off, 0);
+        let single_frame_audio_len = sink_off.captured_audio.len();
+        assert!(single_frame_audio_len > 0);
+        assert_eq!(sink_off.framebuffer[pixel_idx], 0x001F); // Still delayed by 1 frame
+
+        // 2) With 1-frame Run-Ahead: pressing KEY_A on frame 2 immediately presents GREEN!
+        let mut core_on = GbaCore::new(None, rom);
+        let mut sink_on = CoreSink::new(AudioOutput::dummy_for_tests());
+        sink_on.capture_audio = true;
+        sink_on.keypad = 0x03FF;
+        step_gba_frame_with_optional_run_ahead(&mut core_on, &mut sink_on, 1);
+
+        sink_on.captured_audio.clear();
+        sink_on.keypad = gba_core::encode_keyinput(gba_core::KEY_A);
+        step_gba_frame_with_optional_run_ahead(&mut core_on, &mut sink_on, 1);
+
+        assert_eq!(sink_on.framebuffer[pixel_idx], 0x03E0);
+        // Speculative frame must NOT duplicate audio samples.
+        assert_eq!(sink_on.captured_audio.len(), single_frame_audio_len);
+        // Persistent core state must match exact 2-frame cycle boundary of core_off.
+        assert_eq!(
+            core_on.bus.scheduler.current_cycle,
+            core_off.bus.scheduler.current_cycle
+        );
+    }
 }

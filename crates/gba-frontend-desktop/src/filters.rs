@@ -1,6 +1,7 @@
+use std::collections::VecDeque;
 use std::path::{Path, PathBuf};
 use std::sync::OnceLock;
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
 use egui::ColorImage;
 use gba_core::{HostFrontend, LCD_HEIGHT, LCD_WIDTH};
@@ -96,12 +97,12 @@ pub fn agb_srgb_lut() -> &'static [[u8; 4]; 32_768] {
             let lg = g.powf(2.4);
             let lb = b.powf(2.4);
 
-            let out_r = (255.0 * (lr * 0.845 + lg * 0.125 + lb * 0.030).powf(1.0 / 2.2))
-                .clamp(0.0, 255.0);
-            let out_g = (255.0 * (lr * 0.055 + lg * 0.675 + lb * 0.270).powf(1.0 / 2.2))
-                .clamp(0.0, 255.0);
-            let out_b = (255.0 * (lr * 0.000 + lg * 0.195 + lb * 0.805).powf(1.0 / 2.2))
-                .clamp(0.0, 255.0);
+            let out_r =
+                (255.0 * (lr * 0.845 + lg * 0.125 + lb * 0.030).powf(1.0 / 2.2)).clamp(0.0, 255.0);
+            let out_g =
+                (255.0 * (lr * 0.055 + lg * 0.675 + lb * 0.270).powf(1.0 / 2.2)).clamp(0.0, 255.0);
+            let out_b =
+                (255.0 * (lr * 0.000 + lg * 0.195 + lb * 0.805).powf(1.0 / 2.2)).clamp(0.0, 255.0);
 
             table[c] = [out_r as u8, out_g as u8, out_b as u8, 255];
         }
@@ -139,9 +140,12 @@ pub fn ags_001_lut() -> &'static [[u8; 4]; 32_768] {
             let g = (((c >> 5) & 0x1F) as f32) / 31.0;
             let b = (((c >> 10) & 0x1F) as f32) / 31.0;
 
-            let out_r = (255.0 * (0.04 + 0.82 * (r * 0.84 + g * 0.12 + b * 0.04))).clamp(0.0, 255.0);
-            let out_g = (255.0 * (0.05 + 0.82 * (r * 0.06 + g * 0.82 + b * 0.12))).clamp(0.0, 255.0);
-            let out_b = (255.0 * (0.08 + 0.84 * (r * 0.04 + g * 0.10 + b * 0.86))).clamp(0.0, 255.0);
+            let out_r =
+                (255.0 * (0.04 + 0.82 * (r * 0.84 + g * 0.12 + b * 0.04))).clamp(0.0, 255.0);
+            let out_g =
+                (255.0 * (0.05 + 0.82 * (r * 0.06 + g * 0.82 + b * 0.12))).clamp(0.0, 255.0);
+            let out_b =
+                (255.0 * (0.08 + 0.84 * (r * 0.04 + g * 0.10 + b * 0.86))).clamp(0.0, 255.0);
 
             table[c] = [out_r as u8, out_g as u8, out_b as u8, 255];
         }
@@ -150,7 +154,10 @@ pub fn ags_001_lut() -> &'static [[u8; 4]; 32_768] {
 }
 
 #[inline]
-pub fn lut_for_profile(color_correction: bool, profile: ColorProfileChoice) -> &'static [[u8; 4]; 32_768] {
+pub fn lut_for_profile(
+    color_correction: bool,
+    profile: ColorProfileChoice,
+) -> &'static [[u8; 4]; 32_768] {
     if !color_correction || profile == ColorProfileChoice::Linear {
         linear_lut()
     } else {
@@ -225,7 +232,10 @@ impl VideoPostProcessor {
 
             base_rgb: vec![[0u8; 3]; LCD_WIDTH * LCD_HEIGHT],
             prev_rgb: vec![[0u8; 3]; LCD_WIDTH * LCD_HEIGHT],
-            output_image: egui::ColorImage::new([LCD_WIDTH * 3, LCD_HEIGHT * 3], egui::Color32::BLACK),
+            output_image: egui::ColorImage::new(
+                [LCD_WIDTH * 3, LCD_HEIGHT * 3],
+                egui::Color32::BLACK,
+            ),
             filter: DisplayFilter::MyBoySmooth,
             lcd_grid_intensity: 0.08,
         }
@@ -239,6 +249,43 @@ impl VideoPostProcessor {
         self.base_rgb.fill([0, 0, 0]);
         self.has_prev_frame = false;
         self.last_sync_key = None;
+    }
+
+    /// Prewarms the filter/shader pipelines and allocations before frame 0 so cold-start
+    /// latency (e.g. 18.9 ms) is not incurred during active presentation.
+    pub fn prewarm(
+        &mut self,
+        color_correction: bool,
+        lcd_ghosting: bool,
+        filter: DisplayFilter,
+        color_correction_fast: bool,
+        lcd_grid_intensity: f32,
+    ) {
+        let dummy = [0x7FFFu16; LCD_WIDTH * LCD_HEIGHT];
+        let _ = raw_lut_3();
+        let _ = srgb_lut_3();
+        let _ = linear_lut();
+        for &profile in &ColorProfileChoice::ALL {
+            let _ = lut_for_profile(true, profile);
+        }
+        self.sync_rgba_for_capture(
+            &dummy,
+            Some(&dummy),
+            1,
+            color_correction,
+            ColorProfileChoice::Agb001,
+            false,
+            lcd_ghosting,
+        );
+        let _ = self.process_display_filter(
+            &dummy,
+            color_correction,
+            lcd_ghosting,
+            filter,
+            color_correction_fast,
+            lcd_grid_intensity,
+        );
+        self.reset();
     }
 
     fn compute_rgba_frame(
@@ -274,8 +321,10 @@ impl VideoPostProcessor {
             if opts.lcd_ghosting && !opts.frame_blending {
                 // Blend ~65% new frame + ~35% previous frame for authentic TFT persistence.
                 let r = ((blended[0] as u16 * 166 + self.prev_rgba[off] as u16 * 90) >> 8) as u8;
-                let g = ((blended[1] as u16 * 166 + self.prev_rgba[off + 1] as u16 * 90) >> 8) as u8;
-                let b = ((blended[2] as u16 * 166 + self.prev_rgba[off + 2] as u16 * 90) >> 8) as u8;
+                let g =
+                    ((blended[1] as u16 * 166 + self.prev_rgba[off + 1] as u16 * 90) >> 8) as u8;
+                let b =
+                    ((blended[2] as u16 * 166 + self.prev_rgba[off + 2] as u16 * 90) >> 8) as u8;
                 self.curr_rgba[off] = r;
                 self.curr_rgba[off + 1] = g;
                 self.curr_rgba[off + 2] = b;
@@ -423,7 +472,8 @@ impl VideoPostProcessor {
     #[allow(dead_code)]
     pub fn save_screenshot_png(&self, rom_title: &str) -> Result<PathBuf, String> {
         let dir = AppConfig::screenshots_dir();
-        std::fs::create_dir_all(&dir).map_err(|e| format!("Failed creating screenshots dir: {e}"))?;
+        std::fs::create_dir_all(&dir)
+            .map_err(|e| format!("Failed creating screenshots dir: {e}"))?;
         let sanitized: String = rom_title
             .chars()
             .map(|c| if c.is_ascii_alphanumeric() { c } else { '_' })
@@ -526,6 +576,29 @@ impl VideoPostProcessor {
                         self.output_image.pixels[dst_r0 + dx + 1] = c;
                         self.output_image.pixels[dst_r1 + dx] = c;
                         self.output_image.pixels[dst_r1 + dx + 1] = c;
+                    }
+                }
+            }
+
+            DisplayFilter::CrtScanlines => {
+                let out_w = LCD_WIDTH * 2;
+                let out_h = LCD_HEIGHT * 2;
+                if self.output_image.size != [out_w, out_h] {
+                    self.output_image = egui::ColorImage::new([out_w, out_h], egui::Color32::BLACK);
+                }
+                for y in 0..LCD_HEIGHT {
+                    let src_row = y * LCD_WIDTH;
+                    let dst_r0 = (y * 2) * out_w;
+                    let dst_r1 = dst_r0 + out_w;
+                    for x in 0..LCD_WIDTH {
+                        let [r, g, b] = self.base_rgb[src_row + x];
+                        let c0 = egui::Color32::from_rgb(r, g, b);
+                        let c1 = egui::Color32::from_rgb(r / 2, g / 2, b / 2);
+                        let dx = x * 2;
+                        self.output_image.pixels[dst_r0 + dx] = c0;
+                        self.output_image.pixels[dst_r0 + dx + 1] = c0;
+                        self.output_image.pixels[dst_r1 + dx] = c1;
+                        self.output_image.pixels[dst_r1 + dx + 1] = c1;
                     }
                 }
             }
@@ -658,23 +731,75 @@ impl VideoPostProcessor {
 
         &self.output_image
     }
+
+    /// Briefly times every display filter on a patterned 240x160 frame during prewarm and
+    /// returns the measured costs sorted ascending.
+    pub fn measure_filter_costs(
+        &mut self,
+        color_correction: bool,
+        lcd_ghosting: bool,
+        color_correction_fast: bool,
+        lcd_grid_intensity: f32,
+    ) -> Vec<FilterCost> {
+        let pattern = test_filter_pattern_fb();
+        self.prewarm(
+            color_correction,
+            lcd_ghosting,
+            DisplayFilter::Sharp1x,
+            color_correction_fast,
+            lcd_grid_intensity,
+        );
+        let mut costs = Vec::with_capacity(DisplayFilter::ALL.len());
+        for &filter in &DisplayFilter::ALL {
+            for _ in 0..2 {
+                let img = self.process_display_filter(
+                    &pattern,
+                    color_correction,
+                    lcd_ghosting,
+                    filter,
+                    color_correction_fast,
+                    lcd_grid_intensity,
+                );
+                std::hint::black_box(img.pixels.as_ptr());
+            }
+            let mut samples = [0.0f64; 5];
+            for slot in &mut samples {
+                let t0 = Instant::now();
+                for _ in 0..4 {
+                    let img = self.process_display_filter(
+                        &pattern,
+                        color_correction,
+                        lcd_ghosting,
+                        filter,
+                        color_correction_fast,
+                        lcd_grid_intensity,
+                    );
+                    std::hint::black_box(img.pixels.as_ptr());
+                }
+                *slot = t0.elapsed().as_secs_f64() * 1000.0 / 4.0;
+            }
+            samples.sort_by(f64::total_cmp);
+            costs.push(FilterCost {
+                filter,
+                cost_ms: samples[2],
+            });
+        }
+        self.reset();
+        sort_filter_costs(&mut costs);
+        costs
+    }
 }
 
 #[inline(always)]
 fn color_dist(c1: [u8; 3], c2: [u8; 3]) -> u32 {
-    let dr = (c1[0] as i32 - c2[0] as i32).abs() as u32;
-    let dg = (c1[1] as i32 - c2[1] as i32).abs() as u32;
-    let db = (c1[2] as i32 - c2[2] as i32).abs() as u32;
+    let dr = (c1[0] as i32 - c2[0] as i32).unsigned_abs();
+    let dg = (c1[1] as i32 - c2[1] as i32).unsigned_abs();
+    let db = (c1[2] as i32 - c2[2] as i32).unsigned_abs();
     dr + dg + db
 }
 
 #[inline(always)]
-fn blend_corner_xbr(
-    p: [u8; 3],
-    c1: [u8; 3],
-    c2: [u8; 3],
-    diag: [u8; 3],
-) -> egui::Color32 {
+fn blend_corner_xbr(p: [u8; 3], c1: [u8; 3], c2: [u8; 3], diag: [u8; 3]) -> egui::Color32 {
     let d_card = color_dist(c1, c2);
     let d_diag = color_dist(p, diag);
     let d_p_c1 = color_dist(p, c1);
@@ -816,7 +941,10 @@ impl FrontendBridge {
             raw_lut,
             base_rgb: vec![[0u8; 3]; LCD_WIDTH * LCD_HEIGHT],
             prev_rgb: vec![[0u8; 3]; LCD_WIDTH * LCD_HEIGHT],
-            output_image: egui::ColorImage::new([LCD_WIDTH * 3, LCD_HEIGHT * 3], egui::Color32::BLACK),
+            output_image: egui::ColorImage::new(
+                [LCD_WIDTH * 3, LCD_HEIGHT * 3],
+                egui::Color32::BLACK,
+            ),
             filter: DisplayFilter::MyBoySmooth,
             lcd_grid_intensity: 0.08,
             color_correction: true,
@@ -903,6 +1031,29 @@ impl HostFrontend for FrontendBridge {
                         self.output_image.pixels[dst_r0 + dx + 1] = c;
                         self.output_image.pixels[dst_r1 + dx] = c;
                         self.output_image.pixels[dst_r1 + dx + 1] = c;
+                    }
+                }
+            }
+
+            DisplayFilter::CrtScanlines => {
+                let out_w = LCD_WIDTH * 2;
+                let out_h = LCD_HEIGHT * 2;
+                if self.output_image.size != [out_w, out_h] {
+                    self.output_image = egui::ColorImage::new([out_w, out_h], egui::Color32::BLACK);
+                }
+                for y in 0..LCD_HEIGHT {
+                    let src_row = y * LCD_WIDTH;
+                    let dst_r0 = (y * 2) * out_w;
+                    let dst_r1 = dst_r0 + out_w;
+                    for x in 0..LCD_WIDTH {
+                        let [r, g, b] = self.base_rgb[src_row + x];
+                        let c0 = egui::Color32::from_rgb(r, g, b);
+                        let c1 = egui::Color32::from_rgb(r / 2, g / 2, b / 2);
+                        let dx = x * 2;
+                        self.output_image.pixels[dst_r0 + dx] = c0;
+                        self.output_image.pixels[dst_r0 + dx + 1] = c0;
+                        self.output_image.pixels[dst_r1 + dx] = c1;
+                        self.output_image.pixels[dst_r1 + dx + 1] = c1;
                     }
                 }
             }
@@ -1054,9 +1205,11 @@ impl HostFrontend for FrontendBridge {
 
             while self.resample_phase < 1.0 {
                 let frac = self.resample_phase as f32;
-                let l = (self.prev_audio_l as f32 + (cur_l as f32 - self.prev_audio_l as f32) * frac)
+                let l = (self.prev_audio_l as f32
+                    + (cur_l as f32 - self.prev_audio_l as f32) * frac)
                     * self.volume;
-                let r = (self.prev_audio_r as f32 + (cur_r as f32 - self.prev_audio_r as f32) * frac)
+                let r = (self.prev_audio_r as f32
+                    + (cur_r as f32 - self.prev_audio_r as f32) * frac)
                     * self.volume;
 
                 let _ = self.audio_prod.try_push(l.clamp(-32768.0, 32767.0) as i16);
@@ -1094,7 +1247,10 @@ mod tests {
             false,
             false,
         );
-        assert_eq!(img1.pixels[0], egui::Color32::from_rgba_unmultiplied(255, 255, 255, 255));
+        assert_eq!(
+            img1.pixels[0],
+            egui::Color32::from_rgba_unmultiplied(255, 255, 255, 255)
+        );
 
         // Second frame (black) blended 50/50 with previous frame (white) -> ~127 gray.
         let img2 = proc.process_frame_with_blending(
@@ -1106,18 +1262,27 @@ mod tests {
             false,
             false,
         );
-        assert_eq!(img2.pixels[0], egui::Color32::from_rgba_unmultiplied(127, 127, 127, 255));
+        assert_eq!(
+            img2.pixels[0],
+            egui::Color32::from_rgba_unmultiplied(127, 127, 127, 255)
+        );
 
         // Third frame (white) blended with previous raw frame (black) via internal history
         // still produces exact 50/50 mix (no exponential flicker decay).
         proc.frame_blending = true;
         let img3 = proc.process_frame(&white_fb, false, ColorProfileChoice::Linear, false, false);
-        assert_eq!(img3.pixels[0], egui::Color32::from_rgba_unmultiplied(127, 127, 127, 255));
+        assert_eq!(
+            img3.pixels[0],
+            egui::Color32::from_rgba_unmultiplied(127, 127, 127, 255)
+        );
 
         // Disabling frame_blending restores full crisp white.
         proc.frame_blending = false;
         let img4 = proc.process_frame(&white_fb, false, ColorProfileChoice::Linear, false, false);
-        assert_eq!(img4.pixels[0], egui::Color32::from_rgba_unmultiplied(255, 255, 255, 255));
+        assert_eq!(
+            img4.pixels[0],
+            egui::Color32::from_rgba_unmultiplied(255, 255, 255, 255)
+        );
     }
 
     #[test]
@@ -1136,13 +1301,16 @@ mod tests {
             false,
             false,
         );
-        assert_eq!(img.pixels[0], egui::Color32::from_rgba_unmultiplied(127, 127, 0, 255));
+        assert_eq!(
+            img.pixels[0],
+            egui::Color32::from_rgba_unmultiplied(127, 127, 0, 255)
+        );
     }
 
     #[test]
     fn display_filter_modes_and_frontend_bridge_pipeline() {
-        use ringbuf::traits::Split;
         use ringbuf::HeapRb;
+        use ringbuf::traits::Split;
 
         let rb = HeapRb::<i16>::new(1024);
         let (prod, _) = rb.split();
@@ -1190,20 +1358,52 @@ mod tests {
 
         // Verify AuthenticGbaLcd intensity scaling on pure white (0x7FFF)
         // With intensity 0.08, center is full white (255), scanline is subtle ~92% (234), corner is ~88% (225)
-        let lcd_img_8pct = proc.process_display_filter(&test_fb, false, false, DisplayFilter::AuthenticGbaLcd, false, 0.08);
+        let lcd_img_8pct = proc.process_display_filter(
+            &test_fb,
+            false,
+            false,
+            DisplayFilter::AuthenticGbaLcd,
+            false,
+            0.08,
+        );
         let out_w = LCD_WIDTH * 3;
         // Pixel (1, 0) is c_mid
-        assert_eq!(lcd_img_8pct.pixels[1], egui::Color32::from_rgb(255, 255, 255));
+        assert_eq!(
+            lcd_img_8pct.pixels[1],
+            egui::Color32::from_rgb(255, 255, 255)
+        );
         // Pixel (0, 2) is c_scan: [234, 234, 237]
-        assert_eq!(lcd_img_8pct.pixels[2 * out_w], egui::Color32::from_rgb(234, 234, 237));
+        assert_eq!(
+            lcd_img_8pct.pixels[2 * out_w],
+            egui::Color32::from_rgb(234, 234, 237)
+        );
         // Pixel (2, 2) is c_corner: [225, 225, 227]
-        assert_eq!(lcd_img_8pct.pixels[2 * out_w + 2], egui::Color32::from_rgb(225, 225, 227));
+        assert_eq!(
+            lcd_img_8pct.pixels[2 * out_w + 2],
+            egui::Color32::from_rgb(225, 225, 227)
+        );
 
         // With intensity 0.0, grid is disabled: all subpixels evaluate to full white (255)
-        let lcd_img_0pct = proc.process_display_filter(&test_fb, false, false, DisplayFilter::AuthenticGbaLcd, false, 0.0);
-        assert_eq!(lcd_img_0pct.pixels[1], egui::Color32::from_rgb(255, 255, 255));
-        assert_eq!(lcd_img_0pct.pixels[2 * out_w], egui::Color32::from_rgb(255, 255, 255));
-        assert_eq!(lcd_img_0pct.pixels[2 * out_w + 2], egui::Color32::from_rgb(255, 255, 255));
+        let lcd_img_0pct = proc.process_display_filter(
+            &test_fb,
+            false,
+            false,
+            DisplayFilter::AuthenticGbaLcd,
+            false,
+            0.0,
+        );
+        assert_eq!(
+            lcd_img_0pct.pixels[1],
+            egui::Color32::from_rgb(255, 255, 255)
+        );
+        assert_eq!(
+            lcd_img_0pct.pixels[2 * out_w],
+            egui::Color32::from_rgb(255, 255, 255)
+        );
+        assert_eq!(
+            lcd_img_0pct.pixels[2 * out_w + 2],
+            egui::Color32::from_rgb(255, 255, 255)
+        );
     }
 
     #[test]
@@ -1260,5 +1460,702 @@ mod tests {
         // 4. Bottom-Right corner [2, 2] at (5, 5):
         // Down is white, Right is white, center is white -> stays 100% white (255, 255, 255)
         assert_eq!(img.pixels[r2 + 5], egui::Color32::from_rgb(255, 255, 255));
+    }
+
+    #[test]
+    fn quality_governor_jumps_directly_under_50_pct_budget_with_hysteresis_and_override() {
+        let costs = vec![
+            FilterCost {
+                filter: DisplayFilter::Sharp1x,
+                cost_ms: 0.4,
+            },
+            FilterCost {
+                filter: DisplayFilter::MyBoySmooth,
+                cost_ms: 0.5,
+            },
+            FilterCost {
+                filter: DisplayFilter::SoftHandheld,
+                cost_ms: 1.5,
+            },
+            FilterCost {
+                filter: DisplayFilter::CrtScanlines,
+                cost_ms: 2.2,
+            },
+            FilterCost {
+                filter: DisplayFilter::AuthenticGbaLcd,
+                cost_ms: 4.5,
+            },
+            FilterCost {
+                filter: DisplayFilter::SmoothScale2x,
+                cost_ms: 6.5,
+            },
+            FilterCost {
+                filter: DisplayFilter::XbrSmooth3x,
+                cost_ms: 10.0,
+            },
+        ];
+        // Under work_p95 = 13.5 ms with XbrSmooth3x (10.0 ms): est_base = 3.5 ms.
+        // 50% of 16.7427 ms = 8.371 ms -> max affordable filter cost is 4.871 ms -> AuthenticGbaLcd (4.5 ms).
+        let mut gov =
+            QualityGovernor::with_measured_costs(DisplayFilter::XbrSmooth3x, true, costs.clone());
+        assert_eq!(gov.measured_costs().len(), 7);
+        // Transient ~2.3s burst above 70% must NOT trigger premature step-down (hysteresis).
+        for _ in 0..140 {
+            assert_eq!(gov.record_frame(14.0), None);
+        }
+        // Recovery period clears rolling p95 and resets sustained overload streak.
+        for _ in 0..120 {
+            assert_eq!(gov.record_frame(5.0), None);
+        }
+        // Sustained overload (>70% = >11.72 ms) jumps straight to AuthenticGbaLcd in one step.
+        let mut saw_step = None;
+        for f in 0..240 {
+            if let Some(ev) = gov.record_frame(13.5) {
+                saw_step = Some((f, ev));
+                break;
+            }
+        }
+        let (trigger_idx, ev) = saw_step.expect("expected direct measured-cost jump");
+        assert!(
+            trigger_idx < 190,
+            "expected settle within ~3s (<190 frames), got {trigger_idx}"
+        );
+        assert_eq!(ev.from, DisplayFilter::XbrSmooth3x);
+        assert_eq!(ev.to, DisplayFilter::AuthenticGbaLcd);
+        assert_eq!(gov.active_filter(), DisplayFilter::AuthenticGbaLcd);
+
+        // Also check cold-start settle time (<180 frames = ~3.0s) from an empty window.
+        let mut cold_gov = QualityGovernor::with_measured_costs(DisplayFilter::XbrSmooth3x, true, costs);
+        let cold_ev = (0..185)
+            .find_map(|f| cold_gov.record_frame(13.5).map(|ev| (f, ev)))
+            .expect("expected cold-start settle within 180 frames");
+        assert_eq!(cold_ev.1.to, DisplayFilter::AuthenticGbaLcd);
+
+        // During 5-minute (18,000f) lockout after a step-down, quiet frames must NOT step up.
+        for _ in 0..2000 {
+            assert_eq!(gov.record_frame(2.0), None);
+        }
+        assert_eq!(gov.active_filter(), DisplayFilter::AuthenticGbaLcd);
+
+        // User override (`enabled = false`) disables all automatic transitions.
+        gov.set_enabled(false);
+        for _ in 0..500 {
+            assert_eq!(gov.record_frame(15.5), None);
+        }
+        assert_eq!(gov.active_filter(), DisplayFilter::AuthenticGbaLcd);
+    }
+
+    #[test]
+    fn quality_governor_respects_backend_order_and_never_picks_costlier_filter() {
+        // Simulate SwiftShader where AuthenticGbaLcd (`lcd-grid`) is the cheapest filter (0.41 ms),
+        // Sharp1x (`none`) is slightly more expensive (0.52 ms), and XbrSmooth3x/SmoothScale2x are top.
+        let sw_costs = vec![
+            FilterCost {
+                filter: DisplayFilter::AuthenticGbaLcd,
+                cost_ms: 4.1,
+            },
+            FilterCost {
+                filter: DisplayFilter::Sharp1x,
+                cost_ms: 5.2,
+            },
+            FilterCost {
+                filter: DisplayFilter::MyBoySmooth,
+                cost_ms: 6.9,
+            },
+            FilterCost {
+                filter: DisplayFilter::CrtScanlines,
+                cost_ms: 7.2,
+            },
+            FilterCost {
+                filter: DisplayFilter::SoftHandheld,
+                cost_ms: 8.6,
+            },
+            FilterCost {
+                filter: DisplayFilter::XbrSmooth3x,
+                cost_ms: 8.7,
+            },
+            FilterCost {
+                filter: DisplayFilter::SmoothScale2x,
+                cost_ms: 11.8,
+            },
+        ];
+        // Start at SmoothScale2x with work = 16.5 ms -> est_base = 4.7 ms.
+        // Remaining budget for 50% (8.37 ms) is 3.67 ms -> even cheapest (4.1 ms) doesn't fit under 50%,
+        // so governor jumps straight to costs[0] = AuthenticGbaLcd, NEVER picking Sharp1x or anything costlier.
+        let mut gov =
+            QualityGovernor::with_measured_costs(DisplayFilter::SmoothScale2x, true, sw_costs);
+        let mut ev = None;
+        for _ in 0..240 {
+            if let Some(tr) = gov.record_frame(16.5) {
+                ev = Some(tr);
+                break;
+            }
+        }
+        let tr = ev.expect("expected direct drop to cheapest measured filter");
+        assert_eq!(tr.kind, GovernorTransitionKind::StepDown);
+        assert_eq!(tr.to, DisplayFilter::AuthenticGbaLcd);
+
+        // Already at cheapest (AuthenticGbaLcd): further overload must never pick Sharp1x or any other filter.
+        for _ in 0..500 {
+            assert_eq!(gov.record_frame(15.0), None);
+        }
+        assert_eq!(gov.active_filter(), DisplayFilter::AuthenticGbaLcd);
+    }
+
+    #[test]
+    fn quality_governor_recovery_and_doubled_lockout_on_flapping() {
+        let costs = vec![
+            FilterCost {
+                filter: DisplayFilter::Sharp1x,
+                cost_ms: 0.4,
+            },
+            FilterCost {
+                filter: DisplayFilter::MyBoySmooth,
+                cost_ms: 0.5,
+            },
+            FilterCost {
+                filter: DisplayFilter::SoftHandheld,
+                cost_ms: 0.7,
+            },
+            FilterCost {
+                filter: DisplayFilter::CrtScanlines,
+                cost_ms: 0.9,
+            },
+            FilterCost {
+                filter: DisplayFilter::AuthenticGbaLcd,
+                cost_ms: 1.2,
+            },
+            FilterCost {
+                filter: DisplayFilter::SmoothScale2x,
+                cost_ms: 5.0,
+            },
+            FilterCost {
+                filter: DisplayFilter::XbrSmooth3x,
+                cost_ms: 10.0,
+            },
+        ];
+
+        // 1. Transient hiccup (<120 sustained p95 frames >70%): no step-down.
+        let mut gov =
+            QualityGovernor::with_measured_costs(DisplayFilter::XbrSmooth3x, true, costs.clone());
+        for _ in 0..100 {
+            assert_eq!(gov.record_frame(14.5), None);
+        }
+        for _ in 0..180 {
+            assert_eq!(gov.record_frame(4.0), None);
+        }
+        assert_eq!(gov.active_filter(), DisplayFilter::XbrSmooth3x);
+
+        // 2. Sustained overload: est_base = 14.0 - 10.0 = 4.0 ms -> max affordable filter
+        //    under 8.37 ms is AuthenticGbaLcd (4.0 + 5.0 = 9.0 > 8.37, so drops to AuthenticGbaLcd 1.2).
+        let step_down = (0..240)
+            .find_map(|_| gov.record_frame(14.0))
+            .expect("sustained overload must step down");
+        assert_eq!(step_down.kind, GovernorTransitionKind::StepDown);
+        assert_eq!(step_down.to, DisplayFilter::AuthenticGbaLcd);
+        assert_eq!(gov.current_lockout_frames(), GOVERNOR_BASE_LOCKOUT_FRAMES);
+        assert_eq!(gov.up_lockout_remaining(), GOVERNOR_BASE_LOCKOUT_FRAMES);
+
+        // 3. Recovery lockout (18,000f = 5 min): stays locked even under ultra-fast 2.0 ms frames.
+        for _ in 0..GOVERNOR_BASE_LOCKOUT_FRAMES {
+            assert_eq!(gov.record_frame(2.0), None);
+        }
+        assert_eq!(gov.up_lockout_remaining(), 0);
+        // Needs continuous 60s (3,600f) below 35%; interrupt once at 2,000f to test sustain reset.
+        for _ in 0..2000 {
+            assert_eq!(gov.record_frame(2.0), None);
+        }
+        assert_eq!(gov.record_frame(6.5), None); // p95 rises above 35% only if sustained, feed burst >35%
+        for _ in 0..15 {
+            assert_eq!(gov.record_frame(6.5), None);
+        }
+        for _ in 0..1600 {
+            assert_eq!(gov.record_frame(2.0), None);
+        }
+        assert_eq!(gov.active_filter(), DisplayFilter::AuthenticGbaLcd);
+
+        // Full unbroken 3,600f <35%: step up ONE step (AuthenticGbaLcd -> SmoothScale2x, not XbrSmooth3x).
+        let step_up = (0..GOVERNOR_RECOVERY_SUSTAIN_FRAMES)
+            .find_map(|_| gov.record_frame(2.0))
+            .expect("expected single-step recovery after lockout + 60s <35%");
+        assert_eq!(step_up.kind, GovernorTransitionKind::StepUp);
+        assert_eq!(step_up.from, DisplayFilter::AuthenticGbaLcd);
+        assert_eq!(step_up.to, DisplayFilter::SmoothScale2x);
+
+        // 4. Flapping: overload returns within 30s (<1,800f) of step-up -> immediate step-down + DOUBLED lockout.
+        //    est_base = 12.0 - 5.0 = 7.0 ms; AuthenticGbaLcd adds 1.2 ms (8.2 <= 8.37) while SmoothScale2x would be 12.0.
+        let flap_down = (0..120)
+            .find_map(|_| gov.record_frame(12.0))
+            .expect("post-step-up overload within 30s must step back down immediately");
+        assert_eq!(flap_down.kind, GovernorTransitionKind::StepDown);
+        assert_eq!(flap_down.to, DisplayFilter::AuthenticGbaLcd);
+        assert_eq!(
+            gov.current_lockout_frames(),
+            GOVERNOR_BASE_LOCKOUT_FRAMES * 2
+        );
+        assert_eq!(
+            gov.up_lockout_remaining(),
+            GOVERNOR_BASE_LOCKOUT_FRAMES * 2
+        );
+
+        // Well past old 5min + 60s window (24,000 frames), must STILL be locked out because lockout doubled to 10min!
+        for _ in 0..24_000 {
+            assert_eq!(gov.record_frame(2.0), None);
+        }
+        assert_eq!(gov.active_filter(), DisplayFilter::AuthenticGbaLcd);
+        assert!(gov.up_lockout_remaining() > 0);
+
+        // Wait remainder of 10-min (36,000f) lockout + 60s recovery (2.0 ms -> total 6.5? no, est_base with 2.0 is 0):
+        let remaining = gov.up_lockout_remaining() + GOVERNOR_RECOVERY_SUSTAIN_FRAMES + 5;
+        let recovered = (0..remaining)
+            .find_map(|_| gov.record_frame(2.0))
+            .expect("expected recovery after doubled 10-minute lockout expired");
+        assert_eq!(recovered.kind, GovernorTransitionKind::StepUp);
+        assert_eq!(recovered.to, DisplayFilter::SmoothScale2x);
+
+        // Next recovery must respect user_target ceiling and predicted <50% budget:
+        // With work=5.0 ms (<35% of 16.74 = 5.86 ms), XbrSmooth3x predicts (5.0 - 5.0) + 10.0 = 10.0 ms >= 8.37 ms (50%) -> must NOT step up!
+        for _ in 0..(GOVERNOR_RECOVERY_SUSTAIN_FRAMES + 200) {
+            assert_eq!(gov.record_frame(5.0), None);
+        }
+        assert_eq!(gov.active_filter(), DisplayFilter::SmoothScale2x);
+
+        // Also test persisted starting filter below user_target: starts settled at AuthenticGbaLcd while targeting XbrSmooth3x.
+        let mut persisted_gov = QualityGovernor::with_measured_costs(
+            DisplayFilter::XbrSmooth3x,
+            true,
+            costs,
+        );
+        persisted_gov.set_active_from_persisted(DisplayFilter::AuthenticGbaLcd);
+        assert_eq!(persisted_gov.active_filter(), DisplayFilter::AuthenticGbaLcd);
+        let recovered_from_persisted =
+            (0..(GOVERNOR_WINDOW_FRAMES + GOVERNOR_RECOVERY_SUSTAIN_FRAMES))
+                .find_map(|_| persisted_gov.record_frame(2.0))
+                .expect("persisted filter with zero initial lockout can recover after 60s <35%");
+        assert_eq!(recovered_from_persisted.to, DisplayFilter::SmoothScale2x);
+    }
+
+    #[test]
+    fn video_postproc_measure_filter_costs_returns_sorted_all_filters() {
+        let mut postproc = VideoPostProcessor::new();
+        let costs = postproc.measure_filter_costs(false, false, false, 0.08);
+        assert_eq!(costs.len(), DisplayFilter::ALL.len());
+        for win in costs.windows(2) {
+            assert!(
+                win[0].cost_ms <= win[1].cost_ms,
+                "costs not sorted ascending: {:?}",
+                costs
+            );
+        }
+    }
+}
+
+pub const GOVERNOR_BUDGET_MS: f64 = 1000.0 * 280_896.0 / 16_777_216.0;
+pub const GOVERNOR_HIGH_PCT: f64 = 0.70;
+pub const GOVERNOR_TARGET_PCT: f64 = 0.50;
+pub const GOVERNOR_RECOVERY_LOW_PCT: f64 = 0.35;
+pub const GOVERNOR_WINDOW_FRAMES: usize = 120;
+pub const GOVERNOR_DOWN_SUSTAIN_FRAMES: usize = 120;
+pub const GOVERNOR_COOLDOWN_FRAMES: usize = 180;
+pub const GOVERNOR_BASE_LOCKOUT_FRAMES: usize = 18_000; // ~5 minutes at 59.73 Hz
+pub const GOVERNOR_RECOVERY_SUSTAIN_FRAMES: usize = 3_600; // ~60 seconds at 59.73 Hz
+pub const GOVERNOR_FLAP_WINDOW_FRAMES: usize = 1_800; // ~30 seconds at 59.73 Hz
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum GovernorTransitionKind {
+    StepDown,
+    StepUp,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct FilterCost {
+    pub filter: DisplayFilter,
+    pub cost_ms: f64,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct GovernorTransition {
+    pub kind: GovernorTransitionKind,
+    pub from: DisplayFilter,
+    pub to: DisplayFilter,
+    pub rolling_p95_ms: f64,
+}
+
+#[inline]
+pub const fn canonical_governor_filter(filter: DisplayFilter) -> DisplayFilter {
+    match filter {
+        DisplayFilter::RawNearest => DisplayFilter::Sharp1x,
+        other => other,
+    }
+}
+
+/// Deterministic high-contrast 240x160 BGR555 test frame so edge-adaptive filters exercise real branches.
+pub fn test_filter_pattern_fb() -> Box<[u16; LCD_WIDTH * LCD_HEIGHT]> {
+    let mut fb = vec![0u16; LCD_WIDTH * LCD_HEIGHT].into_boxed_slice();
+    for y in 0..LCD_HEIGHT {
+        for x in 0..LCD_WIDTH {
+            let edge = ((x / 4) ^ (y / 4)) & 1;
+            let diag = if (x + y) % 9 < 3 { 31 } else { 4 };
+            let r = if edge == 0 { (x & 31) as u16 } else { diag as u16 };
+            let g = if edge == 0 { diag as u16 } else { (y & 31) as u16 };
+            let b = (((x ^ y) >> 1) & 31) as u16;
+            fb[y * LCD_WIDTH + x] = (b << 10) | (g << 5) | r;
+        }
+    }
+    fb.try_into().unwrap()
+}
+
+pub fn sort_filter_costs(costs: &mut Vec<FilterCost>) {
+    for entry in costs.iter_mut() {
+        entry.filter = canonical_governor_filter(entry.filter);
+        if !entry.cost_ms.is_finite() || entry.cost_ms < 0.0 {
+            entry.cost_ms = 0.0;
+        }
+    }
+    costs.sort_by(|a, b| {
+        a.cost_ms
+            .total_cmp(&b.cost_ms)
+            .then_with(|| a.filter.quality_tier().cmp(&b.filter.quality_tier()))
+    });
+    let mut seen = [false; DisplayFilter::ALL.len()];
+    costs.retain(|entry| {
+        let Some(idx) = DisplayFilter::ALL.iter().position(|&f| f == entry.filter) else {
+            return false;
+        };
+        if seen[idx] {
+            return false;
+        }
+        seen[idx] = true;
+        true
+    });
+}
+
+/// Measured-cost quality governor with overload step-down, conservative recovery, and flap backoff.
+///
+/// Tracks a 120-frame (~2s) rolling `p95` work time against the 16.7427 ms GBA frame budget:
+/// - When rolling `p95` exceeds 70% (`~11.72 ms`) continuously for 120 frames (~2s), jumps
+///   directly to the most expensive strictly cheaper filter predicted to keep total frame time
+///   under ~50% of budget (`~8.37 ms`), or the cheapest measured filter if none fits under 50%.
+/// - Locks out step-ups for 5 minutes (18,000 frames) after any step-down. Once lockout expires,
+///   if rolling `p95` stays below 35% (`~5.86 ms`) continuously for 60s (3,600 frames) and the
+///   next costlier filter predicts total work below 50%, steps up one filter (never above `user_target`).
+/// - If overload (`p95 > 70%`) returns within 30s (1,800 frames) of a step-up, steps back down
+///   immediately and doubles the lockout duration (10m -> 20m -> ...).
+#[derive(Clone, Debug)]
+pub struct QualityGovernor {
+    enabled: bool,
+    user_target: DisplayFilter,
+    active: DisplayFilter,
+    costs: Vec<FilterCost>,
+    window: VecDeque<f64>,
+    scratch: Vec<f64>,
+    high_streak: usize,
+    low_streak: usize,
+    cooldown: usize,
+    up_lockout_remaining: usize,
+    current_lockout_frames: usize,
+    frames_since_step_up: Option<usize>,
+}
+
+impl QualityGovernor {
+    pub fn default_measured_costs() -> Vec<FilterCost> {
+        let mut costs = vec![
+            FilterCost {
+                filter: DisplayFilter::Sharp1x,
+                cost_ms: 0.08,
+            },
+            FilterCost {
+                filter: DisplayFilter::MyBoySmooth,
+                cost_ms: 0.09,
+            },
+            FilterCost {
+                filter: DisplayFilter::SoftHandheld,
+                cost_ms: 0.12,
+            },
+            FilterCost {
+                filter: DisplayFilter::CrtScanlines,
+                cost_ms: 0.13,
+            },
+            FilterCost {
+                filter: DisplayFilter::AuthenticGbaLcd,
+                cost_ms: 0.28,
+            },
+            FilterCost {
+                filter: DisplayFilter::SmoothScale2x,
+                cost_ms: 0.35,
+            },
+            FilterCost {
+                filter: DisplayFilter::XbrSmooth3x,
+                cost_ms: 0.66,
+            },
+        ];
+        sort_filter_costs(&mut costs);
+        costs
+    }
+
+    pub fn new(initial_filter: DisplayFilter, enabled: bool) -> Self {
+        Self::with_measured_costs(initial_filter, enabled, Self::default_measured_costs())
+    }
+
+    pub fn with_measured_costs(
+        initial_filter: DisplayFilter,
+        enabled: bool,
+        mut costs: Vec<FilterCost>,
+    ) -> Self {
+        sort_filter_costs(&mut costs);
+        if costs.is_empty() {
+            costs = Self::default_measured_costs();
+        }
+        let norm = canonical_governor_filter(initial_filter);
+        Self {
+            enabled,
+            user_target: norm,
+            active: norm,
+            costs,
+            window: VecDeque::with_capacity(GOVERNOR_WINDOW_FRAMES),
+            scratch: Vec::with_capacity(GOVERNOR_WINDOW_FRAMES),
+            high_streak: 0,
+            low_streak: 0,
+            cooldown: 0,
+            up_lockout_remaining: 0,
+            current_lockout_frames: GOVERNOR_BASE_LOCKOUT_FRAMES,
+            frames_since_step_up: None,
+        }
+    }
+
+    pub fn set_measured_costs(&mut self, mut costs: Vec<FilterCost>) {
+        sort_filter_costs(&mut costs);
+        if !costs.is_empty() {
+            self.costs = costs;
+        }
+    }
+
+    pub fn measured_costs(&self) -> &[FilterCost] {
+        &self.costs
+    }
+
+    #[cfg(test)]
+    pub fn up_lockout_remaining(&self) -> usize {
+        self.up_lockout_remaining
+    }
+
+    #[cfg(test)]
+    pub fn current_lockout_frames(&self) -> usize {
+        self.current_lockout_frames
+    }
+
+    /// Initializes the active filter from a previously settled per-`(adapter, resolution)` entry
+    /// while preserving `user_target` so conservative recovery can still step back up later.
+    pub fn set_active_from_persisted(&mut self, settled: DisplayFilter) {
+        let norm_settled = canonical_governor_filter(settled);
+        let settled_idx = self.costs.iter().position(|c| c.filter == norm_settled);
+        let target_idx = self.costs.iter().position(|c| c.filter == self.user_target);
+        match (settled_idx, target_idx) {
+            (Some(s), Some(t)) if s <= t => {
+                self.active = norm_settled;
+            }
+            _ => {
+                self.active = self.user_target;
+            }
+        }
+        self.high_streak = 0;
+        self.low_streak = 0;
+        self.cooldown = 0;
+        self.up_lockout_remaining = 0;
+        self.frames_since_step_up = None;
+        self.window.clear();
+    }
+
+    pub fn set_enabled(&mut self, enabled: bool) {
+        if self.enabled != enabled {
+            self.enabled = enabled;
+            self.high_streak = 0;
+            self.low_streak = 0;
+        }
+    }
+
+    pub fn active_filter(&self) -> DisplayFilter {
+        self.active
+    }
+
+    /// Updates the user-chosen filter target and clears transient streaks and flap backoff.
+    pub fn set_user_target(&mut self, filter: DisplayFilter) {
+        let norm = canonical_governor_filter(filter);
+        self.user_target = norm;
+        self.active = norm;
+        self.high_streak = 0;
+        self.low_streak = 0;
+        self.cooldown = 0;
+        self.up_lockout_remaining = 0;
+        self.current_lockout_frames = GOVERNOR_BASE_LOCKOUT_FRAMES;
+        self.frames_since_step_up = None;
+        self.window.clear();
+    }
+
+    pub fn sync_external_filter(&mut self, filter: DisplayFilter) {
+        let norm = canonical_governor_filter(filter);
+        if norm != canonical_governor_filter(self.active) {
+            self.set_user_target(norm);
+        }
+    }
+
+    fn rolling_p95(&mut self) -> Option<f64> {
+        if self.window.len() < GOVERNOR_WINDOW_FRAMES / 2 {
+            return None;
+        }
+        self.scratch.clear();
+        self.scratch.extend(self.window.iter().copied());
+        self.scratch.sort_by(f64::total_cmp);
+        let idx = ((self.scratch.len() - 1) * 95) / 100;
+        self.scratch.get(idx).copied()
+    }
+
+    /// Selects the most expensive strictly cheaper filter predicted to keep total work time
+    /// under ~50% of budget, or the cheapest measured filter when none fits under 50%.
+    fn select_target_under_budget(&self, rolling_p95_ms: f64) -> Option<DisplayFilter> {
+        let active_norm = canonical_governor_filter(self.active);
+        let cur_idx = self.costs.iter().position(|c| c.filter == active_norm)?;
+        if cur_idx == 0 {
+            return None;
+        }
+        let cur_cost_ms = self.costs[cur_idx].cost_ms;
+        let est_base_ms = (rolling_p95_ms - cur_cost_ms).max(0.0);
+        let target_budget_ms = GOVERNOR_BUDGET_MS * GOVERNOR_TARGET_PCT;
+
+        for cand in self.costs[..cur_idx].iter().rev() {
+            if cand.cost_ms <= cur_cost_ms && est_base_ms + cand.cost_ms <= target_budget_ms {
+                return Some(cand.filter);
+            }
+        }
+        // Fallback: jump straight to the cheapest measured filter (never a costlier filter).
+        let cheapest = self.costs[0];
+        if cheapest.filter != active_norm && cheapest.cost_ms <= cur_cost_ms {
+            Some(cheapest.filter)
+        } else {
+            None
+        }
+    }
+
+    /// Selects the next costlier filter one tier above `active` (capped at `user_target`)
+    /// only when its measured cost predicts total frame work below ~50% of budget.
+    fn select_next_step_up(&self, rolling_p95_ms: f64) -> Option<DisplayFilter> {
+        let active_norm = canonical_governor_filter(self.active);
+        let target_norm = canonical_governor_filter(self.user_target);
+        if active_norm == target_norm {
+            return None;
+        }
+        let cur_idx = self.costs.iter().position(|c| c.filter == active_norm)?;
+        let target_idx = self.costs.iter().position(|c| c.filter == target_norm)?;
+        if cur_idx >= target_idx || cur_idx + 1 >= self.costs.len() {
+            return None;
+        }
+        let cur_cost_ms = self.costs[cur_idx].cost_ms;
+        let next = self.costs[cur_idx + 1];
+        let est_base_ms = (rolling_p95_ms - cur_cost_ms).max(0.0);
+        let target_budget_ms = GOVERNOR_BUDGET_MS * GOVERNOR_TARGET_PCT;
+        if est_base_ms + next.cost_ms < target_budget_ms {
+            Some(next.filter)
+        } else {
+            None
+        }
+    }
+
+    /// Feeds one completed frame's work time (`ms`) and returns any filter transition.
+    pub fn record_frame(&mut self, work_ms: f64) -> Option<GovernorTransition> {
+        if !self.enabled {
+            return None;
+        }
+        if self.window.len() == GOVERNOR_WINDOW_FRAMES {
+            self.window.pop_front();
+        }
+        self.window.push_back(work_ms.max(0.0));
+
+        if let Some(frames_up) = self.frames_since_step_up {
+            let next_frames = frames_up.saturating_add(1);
+            if next_frames > GOVERNOR_FLAP_WINDOW_FRAMES {
+                self.frames_since_step_up = None;
+                self.current_lockout_frames = GOVERNOR_BASE_LOCKOUT_FRAMES;
+            } else {
+                self.frames_since_step_up = Some(next_frames);
+            }
+        }
+
+        if self.up_lockout_remaining > 0 {
+            self.up_lockout_remaining -= 1;
+        }
+
+        if self.frames_since_step_up.is_none() && self.cooldown > 0 {
+            self.cooldown -= 1;
+            return None;
+        }
+
+        let p95 = self.rolling_p95()?;
+        let high_thresh = GOVERNOR_BUDGET_MS * GOVERNOR_HIGH_PCT;
+        let low_thresh = GOVERNOR_BUDGET_MS * GOVERNOR_RECOVERY_LOW_PCT;
+
+        if p95 > high_thresh {
+            self.low_streak = 0;
+            if work_ms > high_thresh {
+                self.high_streak += 1;
+            } else {
+                // Current frame is below 70%: do not count recovering frames toward overload.
+                self.high_streak = self.high_streak.saturating_sub(1);
+            }
+            let in_flap_probation = self.frames_since_step_up.is_some();
+            let sustain_met = in_flap_probation || self.high_streak >= GOVERNOR_DOWN_SUSTAIN_FRAMES;
+            if sustain_met && let Some(next) = self.select_target_under_budget(p95) {
+                let prev = self.active;
+                self.active = next;
+                self.high_streak = 0;
+                self.low_streak = 0;
+                self.cooldown = GOVERNOR_COOLDOWN_FRAMES;
+                let next_lockout = if in_flap_probation {
+                    self.current_lockout_frames
+                        .saturating_mul(2)
+                        .max(GOVERNOR_BASE_LOCKOUT_FRAMES * 2)
+                } else {
+                    GOVERNOR_BASE_LOCKOUT_FRAMES
+                };
+                self.current_lockout_frames = next_lockout;
+                self.up_lockout_remaining = next_lockout;
+                self.frames_since_step_up = None;
+                self.window.clear();
+                return Some(GovernorTransition {
+                    kind: GovernorTransitionKind::StepDown,
+                    from: prev,
+                    to: next,
+                    rolling_p95_ms: p95,
+                });
+            }
+            return None;
+        }
+
+        self.high_streak = 0;
+        if self.up_lockout_remaining == 0 && p95 < low_thresh {
+            if let Some(next_up) = self.select_next_step_up(p95) {
+                self.low_streak += 1;
+                if self.low_streak >= GOVERNOR_RECOVERY_SUSTAIN_FRAMES {
+                    let prev = self.active;
+                    self.active = next_up;
+                    self.low_streak = 0;
+                    self.high_streak = 0;
+                    self.cooldown = 0;
+                    self.frames_since_step_up = Some(0);
+                    self.window.clear();
+                    return Some(GovernorTransition {
+                        kind: GovernorTransitionKind::StepUp,
+                        from: prev,
+                        to: next_up,
+                        rolling_p95_ms: p95,
+                    });
+                }
+            } else {
+                self.low_streak = 0;
+            }
+        } else {
+            self.low_streak = 0;
+        }
+
+        None
     }
 }

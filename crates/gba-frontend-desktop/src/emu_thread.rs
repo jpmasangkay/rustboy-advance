@@ -4,16 +4,16 @@
 //! - Lock-free triple buffer for 240x160 (38,400 pixel) BGR555 frame presentation (no Mutex on frame path).
 //! - Thread-safe AtomicU16 input keypad register.
 //! - Dynamic Rate Control (DRC) audio pacing from the SPSC ring buffer:
-//!     target = capacity / 2, ratio = 1.0 + 0.005 * ((target - filled) / target), clamped to ±0.5%.
-//!     Fallback to Instant-based 59.7275 Hz pacer when no audio device exists.
+//!   `target = capacity / 2, ratio = 1.0 + 0.005 * ((target - filled) / target)`, clamped to ±0.5%.
+//!   Fallback to Instant-based 59.7275 Hz pacer when no audio device exists.
 //! - Error channel delivering background emulation errors to the UI status bar without `eprintln!`.
 
 #![allow(dead_code)]
 
 use std::cell::UnsafeCell;
-use std::sync::atomic::{AtomicBool, AtomicU16, AtomicUsize, Ordering};
-use std::sync::mpsc::{channel, Receiver, Sender};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, AtomicU16, AtomicUsize, Ordering};
+use std::sync::mpsc::{Receiver, Sender, channel};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
@@ -59,6 +59,7 @@ impl SharedTripleBuffer {
     ///
     /// # Safety
     /// Only the emulation worker thread accesses this write slot before publishing.
+    #[allow(clippy::mut_from_ref)]
     pub unsafe fn write_buffer_mut(&self, slot: usize) -> &mut [u16; FRAME_PIXELS] {
         unsafe { &mut *self.buffers[slot].get() }
     }
@@ -97,47 +98,182 @@ impl SharedTripleBuffer {
     }
 }
 
+#[cfg(windows)]
+pub(crate) mod win_timer {
+    use std::ffi::c_void;
+    use std::ptr::{null, null_mut};
+    use std::time::Duration;
+
+    const CREATE_WAITABLE_TIMER_HIGH_RESOLUTION: u32 = 0x0000_0002;
+    const TIMER_ALL_ACCESS: u32 = 0x001F_0003;
+    const INFINITE: u32 = 0xFFFF_FFFF;
+
+    #[link(name = "kernel32")]
+    unsafe extern "system" {
+        fn CreateWaitableTimerExW(
+            lp_timer_attributes: *const c_void,
+            lp_timer_name: *const u16,
+            dw_flags: u32,
+            dw_desired_access: u32,
+        ) -> *mut c_void;
+        fn SetWaitableTimer(
+            h_timer: *mut c_void,
+            lp_due_time: *const i64,
+            l_period: i32,
+            pfn_completion_routine: *const c_void,
+            lp_arg_to_completion_routine: *const c_void,
+            f_resume: i32,
+        ) -> i32;
+        fn WaitForSingleObject(h_handle: *mut c_void, dw_milliseconds: u32) -> u32;
+        fn CloseHandle(h_object: *mut c_void) -> i32;
+    }
+
+    #[link(name = "winmm")]
+    unsafe extern "system" {
+        fn timeBeginPeriod(u_period: u32) -> u32;
+        fn timeEndPeriod(u_period: u32) -> u32;
+    }
+
+    pub struct HighResSleepTimer {
+        handle: *mut c_void,
+        has_period_guard: bool,
+    }
+
+    // Kernel waitable timer HANDLE is only mutated through `&mut self`.
+    unsafe impl Send for HighResSleepTimer {}
+
+    impl HighResSleepTimer {
+        pub fn new() -> Self {
+            // SAFETY: Standard Win32 calls with null security/name pointers; fallback handles null.
+            unsafe {
+                let period_ok = timeBeginPeriod(1) == 0;
+                let mut handle = CreateWaitableTimerExW(
+                    null(),
+                    null(),
+                    CREATE_WAITABLE_TIMER_HIGH_RESOLUTION,
+                    TIMER_ALL_ACCESS,
+                );
+                if handle.is_null() {
+                    handle = CreateWaitableTimerExW(null(), null(), 0, TIMER_ALL_ACCESS);
+                }
+                Self {
+                    handle,
+                    has_period_guard: period_ok,
+                }
+            }
+        }
+
+        pub fn sleep_for(&mut self, duration: Duration) {
+            let units_100ns = (duration.as_nanos() / 100) as i64;
+            if units_100ns <= 0 {
+                return;
+            }
+            if !self.handle.is_null() {
+                let due_time = -units_100ns;
+                // SAFETY: `self.handle` is a valid waitable timer owned by `self`.
+                unsafe {
+                    if SetWaitableTimer(self.handle, &due_time, 0, null(), null(), 0) != 0 {
+                        let _ = WaitForSingleObject(self.handle, INFINITE);
+                        return;
+                    }
+                }
+            }
+            std::thread::sleep(duration);
+        }
+    }
+
+    impl Drop for HighResSleepTimer {
+        fn drop(&mut self) {
+            // SAFETY: Closes owned timer handle and releases matching `timeBeginPeriod(1)`.
+            unsafe {
+                if !self.handle.is_null() {
+                    let _ = CloseHandle(self.handle);
+                    self.handle = null_mut();
+                }
+                if self.has_period_guard {
+                    let _ = timeEndPeriod(1);
+                    self.has_period_guard = false;
+                }
+            }
+        }
+    }
+}
+
 /// Dynamic Rate Control (DRC) pacer for the emulation thread.
 pub struct DrcPacer {
     target: usize,
     base_frame_duration: Duration,
-    last_frame_instant: Instant,
+    next_deadline: Instant,
+    #[cfg(windows)]
+    timer: win_timer::HighResSleepTimer,
 }
 
 impl DrcPacer {
     pub fn new(capacity: usize) -> Self {
         Self {
             target: capacity / 2,
-            base_frame_duration: Duration::from_secs_f64(1.0 / 59.7275),
-            last_frame_instant: Instant::now(),
+            base_frame_duration: Duration::from_secs_f64(280_896.0 / 16_777_216.0),
+            next_deadline: Instant::now(),
+            #[cfg(windows)]
+            timer: win_timer::HighResSleepTimer::new(),
         }
     }
 
-    /// Paces the emulation thread using the SPSC queue fill level:
-    /// target = capacity / 2
-    /// resample ratio = 1.0 + 0.005 * ((target - filled) / target), clamped to ±0.5%.
-    /// Falls back to Instant-based 59.7275 Hz pacer when no audio device is present.
-    pub fn pace(&mut self, filled: usize, has_audio_device: bool) {
-        let frame_duration = if has_audio_device {
+    pub fn set_target(&mut self, target: usize) {
+        self.target = target.max(1);
+    }
+
+    pub fn set_base_fps(&mut self, fps: f64) {
+        if fps.is_finite() && fps > 1.0 {
+            self.base_frame_duration = Duration::from_secs_f64(1.0 / fps);
+        }
+    }
+
+    pub fn next_period_duration(&self, filled: usize, has_audio_device: bool) -> Duration {
+        if has_audio_device {
             let target_f = self.target as f64;
             let filled_f = filled as f64;
             let ratio = (1.0 + 0.005 * ((target_f - filled_f) / target_f)).clamp(0.995, 1.005);
             self.base_frame_duration.div_f64(ratio)
         } else {
             self.base_frame_duration
-        };
+        }
+    }
 
-        let elapsed = self.last_frame_instant.elapsed();
-        if elapsed < frame_duration {
-            let sleep_time = frame_duration - elapsed;
-            if sleep_time > Duration::from_millis(1) {
-                thread::sleep(sleep_time - Duration::from_millis(1));
+    /// Paces the emulation thread using the SPSC queue fill level:
+    /// target = capacity / 2 (or adaptive target),
+    /// resample ratio = 1.0 + 0.005 * ((target - filled) / target), clamped to ±0.5%.
+    /// Uses a high-resolution Windows waitable timer + timeBeginPeriod(1) with a short
+    /// final spin tail, falling back to 59.7275 Hz pacing when no audio device is present.
+    pub fn pace(&mut self, filled: usize, has_audio_device: bool) {
+        let frame_duration = self.next_period_duration(filled, has_audio_device);
+
+        let target_instant = self.next_deadline + frame_duration;
+        let now = Instant::now();
+        if now < target_instant {
+            let remaining = target_instant - now;
+            let spin_tail = Duration::from_micros(650);
+            if remaining > spin_tail {
+                let sleep_dur = remaining - spin_tail;
+                #[cfg(windows)]
+                self.timer.sleep_for(sleep_dur);
+                #[cfg(not(windows))]
+                thread::sleep(sleep_dur);
             }
-            while self.last_frame_instant.elapsed() < frame_duration {
+            while Instant::now() < target_instant {
                 std::hint::spin_loop();
             }
+            self.next_deadline = target_instant;
+        } else {
+            // Keep sub-800us jitter aligned to phase, but snap after larger OS/CPU stalls so
+            // subsequent frames do not rush and trigger cascading cadence jitter.
+            let overshoot = now - target_instant;
+            if overshoot > Duration::from_micros(800) {
+                self.next_deadline = now;
+            } else {
+                self.next_deadline = target_instant;
+            }
         }
-        self.last_frame_instant = Instant::now();
     }
 }
 
@@ -204,6 +340,9 @@ impl EmuThreadHandle {
         let worker_join = thread::Builder::new()
             .name("gba-core-worker".into())
             .spawn(move || {
+                // Elevate emulation worker under MMCSS "Games" / ABOVE_NORMAL so
+                // background processes on constrained hardware do not preempt frame pacing.
+                let _mmcss_guard = crate::audio::win_mmcss::MmcssGuard::enter_games();
                 let capacity = audio.capacity();
                 let mut pacer = DrcPacer::new(capacity);
                 let mut write_slot = tb.next_write_slot(0);
@@ -220,7 +359,8 @@ impl EmuThreadHandle {
                             }
                             EmuCommand::LoadState(bytes) => {
                                 if let Err(e) = core.load_state(&bytes) {
-                                    let _ = error_tx.send(format!("Failed to load save state: {e:?}"));
+                                    let _ =
+                                        error_tx.send(format!("Failed to load save state: {e:?}"));
                                 } else {
                                     tb.mark_dirty();
                                 }
@@ -253,6 +393,7 @@ impl EmuThreadHandle {
 
                     // Dynamic rate control pacing
                     let filled = audio.occupied_len();
+                    pacer.set_target(audio.target_fill());
                     pacer.pace(filled, audio.has_device());
                 }
             })
@@ -286,7 +427,9 @@ impl EmuThreadHandle {
     pub fn save_state_sync(&self) -> Result<Vec<u8>, String> {
         let (reply_tx, reply_rx) = channel();
         let _ = self.cmd_tx.send(EmuCommand::SaveState(reply_tx));
-        reply_rx.recv().map_err(|e| format!("Worker save state timeout: {e}"))?
+        reply_rx
+            .recv()
+            .map_err(|e| format!("Worker save state timeout: {e}"))?
     }
 }
 

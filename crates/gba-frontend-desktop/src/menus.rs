@@ -11,12 +11,7 @@ use crate::config::{
     ShaderPreset, ViewportScale,
 };
 
-fn toolbar_btn(
-    ui: &mut egui::Ui,
-    label: &str,
-    active: bool,
-    enabled: bool,
-) -> egui::Response {
+fn toolbar_btn(ui: &mut egui::Ui, label: &str, active: bool, enabled: bool) -> egui::Response {
     let text_color = if !enabled {
         crate::theme::COLOR_TEXT_DISABLED
     } else if active {
@@ -307,6 +302,27 @@ impl RustboyApp {
                             self.show_rewind_settings = true;
                             ui.close_menu();
                         }
+                        ui.menu_button("Run-Ahead Latency", |ui| {
+                            if ui
+                                .radio(self.config.run_ahead_frames == 0, "Off (0 Frames)")
+                                .clicked()
+                            {
+                                self.config.run_ahead_frames = 0;
+                                self.config.save();
+                                ui.close_menu();
+                            }
+                            if ui
+                                .radio(
+                                    self.config.run_ahead_frames == 1,
+                                    "1 Frame (Low Latency)",
+                                )
+                                .clicked()
+                            {
+                                self.config.run_ahead_frames = 1;
+                                self.config.save();
+                                ui.close_menu();
+                            }
+                        });
                         ui.menu_button("PPU Accuracy", |ui| {
                             if ui
                                 .radio(!self.config.dot_accurate_ppu, "Fast Scanline Renderer")
@@ -426,24 +442,23 @@ impl RustboyApp {
                                             )
                                             .clicked()
                                         {
-                                            self.config.display_filter = filter;
-                                            self.config.shader_preset = match filter {
-                                                DisplayFilter::MyBoySmooth => ShaderPreset::SharpBilinear,
-                                                DisplayFilter::Sharp1x | DisplayFilter::RawNearest => ShaderPreset::Nearest,
-                                                DisplayFilter::XbrSmooth3x => ShaderPreset::Nearest,
-                                                DisplayFilter::AuthenticGbaLcd => ShaderPreset::LcdGrid,
-                                                DisplayFilter::SoftHandheld => ShaderPreset::SharpBilinear,
-                                                DisplayFilter::SmoothScale2x => ShaderPreset::ScaleEdge,
-                                            };
-                                            self.config.scanline_grid = filter == DisplayFilter::AuthenticGbaLcd;
-                                            self.config.save();
-                                            self.sink.frame_dirty = true;
-                                            self.lcd_tex = None;
+                                            self.set_display_filter_from_user(filter);
                                             ui.close_menu();
                                         }
                                     }
                                 },
                             );
+                            if ui
+                                .checkbox(
+                                    &mut self.config.auto_quality_governor,
+                                    "Auto Quality Governor (Step Down Under Load)",
+                                )
+                                .clicked()
+                            {
+                                self.quality_governor
+                                    .set_enabled(self.config.auto_quality_governor);
+                                self.config.save();
+                            }
                             ui.separator();
                             ui.horizontal(|ui| {
                                 ui.label("LCD Grid Intensity:");
@@ -959,20 +974,8 @@ impl RustboyApp {
                     let filter_label = format!("🎛 Filter: {}", self.config.display_filter.label());
                     let filter_resp = toolbar_btn(ui, &filter_label, false, true);
                     if filter_resp.clicked() {
-                        self.config.display_filter = self.config.display_filter.next();
-                        self.config.shader_preset = match self.config.display_filter {
-                            DisplayFilter::MyBoySmooth => ShaderPreset::SharpBilinear,
-                            DisplayFilter::Sharp1x | DisplayFilter::RawNearest => ShaderPreset::Nearest,
-                            DisplayFilter::XbrSmooth3x => ShaderPreset::Nearest,
-                            DisplayFilter::AuthenticGbaLcd => ShaderPreset::LcdGrid,
-                            DisplayFilter::SoftHandheld => ShaderPreset::SharpBilinear,
-                            DisplayFilter::SmoothScale2x => ShaderPreset::ScaleEdge,
-                        };
-                        self.config.scanline_grid =
-                            self.config.display_filter == DisplayFilter::AuthenticGbaLcd;
-                        self.config.save();
-                        self.sink.frame_dirty = true;
-                        self.lcd_tex = None;
+                        let next_filter = self.config.display_filter.next();
+                        self.set_display_filter_from_user(next_filter);
                     }
                     let filter_desc = self.config.display_filter.description();
                     let filter_resp = filter_resp.on_hover_text(format!(
@@ -984,21 +987,21 @@ impl RustboyApp {
                                 .selectable_label(self.config.display_filter == f, f.description())
                                 .clicked()
                             {
-                                self.config.display_filter = f;
-                                self.config.shader_preset = match f {
-                                    DisplayFilter::MyBoySmooth => ShaderPreset::SharpBilinear,
-                                    DisplayFilter::Sharp1x | DisplayFilter::RawNearest => ShaderPreset::Nearest,
-                                    DisplayFilter::XbrSmooth3x => ShaderPreset::Nearest,
-                                    DisplayFilter::AuthenticGbaLcd => ShaderPreset::LcdGrid,
-                                    DisplayFilter::SoftHandheld => ShaderPreset::SharpBilinear,
-                                    DisplayFilter::SmoothScale2x => ShaderPreset::ScaleEdge,
-                                };
-                                self.config.scanline_grid = f == DisplayFilter::AuthenticGbaLcd;
-                                self.config.save();
-                                self.sink.frame_dirty = true;
-                                self.lcd_tex = None;
+                                self.set_display_filter_from_user(f);
                                 ui.close_menu();
                             }
+                        }
+                        ui.separator();
+                        if ui
+                            .checkbox(
+                                &mut self.config.auto_quality_governor,
+                                "Auto Quality Governor",
+                            )
+                            .clicked()
+                        {
+                            self.quality_governor
+                                .set_enabled(self.config.auto_quality_governor);
+                            self.config.save();
                         }
                         ui.separator();
                         ui.horizontal(|ui| {

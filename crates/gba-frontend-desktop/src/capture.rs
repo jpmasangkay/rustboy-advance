@@ -157,7 +157,9 @@ impl<W: Write> GifRecorder<W> {
             ));
         }
 
-        let take = self.source_frames.is_multiple_of(self.fps_mode.frame_skip());
+        let take = self
+            .source_frames
+            .is_multiple_of(self.fps_mode.frame_skip());
         self.source_frames += 1;
         if !take {
             return Ok(false);
@@ -174,18 +176,15 @@ impl<W: Write> GifRecorder<W> {
         color_correction: bool,
         profile: ColorProfileChoice,
     ) -> Result<bool, String> {
-        let take = self.source_frames.is_multiple_of(self.fps_mode.frame_skip());
+        let take = self
+            .source_frames
+            .is_multiple_of(self.fps_mode.frame_skip());
         self.source_frames += 1;
         if !take {
             return Ok(false);
         }
 
-        bgr555_to_rgba(
-            fb_bgr555,
-            color_correction,
-            profile,
-            &mut self.scratch_rgba,
-        );
+        bgr555_to_rgba(fb_bgr555, color_correction, profile, &mut self.scratch_rgba);
         self.encode_scratch_frame()?;
         Ok(true)
     }
@@ -449,8 +448,9 @@ impl CaptureController {
         if self.gif.is_some() {
             return Err("GIF recording is already active".into());
         }
-        let path = custom_path
-            .unwrap_or_else(|| capture_output_path(&AppConfig::screenshots_dir(), rom_title, "gif"));
+        let path = custom_path.unwrap_or_else(|| {
+            capture_output_path(&AppConfig::screenshots_dir(), rom_title, "gif")
+        });
         let rec = GifRecorder::start(path.clone(), self.gif_fps_mode)?;
         self.gif = Some(rec);
         Ok(path)
@@ -472,8 +472,9 @@ impl CaptureController {
         if self.wav.is_some() {
             return Err("WAV audio recording is already active".into());
         }
-        let path = custom_path
-            .unwrap_or_else(|| capture_output_path(&AppConfig::screenshots_dir(), rom_title, "wav"));
+        let path = custom_path.unwrap_or_else(|| {
+            capture_output_path(&AppConfig::screenshots_dir(), rom_title, "wav")
+        });
         let rec = WavRecorder::start(path.clone())?;
         self.wav = Some(rec);
         Ok(path)
@@ -598,7 +599,9 @@ mod tests {
         assert_eq!(summary30.source_frames, 4);
         assert!(gif30_bytes.starts_with(b"GIF89a"));
 
-        let mut dec30 = gif::DecodeOptions::new().read_info(Cursor::new(&gif30_bytes)).unwrap();
+        let mut dec30 = gif::DecodeOptions::new()
+            .read_info(Cursor::new(&gif30_bytes))
+            .unwrap();
         let mut count30 = 0usize;
         while let Some(frame) = dec30.read_next_frame().unwrap() {
             assert_eq!(frame.delay, 3);
@@ -683,8 +686,12 @@ mod tests {
         );
 
         let mut gif = GifRecorder::start(gif_path.clone(), GifFpsMode::Fps60).unwrap();
-        gif.push_bgr555_frame(&solid_bgr555_frame(0x03E0), false, ColorProfileChoice::Linear)
-            .unwrap();
+        gif.push_bgr555_frame(
+            &solid_bgr555_frame(0x03E0),
+            false,
+            ColorProfileChoice::Linear,
+        )
+        .unwrap();
         let (_, gsum) = gif.finish().unwrap();
         assert_eq!(gsum.frames_written, 1);
         assert_eq!(gsum.path.as_deref(), Some(gif_path.as_path()));
@@ -702,7 +709,10 @@ mod tests {
         assert_eq!(wav_disk.len(), 52);
         assert_eq!(&wav_disk[0..4], b"RIFF");
         assert_eq!(&wav_disk[8..12], b"WAVE");
-        assert_eq!(u32::from_le_bytes([wav_disk[4], wav_disk[5], wav_disk[6], wav_disk[7]]), 44);
+        assert_eq!(
+            u32::from_le_bytes([wav_disk[4], wav_disk[5], wav_disk[6], wav_disk[7]]),
+            44
+        );
         assert_eq!(
             u32::from_le_bytes([wav_disk[40], wav_disk[41], wav_disk[42], wav_disk[43]]),
             8

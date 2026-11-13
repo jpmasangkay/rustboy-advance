@@ -578,11 +578,7 @@ impl KeyBindings {
         match target {
             ControlTarget::Button(btn) => {
                 let s = self.key_name(btn);
-                if s.is_empty() {
-                    None
-                } else {
-                    Some(s)
-                }
+                if s.is_empty() { None } else { Some(s) }
             }
             ControlTarget::TurboA => self.turbo_a.as_deref(),
             ControlTarget::TurboB => self.turbo_b.as_deref(),
@@ -737,23 +733,25 @@ impl ViewportScale {
 #[derive(Copy, Clone, PartialEq, Eq, Debug, Serialize, Deserialize, Default)]
 pub enum DisplayFilter {
     #[default]
-    MyBoySmooth,     // 1x (240x160) Native Linear ("MyBoy Smooth")
+    MyBoySmooth, // 1x (240x160) Native Linear ("MyBoy Smooth")
     Sharp1x,         // 1x (240x160) Native Nearest ("Sharp 1x")
     XbrSmooth3x,     // 3x (720x480) xBR 3x edge smoothing (Laptop HD)
     AuthenticGbaLcd, // 3x (720x480) LCD Subpixel Dot-Matrix
     SoftHandheld,    // 2x (480x320) Sharp-Bilinear
     SmoothScale2x,   // 2x (480x320) EPX / Scale2x diagonal smoothing
+    CrtScanlines,    // 2x (480x320) CRT Scanlines
     RawNearest,      // Backward compatibility alias for Sharp 1x
 }
 
 impl DisplayFilter {
-    pub const ALL: [Self; 6] = [
+    pub const ALL: [Self; 7] = [
         Self::MyBoySmooth,
         Self::Sharp1x,
         Self::XbrSmooth3x,
         Self::AuthenticGbaLcd,
         Self::SoftHandheld,
         Self::SmoothScale2x,
+        Self::CrtScanlines,
     ];
 
     pub fn label(self) -> &'static str {
@@ -764,6 +762,7 @@ impl DisplayFilter {
             Self::AuthenticGbaLcd => "LCD Matrix",
             Self::SoftHandheld => "Soft LCD",
             Self::SmoothScale2x => "Scale2x",
+            Self::CrtScanlines => "CRT Scanlines",
         }
     }
 
@@ -775,6 +774,7 @@ impl DisplayFilter {
             Self::AuthenticGbaLcd => "LCD Matrix (3x subpixel grid)",
             Self::SoftHandheld => "Soft Handheld (2x sharp-bilinear)",
             Self::SmoothScale2x => "Smooth Pixel Art (Scale2x / EPX)",
+            Self::CrtScanlines => "CRT Scanlines (2x with scanline beam gaps)",
         }
     }
 
@@ -785,7 +785,8 @@ impl DisplayFilter {
             Self::XbrSmooth3x => Self::AuthenticGbaLcd,
             Self::AuthenticGbaLcd => Self::SoftHandheld,
             Self::SoftHandheld => Self::SmoothScale2x,
-            Self::SmoothScale2x => Self::MyBoySmooth,
+            Self::SmoothScale2x => Self::CrtScanlines,
+            Self::CrtScanlines => Self::MyBoySmooth,
         }
     }
 
@@ -796,7 +797,7 @@ impl DisplayFilter {
             Self::XbrSmooth3x | Self::AuthenticGbaLcd | Self::SoftHandheld => {
                 egui::TextureOptions::LINEAR
             }
-            Self::SmoothScale2x => egui::TextureOptions::NEAREST,
+            Self::SmoothScale2x | Self::CrtScanlines => egui::TextureOptions::NEAREST,
         }
     }
 
@@ -808,9 +809,30 @@ impl DisplayFilter {
             Self::XbrSmooth3x | Self::AuthenticGbaLcd => {
                 (gba_core::LCD_WIDTH * 3, gba_core::LCD_HEIGHT * 3)
             }
-            Self::SoftHandheld | Self::SmoothScale2x => {
+            Self::SoftHandheld | Self::SmoothScale2x | Self::CrtScanlines => {
                 (gba_core::LCD_WIDTH * 2, gba_core::LCD_HEIGHT * 2)
             }
+        }
+    }
+
+    pub const fn default_shader_preset(self) -> ShaderPreset {
+        match self {
+            Self::MyBoySmooth | Self::SoftHandheld => ShaderPreset::SharpBilinear,
+            Self::Sharp1x | Self::RawNearest | Self::XbrSmooth3x => ShaderPreset::Nearest,
+            Self::AuthenticGbaLcd => ShaderPreset::LcdGrid,
+            Self::SmoothScale2x => ShaderPreset::ScaleEdge,
+            Self::CrtScanlines => ShaderPreset::CrtScanlines,
+        }
+    }
+
+    pub const fn quality_tier(self) -> u8 {
+        match self {
+            Self::Sharp1x | Self::RawNearest => 0,
+            Self::MyBoySmooth => 1,
+            Self::SoftHandheld => 2,
+            Self::CrtScanlines | Self::AuthenticGbaLcd => 3,
+            Self::SmoothScale2x => 4,
+            Self::XbrSmooth3x => 5,
         }
     }
 }
@@ -877,12 +899,8 @@ pub enum ColorProfileChoice {
 }
 
 impl ColorProfileChoice {
-    pub const ALL: [ColorProfileChoice; 4] = [
-        Self::Agb001,
-        Self::Ags101,
-        Self::Ags001,
-        Self::Linear,
-    ];
+    pub const ALL: [ColorProfileChoice; 4] =
+        [Self::Agb001, Self::Ags101, Self::Ags001, Self::Linear];
 
     pub const fn label(self) -> &'static str {
         match self {
@@ -1046,6 +1064,14 @@ fn default_max_frameskip() -> u8 {
     3
 }
 
+fn default_run_ahead_frames() -> u8 {
+    0
+}
+
+fn default_auto_quality_governor() -> bool {
+    true
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(default)]
 pub struct AppConfig {
@@ -1064,6 +1090,10 @@ pub struct AppConfig {
     pub viewport_scale: ViewportScale,
     #[serde(default)]
     pub display_filter: DisplayFilter,
+    #[serde(default = "default_auto_quality_governor")]
+    pub auto_quality_governor: bool,
+    #[serde(default)]
+    pub governor_settled_filters: BTreeMap<String, DisplayFilter>,
     #[serde(default)]
     pub shader_preset: ShaderPreset,
     #[serde(default)]
@@ -1073,6 +1103,8 @@ pub struct AppConfig {
     pub auto_frameskip: bool,
     #[serde(default = "default_max_frameskip")]
     pub max_frameskip: u8,
+    #[serde(default = "default_run_ahead_frames")]
+    pub run_ahead_frames: u8,
     #[serde(default)]
     pub dmg_palette: DmgPaletteChoice,
     pub master_volume: u8,
@@ -1125,11 +1157,14 @@ impl Default for AppConfig {
             lcd_grid_intensity: 0.08,
             viewport_scale: ViewportScale::FitWindow,
             display_filter: DisplayFilter::MyBoySmooth,
+            auto_quality_governor: default_auto_quality_governor(),
+            governor_settled_filters: BTreeMap::new(),
             shader_preset: ShaderPreset::Nearest,
             frame_blending: false,
             dot_accurate_ppu: false,
             auto_frameskip: default_auto_frameskip(),
             max_frameskip: default_max_frameskip(),
+            run_ahead_frames: default_run_ahead_frames(),
             dmg_palette: DmgPaletteChoice::default(),
             master_volume: 100,
             muted: false,
@@ -1186,17 +1221,17 @@ impl AppConfig {
     pub fn from_json_str(raw: &str) -> Self {
         let mut cfg: Self = serde_json::from_str(raw).unwrap_or_default();
         if let Ok(val) = serde_json::from_str::<serde_json::Value>(raw) {
-            if val.get("display_filter").is_none() {
-                if val.get("scanline_grid").is_some() || val.get("shader_preset").is_some() {
-                    if cfg.scanline_grid || cfg.shader_preset == ShaderPreset::LcdGrid {
-                        cfg.display_filter = DisplayFilter::AuthenticGbaLcd;
-                    } else if cfg.shader_preset == ShaderPreset::SharpBilinear {
-                        cfg.display_filter = DisplayFilter::SoftHandheld;
-                    } else if cfg.shader_preset == ShaderPreset::ScaleEdge {
-                        cfg.display_filter = DisplayFilter::SmoothScale2x;
-                    } else if cfg.shader_preset == ShaderPreset::Nearest {
-                        cfg.display_filter = DisplayFilter::RawNearest;
-                    }
+            if val.get("display_filter").is_none()
+                && (val.get("scanline_grid").is_some() || val.get("shader_preset").is_some())
+            {
+                if cfg.scanline_grid || cfg.shader_preset == ShaderPreset::LcdGrid {
+                    cfg.display_filter = DisplayFilter::AuthenticGbaLcd;
+                } else if cfg.shader_preset == ShaderPreset::SharpBilinear {
+                    cfg.display_filter = DisplayFilter::SoftHandheld;
+                } else if cfg.shader_preset == ShaderPreset::ScaleEdge {
+                    cfg.display_filter = DisplayFilter::SmoothScale2x;
+                } else if cfg.shader_preset == ShaderPreset::Nearest {
+                    cfg.display_filter = DisplayFilter::RawNearest;
                 }
             }
             if val.get("shader_preset").is_none() && cfg.scanline_grid {
@@ -1255,6 +1290,52 @@ impl AppConfig {
         self.per_rom
             .get(&exact_key)
             .or_else(|| self.per_rom.get(code))
+    }
+
+    /// Maps an output viewport resolution + configured scale into a deterministic bucket string
+    /// for per-`(adapter, resolution)` governor filter persistence.
+    pub fn resolution_bucket(width: u32, height: u32, window_scale: u8) -> String {
+        if width == 0 || height == 0 {
+            let s = window_scale.clamp(1, 5) as u32;
+            return format!("{}x{}", 240 * s, 160 * s);
+        }
+        if width.is_multiple_of(240)
+            && height.is_multiple_of(160)
+            && (width / 240) == (height / 160)
+        {
+            return format!("{width}x{height}");
+        }
+        match height {
+            0..=240 => "240p".to_string(),
+            241..=360 => "360p".to_string(),
+            361..=540 => "480p".to_string(),
+            541..=720 => "720p".to_string(),
+            721..=1080 => "1080p".to_string(),
+            _ => "1440p+".to_string(),
+        }
+    }
+
+    pub fn governor_profile_key(
+        adapter_name: &str,
+        adapter_backend: &str,
+        width: u32,
+        height: u32,
+        window_scale: u8,
+    ) -> String {
+        format!(
+            "{}|{}|{}",
+            adapter_backend.trim(),
+            adapter_name.trim(),
+            Self::resolution_bucket(width, height, window_scale)
+        )
+    }
+
+    pub fn settled_filter_for(&self, key: &str) -> Option<DisplayFilter> {
+        self.governor_settled_filters.get(key).copied()
+    }
+
+    pub fn set_settled_filter(&mut self, key: String, filter: DisplayFilter) {
+        self.governor_settled_filters.insert(key, filter);
     }
 }
 
@@ -1354,7 +1435,8 @@ mod tests {
             assert!(!scale.description().is_empty());
             assert_eq!(scale.next().next().next().next(), scale);
             let json = serde_json::to_string(&scale).expect("serialize viewport scale");
-            let back: ViewportScale = serde_json::from_str(&json).expect("deserialize viewport scale");
+            let back: ViewportScale =
+                serde_json::from_str(&json).expect("deserialize viewport scale");
             assert_eq!(back, scale);
         }
 
@@ -1365,7 +1447,8 @@ mod tests {
         assert_eq!(migrated.effective_shader_preset(), ShaderPreset::LcdGrid);
         assert!(!migrated.frame_blending);
 
-        let modern_json = r#"{"scanline_grid": true, "shader_preset": "CrtScanlines", "frame_blending": true}"#;
+        let modern_json =
+            r#"{"scanline_grid": true, "shader_preset": "CrtScanlines", "frame_blending": true}"#;
         let modern = AppConfig::from_json_str(modern_json);
         assert_eq!(modern.shader_preset, ShaderPreset::CrtScanlines);
         assert_eq!(modern.effective_shader_preset(), ShaderPreset::CrtScanlines);
@@ -1382,7 +1465,10 @@ mod tests {
     #[test]
     fn viewport_scale_toolbar_labels_and_dimensions() {
         assert_eq!(ViewportScale::FitWindow.toolbar_label(), "Size: Fit");
-        assert_eq!(ViewportScale::Handheld3x.toolbar_label(), "Size: Handheld 3x");
+        assert_eq!(
+            ViewportScale::Handheld3x.toolbar_label(),
+            "Size: Handheld 3x"
+        );
         assert_eq!(ViewportScale::Compact2x.toolbar_label(), "Size: Compact 2x");
         assert_eq!(ViewportScale::Medium4x.toolbar_label(), "Size: Medium 4x");
 
@@ -1402,5 +1488,24 @@ mod tests {
         assert_eq!((w * 3.0, h * 3.0), (720.0, 480.0));
         assert_eq!((w * 2.0, h * 2.0), (480.0, 320.0));
         assert_eq!((w * 4.0, h * 4.0), (960.0, 640.0));
+    }
+
+    #[test]
+    fn governor_settled_filter_persists_per_adapter_and_resolution() {
+        let mut cfg = AppConfig::default();
+        let k1 = AppConfig::governor_profile_key("RTX 5070", "Vulkan", 720, 480, 3);
+        let k2 = AppConfig::governor_profile_key("RTX 5070", "Vulkan", 1920, 1080, 3);
+        let k3 = AppConfig::governor_profile_key("softbuffer", "NoGpu", 720, 480, 3);
+        assert_eq!(k1, "Vulkan|RTX 5070|720x480");
+        assert_eq!(k2, "Vulkan|RTX 5070|1080p");
+        assert_eq!(k3, "NoGpu|softbuffer|720x480");
+
+        cfg.set_settled_filter(k1.clone(), DisplayFilter::MyBoySmooth);
+        cfg.set_settled_filter(k2.clone(), DisplayFilter::Sharp1x);
+        let raw = serde_json::to_string(&cfg).expect("serialize config");
+        let back = AppConfig::from_json_str(&raw);
+        assert_eq!(back.settled_filter_for(&k1), Some(DisplayFilter::MyBoySmooth));
+        assert_eq!(back.settled_filter_for(&k2), Some(DisplayFilter::Sharp1x));
+        assert_eq!(back.settled_filter_for(&k3), None);
     }
 }

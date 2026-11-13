@@ -13,7 +13,7 @@ use gba_core::{LCD_HEIGHT as GBA_HEIGHT, LCD_WIDTH as GBA_WIDTH};
 use crate::app::{CoreSink, RustboyApp};
 use crate::config::DmgPaletteChoice;
 use crate::game_settings::CartridgeHardwareDefaults;
-use crate::rom_loader::{gb_cart_type_label, gb_short_game_code, PatchFormat, RomPlatform};
+use crate::rom_loader::{PatchFormat, RomPlatform, gb_cart_type_label, gb_short_game_code};
 
 /// Horizontal centering offset (in pixels) of the 160x144 GB screen inside the 240x160 buffer.
 pub(crate) const GB_VIEW_OFFSET_X: usize = (GBA_WIDTH - GB_WIDTH) / 2;
@@ -230,28 +230,41 @@ impl RustboyApp {
         }
     }
 
-    /// Restores a raw state snapshot into the active core and refreshes PPU/APU state and framebuffer.
-    pub(crate) fn load_active_core_state_raw(&mut self, bytes: &[u8]) -> Result<(), String> {
+    /// Restores a raw state snapshot into the active core and optionally refreshes PPU framebuffer.
+    pub(crate) fn restore_active_core_state_raw(
+        &mut self,
+        bytes: &[u8],
+        refresh_fb: bool,
+    ) -> Result<(), String> {
         if let Some(core) = &mut self.core {
             core.load_state_raw(bytes).map_err(|e| format!("{e:?}"))?;
             core.bus.ppu.dot_accurate_mode = self.config.dot_accurate_ppu;
             core.bus.ppu.layer_enable_mask = self.config.layer_mask;
             core.bus.apu.channel_enable_mask = self.config.audio_channel_mask;
             core.bus.apu.master_volume_pct = self.config.master_volume;
-            self.sink
-                .framebuffer
-                .copy_from_slice(&*core.bus.ppu.framebuffer);
-            self.sink.frame_dirty = true;
+            if refresh_fb {
+                self.sink
+                    .framebuffer
+                    .copy_from_slice(&*core.bus.ppu.framebuffer);
+                self.sink.frame_dirty = true;
+            }
             Ok(())
         } else if let Some(gb) = &mut self.gb {
             gb.core.load_state(bytes).map_err(|e| format!("{e:?}"))?;
             gb.core.set_dmg_palette(self.config.dmg_palette.to_core());
-            blit_gb_to_gba_fb(gb.core.framebuffer(), &mut self.sink.framebuffer);
-            self.sink.frame_dirty = true;
+            if refresh_fb {
+                blit_gb_to_gba_fb(gb.core.framebuffer(), &mut self.sink.framebuffer);
+                self.sink.frame_dirty = true;
+            }
             Ok(())
         } else {
             Err("No active ROM loaded".into())
         }
+    }
+
+    /// Restores a raw state snapshot into the active core and refreshes PPU/APU state and framebuffer.
+    pub(crate) fn load_active_core_state_raw(&mut self, bytes: &[u8]) -> Result<(), String> {
+        self.restore_active_core_state_raw(bytes, true)
     }
 
     /// Applies the chosen DMG color palette to the active GB core (if monochrome DMG) and config.

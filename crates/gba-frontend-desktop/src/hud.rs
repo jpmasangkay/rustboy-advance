@@ -1,18 +1,13 @@
 use std::time::Instant;
 
-use egui::{
-    self, Align, Align2, Color32, CornerRadius, Layout, RichText, Sense, Stroke,
-    Vec2,
-};
+use egui::{self, Align, Align2, Color32, CornerRadius, Layout, RichText, Sense, Stroke, Vec2};
 use gba_core::{LCD_HEIGHT, LCD_WIDTH};
 
-use crate::app::{RustboyApp, ACCENT_TEAL, BG_CARD, BORDER_HAIRLINE, TEXT_MUTED};
+use crate::app::{ACCENT_TEAL, BG_CARD, BORDER_HAIRLINE, RustboyApp, TEXT_MUTED};
 use crate::config::{BezelStyle, ShaderPreset, ViewportScale};
 use crate::gb_bridge::{GB_VIEW_OFFSET_X, GB_VIEW_OFFSET_Y};
 use crate::rom_loader::RomPlatform;
-use crate::shaders::{
-    color_profile_uniform, ShaderRenderParams,
-};
+use crate::shaders::{ShaderRenderParams, color_profile_uniform};
 
 impl RustboyApp {
     pub(crate) fn draw_status_bar(&mut self, ctx: &egui::Context) {
@@ -38,9 +33,7 @@ impl RustboyApp {
                     let n_folders = self.rom_folders.len();
                     let left_text = if let Some(t) = &self.toast {
                         t.text.clone()
-                    } else if n_games == 0 && n_folders == 0 {
-                        format!("{n_games} Games | {n_folders} Folders | Core: GBA-ARM7TDMI (Strict JIT)")
-                    } else if self.has_active_game() {
+                    } else if (n_games == 0 && n_folders == 0) || self.has_active_game() {
                         format!("{n_games} Games | {n_folders} Folders | Core: GBA-ARM7TDMI (Strict JIT)")
                     } else {
                         format!("{n_games} Games | {n_folders} Folders")
@@ -69,10 +62,19 @@ impl RustboyApp {
                         ui.add_space(8.0);
                         let underruns = self.sink.audio.underruns();
                         let occ = self.sink.audio.occupancy_percent();
-                        ui.label(
-                            RichText::new(format!("DRC: {occ:.1}% (Underruns: {underruns})"))
+                        let drc_text = if underruns > 0 {
+                            format!("DRC: {occ:.1}% ({underruns} underruns)")
+                        } else {
+                            format!("DRC: {occ:.1}%")
+                        };
+                        ui.monospace(
+                            RichText::new(drc_text)
                                 .small()
-                                .color(if underruns > 0 { Color32::from_rgb(239, 68, 68) } else { crate::theme::COLOR_TEXT_SECONDARY }),
+                                .color(if underruns > 0 {
+                                    Color32::from_rgb(239, 68, 68)
+                                } else {
+                                    crate::theme::COLOR_TEXT_SECONDARY
+                                }),
                         );
                         ui.add_space(8.0);
                         ui.label(
@@ -164,8 +166,11 @@ impl RustboyApp {
 
         // Inner dark bezel surround around LCD
         let inner_bevel = screen_rect.expand(6.0);
-        ui.painter()
-            .rect_filled(inner_bevel, CornerRadius::same(4), Color32::from_rgb(10, 12, 16));
+        ui.painter().rect_filled(
+            inner_bevel,
+            CornerRadius::same(4),
+            Color32::from_rgb(10, 12, 16),
+        );
         ui.painter().rect_stroke(
             inner_bevel,
             CornerRadius::same(4),
@@ -209,8 +214,11 @@ impl RustboyApp {
         if !self.show_pause_overlay {
             return;
         }
-        ui.painter()
-            .rect_filled(disp_rect, CornerRadius::ZERO, Color32::from_black_alpha(170));
+        ui.painter().rect_filled(
+            disp_rect,
+            CornerRadius::ZERO,
+            Color32::from_black_alpha(170),
+        );
 
         let card_w = 280.0;
         let card_h = 280.0;
@@ -232,80 +240,95 @@ impl RustboyApp {
         let mut hard_reset = false;
         let mut close_game = false;
 
-        ui.allocate_new_ui(egui::UiBuilder::new().max_rect(card_rect.shrink(16.0)), |ui| {
-            ui.vertical_centered(|ui| {
-                ui.heading(
-                    RichText::new("PAUSED")
-                        .strong()
-                        .color(ACCENT_TEAL)
-                        .size(18.0),
-                );
-                ui.label(RichText::new(&self.rom_title).color(Color32::WHITE).strong());
-                ui.add_space(8.0);
+        ui.allocate_new_ui(
+            egui::UiBuilder::new().max_rect(card_rect.shrink(16.0)),
+            |ui| {
+                ui.vertical_centered(|ui| {
+                    ui.heading(
+                        RichText::new("PAUSED")
+                            .strong()
+                            .color(ACCENT_TEAL)
+                            .size(18.0),
+                    );
+                    ui.label(
+                        RichText::new(&self.rom_title)
+                            .color(Color32::WHITE)
+                            .strong(),
+                    );
+                    ui.add_space(8.0);
 
-                if ui
-                    .add_sized([card_w - 40.0, 30.0], egui::Button::new("▶  Resume Emulation"))
-                    .clicked()
-                {
-                    resume = true;
-                }
-                ui.add_space(4.0);
-                let hardcore = self.is_ra_hardcore_active();
-                if ui
-                    .add_enabled(
-                        !hardcore,
-                        egui::Button::new("💾 Quick Save (Slot 1)").min_size(Vec2::new(card_w - 40.0, 26.0)),
-                    )
-                    .on_disabled_hover_text("Disabled in RetroAchievements Hardcore Mode")
-                    .clicked()
-                {
-                    quick_save = true;
-                }
-                ui.add_space(4.0);
-                if ui
-                    .add_enabled(
-                        !hardcore,
-                        egui::Button::new("📂 Quick Load (Slot 1)").min_size(Vec2::new(card_w - 40.0, 26.0)),
-                    )
-                    .on_disabled_hover_text("Disabled in RetroAchievements Hardcore Mode")
-                    .clicked()
-                {
-                    quick_load = true;
-                }
-                ui.add_space(4.0);
-                if ui
-                    .add_enabled(
-                        !hardcore,
-                        egui::Button::new("🖼️ Save State Manager (F6)")
-                            .min_size(Vec2::new(card_w - 40.0, 26.0)),
-                    )
-                    .on_disabled_hover_text("Disabled in RetroAchievements Hardcore Mode")
-                    .clicked()
-                {
-                    open_states = true;
-                }
-                ui.add_space(4.0);
-                if ui
-                    .add_sized([card_w - 40.0, 26.0], egui::Button::new("🔄 Hard Reset (Ctrl+R)"))
-                    .clicked()
-                {
-                    hard_reset = true;
-                }
-                ui.add_space(4.0);
-                if ui
-                    .add_sized(
-                        [card_w - 40.0, 26.0],
-                        egui::Button::new(
-                            RichText::new("⏹ Return to Library")
-                                .color(Color32::from_rgb(255, 120, 120)),
-                        ),
-                    )
-                    .clicked()
-                {
-                    close_game = true;
-                }
-            });
-        });
+                    if ui
+                        .add_sized(
+                            [card_w - 40.0, 30.0],
+                            egui::Button::new("▶  Resume Emulation"),
+                        )
+                        .clicked()
+                    {
+                        resume = true;
+                    }
+                    ui.add_space(4.0);
+                    let hardcore = self.is_ra_hardcore_active();
+                    if ui
+                        .add_enabled(
+                            !hardcore,
+                            egui::Button::new("💾 Quick Save (Slot 1)")
+                                .min_size(Vec2::new(card_w - 40.0, 26.0)),
+                        )
+                        .on_disabled_hover_text("Disabled in RetroAchievements Hardcore Mode")
+                        .clicked()
+                    {
+                        quick_save = true;
+                    }
+                    ui.add_space(4.0);
+                    if ui
+                        .add_enabled(
+                            !hardcore,
+                            egui::Button::new("📂 Quick Load (Slot 1)")
+                                .min_size(Vec2::new(card_w - 40.0, 26.0)),
+                        )
+                        .on_disabled_hover_text("Disabled in RetroAchievements Hardcore Mode")
+                        .clicked()
+                    {
+                        quick_load = true;
+                    }
+                    ui.add_space(4.0);
+                    if ui
+                        .add_enabled(
+                            !hardcore,
+                            egui::Button::new("🖼️ Save State Manager (F6)")
+                                .min_size(Vec2::new(card_w - 40.0, 26.0)),
+                        )
+                        .on_disabled_hover_text("Disabled in RetroAchievements Hardcore Mode")
+                        .clicked()
+                    {
+                        open_states = true;
+                    }
+                    ui.add_space(4.0);
+                    if ui
+                        .add_sized(
+                            [card_w - 40.0, 26.0],
+                            egui::Button::new("🔄 Hard Reset (Ctrl+R)"),
+                        )
+                        .clicked()
+                    {
+                        hard_reset = true;
+                    }
+                    ui.add_space(4.0);
+                    if ui
+                        .add_sized(
+                            [card_w - 40.0, 26.0],
+                            egui::Button::new(
+                                RichText::new("⏹ Return to Library")
+                                    .color(Color32::from_rgb(255, 120, 120)),
+                            ),
+                        )
+                        .clicked()
+                    {
+                        close_game = true;
+                    }
+                });
+            },
+        );
 
         if resume {
             self.show_pause_overlay = false;
@@ -391,6 +414,7 @@ impl RustboyApp {
         {
             if pipeline.is_preset_available(shader_preset) {
                 if self.sink.frame_dirty || pipeline.needs_initial_upload() {
+                    let present_t0 = Instant::now();
                     pipeline.stage_frames(
                         &self.sink.framebuffer,
                         &self.sink.prev_framebuffer,
@@ -407,6 +431,7 @@ impl RustboyApp {
                         frame_blending,
                         lcd_ghosting,
                     );
+                    self.last_present_ms = present_t0.elapsed().as_secs_f32() * 1000.0;
                     self.sink.frame_dirty = false;
                 }
                 shader_pipeline_arc = Some(pipeline_arc.clone());
@@ -421,17 +446,20 @@ impl RustboyApp {
         if shader_pipeline_arc.is_none() {
             let tex_options = self.config.display_filter.texture_options();
             if self.sink.frame_dirty || self.lcd_tex.is_none() {
-                self.postproc.sync_rgba_for_capture(
-                    &self.sink.framebuffer,
-                    self.sink
-                        .has_prev_frame
-                        .then_some(&self.sink.prev_framebuffer),
-                    self.sink.frame_seq,
-                    color_correction,
-                    color_profile,
-                    frame_blending,
-                    lcd_ghosting,
-                );
+                let present_t0 = Instant::now();
+                if frame_blending {
+                    self.postproc.sync_rgba_for_capture(
+                        &self.sink.framebuffer,
+                        self.sink
+                            .has_prev_frame
+                            .then_some(&self.sink.prev_framebuffer),
+                        self.sink.frame_seq,
+                        color_correction,
+                        color_profile,
+                        frame_blending,
+                        lcd_ghosting,
+                    );
+                }
                 let green_swap = self
                     .core
                     .as_ref()
@@ -458,7 +486,7 @@ impl RustboyApp {
 
                 // Zero-allocation buffer reuse: extract newly rendered pixel buffer using std::mem::replace
                 // to reuse the scratch buffer without any per-frame allocations.
-                let new_pixels = std::mem::replace(&mut self.postproc.output_image.pixels, Vec::new());
+                let new_pixels = std::mem::take(&mut self.postproc.output_image.pixels);
                 let old_scratch = std::mem::replace(&mut out_img.pixels, new_pixels);
                 self.postproc.output_image.pixels = old_scratch;
                 out_img.size = target_size;
@@ -475,6 +503,7 @@ impl RustboyApp {
                 } else {
                     self.lcd_tex = Some(ctx.load_texture("gba_lcd", arc_to_upload, tex_options));
                 }
+                self.last_present_ms = present_t0.elapsed().as_secs_f32() * 1000.0;
                 self.sink.frame_dirty = false;
             }
         }
@@ -575,7 +604,8 @@ impl RustboyApp {
                                         .strong()
                                         .color(ACCENT_TEAL),
                                 );
-                                let (r1, resp1) = ui.allocate_exact_size(panel_size, Sense::click());
+                                let (r1, resp1) =
+                                    ui.allocate_exact_size(panel_size, Sense::click());
                                 p1_rect = r1;
                                 if resp1.double_clicked() {
                                     toggle_fullscreen = true;
@@ -596,7 +626,8 @@ impl RustboyApp {
                                         .strong()
                                         .color(TEXT_MUTED),
                                 );
-                                let (r2, resp2) = ui.allocate_exact_size(panel_size, Sense::click());
+                                let (r2, resp2) =
+                                    ui.allocate_exact_size(panel_size, Sense::click());
                                 if resp2.double_clicked() {
                                     toggle_fullscreen = true;
                                 }
@@ -651,7 +682,8 @@ impl RustboyApp {
                 }
                 ViewportScale::FitWindow => {
                     if self.config.integer_scaling {
-                        let factor = ((avail.x / ref_w).floor().min((avail.y / ref_h).floor())).max(1.0);
+                        let factor =
+                            ((avail.x / ref_w).floor().min((avail.y / ref_h).floor())).max(1.0);
                         Vec2::new(ref_w * factor, ref_h * factor)
                     } else {
                         let scale = (avail.x / ref_w).min(avail.y / ref_h).max(0.5);
@@ -733,7 +765,9 @@ impl RustboyApp {
                                         egui::Pos2::new(rect.left() + x * sx, rect.top() + y * sy),
                                         egui::Align2::LEFT_TOP,
                                         text,
-                                        egui::FontId::monospace((8.0 * text_scale).clamp(10.0, 20.0)),
+                                        egui::FontId::monospace(
+                                            (8.0 * text_scale).clamp(10.0, 20.0),
+                                        ),
                                         Color32::from_rgba_unmultiplied(
                                             color[0], color[1], color[2], color[3],
                                         ),
@@ -813,7 +847,10 @@ impl RustboyApp {
         );
         let pad = Vec2::new(7.0, 3.0);
         let dot_w = 10.0;
-        let box_size = Vec2::new(galley.size().x + pad.x * 2.0 + dot_w, galley.size().y + pad.y * 2.0);
+        let box_size = Vec2::new(
+            galley.size().x + pad.x * 2.0 + dot_w,
+            galley.size().y + pad.y * 2.0,
+        );
         let pill_rect = egui::Rect::from_min_size(
             egui::pos2(
                 screen_rect.right() - box_size.x - 8.0,

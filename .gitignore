@@ -66,3 +66,9 @@ PresentMon*.csv
 
 # WebAssembly build output (rebuilt locally and in CI)
 web/pkg/
+
+# Distribution builds and release packages
+dist/
+release-build/
+*.zip
+

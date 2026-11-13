@@ -27,6 +27,9 @@ Thumbs.db
 *.ups
 *.bps
 
+# Compiled executables
+*.exe
+
 # Temporary logs, image dumps, and scratch files
 *.ppm
 *.log
@@ -35,11 +38,25 @@ Thumbs.db
 frame_*.png
 test_output/
 test-roms/
+roms/
 fuzz/corpus/
 fuzz/artifacts/
 fuzz/target/
 .gemini/
 .antigravity/
+
+# Transient performance captures and raw benchmark dumps (keep perf/REPORT.md, baselines, replays, scripts)
+perf/*.csv
+perf/*.csv.summary.json
+perf/*.log
+perf/bench-*.json
+perf/realtime-*.json
+perf/filters-*.json
+perf/selftest-*.json
+perf/softbuffer-*.json
+perf/weak_hardware.json
+perf/phase*
+PresentMon*.csv
 
 
 # WebAssembly build output (rebuilt locally and in CI)

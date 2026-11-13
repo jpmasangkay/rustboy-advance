@@ -1,49 +1,51 @@
 # Rustboy Advance Performance, Weak-Hardware & Portability Report
 
 **Workspace:** `crates/gba-core`, `crates/gba-frontend-desktop` (`rustboy-advance.exe`), `crates/gba-testrunner`  
-**Final Binary:** `target\release\rustboy-advance.exe` (`build_time_utc: 2026-11-13T09:22:48Z`, `11,538,432` bytes, SHA256 `9f5f32383ca14b64ff8f22131249f0fba7aee56cb4dd3864b0ab81b8e022911a`, commit `fc25e98b72a0-dirty`, `0` compiler warnings)  
-**Host Environment:** AMD Ryzen 9 8945HX (16C / 32T), `32,560 MB` RAM, Windows 11 (`10.0.26300`), display `2560 x 1600 @ 240 Hz` (`NVIDIA GeForce RTX 5070 Laptop GPU`), `rustc 1.99.1` (`x86_64-pc-windows-gnu`, `rust-lld`, LLVM `23.1.1`)  
+**Branch / Build:** Clean tagged commit `phase9-final` on branch `perf/smooth-weak-hardware` (`main` untouched at `fc25e98`; `0` compiler warnings; post-tag clean rebuild embeds a non-`-dirty` commit hash in `--selftest` JSON)  
+**Host Environment:** AMD Ryzen 9 8945HX (16C / 32T), `32,560 MB` RAM, Windows 11 (`10.0.26300`), built-in display `2560 x 1600` (Windows Settings exposes `60 Hz` and `240 Hz` only; `NVIDIA GeForce RTX 5070 Laptop GPU`), `rustc 1.99.1` (`x86_64-pc-windows-gnu`, `rust-lld`, LLVM `23.1.1`)  
 **Release Profile (`Cargo.toml`):** `opt-level = 3`, `lto = "fat"`, `codegen-units = 1`, `panic = "abort"`, `strip = "symbols"`  
 **Test ROMs (never committed):** `C:\Users\My Laptop\Downloads\Summon Night - Swordcraft Story (USA).gba` (read-only external ROM with deterministic `3,600f` replay `perf/replays/summon_night.txt` + `perf/replays/summon_night.sav`), `9` git-ignored stress ROMs + `13` `jsmolka/gba-tests` ROMs in `roms/homebrew/`, and embedded MIT/Apache `STRESS_SELF` (`stress_rom.rs`).
 
 ---
 
-## 1. Quick Results (Phase 8 Final)
+## 1. Quick Results (Phase 9 Final)
 
-- **`8a` Fixed GPU `--selftest` Measurement (`2x -> 8x`, `0.081 ms` Fixed GPU Wait):**
-  - Updated GPU `--selftest` to pace and scale **only** emulation + CPU filter/submit by `--slowdown N` (never GPU fence/`poll` wait) and use non-blocking `Maintain::Poll` during paced work timing, measuring isolated blocking `Maintain::Wait` separately (`avg = 0.081 ms`, `p95 = 0.098 ms`, `p99.5 = 0.112 ms`).
-  - Auto-GPU `--selftest` (`RTX 5070 Vulkan`, `embedded:STRESS_SELF`) now measures `p99.5 = 1.764 ms` at `1x` and **`8x`** smooth & zero-over-budget ceiling (`12x` = `5.00%` FAIL at `p99.5 = 20.45 ms`), matching the headroom gap between `STRESS_SELF` (`0.888 ms` emu) and lighter *Summon Night* (`0.453 ms` emu, `13x` full-replay ceiling).
-- **`8b` Real Desktop Window Vsync Runs (`4 x 5 min`) & `59.73 Hz` Refresh Fix:**
-  - Pre-fix `eframe`/Vulkan (`perf/smoke-vulkan.csv.summary.json`) saturated the `240 Hz` swapchain into `[3v, 4v, 5v]` hold beating (`75.03%` repeated UI frames, **`66.67%` GBA cadence jitter `> 2 ms`**, `p99 = 21.599 ms`) due to unconditional `request_repaint()` + `egui`'s `predicted_dt` subtraction clamping `<= 16.67 ms` delays to `0`.
-  - Fixed with a clamped monotonic `pacing_deadline`, `predicted_dt`-compensated `request_repaint_after`, and default `--sync-60hz` (`60.000 Hz`, absorbed by `+0.456%` audio DRC within `±1.0%`), reducing `300s` steady jitter `> 2 ms` to **`0.000%–0.090%`**, `> 2x` frames to **`0.000%`**, and audio underruns to **`0`** across all 4 modes (Vulkan & `--no-gpu`, Windowed & Fullscreen).
-- **`8c` DX12 WARP Scaling Root Cause (`34 ms` vs `0.19 ms` No-GPU) & Auto-Selection:**
-  - Confirmed DX12 WARP (`Microsoft Basic Render Driver`) already uses CPU filtering + `PlainTexturePresenter` (`fs_plain`); `--profile-sw` isolated its `4.46 -> 16.21 -> 34.06 ms` scaling to **`d3d10warp.dll` `write_texture` upload bandwidth** (`~24 µs/KB`: `153 KB` at `240x160` = `3.87 ms` vs `1.38 MB` at `720x480` = `33.12 ms`), whereas real `softbuffer` presents at **`0.185–0.190 ms`** (`0.149 ms` in tight XRGB8 blit loop).
-  - Auto-selection now prefers the **No-GPU presenter (`winit + softbuffer`)** over any `DeviceType::Cpu` adapter unless startup micro-benchmarking proves that CPU adapter faster, logging both measured timings and the selection reason.
-- **`8d` `softbuffer` Real-Window Scaling (`720x480`..`2560x1600`, `1x / 8x / 15x`):**
-  - Optimized `no_gpu.rs` `blit_inner` (border-only clear, integer `copy_within` row reuse, separable cached horizontal scanlines). At **`1x`**, all sizes through `2560x1600` fit inside `16.743 ms` (`0.00%` over, worst `<= 5.12 ms`). At **`8x`**, `myboy-smooth` stops fitting above `720x480` (`1280x720` = `51.67%` over) and `none` stops fitting above `1280x720` (`1920x1080` = `29.17%` over). At **`15x`**, all sizes exceed `16.743 ms` (`720x480 none` = `17.50%` over).
-- **`8e` & `8f` Simulated Zero-Adapter Fallback & Portable Binary Attribution:**
-  - `--simulate-no-adapter` returns `0` adapters, falls back automatically to `winit + softbuffer`, passes `--selftest` (`8x` smooth / `6x` zero-over-budget), and runs a smooth live window (`8.2 s`, `0` repeats, `0` jitter, `0` underruns) while keeping `--no-gpu` intact.
-  - Added `exe_sha256`, `git_commit`, and `build_time_utc` to all `--selftest` JSON files and text summaries.
+- **`9a` Clean Branch, Logical Commits & Tagged Rebuild (`perf/smooth-weak-hardware`):**
+  - Saved Phases 1–9 cleanly in logical commits on `perf/smooth-weak-hardware` (keeping `main` untouched at `fc25e98`, zero pushes, all ROMs/`*.sav`/transient logs git-ignored), tagged `phase9-final`, and ran `cargo clean --release -p gba-frontend-desktop` before rebuilding so `--selftest` JSON embeds a clean commit hash (no `-dirty`).
+- **`9b` Refresh-Rate Adaptive Sync & Live `60 Hz` / `240 Hz` Window Telemetry (`display_timing.rs`):**
+  - **`60 Hz` Vulkan windowed (`300 s`, `sync_60hz=true`):** **`17,880 / 17,880` (`100.00%`)** frames held exact `[1v]` DWM scanout (`0` unusual repeats, `0` drops, `0` `dwm_dropped`, `0` underruns, `jitter>2ms = 0.017%`, `p50 = 16.691 ms`, `max = 19.827 ms`), even though raw intervals `> 16.74 ms` report `45.92%` around the `16.67 ms` boundary.
+  - **`240 Hz` A/B (`300 s` Vulkan windowed):** Snapping to `60.000 Hz` (`+0.456%` audio DRC) keeps `0` underruns, `0` app repeats, `0` `>2ms` cadence jitter, and `83.25%` (`14,886 / 17,881`) on exact `[4v]`; forcing `--no-sync-60hz` (`59.7275 Hz`) drops `-82` frames/5 min, nearly doubles `>17.5 ms` (`1.303% -> 2.371%`), and shifts `5v+` DWM holds from `290.13/min` to `330.62/min` (`+65` beat-drift holds/min).
+  - **Sync Rule (`should_snap_to_60hz`):** Automatically snaps to `60.000 Hz` ONLY within `±0.35 Hz` of a `60 Hz` integer multiple (`60, 120, 180, 240 Hz`), and runs authentic `59.7275 Hz` elsewhere (verified via `--simulate-refresh-hz 100` and `--simulate-refresh-hz 144`).
+  - **Host Scope Notes:** Windows Settings on this panel exposes only `60 Hz` and `240 Hz` (no `100 Hz`/`144 Hz` UI mode); unelevated `SetDisplayConfig` (`ERROR_ACCESS_DENIED`), `ChangeDisplaySettingsExW` (`DISP_CHANGE_FAILED`), and `presentmon.exe` (`access denied`) cannot run unelevated, so on-screen timing was measured unelevated via `DwmGetCompositionTimingInfo` physical `qpc_vblank / qpc_refresh_period` scanout spans.
+- **`9c` Child-Process GPU Startup Probe & Auto `--no-gpu` Recovery (`gpu_probe.rs`, `config.rs`):**
+  - Before `eframe` touches the GPU (`panic = "abort"` safe), launches a timeout-guarded (`7,000 ms`) `--gpu-probe` child creating `Instance -> Adapter -> hidden Surface -> Device -> first offscreen frame`.
+  - Verified end-to-end across all 3 injected failure stages (`device` abort `0xC0000409`, `surface` abort, `hang` `1,500 ms` timeout): Launch 1 falls back to live `--no-gpu` and writes `blocked_gpu_adapters` in `config.json`; Launch 2 skips GPU probe immediately; `--retry-gpu` clears the blocklist and recovers `RTX 5070 Vulkan`.
+- **`9d` Large-Window CPU Cap `<= 720x480` + Win32 `StretchDIBits` (`filters.rs`, `no_gpu.rs`):**
+  - Replaced pure `softbuffer` large-frame CPU scaling under overload with `QualityGovernor::CapResolution` (`<= 720x480` intermediate buffer + Win32 `StretchDIBits` `COLORONCOLOR`), preserving the active filter (`MyBoy Smooth`) instead of dropping visual quality first.
+  - At **`8x` `--slowdown` (`120f`)**, uncapped `softbuffer` (`myboy-smooth`) fails above `720x480` (`1280x720 = 22.50%`, `1920x1080 = 100.00%`, `2560x1600 = 0.83%`), while capped `stretchdibits-coloroncolor` (`<= 720x480`) **fits `100%` of sizes through `2560x1600` with `0.00%` over budget** (`p95 = 9.022 / 9.197 / 8.804 ms`, `present p95 = 1.136–2.434 ms`).
+  - **Live `--no-gpu --fullscreen (2560x1600) --slowdown 8 --governor`:** `CapResolution` fired at frame `178` (`~3 s`), cutting `present_ms` `p95` from `2.059 ms` to **`0.149 ms`** and reducing post-cap `>2x` spikes and audio underruns to **`0`**.
+- **Core & Adapter Foundations (Phases 1–8 Retained):** Clean subsystem timing (`1,823.5 FPS` *Summon Night* headless, `0.453 ms` emu), `10/10` determinism hashes, `13/13` `jsmolka/gba-tests`, `Vulkan -> DX12 -> GL -> No-GPU (winit + softbuffer)` fallback (with automatic `No-GPU` preference over slower `DeviceType::Cpu` adapters), `QualityGovernor` recovery + persistence, and baseline `x86-64` SSE2/SSE3 portability importing stock OS DLLs only.
 
-> *Weak-Hardware & VM Scope Note:* Physical baseline-CPU (`Core 2` / non-AVX) Windows 10 VMs and bare-metal GPU-less VMs were not available on this host. Zero-adapter fallback was verified end-to-end via `--simulate-no-adapter` (both `--selftest` and live `8.2 s` window), `--no-gpu` (`--selftest`, `--bench-softbuffer`, two `300 s` desktop runs), and unit tests. All `--slowdown N` and software-adapter runs approximate weak hardware and do not replace testing on real low-end devices.
+> *Weak-Hardware & Elevation Scope Note:* Physical baseline-CPU (`Core 2` / non-AVX) Windows 10 VMs, bare-metal GPU-less VMs, physical `100 Hz`/`144 Hz` modes on this panel, and Admin ETW `PresentMon` / display-mode syscalls were unavailable in this environment and are not claimed as run directly.
 
 ---
 
-## 2. Final Verified Numbers (Phase 8 Build, `9f5f3238...`)
+## 2. Final Verified Numbers & Phase 9 Results
 
 ### 2.1 Verification & Accuracy Scorecard
 
 | Check | Command | Final Observed Result | Status |
 | :--- | :--- | :--- | :---: |
-| **Release Build** | `cargo build --release --offline --workspace` | Finished in `1m 26s`, **`0` warnings, `0` errors** (`2026-11-13T09:22:48Z`, `commit fc25e98b72a0-dirty`, `11,538,432` B, `sha256: 9f5f3238...2911a`) | **PASS** |
-| **Workspace Unit Tests** | `cargo test --offline --workspace` | **`163 passed, 0 failed, 0 ignored`** (`gb-core 12`, `gba-core 44`, `gba-debugger 8`, `gba-frontend-desktop 72`, `gba-frontend-web 6`, `gba-libretro 14`, `gba-testrunner 7`) | **PASS** |
+| **Clean Tagged Release Build** | `cargo clean --release -p gba-frontend-desktop && cargo build --release --offline --workspace` | Built cleanly after `phase9-final` tag (`0` warnings, `0` errors; clean non-`-dirty` commit in `--selftest` JSON) | **PASS** |
+| **Workspace Unit Tests** | `cargo test --offline --workspace` | **`168 passed, 0 failed, 0 ignored`** (`gb-core 12`, `gba-core 44`, `gba-debugger 8`, `gba-frontend-desktop 77`, `gba-frontend-web 6`, `gba-libretro 14`, `gba-testrunner 7`) | **PASS** |
 | **Determinism Hashes** | Sequential `--headless --verify-hashes` across all `10` entries in `perf/verify_all_hashes.ps1` | **`10 / 10` PASS** (`core_vid`, `pres_vid`, `audio` CRC32 bit-identical across *Summon Night* `3,600f` + all `9` `600f` stress ROMs) | **PASS** |
 | **`jsmolka/gba-tests`** | `cargo run --release --offline -p gba-testrunner -- --suite jsmolka` | **`13 passed, 0 failed, 0 skipped`** | **PASS** |
-| **`--selftest` (`4` Modes)** | `rustboy-advance.exe --selftest` (`auto`, `--software-adapter`, `--no-gpu`, `--simulate-no-adapter`) | **`4 / 4` PASS** (`0` dropped work, `0` `>2x` spikes, `0` underruns) | **PASS** |
-| **Real Window `300s` Runs** | `--perf-seconds 300 --perf-log ...` (Vulkan Windowed & Fullscreen, `--no-gpu` Windowed & Fullscreen) | **`4 / 4` PASS** (`0.000%` `>2x`, `0` underruns, `<= 0.090%` cadence jitter `>2 ms`) | **PASS** |
-| **Simulated No-Adapter Window** | `--simulate-no-adapter --perf-seconds 8 --perf-log perf\sim-no-adapter.csv` | **`PASS`** (`8.2 s`, `0%` repeats, `0%` jitter, `0%` `>2x`, `0` underruns, audio active) | **PASS** |
+| **`--selftest` (`4` Modes)** | `rustboy-advance.exe --selftest` (`auto`, `--software-adapter`, `--no-gpu`, `--simulate-no-adapter`) | **`4 / 4` PASS** (`0` dropped work, `0` `>2x` spikes, `0` underruns; clean commit hash verified) | **PASS** |
+| **Real Window `300s` Runs (`9b` + Phase 8)** | `--perf-seconds 300 --perf-log ...` (Vulkan & `--no-gpu` at `60 Hz` & `240 Hz`, Windowed & Fullscreen, plus `240 Hz --no-sync-60hz` A/B) | **All `300 s` runs PASS** (`0.000%` `>2x`, `0` underruns, `17,880/17,880` `[1v]` DWM scanout on `60 Hz` Vulkan) | **PASS** |
+| **Broken-GPU Guard (`9c`)** | `--probe-fail-stage device\|surface\|hang`, relaunch skip check, then `--retry-gpu` | **`3 / 3` stages PASS** (fallback to `No-GPU` + `config.json` record -> immediate skip -> `--retry-gpu` recovery) | **PASS** |
+| **CPU Large-Window Cap (`9d`)** | `--bench-softbuffer --frames 120` (`perf\softbuffer-20261113-121114.json`) + `--no-gpu --fullscreen --slowdown 8 --governor` | **`100%` FIT at `8x`** for `<= 720x480 + StretchDIBits` (`1280x720..2560x1600`, `0.00%` over) + **`0` post-cap underruns / `0` `>2x`** live | **PASS** |
 
-### 2.2 Portable `--selftest` Across All 4 Modes (`8a`, `8e`, `8f`)
+### 2.2 Portable `--selftest` Across All 4 Modes (Phase 8 Baseline, `8a`, `8e`, `8f`)
 
 Measured on `embedded:STRESS_SELF (Mode0 4xBG + 128 Sprites + Alpha)` with `120` paced warmup frames discarded before collecting `600` paced frames (`Maintain::Poll` on GPU) and sweeping `N = 1, 2, 4, 6, 8, 12, 16, 24` (`300` frames/step):
 
@@ -117,23 +119,69 @@ Measured over `120` *Summon Night* frames per condition on a real `winit + softb
 
 Running `--simulate-no-adapter --perf-seconds 8 --perf-log perf\sim-no-adapter.csv` logged automatic fallback along `[Vulkan -> DX12 -> GL -> No-GPU presenter (winit + softbuffer)]` (`NoGpu / CpuFallback`), opened a live window with active audio (`0` underruns), and achieved `8.2 s, 445 presented (370 steady) | Wall & GBA: p50 = 16.706, p95 = 17.038, p99 = 17.238, max = 17.788 ms | 0.000% >2x | 0.000% jitter >2ms | 0/370 (0.00%) repeats | emu avg 0.300 (p95 0.537) ms | present avg 2.554 (p95 2.897) ms`.
 
+### 2.7 Phase 9: Refresh Rates (`9b`), GPU Startup Guard (`9c`), and Large-Window CPU Cap (`9d`)
+
+#### `9b` Refresh-Rate Adaptive Sync & Live `60 Hz` / `240 Hz` DWM Scanout (`display_timing.rs`)
+
+Because `presentmon.exe` fails unelevated (`access denied`) and unelevated `SetDisplayConfig` (`ERROR_ACCESS_DENIED`) / `ChangeDisplaySettingsExW` (`DISP_CHANGE_FAILED`) cannot switch monitor modes (and Windows Settings on this panel offers only **`60 Hz`** and **`240 Hz`**, with no `100 Hz`/`144 Hz` option), live `300 s` captures were run across `60 Hz` and `240 Hz` using Windows `DwmGetCompositionTimingInfo` physical vblank spans (`(qpc_vblank - prev_qpc_vblank) / qpc_refresh_period`), plus `--simulate-refresh-hz` checks for `60 / 100 / 144 Hz`:
+
+| Condition (`300 s`, *Summon Night* + looping replay) | Display / Sync Mode | Steady Frames (`duration`) | GBA Cadence `p50 / p95 / p99 / Max` (ms) | `> 16.74 ms` / `> 17.5 ms` | `> 2x` / Jitter `> 2 ms` | DWM Physical Vblank Span Histogram | DWM `unusual_repeats` / `short` (`dwm_dropped`) | App Repeats / Underruns |
+| :--- | :---: | :---: | :---: | :---: | :---: | :--- | :---: | :---: |
+| **Vulkan Windowed `60 Hz`** (`perf\win_9b_60hz_vulkan.csv`) | `60.00 Hz` / `sync60=true` (`60.0 Hz`) | `17,880` (`300.0 s`) | `16.691 / 17.477 / 17.839 / 19.827` | `45.92%` / `4.46%` | `0.000%` / `0.017%` | **`[1v: 17,880]` (`100.00%`)** | **`0 (0.00/m)` / `0 (0.00/m)` (`0`)** | `0` / `0` |
+| **`--no-gpu` Windowed `60 Hz`** (`perf\win_9b_60hz_nogpu.csv`) | `60.00 Hz` / `sync60=true` (`60.0 Hz`) | `17,847` (`300.2 s`) | `16.712 / 19.279 / 20.532 / 25.674` | `40.92%` / `8.77%` | `0.000%` / `12.170%` | `[0v: 98, 1v: 17,606, 2v: 143]` | `143 (28.77/m)` / `98 (19.72/m)` (`0`) | `0` / `0` |
+| **Vulkan Windowed `240 Hz`** (`perf\win_9b_240hz_vulkan.csv`) | `239.99 Hz` / `sync60=true` (`60.0 Hz`) | `17,881` (`300.0 s`) | `16.690 / 17.265 / 17.540 / 18.560` | `44.50%` / `1.30%` | `0.000%` / `0.000%` | `[1v: 9, 2v: 99, 3v: 1,446, 4v: 14,886 (83.25%), 5v: 1,311, 6v: 32, 7v: 98]` | `1,441 (290.13/m)` / `1,554 (312.88/m)` (`0`) | `0` / `0` |
+| **Vulkan `240 Hz --no-sync-60hz`** (`perf\win_9b_240hz_vulkan_nosync60.csv`) | `239.99 Hz` / `sync60=false` (`59.73 Hz`) | `17,799` (`300.0 s`) | `16.771 / 17.361 / 17.606 / 18.575` | `53.00%` / `2.37%` | `0.000%` / `0.000%` | `[1v: 40, 2v: 94, 3v: 1,196, 4v: 14,827, 5v: 1,524, 6v: 53, 7v: 65]` | `1,642 (330.62/m)` / `1,330 (267.80/m)` (`0`) | `0` / `0` |
+| **`--no-gpu` Windowed `240 Hz`** (`perf\win_9b_240hz_nogpu.csv`) | `240.00 Hz` / `sync60=true` (`60.0 Hz`) | `17,847` (`300.2 s`) | `16.711 / 17.060 / 17.274 / 20.987` | `40.10%` / `0.24%` | `0.000%` / `0.011%` | `[1v: 23, 2v: 127, 3v: 1,061, 4v: 15,337 (85.94%), 5v: 1,144, 6v: 49, 7v: 101, 8v: 5]` | `1,299 (261.36/m)` / `1,211 (243.65/m)` (`0`) | `0` / `0` |
+
+- **Why the Adopted Sync Rule Is Optimal:** On `60 Hz` Vulkan (`sync_60hz=true`), **`17,880 / 17,880`** consecutive frames landed on **exact `1` vblank (`0` repeats, `0` drops)** even though raw timing noise past `16.74 ms` reads `45.92%` (`max = 19.827 ms`, `jitter>2ms = 0.017%`). At `240 Hz`, snapping to `60.0 Hz` holds `4v` cleanly (`83.25%` Vulkan / `85.94%` `--no-gpu`, symmetric `±1` vblank noise around the `4.167 ms` quantum because CPU polling/sleep wakes across `4.167 ms` edges without `240 Hz`-quantized sleep), while disabling it (`--no-sync-60hz`, `59.7275 Hz`) drops `82` unique frames/5 min, nearly doubles `>17.5 ms` (`1.30% -> 2.37%`), and adds `~40.5` excess `5v+` holds/min (`330.62` vs `290.13/min`) due to `59.7275 -> 60 Hz` beat drift. `display_timing::should_snap_to_60hz` therefore snaps to `60.000 Hz` (`+0.456%` DRC) **only** within `±0.35 Hz` of a `60 Hz` multiple (`60, 120, 180, 240, ...`) and keeps authentic `59.7275 Hz` elsewhere (verified via `--simulate-refresh-hz 100` and `--simulate-refresh-hz 144` -> `sync_60hz=false`, and `--simulate-refresh-hz 60` -> `sync_60hz=true`). Note: at `60 Hz`, `--no-gpu` CPU GDI BitBlt variance (`present avg 3.347 ms`, `p95 7.003 ms`) occasionally straddles the `16.67 ms` DWM boundary (`2v:143` / `0v:98`), whereas `240 Hz` absorbs BitBlt jitter cleanly inside `4v` (`jitter>2ms = 0.011%`).
+
+#### `9c` Broken-GPU Startup Guard & Automatic `--no-gpu` Recovery (`gpu_probe.rs`, `config.rs`)
+
+Before `eframe` initializes GPU drivers (`panic = "abort"` safety), `ensure_gpu_startup_safe` launches a timeout-guarded `--gpu-probe` child process (`DEFAULT_GPU_PROBE_TIMEOUT_MS = 7,000 ms`, giving Windows Error Reporting `~4.4 s` to tear down `0xC0000409` fastfail aborts without misclassifying them as hangs; healthy cold Vulkan probe passes in `~612 ms`):
+
+| Injected Fault Stage (Release Binary CLI + Isolated `APPDATA`) | Launch 1 (`--probe-fail-stage ...`) | Relaunch Outcome (No Flags) | Recovery (`--retry-gpu`) |
+| :--- | :--- | :--- | :--- |
+| **`device`** (`--probe-fail-stage device`) | Child aborted (`exit -1073740791`), fell back to `No-GPU` window, saved `failed_stage: "device"` in `config.json` | Auto-skipped GPU (`Skipped blocked GPU adapter ... failed at device`), instant `No-GPU` | Cleared `blocked_gpu_adapters`, passed probe, restored `RTX 5070 Vulkan` |
+| **`surface`** (`--probe-fail-stage surface`) | Child aborted (`exit -1073740791`), fell back to `No-GPU` window, saved `failed_stage: "surface"` in `config.json` | Auto-skipped GPU immediately (`No-GPU`) | Cleared blocklist, passed probe, restored `RTX 5070 Vulkan` |
+| **`hang`** (`--probe-fail-stage hang --gpu-probe-timeout-ms 1500`) | Timed out at `first_frame_hanging` (`1,500 ms`), killed child, fell back to `No-GPU`, saved `failed_stage: "hang"` | Auto-skipped GPU immediately (`No-GPU`) | Cleared blocklist, passed probe, restored `RTX 5070 Vulkan` |
+
+#### `9d` Large-Window CPU Cap `<= 720x480` + Win32 `StretchDIBits` (`perf\softbuffer-20261113-121114.json`)
+
+Measured over `120` *Summon Night* frames per condition on a real `winit` window (`budget = 16.743 ms`), comparing uncapped CPU `softbuffer` against capping the CPU raster buffer at `<= 720x480` and letting Win32 `StretchDIBits` scale to the window (`COLORONCOLOR` / `HALFTONE`):
+
+| Resolution | Path | `filter` | `1x` Total `Avg / p95` (`Over %`) | `8x` Present `Avg / p95` (ms) | `8x` Total `Avg / p95 / Worst` (ms) | `8x` Over (`Fit?`) | `15x` Total `p95 / Worst` (ms) | `15x` Over (`Fit?`) |
+| :--- | :--- | :--- | :---: | :---: | :---: | :---: | :---: | :---: |
+| `720x480` | `softbuffer` | `myboy-smooth` | `0.960 / 0.965` (`0.00%`) | `1.228 / 1.532` | `7.829 / 9.358 / 10.594` | **`0.00%` (FIT)** | `17.016 / 21.222` | `8.33%` (EXCEEDS) |
+| `1280x720` | `softbuffer` *(uncapped)* | `myboy-smooth` | `1.735 / 1.939` (`0.00%`) | `7.882 / 10.741` | `15.292 / 22.070 / 23.601` | `22.50%` (EXCEEDS) | `27.941 / 39.335` | `100.00%` (EXCEEDS) |
+| **`1280x720`** | **`stretchdibits-coloroncolor`** | **`myboy-smooth`** | `0.937 / 1.027` (`0.00%`) | **`0.896 / 1.217`** | **`7.511 / 9.022 / 10.303`** | **`0.00%` (FIT)** | `26.045 / 27.785` | `37.50%` (EXCEEDS) |
+| `1280x720` | `stretchdibits-halftone` | `myboy-smooth` | `0.924 / 0.982` (`0.00%`) | `0.914 / 1.215` | `7.524 / 8.268 / 10.743` | `0.00%` (**FIT**) | `15.834 / 18.011` | `1.67%` (EXCEEDS) |
+| `1920x1080` | `softbuffer` *(uncapped)* | `myboy-smooth` | `2.699 / 2.867` (`0.00%`) | `14.071 / 14.577` | `20.535 / 21.412 / 21.800` | `100.00%` (EXCEEDS) | `42.279 / 50.024` | `100.00%` (EXCEEDS) |
+| **`1920x1080`** | **`stretchdibits-coloroncolor`** | **`none` / `myboy-smooth`** | `0.935 / 0.994` / `0.961 / 1.156` | `0.884 / 1.094` / `0.981 / 2.434` | `7.367 / 8.164` / **`8.004 / 9.197 / 11.800`** | **`0.00%` (FIT)** | `15.425 / 16.565` (`none`) / `18.915` (`myboy`) | **`0.00%` FIT (`none`)** / `6.67%` (`myboy`) |
+| `2560x1600` | `softbuffer` *(uncapped)* | `none` / `myboy-smooth` | `1.377 / 1.586` / `1.526 / 1.785` | `6.410 / 10.128` / `5.004 / 8.410` | `12.904 / 16.903` / `11.418 / 15.083` | `6.67%` / `0.83%` (EXCEEDS) | `31.896` / `32.216` | `100.00%` (EXCEEDS) |
+| **`2560x1600`** | **`stretchdibits-coloroncolor`** | **`myboy-smooth`** | `0.929 / 0.989` (`0.00%`) | **`0.911 / 1.136`** | **`7.701 / 8.804 / 10.522`** | **`0.00%` (FIT)** | `15.891 / 20.567` | `2.50%` (EXCEEDS) |
+| `2560x1600` | `stretchdibits-halftone` | `myboy-smooth` | `0.950 / 1.054` (`0.00%`) | `0.897 / 1.097` | `7.515 / 8.506 / 10.410` | `0.00%` (**FIT**) | `17.655 / 23.283` | `9.17%` (EXCEEDS) |
+
+- **Live Fullscreen Verification (`perf\nogpu_9d_fullscreen_8x.csv`, `--no-gpu --fullscreen --filter myboy-smooth --governor --slowdown 8`, `2560x1600`):** Before capping (`f10..177`), `present_ms` averaged `1.798 ms` (`p95 = 2.059`, `max = 2.481`) and `wall_interval_ms` averaged `17.100 ms` (`p95 = 19.344`, `11` startup underruns). At frame `178` (`~3 s`), `QualityGovernor::CapResolution` locked `capped_720x480=true` while preserving `MyBoy Smooth` (dropping `present_ms` by `13x` to **`avg = 0.139 / p95 = 0.149 / max = 0.283 ms`** across `f188..389`, settling `wall_interval_ms` to `avg = 16.618 / p95 = 18.068 / max = 19.227 ms` with **`0` post-cap underruns** and **`0` `>2x` spikes**).
+
 ---
 
 ## 3. Methodology, Architecture & Portability
 
-### 3.1 Adapter Discovery, Fallback Order & No-GPU Presenter (`shaders.rs`, `no_gpu.rs`, `app_host.rs`, `main.rs`, `8c`, `8e`)
+### 3.1 Adapter Discovery, Startup Probe Guard & Refresh Sync (`gpu_probe.rs`, `display_timing.rs`, `shaders.rs`, `no_gpu.rs`, `app_host.rs`, `main.rs`)
+- **Timeout-Guarded Child Startup Probe (`9c`, `gpu_probe.rs`):** Unless `--no-gpu` is set or `--simulate-no-adapter` simulates zero adapters, `ensure_gpu_startup_safe` checks `AppConfig::blocked_gpu_adapters` for the candidate adapter and, if not blocked, spawns `--gpu-probe` (`7,000 ms` timeout) exercising `Instance -> Adapter -> hidden Surface -> Device -> first offscreen frame`. Crashes (`panic = "abort"` / driver fault), hangs, or errors mark that adapter blocked in `config.json` with `failed_stage` and immediately fall back to `run_no_gpu_desktop`; `--retry-gpu` clears the blocklist.
 - **Enforced Fallback Chain (`shaders::ADAPTER_FALLBACK_ORDER`):** **`Vulkan -> DX12 -> GL -> No-GPU presenter (winit + softbuffer)`**.
   - Normal `select_preferred_adapter` scores `Vulkan > Dx12 > Gl`, prefers hardware GPUs (`DiscreteGpu > IntegratedGpu > VirtualGpu > Other > Cpu`). If only a `DeviceType::Cpu` adapter exists, startup benchmarks it against `NoGpuCpuPresenter` (`winit + softbuffer`) and automatically picks No-GPU unless the `Cpu` adapter measures faster (`log` prints both timings and the reason).
   - `--software-adapter` (`discover_software_cpu_adapter`) selects CPU adapters explicitly in `Vulkan -> DX12 -> GL` order (preferring `SwiftShader Device (Subzero)` when installed, or `Microsoft Basic Render Driver` DX12 WARP on Windows 10+). Both `Cpu` adapters run filters on CPU (`VideoPostProcessor`) and present via `PlainTexturePresenter`.
-  - If `--no-gpu` is passed, `--simulate-no-adapter` is set, OR `0` hardware/faster adapters initialize, `run_no_gpu_desktop` launches a pure `winit 0.30 + softbuffer 0.4` XRGB8 window using `NoGpuCpuPresenter` (full input, drag-and-drop/`Ctrl+O`, `.sav`, CPAL audio, `--sync-60hz` DRC, `QualityGovernor`, and `--perf-log`).
+  - If `--no-gpu` is passed, `--simulate-no-adapter` is set, GPU startup probe fails/blocks, OR `0` hardware/faster adapters initialize, `run_no_gpu_desktop` launches a pure `winit 0.30 + softbuffer 0.4` XRGB8 window (automatically switching to Win32 `StretchDIBits` `COLORONCOLOR` when `QualityGovernor` activates the `<= 720x480` cap) with full input, drag-and-drop/`Ctrl+O`, `.sav`, CPAL audio, adaptive sync DRC, and `--perf-log`.
+- **Adaptive Refresh-Rate Sync (`9b`, `display_timing.rs`):** `resolve_sync_decision` queries DWM / `EnumDisplaySettingsW` refresh rate (with `--simulate-refresh-hz` override for testing and `--sync-60hz` / `--no-sync-60hz` flags) and snaps `59.7275 Hz -> 60.000 Hz` (`+0.456%` audio DRC) only within `±0.35 Hz` of a `60 Hz` integer multiple (`60, 120, 180, 240, ...`), while `DwmScanoutTracker` logs per-frame physical vblank spans via `DwmGetCompositionTimingInfo`.
 
-### 3.2 Quality Governor Recovery & Persistence (`7c`, `filters.rs`, `config.rs`, `app.rs`, `no_gpu.rs`)
-- Startup `prewarm()` micro-times all 7 distinct filter costs on the active backend (`VideoPostProcessor`, `BenchWgpuContext`, or `NoGpuCpuPresenter`) and sorts ascending.
-- **Step-Down:** Rolling `120f` window (`min 60f`); if `p95 > 70%` (`11.72 ms`) persists for `120` frames (`saturating_sub(1)` hysteresis on quiet frames), jumps straight to the costliest strictly cheaper filter with `est_base + cost <= 50%` (`8.37 ms`), sets `cooldown = 180f`, and starts a **`18,000f` (~5-minute) upward lockout**.
-- **Conservative Step-Up Recovery:** Once `up_lockout_remaining == 0` and `active` is below `user_target`, if rolling `p95 < 35%` (`< 5.86 ms`) holds continuously for **`3,600f` (~60s)** AND `est_base + next_costlier_cost < 50%` (`< 8.37 ms`), steps up **one** tier toward `user_target`.
+### 3.2 Quality Governor Recovery, `720x480` Cap & Persistence (`7c`, `9d`, `filters.rs`, `config.rs`, `app.rs`, `no_gpu.rs`)
+- Startup `prewarm()` micro-times all 7 distinct filter costs on the active backend (`VideoPostProcessor`, `BenchWgpuContext`, or `NoGpuCpuPresenter`) and sorts ascending; when No-GPU window size exceeds `720x480`, it also measures capped `<= 720x480 + StretchDIBits` costs.
+- **Step-Down (`CapResolution` First on Overload in Large No-GPU Windows):** Rolling `120f` window (`min 60f`); if `p95 > 70%` (`11.72 ms`) persists for `120` frames (`saturating_sub(1)` hysteresis on quiet frames), No-GPU large windows (`> 720x480`) activate **`CapResolution` (`<= 720x480` + Win32 `StretchDIBits`)** first if the active filter fits under `50%` (`8.37 ms`) capped — keeping high-quality filtering without multi-megapixel CPU copies — and otherwise jump straight to the costliest strictly cheaper filter with `est_base + cost <= 50%` (`8.37 ms`), setting `cooldown = 180f` and starting a **`18,000f` (~5-minute) upward lockout**.
+- **Conservative Step-Up Recovery:** Once `up_lockout_remaining == 0` and either resolution is capped or `active` is below `user_target`, if rolling `p95 < 35%` (`< 5.86 ms`) holds continuously for **`3,600f` (~60s)** AND the restored configuration fits `< 50%` (`< 8.37 ms`), steps up one tier (`UncapResolution` before increasing filter complexity).
 - **Anti-Flap Backoff:** If overload (`p95 > 70%`) returns within **`1,800f` (~30s)** of a step-up, `QualityGovernor` steps back down immediately (without waiting another `120f`) and **doubles `current_lockout_frames`** (`5m -> 10m -> 20m -> ...`). Changing `user_target` manually resets backoff.
 - **Persistence:** `AppConfig::governor_settled_filters` stores settled filters keyed by `governor_profile_key(adapter, resolution_bucket)` across sessions (`720p`, `1080p`, `1440p`, `4k+`).
-- **Unit Coverage (`filters::tests` 8/8, `config::tests`):** `quality_governor_jumps_directly_under_50_pct_budget_with_hysteresis_and_override` (transient hiccup + sustained overload + lockout + override), `quality_governor_respects_backend_order_and_never_picks_costlier_filter`, `quality_governor_recovery_and_doubled_lockout_on_flapping`, and `governor_settled_filter_persists_per_adapter_and_resolution`.
+- **Unit Coverage (`filters::tests` 9/9, `config::tests`, `display_timing::tests` 3/3, `gpu_probe::tests`):** Covers `quality_governor_jumps_directly_under_50_pct_budget_with_hysteresis_and_override`, `quality_governor_respects_backend_order_and_never_picks_costlier_filter`, `quality_governor_recovery_and_doubled_lockout_on_flapping`, `quality_governor_caps_large_output_to_720x480_before_dropping_filter`, `governor_settled_filter_persists_per_adapter_and_resolution`, `guard_records_each_failure_stage_skips_next_launch_and_recovers_with_retry`, and `sync_rule_snaps_only_on_60hz_multiples` / `expected_vblanks_handles_integer_and_fractional_ratios` / `windows_display_timing_queries_succeed_unelevated`.
 
 ### 3.3 Portability Verification (`7d`)
 - **Minimum Supported Windows OS:** Official `rustc 1.99.1` `x86_64-pc-windows-gnu` tier guarantees require **Windows 10** (or Windows Server 2016+) or later.

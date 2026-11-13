@@ -1,0 +1,14 @@
+scene alpha_blend 0..200
+scene fade_white 200..400
+scene fade_black 400..600
+
+# Default mode=0; tap R once at frame 5 to enter mode 1 (Alpha Blend)
+range 5..7 R
+# Increase EVA (RIGHT) and EVB (UP) to active mid-range alpha blend
+range 20..80 RIGHT+UP
+# At frame 200 tap R -> mode 2 (Fade to White), hold A to ramp EY
+range 200..202 R
+range 210..270 A
+# At frame 400 tap R -> mode 3 (Fade to Black)
+range 400..402 R
+

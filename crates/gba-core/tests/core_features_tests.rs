@@ -25,7 +25,10 @@ impl Default for TestFrontend {
 }
 
 impl HostFrontend for TestFrontend {
-    fn present_frame(&mut self, framebuffer_bgr555: &[u16; gba_core::LCD_WIDTH * gba_core::LCD_HEIGHT]) {
+    fn present_frame(
+        &mut self,
+        framebuffer_bgr555: &[u16; gba_core::LCD_WIDTH * gba_core::LCD_HEIGHT],
+    ) {
         self.frames += 1;
         self.last_frame = *framebuffer_bgr555;
     }
@@ -115,16 +118,23 @@ fn scheduler_all_14_slots_never_drop_and_cancel() {
 #[test]
 fn stop_mode_via_haltcnt_and_swi_wakes_only_on_keypad_cart_serial() {
     // HALTCNT path: write 0x80 to 0x0400_0301, then increment r5 after wake and loop.
-    let rom = rom_from_arm_words(&[
+    let words = [
         0xE3A0_0301, // mov r0, #0x04000000
         0xE3A0_1080, // mov r1, #0x80
         0xE280_2C03, // add r2, r0, #0x300
         0xE5C2_1001, // strb r1, [r2, #1] -> HALTCNT = 0x80 (STOP)
         0xE285_5001, // add r5, r5, #1
         0xEAFF_FFFE, // b .
-    ]);
+    ];
+    let rom = rom_from_arm_words(&words);
 
     let mut core = GbaCore::new(None, rom);
+    // On real GBA hardware, writes to HALTCNT (0x04000301) are only accepted when executing from BIOS (PC < 0x4000).
+    // Install the code snippet into BIOS at 0x0100 and set PC there to test BIOS-mediated HALTCNT execution.
+    for (i, &w) in words.iter().enumerate() {
+        core.bus.bios[0x0100 + i * 4..0x0104 + i * 4].copy_from_slice(&w.to_le_bytes());
+    }
+    core.cpu.flush_pipeline(&mut core.bus, 0x0100);
     // Enable VBlank + Timer0 + Keypad IRQ in IE, enable VBlank IRQ + Timer0, and KEYCNT on button A.
     core.bus.write_16(
         0x0400_0200,
@@ -137,11 +147,8 @@ fn stop_mode_via_haltcnt_and_swi_wakes_only_on_keypad_cart_serial() {
         .write_16(0x0400_0100, 0xFFFE, AccessType::NonSequential); // TM0CNT_L
     core.bus
         .write_16(0x0400_0102, 0x00C0, AccessType::NonSequential); // TM0CNT_H enabled + IRQ
-    core.bus.write_16(
-        0x0400_0132,
-        (1 << 14) | 0x0001,
-        AccessType::NonSequential,
-    ); // KEYCNT IRQ on button A
+    core.bus
+        .write_16(0x0400_0132, (1 << 14) | 0x0001, AccessType::NonSequential); // KEYCNT IRQ on button A
 
     let mut frontend = TestFrontend::default();
     for _ in 0..4 {
@@ -186,11 +193,9 @@ fn stop_mode_via_haltcnt_and_swi_wakes_only_on_keypad_cart_serial() {
         0xEAFF_FFFE, // b .
     ]);
     let mut core_swi = GbaCore::new(None, swi_rom);
-    core_swi.bus.write_16(
-        0x0400_0200,
-        (1 << 0) | (1 << 13),
-        AccessType::NonSequential,
-    ); // IE: VBlank | GamePak
+    core_swi
+        .bus
+        .write_16(0x0400_0200, (1 << 0) | (1 << 13), AccessType::NonSequential); // IE: VBlank | GamePak
     let mut fe2 = TestFrontend::default();
     core_swi.run_frame(&mut fe2);
     assert!(core_swi.cpu.stopped, "SWI 0x03 must enter STOP");
@@ -258,7 +263,11 @@ fn sio_no_cable_completion_rcnt_defaults_and_link_hook() {
         0,
         "Normal 8-bit start bit clears after scheduled duration"
     );
-    assert_eq!(core.peek8(0x0400_012A), 0xFF, "Normal 8-bit no-cable reads 0xFF");
+    assert_eq!(
+        core.peek8(0x0400_012A),
+        0xFF,
+        "Normal 8-bit no-cable reads 0xFF"
+    );
     assert_ne!(
         core.peek16(0x0400_0202) & (1 << 7),
         0,
@@ -372,7 +381,10 @@ fn save_state_rbas_header_lz4_errors_and_no_state_mutation() {
     bad_ver[4..6].copy_from_slice(&(STATE_VERSION + 1).to_le_bytes());
     let parsed_ver = state_info(&bad_ver).expect("state_info inspects mismatched version");
     assert_eq!(parsed_ver.version, STATE_VERSION + 1);
-    assert_eq!(core.load_state(&bad_ver), Err(SaveStateError::VersionMismatch));
+    assert_eq!(
+        core.load_state(&bad_ver),
+        Err(SaveStateError::VersionMismatch)
+    );
 
     // 3) RomMismatch
     let mut other_rom = rom;
@@ -399,7 +411,10 @@ fn save_state_rbas_header_lz4_errors_and_no_state_mutation() {
     let last = corrupt_payload.len() - 1;
     corrupt_payload[last] ^= 0xFF;
     corrupt_payload[last - 3] ^= 0xAA;
-    assert_eq!(core.load_state(&corrupt_payload), Err(SaveStateError::Corrupt));
+    assert_eq!(
+        core.load_state(&corrupt_payload),
+        Err(SaveStateError::Corrupt)
+    );
 
     // Verify none of the rejected loads mutated existing core state.
     assert_eq!(core.peek32(0x0300_0010), 0xCAFE_BABE);
@@ -435,7 +450,11 @@ fn debug_control_watchpoints_breakpoints_and_step_one_debug() {
     // 1) Write watchpoint hit in run_frame_debug.
     let ctrl_write = DebugControl {
         breakpoints: Vec::new(),
-        watchpoints: vec![Watchpoint::new(0x0300_0010, 0x0300_0020, WatchpointKind::Write)],
+        watchpoints: vec![Watchpoint::new(
+            0x0300_0010,
+            0x0300_0020,
+            WatchpointKind::Write,
+        )],
     };
     let stop1 = core.run_frame_debug(&mut fe, &ctrl_write);
     assert_eq!(
@@ -447,7 +466,10 @@ fn debug_control_watchpoints_breakpoints_and_step_one_debug() {
             value: 0x5A,
         }
     );
-    assert!(!core.bus.watchpoint_active, "fast-path cleared after return");
+    assert!(
+        !core.bus.watchpoint_active,
+        "fast-path cleared after return"
+    );
 
     // 2) Single-step ReadWrite watchpoint hits on ldrb.
     let ctrl_rw = DebugControl {
@@ -540,7 +562,10 @@ fn gamedb_lookup_precedence_fallback_and_flash_chip_ids() {
     assert_eq!(fr_core.bus.cart.effective_save_type(), SaveType::Flash128K);
 
     // Manual override still wins over GameDB.
-    fr_core.bus.cart.set_save_type_override(Some(SaveType::Sram32K));
+    fr_core
+        .bus
+        .cart
+        .set_save_type_override(Some(SaveType::Sram32K));
     assert_eq!(fr_core.bus.cart.effective_save_type(), SaveType::Sram32K);
 
     // 3) Unknown game code falls back to heuristics (SRAM_V string).
@@ -577,11 +602,15 @@ fn gamedb_lookup_precedence_fallback_and_flash_chip_ids() {
 
     enter_id(&mut f64_core);
     assert_eq!(
-        f64_core.bus.read_8(0x0E00_0000, AccessType::NonSequential, 0, false),
+        f64_core
+            .bus
+            .read_8(0x0E00_0000, AccessType::NonSequential, 0, false),
         0x32
     );
     assert_eq!(
-        f64_core.bus.read_8(0x0E00_0001, AccessType::NonSequential, 0, false),
+        f64_core
+            .bus
+            .read_8(0x0E00_0001, AccessType::NonSequential, 0, false),
         0x1B
     );
     exit_id(&mut f64_core);
@@ -592,11 +621,15 @@ fn gamedb_lookup_precedence_fallback_and_flash_chip_ids() {
         .set_flash_id_override(Some(FlashChipId::SST_64K));
     enter_id(&mut f64_core);
     assert_eq!(
-        f64_core.bus.read_8(0x0E00_0000, AccessType::NonSequential, 0, false),
+        f64_core
+            .bus
+            .read_8(0x0E00_0000, AccessType::NonSequential, 0, false),
         FlashChipId::SST_64K.manufacturer
     );
     assert_eq!(
-        f64_core.bus.read_8(0x0E00_0001, AccessType::NonSequential, 0, false),
+        f64_core
+            .bus
+            .read_8(0x0E00_0001, AccessType::NonSequential, 0, false),
         FlashChipId::SST_64K.device
     );
     exit_id(&mut f64_core);
@@ -606,11 +639,15 @@ fn gamedb_lookup_precedence_fallback_and_flash_chip_ids() {
     let mut em_core = GbaCore::new(None, em_rom);
     enter_id(&mut em_core);
     assert_eq!(
-        em_core.bus.read_8(0x0E00_0000, AccessType::NonSequential, 0, false),
+        em_core
+            .bus
+            .read_8(0x0E00_0000, AccessType::NonSequential, 0, false),
         0x62
     );
     assert_eq!(
-        em_core.bus.read_8(0x0E00_0001, AccessType::NonSequential, 0, false),
+        em_core
+            .bus
+            .read_8(0x0E00_0001, AccessType::NonSequential, 0, false),
         0x13
     );
     exit_id(&mut em_core);
@@ -638,7 +675,10 @@ fn idle_loop_skip_safe_polling_vs_countdown_and_gamedb_addr() {
     assert!(core_skip.idle_skip_enabled);
     let mut fe = TestFrontend::default();
     core_skip.run_frame(&mut fe);
-    assert_eq!(core_skip.cpu.gpr[5], 1, "loop must exit cleanly at VCOUNT 160");
+    assert_eq!(
+        core_skip.cpu.gpr[5], 1,
+        "loop must exit cleanly at VCOUNT 160"
+    );
 
     // Countdown loop (has register mutation without safe poll load) must NEVER be skipped:
     // 0x00: mov r1, #500

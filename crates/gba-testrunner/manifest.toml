@@ -249,7 +249,7 @@ rom_path = "test-roms/nba-hw-test/bus/128kb-boundary/128kb-boundary.gba"
 frames = 60
 criterion = "screenshot"
 known_failure = true
-known_bad_crc32 = "0xef43f2c5"
+known_bad_crc32 = "0x8e9c5c44"
 notes = "13/16 pass; DMA DEC 07FFFFF8 (68 vs 63) & 0801FFF0/0803FFF0 (68 vs 70) fail"
 
 [[tests]]
@@ -271,7 +271,7 @@ rom_path = "test-roms/nba-hw-test/dma/force-nseq-access/force-nseq-access.gba"
 frames = 60
 criterion = "screenshot"
 known_failure = true
-known_bad_crc32 = "0x0aeb8290"
+known_bad_crc32 = "0x72dcf1e2"
 notes = "0/2 pass (EWRAM DMA: 78 vs 88, ROM DMA: 78 vs 88)"
 
 [[tests]]
@@ -281,9 +281,6 @@ name = "nba-hw-test/dma/latch.gba"
 rom_path = "test-roms/nba-hw-test/dma/latch/latch.gba"
 frames = 60
 criterion = "screenshot"
-known_failure = true
-known_bad_crc32 = "0xcf7649a4"
-notes = "2/4 pass (DMA LATCH 1: 0xc0de vs 0xdead, DMA LATCH 2: 0xc0de vs 0x1234)"
 
 [[tests]]
 id = "nba_dma_start_delay"
@@ -292,9 +289,6 @@ name = "nba-hw-test/dma/start-delay.gba"
 rom_path = "test-roms/nba-hw-test/dma/start-delay/start-delay.gba"
 frames = 60
 criterion = "screenshot"
-known_failure = true
-known_bad_crc32 = "0xcd81f685"
-notes = "0/1 pass (IMM: 18 vs 20)"
 
 [[tests]]
 id = "nba_haltcnt"
@@ -303,9 +297,6 @@ name = "nba-hw-test/haltcnt.gba"
 rom_path = "test-roms/nba-hw-test/haltcnt/haltcnt.gba"
 frames = 60
 criterion = "screenshot"
-known_failure = true
-known_bad_crc32 = "0x39cd150e"
-notes = "0/6 pass (HALTCNT DIRECT/CPUSET/POSTFLG/TIME IWRAM & ROM)"
 
 [[tests]]
 id = "nba_irq_delay"
@@ -408,9 +399,6 @@ name = "nba-hw-test/timer/reload.gba"
 rom_path = "test-roms/nba-hw-test/timer/reload/reload.gba"
 frames = 60
 criterion = "screenshot"
-known_failure = true
-known_bad_crc32 = "0x56386c33"
-notes = "4/7 pass (FFF8 32 7: 0xdeae vs 0xfff9; FFFF 16/32 0: 0xdeb5 vs 0xdeb4)"
 
 [[tests]]
 id = "nba_timer_start_stop"
@@ -419,9 +407,6 @@ name = "nba-hw-test/timer/start-stop.gba"
 rom_path = "test-roms/nba-hw-test/timer/start-stop/start-stop.gba"
 frames = 60
 criterion = "screenshot"
-known_failure = true
-known_bad_crc32 = "0x29380c6f"
-notes = "1/2 pass (2ND: 7 vs 8)"
 
 [[tests]]
 id = "nba_timer_tick_before_reload"
@@ -430,9 +415,6 @@ name = "nba-hw-test/timer/tick-before-reload.gba"
 rom_path = "test-roms/nba-hw-test/timer/tick-before-reload/tick-before-reload.gba"
 frames = 60
 criterion = "screenshot"
-known_failure = true
-known_bad_crc32 = "0xf9bb7091"
-notes = "0/2 pass (TM1CNT_L: 0 vs 1, IF: 0 vs 8)"
 
 # --- Tonc PPU & Hardware Demos ---
 

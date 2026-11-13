@@ -16,12 +16,18 @@ fn test_jit_initialization_and_graceful_fallback() {
     let mut core = GbaCore::new(None, rom);
 
     // Verify interpreter is default and fallback
-    assert!(!core.jit.enabled, "Interpreter must remain the default when core is instantiated");
+    assert!(
+        !core.jit.enabled,
+        "Interpreter must remain the default when core is instantiated"
+    );
 
     // Check availability (will be true on x86_64/aarch64 with jit feature, or false gracefully if disabled)
     #[cfg(feature = "jit")]
     {
-        assert!(core.jit.available, "Cranelift JIT should be available on host architecture");
+        assert!(
+            core.jit.available,
+            "Cranelift JIT should be available on host architecture"
+        );
         core.jit.enabled = true;
         assert!(core.jit.enabled);
         core.jit.enabled = false;
@@ -46,7 +52,11 @@ fn test_jit_code_page_invalidation() {
     core.run_frame(&mut fe);
 
     // Simulate writing to EWRAM code page (0x0200_0000 -> page 512)
-    core.bus.write_32(0x0200_0000, 0x12345678, gba_core::bus::AccessType::NonSequential);
+    core.bus.write_32(
+        0x0200_0000,
+        0x12345678,
+        gba_core::bus::AccessType::NonSequential,
+    );
     assert_eq!(core.bus.code_page_invalidated, Some(0x0200_0000 >> 14));
 
     // Next step must consume the invalidation and clear JIT blocks for that page

@@ -1,0 +1,6 @@
+scene m7_perspective 0..600
+
+# Drive forward and steer across Mode 7 floor + horizon + sprites
+range 20..600 A
+pulse 60..600 120 40 RIGHT
+

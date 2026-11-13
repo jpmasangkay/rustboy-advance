@@ -1,0 +1,4 @@
+scene mode3 0..200
+scene mode4 200..400
+scene mode5 400..600
+

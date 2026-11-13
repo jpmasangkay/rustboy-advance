@@ -1,0 +1,8 @@
+scene obj_mosaic 0..200
+scene bg_and_obj_mosaic 200..600
+
+# Increase OBJ H/V mosaic levels
+range 10..60 RIGHT+UP
+# Hold A + RIGHT + UP to increase BG H/V mosaic levels alongside OBJ mosaic
+range 200..260 A+RIGHT+UP
+

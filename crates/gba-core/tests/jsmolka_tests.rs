@@ -91,13 +91,23 @@ fn jsmolka_gba_tests() {
         );
 
         if r12 != 0 || !converged {
-            failures.push(format!("{rel}: r12={r12:#x}, converged={converged}, pc={pc:#010x}"));
+            failures.push(format!(
+                "{rel}: r12={r12:#x}, converged={converged}, pc={pc:#010x}"
+            ));
         }
 
         match rel {
             "ppu/hello.gba" => {
-                let lit = frontend.framebuffer.iter().filter(|&&c| c == 0x7FFF).count();
-                let dark = frontend.framebuffer.iter().filter(|&&c| c == 0x0000).count();
+                let lit = frontend
+                    .framebuffer
+                    .iter()
+                    .filter(|&&c| c == 0x7FFF)
+                    .count();
+                let dark = frontend
+                    .framebuffer
+                    .iter()
+                    .filter(|&&c| c == 0x0000)
+                    .count();
                 assert!(
                     lit > 0 && dark > 0,
                     "ppu/hello.gba should render white glyphs on black backdrop (lit={lit}, dark={dark})"
@@ -108,16 +118,26 @@ fn jsmolka_gba_tests() {
                     let expected = ((stripe as u16) * 2) << 10;
                     let actual = frontend.framebuffer[stripe * 16];
                     assert_eq!(
-                        actual, expected,
+                        actual,
+                        expected,
                         "ppu/shades.gba stripe {stripe} at x={} mismatch",
                         stripe * 16
                     );
                 }
             }
             "ppu/stripes.gba" => {
-                assert_eq!(frontend.framebuffer[0], 0x560B, "ppu/stripes tile 1 backdrop stripe");
-                assert_eq!(frontend.framebuffer[8], 0x6290, "ppu/stripes tile 0 green stripe");
-                assert_eq!(frontend.framebuffer[16], 0x560B, "ppu/stripes second tile 1 stripe");
+                assert_eq!(
+                    frontend.framebuffer[0], 0x560B,
+                    "ppu/stripes tile 1 backdrop stripe"
+                );
+                assert_eq!(
+                    frontend.framebuffer[8], 0x6290,
+                    "ppu/stripes tile 0 green stripe"
+                );
+                assert_eq!(
+                    frontend.framebuffer[16], 0x560B,
+                    "ppu/stripes second tile 1 stripe"
+                );
             }
             _ => {}
         }

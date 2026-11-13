@@ -1,0 +1,5 @@
+scene affine_sprite_rotate 0..600
+
+# Rotate multi-sprite affine combo continuously
+range 0..600 L
+

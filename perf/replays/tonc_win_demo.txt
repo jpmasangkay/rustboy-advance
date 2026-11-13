@@ -1,0 +1,7 @@
+scene win_scroll 0..600
+
+# Move window continuously across background and sprites
+range 20..180 RIGHT+DOWN
+range 200..360 LEFT+UP
+range 380..540 RIGHT+DOWN
+

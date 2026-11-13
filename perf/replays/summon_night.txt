@@ -1,0 +1,37 @@
+scene boot 0..560
+scene title 560..800
+scene menus 800..1600
+scene overworld 1600..2600
+scene battle 2600..3600
+
+pulse 680..760 15 2 START
+# Title menu: Continue -> A
+range 800..815 DOWN
+pulse 820..950 15 3 A
+# File Select: load DATA 1
+pulse 980..1020 15 3 A
+# Close save pedestal prompt if open:
+pulse 1050..1150 15 3 B
+# Open START menu to inspect Status / Gear / Items:
+pulse 1180..1200 15 3 START
+# Inspect Status
+pulse 1220..1240 15 3 A
+# Dismiss popup and exit menu:
+pulse 1280..1300 15 3 B
+pulse 1320..1340 15 3 B
+pulse 1360..1380 15 3 B
+# Inside Central Tower 1F: walk all the way LEFT to blue stairs and ascend to 2F:
+range 1600..1860 LEFT
+range 1870..2100 UP
+# On 2F corridor: down to hallway, left to ceremony door, and up:
+range 2110..2170 DOWN
+range 2180..2360 LEFT
+range 2370..2510 UP
+range 2520..2540 RIGHT
+# Face officer on right and talk to open door:
+pulse 2545..2670 8 3 A
+# Step into doorway and walk UP into Ceremony Hall:
+range 2680..2705 RIGHT
+range 2710..2870 UP
+# In Ceremony Hall: mingle with contestants:
+pulse 2880..3600 8 3 A

@@ -1,0 +1,8 @@
+scene mode3 0..200
+scene mode4 200..400
+scene mode5 400..600
+
+# Advance Mode 3 -> Mode 4 at frame 200, Mode 4 -> Mode 5 at frame 400
+range 200..202 RIGHT
+range 400..402 RIGHT
+

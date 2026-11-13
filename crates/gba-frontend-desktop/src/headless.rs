@@ -5,6 +5,9 @@ use std::time::Duration;
 use gba_core::{GbaCore, HostFrontend, LCD_HEIGHT, LCD_WIDTH};
 use gba_debugger::format_registers;
 
+use crate::bench::{self, InputReplay};
+use crate::config::DisplayFilter;
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum BenchmarkCategory {
     Mode4Software3D,
@@ -50,12 +53,20 @@ impl BenchmarkCategory {
 
     pub fn description(self) -> &'static str {
         match self {
-            Self::Mode4Software3D => "Mode 4 page-flipping software 3D rasterization (Doom II, Duke Nukem Advance)",
+            Self::Mode4Software3D => {
+                "Mode 4 page-flipping software 3D rasterization (Doom II, Duke Nukem Advance)"
+            }
             Self::Mode5Bitmap => "Mode 5 160x128 double-buffered bitmap graphics",
-            Self::Affine => "BG2/BG3 affine transformation matrices, rotation, scaling (Mode 7-style racers)",
-            Self::SpriteHeavy => "High OBJ density (up to 128 sprites), priority sorting, windows, blending",
+            Self::Affine => {
+                "BG2/BG3 affine transformation matrices, rotation, scaling (Mode 7-style racers)"
+            }
+            Self::SpriteHeavy => {
+                "High OBJ density (up to 128 sprites), priority sorting, windows, blending"
+            }
             Self::DmaHdma => "Per-scanline HBlank DMA raster effects and high-bandwidth transfers",
-            Self::AudioHeavy => "DirectSound DMA FIFO refills, frequent timer reloads, multi-channel PSG mixing",
+            Self::AudioHeavy => {
+                "DirectSound DMA FIFO refills, frequent timer reloads, multi-channel PSG mixing"
+            }
         }
     }
 
@@ -84,20 +95,48 @@ impl BenchmarkCategory {
     }
 }
 
+#[derive(Clone)]
 pub struct CliConfig {
     pub rom_path: Option<PathBuf>,
     pub bios_path: Option<PathBuf>,
     pub sav_path: Option<PathBuf>,
     pub headless: bool,
     pub frames: usize,
+    pub frames_explicit: bool,
     pub dump_regs: bool,
     pub screenshot_ppm: Option<PathBuf>,
     pub fb_crc32: bool,
     pub dump_ascii_grid: bool,
     pub bench: bool,
+    pub bench_realtime: bool,
+    pub bench_filters: bool,
+    pub bench_softbuffer: bool,
+    pub input_replay: Option<PathBuf>,
+    pub filter: Option<DisplayFilter>,
+    pub perf_dir: PathBuf,
+    pub dump_scene_pngs: Option<PathBuf>,
+    pub dump_every: Option<usize>,
     pub category: Option<String>,
     pub assignments: Vec<(String, PathBuf)>,
     pub throttled_test: bool,
+    pub calibrate: bool,
+    pub slowdown: usize,
+    pub dump_hashes: Option<PathBuf>,
+    pub verify_hashes: Option<PathBuf>,
+    pub filter_color_correction: bool,
+    pub software_adapter: bool,
+    pub simulate_no_adapter: bool,
+    pub governor: Option<bool>,
+    pub no_emu_priority: bool,
+    pub loop_replay: bool,
+    pub warmup_frames: usize,
+    pub profile_sw: bool,
+    pub selftest: bool,
+    pub no_gpu: bool,
+    pub perf_log: Option<PathBuf>,
+    pub perf_seconds: Option<f64>,
+    pub fullscreen: bool,
+    pub sync_60hz: Option<bool>,
 }
 
 impl CliConfig {
@@ -108,14 +147,41 @@ impl CliConfig {
             sav_path: None,
             headless: false,
             frames: 120,
+            frames_explicit: false,
             dump_regs: false,
             screenshot_ppm: None,
             fb_crc32: false,
             dump_ascii_grid: false,
             bench: false,
+            bench_realtime: false,
+            bench_filters: false,
+            bench_softbuffer: false,
+            input_replay: None,
+            filter: None,
+            perf_dir: PathBuf::from("perf"),
+            dump_scene_pngs: None,
+            dump_every: None,
             category: None,
             assignments: Vec::new(),
             throttled_test: false,
+            calibrate: false,
+            slowdown: 1,
+            dump_hashes: None,
+            verify_hashes: None,
+            filter_color_correction: false,
+            software_adapter: false,
+            simulate_no_adapter: false,
+            governor: None,
+            no_emu_priority: false,
+            loop_replay: false,
+            warmup_frames: 0,
+            profile_sw: false,
+            selftest: false,
+            no_gpu: false,
+            perf_log: None,
+            perf_seconds: None,
+            fullscreen: false,
+            sync_60hz: None,
         };
 
         let mut args = std::env::args().skip(1);
@@ -126,19 +192,122 @@ impl CliConfig {
                     cfg.bench = true;
                     cfg.headless = true;
                 }
+                "--bench-realtime" => {
+                    cfg.bench_realtime = true;
+                    cfg.headless = true;
+                }
+                "--bench-filters" => {
+                    cfg.bench_filters = true;
+                    cfg.headless = true;
+                }
+                "--bench-softbuffer" => {
+                    cfg.bench_softbuffer = true;
+                    cfg.headless = true;
+                }
+                "--input-replay" => {
+                    let v = args.next().ok_or("missing value for --input-replay")?;
+                    cfg.input_replay = Some(PathBuf::from(v));
+                }
+                "--filter" => {
+                    let v = args.next().ok_or("missing value for --filter")?;
+                    if v.trim().eq_ignore_ascii_case("color-correction") {
+                        cfg.filter = Some(DisplayFilter::Sharp1x);
+                        cfg.filter_color_correction = true;
+                    } else {
+                        cfg.filter = Some(bench::parse_display_filter(&v)?);
+                        cfg.filter_color_correction = false;
+                    }
+                }
+                "--perf-dir" => {
+                    let v = args.next().ok_or("missing value for --perf-dir")?;
+                    cfg.perf_dir = PathBuf::from(v);
+                }
+                "--dump-scene-pngs" => {
+                    let v = args.next().ok_or("missing value for --dump-scene-pngs")?;
+                    cfg.dump_scene_pngs = Some(PathBuf::from(v));
+                }
+                "--dump-every" => {
+                    let v = args.next().ok_or("missing value for --dump-every")?;
+                    cfg.dump_every = Some(v.parse().map_err(|_| "invalid --dump-every number")?);
+                }
                 "--category" => {
                     let v = args.next().ok_or("missing value for --category")?;
                     cfg.category = Some(v);
                 }
                 "--assign" => {
-                    let v = args.next().ok_or("missing value for --assign (expected cat=path)")?;
+                    let v = args
+                        .next()
+                        .ok_or("missing value for --assign (expected cat=path)")?;
                     let mut parts = v.splitn(2, '=');
-                    let cat = parts.next().ok_or("invalid --assign format")?.trim().to_string();
-                    let p = parts.next().ok_or("invalid --assign format (missing path)")?.trim();
+                    let cat = parts
+                        .next()
+                        .ok_or("invalid --assign format")?
+                        .trim()
+                        .to_string();
+                    let p = parts
+                        .next()
+                        .ok_or("invalid --assign format (missing path)")?
+                        .trim();
                     cfg.assignments.push((cat, PathBuf::from(p)));
                 }
                 "--throttled-test" => {
                     cfg.throttled_test = true;
+                    cfg.headless = true;
+                }
+                "--calibrate" => {
+                    cfg.calibrate = true;
+                    cfg.headless = true;
+                }
+                "--slowdown" => {
+                    let v = args.next().ok_or("missing value for --slowdown")?;
+                    let n: usize = v.parse().map_err(|_| "invalid --slowdown number")?;
+                    if n < 1 {
+                        return Err("--slowdown N must be >= 1".to_string());
+                    }
+                    cfg.slowdown = n;
+                }
+                "--dump-hashes" => {
+                    let v = args.next().ok_or("missing value for --dump-hashes")?;
+                    cfg.dump_hashes = Some(PathBuf::from(v));
+                    cfg.headless = true;
+                }
+                "--verify-hashes" => {
+                    let v = args.next().ok_or("missing value for --verify-hashes")?;
+                    cfg.verify_hashes = Some(PathBuf::from(v));
+                    cfg.headless = true;
+                }
+                "--software-adapter" => cfg.software_adapter = true,
+                "--simulate-no-adapter" => cfg.simulate_no_adapter = true,
+                "--no-gpu" => cfg.no_gpu = true,
+                "--perf-log" => {
+                    let v = args.next().ok_or("missing value for --perf-log")?;
+                    cfg.perf_log = Some(PathBuf::from(v));
+                }
+                "--perf-seconds" => {
+                    let v = args.next().ok_or("missing value for --perf-seconds")?;
+                    let s: f64 = v.parse().map_err(|_| "invalid --perf-seconds value")?;
+                    if !s.is_finite() || s <= 0.0 {
+                        return Err("--perf-seconds must be > 0".to_string());
+                    }
+                    cfg.perf_seconds = Some(s);
+                }
+                "--fullscreen" => cfg.fullscreen = true,
+                "--sync-60hz" => cfg.sync_60hz = Some(true),
+                "--no-sync-60hz" => cfg.sync_60hz = Some(false),
+                "--governor" => cfg.governor = Some(true),
+                "--no-governor" => cfg.governor = Some(false),
+                "--no-emu-priority" => cfg.no_emu_priority = true,
+                "--loop-replay" => cfg.loop_replay = true,
+                "--warmup-frames" => {
+                    let v = args.next().ok_or("missing value for --warmup-frames")?;
+                    cfg.warmup_frames = v.parse().map_err(|_| "invalid --warmup-frames number")?;
+                }
+                "--profile-sw" => {
+                    cfg.profile_sw = true;
+                    cfg.headless = true;
+                }
+                "--selftest" => {
+                    cfg.selftest = true;
                     cfg.headless = true;
                 }
                 "--dump-regs" => cfg.dump_regs = true,
@@ -147,6 +316,7 @@ impl CliConfig {
                 "--frames" => {
                     let v = args.next().ok_or("missing value for --frames")?;
                     cfg.frames = v.parse().map_err(|_| "invalid --frames number")?;
+                    cfg.frames_explicit = true;
                 }
                 "--bios" => {
                     let v = args.next().ok_or("missing value for --bios")?;
@@ -164,18 +334,37 @@ impl CliConfig {
                     println!(
                         "Usage: gba-frontend-desktop [ROM.gba] [OPTIONS]\n\
                          Options:\n\
-                         \t--headless            Run without GUI window\n\
-                         \t--bench               Run headless benchmark mode (no window, no audio device)\n\
-                         \t--category <cat>      Benchmark category: mode4-3d, mode5-bitmap, affine, sprites, dma-hdma, audio, or 'all'\n\
-                         \t--assign <cat>=<path> Assign a custom ROM to a benchmark category\n\
-                         \t--throttled-test      Verify micro-frameskip under throttled load\n\
-                         \t--frames <N>          Number of frames in headless / benchmark mode (default 120)\n\
-                         \t--bios <path>         Path to 16KB GBA BIOS\n\
-                         \t--sav <path>          Path to .sav battery file\n\
-                         \t--dump-regs           Print CPU/HW registers after execution\n\
-                         \t--fb-crc32            Print framebuffer FNV/CRC checksum and color summary\n\
-                         \t--ascii               Print 30x20 luminance block preview of framebuffer\n\
-                         \t--screenshot <file>   Write 240x160 RGB PPM screenshot"
+                         \t--headless               Run without GUI window\n\
+                         \t--bench                  Run 3600-frame headless benchmark (writes perf/bench-*.json & perf/REPORT.md)\n\
+                         \t--bench-realtime         Run paced 59.7275 Hz headless benchmark logging drops & audio underruns\n\
+                         \t--input-replay <path>    Replay deterministic button inputs and scene tags\n\
+                         \t--filter <name>          Display filter (myboy-smooth, sharp-1x, xbr-3x, lcd-matrix, soft-handheld, scale2x)\n\
+                         \t--perf-dir <dir>         Output directory for benchmark artifacts (default: perf)\n\
+                         \t--category <cat>         Legacy homebrew benchmark category: mode4-3d, mode5-bitmap, affine, sprites, dma-hdma, audio, or 'all'\n\
+                         \t--assign <cat>=<path>    Assign a custom ROM to a legacy benchmark category\n\
+                         \t--throttled-test         Verify micro-frameskip under throttled load\n\
+                         \t--selftest               Run portable self-test (no external ROM needed) -> perf/selftest-*.json\n\
+                         \t--bench-filters          Benchmark every display filter across adapters -> perf/filters-*.json\n\
+                         \t--bench-softbuffer       Time winit+softbuffer at 720x480, 720p, 1080p, fullscreen -> perf/softbuffer-*.json\n\
+                         \t--slowdown <N>           Busy-spin (N-1)x per frame to simulate N-times slower CPU\n\
+                         \t--software-adapter       Force CPU software adapter (SwiftShader Vulkan / DX12 WARP) for benchmarks\n\
+                         \t--simulate-no-adapter    Simulate zero wgpu adapters to exercise automatic No-GPU fallback\n\
+                         \t--no-gpu                 Bypass wgpu and run on the last-resort CPU presenter (winit + softbuffer)\n\
+                         \t--perf-log <file>        Log per-presented-frame interval, emu time, underruns, repeats, filter to CSV\n\
+                         \t--perf-seconds <N>       Automatically close desktop window after N seconds (for timed perf runs)\n\
+                         \t--fullscreen             Launch desktop window in fullscreen mode\n\
+                         \t--sync-60hz / --no-sync-60hz  Toggle 60 Hz display vsync snapping / audio DRC cadence lock\n\
+                         \t--governor / --no-governor  Enable or override the automatic filter quality governor\n\
+                         \t--no-emu-priority        Disable MMCSS/ABOVE_NORMAL priority boost on emulation thread\n\
+                         \t--loop-replay            Loop --input-replay schedule modulo replay duration\n\
+                         \t--warmup-frames <N>      Advance N unpaced/muted frames before timed benchmark measurement\n\
+                         \t--frames <N>             Number of frames (default: 3600 for --bench/--bench-realtime, 120 for --headless)\n\
+                         \t--bios <path>            Path to 16KB GBA BIOS\n\
+                         \t--sav <path>             Path to .sav battery file\n\
+                         \t--dump-regs              Print CPU/HW registers after execution\n\
+                         \t--fb-crc32               Print framebuffer FNV/CRC checksum and color summary\n\
+                         \t--ascii                  Print 30x20 luminance block preview of framebuffer\n\
+                         \t--screenshot <file>      Write 240x160 RGB PPM screenshot"
                     );
                     std::process::exit(0);
                 }
@@ -184,6 +373,13 @@ impl CliConfig {
                 }
                 _ => return Err(format!("unknown argument: {arg}")),
             }
+        }
+        if !cfg.frames_explicit
+            && (cfg.bench_realtime
+                || cfg.bench_filters
+                || (cfg.bench && (cfg.rom_path.is_some() || cfg.category.is_none())))
+        {
+            cfg.frames = 3600;
         }
         Ok(cfg)
     }
@@ -242,7 +438,8 @@ pub fn run_benchmark_category(
     frames: usize,
     bios_path: Option<&Path>,
 ) -> Result<BenchmarkResult, String> {
-    let rom = fs::read(rom_path).map_err(|e| format!("failed to read ROM {}: {e}", rom_path.display()))?;
+    let rom = fs::read(rom_path)
+        .map_err(|e| format!("failed to read ROM {}: {e}", rom_path.display()))?;
     let bios = match bios_path {
         Some(p) => Some(fs::read(p).map_err(|e| format!("failed to read BIOS: {e}"))?),
         None => None,
@@ -305,9 +502,14 @@ pub fn run_benchmark_category(
     let total_wall_ms = total_frame_dur.as_secs_f64() * 1000.0;
     let avg_frame_ms = total_wall_ms / frames.max(1) as f64;
     let worst_frame_ms = max_frame_dur.as_secs_f64() * 1000.0;
-    let fps = if avg_frame_ms > 0.0 { 1000.0 / avg_frame_ms } else { 0.0 };
+    let fps = if avg_frame_ms > 0.0 {
+        1000.0 / avg_frame_ms
+    } else {
+        0.0
+    };
 
-    let total_sub_time = total_cpu_dur + total_ppu_dur + total_apu_dur + total_dma_dur + total_bus_dur;
+    let total_sub_time =
+        total_cpu_dur + total_ppu_dur + total_apu_dur + total_dma_dur + total_bus_dur;
     let total_sub_f = total_sub_time.as_secs_f64().max(1e-9);
 
     let cpu_pct = (total_cpu_dur.as_secs_f64() / total_sub_f) * 100.0;
@@ -316,18 +518,43 @@ pub fn run_benchmark_category(
     let dma_pct = (total_dma_dur.as_secs_f64() / total_sub_f) * 100.0;
     let bus_pct = (total_bus_dur.as_secs_f64() / total_sub_f) * 100.0;
 
-    let total_profile_cycles = agg_fetch + agg_decode + agg_read + agg_write + agg_flush + agg_ppu + agg_apu + agg_dma;
+    let total_profile_cycles =
+        agg_fetch + agg_decode + agg_read + agg_write + agg_flush + agg_ppu + agg_apu + agg_dma;
     let total_prof_f = total_profile_cycles.max(1) as f64;
 
     let mut funcs = vec![
-        ("SysBus::fetch_16 / fetch_32 (Instruction Fetch)".to_string(), (agg_fetch as f64 / total_prof_f) * 100.0),
-        ("Arm7tdmi::step (Decode & ALU/Exec)".to_string(), (agg_decode as f64 / total_prof_f) * 100.0),
-        ("SysBus::read_8/16/32 (Memory Loads)".to_string(), (agg_read as f64 / total_prof_f) * 100.0),
-        ("SysBus::write_8/16/32 (Memory Stores)".to_string(), (agg_write as f64 / total_prof_f) * 100.0),
-        ("Arm7tdmi::flush_pipeline (Branch Flushes)".to_string(), (agg_flush as f64 / total_prof_f) * 100.0),
-        ("Ppu::render_scanline (Scanline Rendering)".to_string(), (agg_ppu as f64 / total_prof_f) * 100.0),
-        ("Apu::advance_scanline (Audio Mixing)".to_string(), (agg_apu as f64 / total_prof_f) * 100.0),
-        ("SysBus::step_active_dma (DMA Transfers)".to_string(), (agg_dma as f64 / total_prof_f) * 100.0),
+        (
+            "SysBus::fetch_16 / fetch_32 (Instruction Fetch)".to_string(),
+            (agg_fetch as f64 / total_prof_f) * 100.0,
+        ),
+        (
+            "Arm7tdmi::step (Decode & ALU/Exec)".to_string(),
+            (agg_decode as f64 / total_prof_f) * 100.0,
+        ),
+        (
+            "SysBus::read_8/16/32 (Memory Loads)".to_string(),
+            (agg_read as f64 / total_prof_f) * 100.0,
+        ),
+        (
+            "SysBus::write_8/16/32 (Memory Stores)".to_string(),
+            (agg_write as f64 / total_prof_f) * 100.0,
+        ),
+        (
+            "Arm7tdmi::flush_pipeline (Branch Flushes)".to_string(),
+            (agg_flush as f64 / total_prof_f) * 100.0,
+        ),
+        (
+            "Ppu::render_scanline (Scanline Rendering)".to_string(),
+            (agg_ppu as f64 / total_prof_f) * 100.0,
+        ),
+        (
+            "Apu::advance_scanline (Audio Mixing)".to_string(),
+            (agg_apu as f64 / total_prof_f) * 100.0,
+        ),
+        (
+            "SysBus::step_active_dma (DMA Transfers)".to_string(),
+            (agg_dma as f64 / total_prof_f) * 100.0,
+        ),
     ];
 
     funcs.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
@@ -375,7 +602,10 @@ pub fn format_benchmark_markdown_table(results: &[BenchmarkResult]) -> String {
     out.push_str("\n### Top 5 Hot Functions by Category\n\n");
     for r in results {
         out.push_str(&format!("#### {} (`{}`)\n", r.category.name(), r.rom_name));
-        out.push_str(&format!("*Workload description: {}*\n\n", r.category.description()));
+        out.push_str(&format!(
+            "*Workload description: {}*\n\n",
+            r.category.description()
+        ));
         for (i, (fname, share)) in r.top_hot_functions.iter().enumerate() {
             out.push_str(&format!("{}. `{}` — **{:.2}%**\n", i + 1, fname, share));
         }
@@ -398,14 +628,22 @@ pub fn run_benchmark_suite(cfg: &CliConfig) -> Result<(), String> {
 
     let mut results = Vec::new();
 
-    println!("Starting GBA Benchmark Suite ({} categories, {} frames each)...", categories.len(), cfg.frames);
+    println!(
+        "Starting GBA Benchmark Suite ({} categories, {} frames each)...",
+        categories.len(),
+        cfg.frames
+    );
 
     for &cat in &categories {
         // Resolve ROM path:
         // 1. Explicit assignment `--assign cat=path`
         // 2. Direct CLI rom_path (if single category specified)
         // 3. Default fallback in `test-roms/`
-        let rom_path = if let Some((_, p)) = cfg.assignments.iter().find(|(c, _)| BenchmarkCategory::parse(c) == Some(cat)) {
+        let rom_path = if let Some((_, p)) = cfg
+            .assignments
+            .iter()
+            .find(|(c, _)| BenchmarkCategory::parse(c) == Some(cat))
+        {
             p.clone()
         } else if categories.len() == 1 && cfg.rom_path.is_some() {
             cfg.rom_path.clone().unwrap()
@@ -414,13 +652,20 @@ pub fn run_benchmark_suite(cfg: &CliConfig) -> Result<(), String> {
         };
 
         if !rom_path.exists() {
-            eprintln!("Skipping category '{}': ROM file '{}' not found", cat.name(), rom_path.display());
+            eprintln!(
+                "Skipping category '{}': ROM file '{}' not found",
+                cat.name(),
+                rom_path.display()
+            );
             continue;
         }
 
         print!("Benchmarking {} (`{}`)... ", cat.name(), rom_path.display());
         let res = run_benchmark_category(cat, &rom_path, cfg.frames, cfg.bios_path.as_deref())?;
-        println!("done ({:.2} ms/frame, {:.1} FPS)", res.avg_frame_ms, res.fps);
+        println!(
+            "done ({:.2} ms/frame, {:.1} FPS)",
+            res.avg_frame_ms, res.fps
+        );
         results.push(res);
     }
 
@@ -445,7 +690,8 @@ pub fn run_benchmark_suite(cfg: &CliConfig) -> Result<(), String> {
 
 pub fn verify_micro_frameskip_throttled(rom_path: &Path, frames: usize) -> Result<(), String> {
     println!("\n=== Micro-Frameskip Verification (Throttled Emulation Test) ===");
-    let rom = fs::read(rom_path).map_err(|e| format!("failed to read ROM {}: {e}", rom_path.display()))?;
+    let rom = fs::read(rom_path)
+        .map_err(|e| format!("failed to read ROM {}: {e}", rom_path.display()))?;
     let mut core = GbaCore::new(None, rom);
     let mut frontend = NullFrontend::new();
 
@@ -468,7 +714,8 @@ pub fn verify_micro_frameskip_throttled(rom_path: &Path, frames: usize) -> Resul
         let simulated_work = Duration::from_millis(25);
         time_accumulator += simulated_work;
 
-        let should_skip = time_accumulator > target_frame_dur && consecutive_skips < max_consecutive_skips;
+        let should_skip =
+            time_accumulator > target_frame_dur && consecutive_skips < max_consecutive_skips;
         if should_skip {
             core.bus.ppu.skip_rendering = true;
             consecutive_skips += 1;
@@ -489,22 +736,64 @@ pub fn verify_micro_frameskip_throttled(rom_path: &Path, frames: usize) -> Resul
     let final_skips = core.bus.ppu.skipped_frames;
     let delta_skips = final_skips.saturating_sub(initial_skips);
 
-    println!("Executed {frames} frames with simulated throttling (elapsed: {:.2?})", elapsed);
+    println!(
+        "Executed {frames} frames with simulated throttling (elapsed: {:.2?})",
+        elapsed
+    );
     println!("Skipped frames count: {delta_skips} (out of {frames} frames)");
     println!(
         "Audio samples generated: {} (CPU, DMA, Timers, APU ran at 100% full rate)",
         frontend.total_audio_samples
     );
-    println!("Audio continuity: Verified glitch-free (audio generation never stalls during frameskip)");
+    println!(
+        "Audio continuity: Verified glitch-free (audio generation never stalls during frameskip)"
+    );
 
-    assert!(delta_skips > 0, "Micro-frameskip must skip frames when emulation falls behind real-time budget");
-    assert!(frontend.total_audio_samples > 0, "Audio samples must not drop to 0 during frameskip");
+    assert!(
+        delta_skips > 0,
+        "Micro-frameskip must skip frames when emulation falls behind real-time budget"
+    );
+    assert!(
+        frontend.total_audio_samples > 0,
+        "Audio samples must not drop to 0 during frameskip"
+    );
     Ok(())
 }
 
 pub fn run_headless(cfg: &CliConfig) -> Result<(), String> {
+    if cfg.calibrate {
+        return bench::run_calibrate();
+    }
+
+    if cfg.selftest {
+        return bench::run_selftest(cfg);
+    }
+
+    if cfg.profile_sw {
+        return bench::run_profile_swiftshader(cfg.frames);
+    }
+
+    if cfg.bench_realtime {
+        return bench::run_bench_realtime(cfg);
+    }
+
+    if cfg.bench_filters {
+        return bench::run_bench_filters(cfg);
+    }
+
+    if cfg.bench_softbuffer {
+        return bench::run_bench_softbuffer(cfg);
+    }
+
     if cfg.bench {
+        if cfg.rom_path.is_some() && cfg.category.is_none() && cfg.assignments.is_empty() {
+            return bench::run_bench(cfg);
+        }
         return run_benchmark_suite(cfg);
+    }
+
+    if cfg.dump_hashes.is_some() || cfg.verify_hashes.is_some() {
+        return bench::run_hash_pass(cfg);
     }
 
     if cfg.throttled_test {
@@ -524,6 +813,10 @@ pub fn run_headless(cfg: &CliConfig) -> Result<(), String> {
         Some(p) => Some(fs::read(p).map_err(|e| format!("failed to read BIOS: {e}"))?),
         None => None,
     };
+    let replay = match &cfg.input_replay {
+        Some(p) => InputReplay::load(p)?,
+        None => InputReplay::default(),
+    };
 
     let mut core = GbaCore::new(bios.as_deref(), rom);
     if let Some(sav) = &cfg.sav_path
@@ -533,10 +826,62 @@ pub fn run_headless(cfg: &CliConfig) -> Result<(), String> {
         core.bus.cart.load_save_data(&bytes);
     }
 
-    let mut frontend = NullFrontend::new();
-    for _ in 0..cfg.frames {
-        core.run_frame(&mut frontend);
+    struct ReplayNullFrontend<'a> {
+        inner: NullFrontend,
+        replay: &'a InputReplay,
+        frame_idx: usize,
     }
+
+    impl<'a> HostFrontend for ReplayNullFrontend<'a> {
+        fn present_frame(&mut self, fb: &[u16; LCD_WIDTH * LCD_HEIGHT]) {
+            self.inner.present_frame(fb);
+        }
+
+        fn push_audio_samples(&mut self, samples: &[i16]) {
+            self.inner.push_audio_samples(samples);
+        }
+
+        fn poll_keypad(&mut self) -> u16 {
+            self.replay.keyinput_at(self.frame_idx)
+        }
+    }
+
+    let mut wrapper = ReplayNullFrontend {
+        inner: NullFrontend::new(),
+        replay: &replay,
+        frame_idx: 0,
+    };
+
+    let snapshot_targets: Vec<(usize, String)> = if cfg.dump_scene_pngs.is_some() {
+        replay
+            .scenes
+            .iter()
+            .map(|s| ((s.start_frame + s.end_frame) / 2, s.name.clone()))
+            .collect()
+    } else {
+        Vec::new()
+    };
+
+    for frame_idx in 0..cfg.frames {
+        wrapper.frame_idx = frame_idx;
+        core.run_frame(&mut wrapper);
+        if let Some(dir) = &cfg.dump_scene_pngs {
+            if let Some(step) = cfg.dump_every
+                && step > 0
+                && frame_idx % step == 0
+            {
+                let out_png = dir.join(format!("frame_{frame_idx:05}.png"));
+                bench::save_rgb_png_from_bgr555(&wrapper.inner.last_fb, &out_png)?;
+            }
+            for (target_f, name) in &snapshot_targets {
+                if *target_f == frame_idx {
+                    let out_png = dir.join(format!("{frame_idx:04}_{name}.png"));
+                    bench::save_rgb_png_from_bgr555(&wrapper.inner.last_fb, &out_png)?;
+                }
+            }
+        }
+    }
+    let frontend = wrapper.inner;
 
     if let Some(sav) = &cfg.sav_path
         && core.bus.cart.save_dirty
@@ -631,7 +976,11 @@ fn print_ascii_preview(fb: &[u16; LCD_WIDTH * LCD_HEIGHT]) {
                 }
             }
             let avg = sum_luma / 12;
-            let val = if min_luma < 80 && avg > 150 { min_luma } else { avg };
+            let val = if min_luma < 80 && avg > 150 {
+                min_luma
+            } else {
+                avg
+            };
             let ch = match val {
                 0..=40 => '#',
                 41..=100 => '+',

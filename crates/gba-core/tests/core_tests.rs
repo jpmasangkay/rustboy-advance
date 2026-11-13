@@ -1439,7 +1439,8 @@ fn test_timer_overhead_and_subsystem_breakdown() {
     let frame_overhead_us = (calls_per_frame as f64 * ns_per_call) / 1000.0;
     println!("Estimated timer overhead per frame ({calls_per_frame} calls): {frame_overhead_us:.3} us ({:.4} ms)", frame_overhead_us / 1000.0);
 
-    let rom_path = r#"C:\Users\My Laptop\Downloads\Summon Night - Swordcraft Story (USA).gba"#;
+    let env_rom = std::env::var("GBA_BENCHMARK_ROM").ok();
+    let rom_path = env_rom.as_deref().unwrap_or("roms/benchmark.gba");
     if let Ok(rom) = std::fs::read(rom_path) {
         let mut core = gba_core::GbaCore::new(None, rom);
         struct DummyFe;
@@ -1484,7 +1485,7 @@ fn test_timer_overhead_and_subsystem_breakdown() {
         let dma_ms = (dma_total.as_secs_f64() * 1000.0) / 120.0;
         let other_ms = uninst_per_frame_ms - (ppu_ms + apu_ms + dma_ms);
 
-        println!("\n=== EMPIRICAL COMPARISON (120 frames of Summon Night) ===");
+        println!("\n=== EMPIRICAL COMPARISON (120 frames of benchmark ROM) ===");
         println!("Pass 1 (Uninstrumented run_frame):     {uninst_per_frame_ms:.4} ms/frame ({:.1} FPS)", 1000.0 / uninst_per_frame_ms);
         println!("Pass 2 (Instrumented run_frame_bench): {bench_per_frame_ms:.4} ms/frame ({:.1} FPS)", 1000.0 / bench_per_frame_ms);
         println!("Empirical Instrumentation Overhead:    {empirical_timer_overhead_ms:.4} ms/frame ({:.2}%)", (empirical_timer_overhead_ms / uninst_per_frame_ms) * 100.0);

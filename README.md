@@ -5,14 +5,14 @@
 
 **Emulate. Debug. Rewind. Pure Rust.**
 
-A high-performance, cycle-accurate Game Boy Advance (GBA) and Game Boy / Game Boy Color (GB/GBC) emulator, debugger, and TAS toolkit built entirely in Rust. Features an HLE/LLE ARM7TDMI core with pipelined instruction execution, scanline-accurate Mode 0–5 PPU with multi-layer alpha blending, comprehensive 6-channel APU synthesizer with Kaiser sinc resamplers, fluid real-time XOR-delta rewind, live disassembler/memory inspector, GDB remote stub on `:2345`, GLSL shader pipeline, pure-Rust Piccolo Lua 5.4 scripting, RetroAchievements integration, 2-player local split-screen & TCP Netplay link cable, and a sleek DuckStation-inspired game library interface.
+A high-performance, cycle-accurate Game Boy Advance (GBA) and Game Boy / Game Boy Color (GB/GBC) emulator, debugger, and TAS toolkit built entirely in Rust. Features an HLE/LLE ARM7TDMI core with pipelined instruction execution, scanline-accurate Mode 0–5 PPU with multi-layer alpha blending, comprehensive 6-channel APU synthesizer with Kaiser sinc resamplers, fluid real-time XOR-delta rewind, live disassembler/memory inspector, GDB remote stub on `:2345`, WGSL (`wgpu`) shader pipeline with automatic `winit`/`softbuffer` No-GPU fallback, pure-Rust Piccolo Lua 5.4 scripting, RetroAchievements integration, 2-player local split-screen & TCP Netplay link cable, and a sleek DuckStation-inspired game library interface.
 
 [![Rust](https://img.shields.io/badge/Rust-1.85+-DEA584?style=for-the-badge&logo=rust&logoColor=white)](https://www.rust-lang.org)
 [![Edition](https://img.shields.io/badge/Edition-2024-blue?style=for-the-badge)](https://www.rust-lang.org)
 [![WebAssembly](https://img.shields.io/badge/WebAssembly-WASM-654FF0?style=for-the-badge&logo=webassembly&logoColor=white)](https://webassembly.org)
 [![egui](https://img.shields.io/badge/egui-0.31-4183C4?style=for-the-badge)](https://github.com/emilk/egui)
 [![winit](https://img.shields.io/badge/winit-0.30-333333?style=for-the-badge)](https://github.com/rust-windowing/winit)
-[![OpenGL](https://img.shields.io/badge/OpenGL-Glow-5586A4?style=for-the-badge&logo=opengl&logoColor=white)](https://github.com/grovesNL/glow)
+[![wgpu](https://img.shields.io/badge/wgpu-24.0-4E8EE9?style=for-the-badge)](https://wgpu.rs)
 [![License: MPL-2.0](https://img.shields.io/badge/License-MPL--2.0-yellow.svg?style=for-the-badge)](LICENSE)
 
 🖥️ **Repository:** [github.com/jpmasangkay/rustboy-advance](https://github.com/jpmasangkay/rustboy-advance)
@@ -34,13 +34,10 @@ A high-performance, cycle-accurate Game Boy Advance (GBA) and Game Boy / Game Bo
 - **All display modes** — Mode 0, 1, 2 (tiled text & affine backgrounds) and Mode 3, 4, 5 (bitmap frame-buffer modes with page flipping and VRAM unmapped mirroring).
 - **128 hardware sprites (OBJs)** — rotation/scaling (affine matrix transformations), mosaic effects, double-size flags, and semi-transparent priority arbitration.
 - **Full color compositor** — multi-layer alpha blending, brightness increase/decrease, windowing (Win0, Win1, WinOBJ), and GREENSWAP support.
-- **GLSL shader pipeline** — hardware-accelerated GLSL 140 / OpenGL 3.3 shaders with preset hot-switching:
-  - `Nearest` (pixel-crisp integer scaling)
-  - `SharpBilinear` (anti-shimmer pixel scaling)
-  - `LcdGrid` (authentic GBA LCD pixel matrix with subpixel boundaries)
-  - `CrtScanlines` (classic CRT beam profile with phosphor glow)
-  - `ScaleEdge` (smart edge smoothing)
-  - `Frame Blending` (50/50 flicker fix for transparency effects)
+- **WGSL (`wgpu`) shader pipeline & No-GPU fallback** — hardware-accelerated WGSL shaders (`Vulkan` → `DX12` → `GL`) with GPU startup probe guard, adaptive `QualityGovernor` scaling, and automatic `winit` + `softbuffer` No-GPU fallback (capped at `720×480` via Win32 `StretchDIBits` on Windows):
+  - **Shader presets:** `Nearest`, `SharpBilinear`, `LcdGrid`, `CrtScanlines`, and `ScaleEdge`
+  - **Display filters & color LUTs:** `MyBoy Smooth`, `Sharp 1x`, `xBR 3x`, `LCD Matrix`, `Soft LCD`, `Scale2x`, and `CRT Scanlines` (`AGB-001`, `AGS-101`, `AGS-001`, `Linear`)
+  - **Frame Blending & LCD Ghosting** (50/50 transparency flicker fix and inter-frame persistence)
 
 ### 🔊 APU & Sound Synthesis
 
@@ -89,12 +86,12 @@ A high-performance, cycle-accurate Game Boy Advance (GBA) and Game Boy / Game Bo
 | **gba-core** | Decoupled, `no_std`-ready core emulation engine (ARM7TDMI, PPU, APU, Bus, Cartridge, Timers, DMA) |
 | **gb-core** | Dedicated `#![no_std]` + alloc Game Boy & Game Boy Color emulation core (SM83, MBC, PPU, APU) |
 | **gba-debugger** | Disassembler for ARM and Thumb instruction sets, breakpoint engine, memory inspector, GDB stub |
-| **gba-frontend-desktop** | Cross-platform native desktop application with egui, GLSL shaders, TAS movies, Lua, and Netplay |
-| **gba-frontend-web** | WebAssembly (WASM) frontend bindings with AudioWorklet and WebGL presentation |
+| **gba-frontend-desktop** | Cross-platform native desktop application with `eframe`/`egui`, WGSL (`wgpu`) shaders, `softbuffer` No-GPU fallback, `.rbm` TAS movies, Lua, and Netplay |
+| **gba-frontend-web** | WebAssembly (WASM) frontend bindings paired with Canvas 2D pixel presentation and AudioWorklet audio |
 | **gba-libretro** | Libretro core bridge for RetroArch and RetroPie ecosystems with 32K color LUTs and rumble |
 | **gba-testrunner** | Automated test harness executing JSMolka, FuzzARM, ARMWrestler, NanoBoyAdvance, and Tonc suites |
-| **winit 0.30 & glutin 0.32** | Cross-platform window creation and OpenGL context management |
-| **glow** | Modern, lightweight OpenGL bindings for accelerated framebuffer presentation and GLSL shaders |
+| **winit 0.30 & softbuffer 0.4** | Cross-platform window management and software framebuffer presentation for `--no-gpu` fallback |
+| **wgpu 24.0** | Hardware-accelerated GPU presentation (`Vulkan`, `DX12`, `GL`) and WGSL post-processing shaders |
 | **egui 0.31** | Immediate-mode GUI library powering the ROM library, menu bars, HUD, and debugger windows |
 | **cpal** | Low-latency cross-platform native audio streaming |
 | **gilrs** | Cross-platform gamepad and controller input handling with vibration support |
@@ -107,7 +104,7 @@ A high-performance, cycle-accurate Game Boy Advance (GBA) and Game Boy / Game Bo
 ### Prerequisites
 
 - [Rust SDK](https://rustup.rs/) (1.85 or later with `cargo`)
-- A system supporting OpenGL 3.3+ (Windows, Linux, or macOS)
+- Windows, Linux, or macOS (Vulkan, DX12, Metal, or OpenGL GPU recommended; automatic `winit` + `softbuffer` `--no-gpu` CPU fallback supported)
 - GBA ROM files (`.gba`) or GB/GBC ROM files (`.gb`, `.gbc`)
 
 ### Installation & Build
@@ -120,7 +117,8 @@ cd rustboy-advance
 # Build the desktop release binary
 cargo build --release -p gba-frontend-desktop
 
-# Run the automated test suite across all test ROMs
+# Fetch public test ROMs (first time only), then run the automated test suite
+./scripts/fetch-test-roms.sh   # or .\scripts\fetch-test-roms.ps1 on Windows
 cargo run -p gba-testrunner -- --report TEST_RESULTS.md --fail-on-unexpected
 ```
 
@@ -158,41 +156,44 @@ node web/server.js
 
 ### Default Keyboard Mapping
 
-| GBA Button | Primary Key | Alternate Key | Gamepad (XInput / DualShock) |
-|------------|-------------|---------------|------------------------------|
-| **D-Pad Up** | `Up Arrow` | `W` | D-Pad Up / Left Stick Up |
-| **D-Pad Down** | `Down Arrow` | `S` | D-Pad Down / Left Stick Down |
-| **D-Pad Left** | `Left Arrow` | `A` | D-Pad Left / Left Stick Left |
-| **D-Pad Right** | `Right Arrow` | `D` | D-Pad Right / Left Stick Right |
-| **Button A** | `Z` | `J` | Button A (Cross) |
-| **Button B** | `X` | `K` | Button B (Circle) |
-| **Left Shoulder (L)** | `Q` | `U` | Left Bumper (LB / L1) |
-| **Right Shoulder (R)** | `E` | `I` | Right Bumper (RB / R1) |
-| **Start** | `Enter` | `Return` | Start / Options |
-| **Select** | `Backspace` | `Shift` | Back / Share |
+| GBA Button | Player 1 Default | Player 2 (Local Link) |
+|------------|------------------|-----------------------|
+| **D-Pad Up** | `ArrowUp` | `I` |
+| **D-Pad Down** | `ArrowDown` | `K` |
+| **D-Pad Left** | `ArrowLeft` | `J` |
+| **D-Pad Right** | `ArrowRight` | `L` |
+| **Button A** | `Z` | `O` |
+| **Button B** | `X` | `U` |
+| **Left Shoulder (L)** | `Q` | `7` |
+| **Right Shoulder (R)** | `E` | `8` |
+| **Start** | `Enter` | `N` |
+| **Select** | `Backspace` | `M` |
+| **Turbo A / Turbo B** | `V` / `C` | — |
+
+Gamepad controllers (`gilrs`) are supported out of the box and all keyboard/gamepad bindings can be remapped in the UI under **Input Settings**.
 
 ### Hotkeys & Shortcuts
 
 | Action | Shortcut |
 |--------|----------|
+| **Open ROM** | `Ctrl+O` |
+| **Close ROM / Return to Library** | `Ctrl+W` |
+| **Pause Overlay / Exit Fullscreen** | `Esc` |
+| **Pause / Resume** | `Space` |
 | **Rewind Gameplay** | Hold `R` |
-| **Fast Forward (Turbo)** | Hold `Tab` / Toggle `Space` |
-| **Pause / Resume** | `P` / `Space` |
-| **Toggle Fullscreen** | `F11` / Double-Click Viewport |
+| **Fast Forward (Turbo)** | Hold `Tab` |
+| **Toggle Fullscreen** | `F11` |
 | **Visual Save State Manager** | `F6` |
-| **Quick Save State (Slots 1–5)** | `F1` – `F5` |
-| **Quick Load State (Slots 1–5)** | `Shift+F1` – `Shift+F5` |
+| **Quick Save State (Slots 1–5)** | `F1` (configurable), `F2`–`F5` |
+| **Quick Load State (Slots 1–5)** | `Shift+F1` (configurable), `Shift+F2`–`F5` |
 | **Undo Last Save / Load Action** | `Ctrl+Z` |
 | **Advance Single Frame** | `Ctrl+N` |
 | **Hard Reset** | `Ctrl+R` |
 | **Mute / Unmute Audio** | `Ctrl+M` |
 | **Take Screenshot** | `F12` |
-| **Toggle HUD & Status Bar** | `Ctrl+S` |
-| **Memory Search** | `Ctrl+F` |
-| **GDB Remote Stub** | `Ctrl+G` |
-| **Lua Scripting Console** | `Ctrl+L` |
-| **Record GIF Video** | `Ctrl+Shift+R` |
-| **Record WAV Audio** | `Ctrl+Shift+A` |
+| **Toggle Action Toolbar** | `Ctrl+T` |
+| **Toggle Status Bar** | `Ctrl+S` |
+| **Boktai Solar Sensor (- / +)** | `[` / `]` |
 
 ---
 
@@ -207,10 +208,10 @@ Built with ❤️ by **John Paul Masangkay** ([@jpmasangkay](https://github.com/
 - **Martin Korth (GBATEK)** — The definitive Game Boy Advance technical reference
 - **Vicki Pfau & the mGBA project** — Invaluable documentation and test suites for GBA edge cases
 - **NanoBoyAdvance, JSMolka, and FuzzARM authors** — Outstanding automated hardware test ROM suites
-- **The Rust Community** — For crates like `egui`, `winit`, `glow`, `cpal`, and `piccolo`
+- **The Rust Community** — For crates like `egui`, `winit`, `wgpu`, `softbuffer`, `cpal`, and `piccolo`
 
 ---
 
 ## 📄 License
 
-This project is licensed under the Mozilla Public License 2.0 ([MPL-2.0](LICENSE)).
+This project is licensed under the Mozilla Public License 2.0 ([MPL-2.0](LICENSE) — see the [official text](https://www.mozilla.org/en-US/MPL/2.0/)).

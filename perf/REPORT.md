@@ -4,7 +4,7 @@
 **Branch / Build:** Clean tagged commit `phase9-final` on branch `perf/smooth-weak-hardware` (`main` untouched at `fc25e98`; `0` compiler warnings; post-tag clean rebuild embeds a non-`-dirty` commit hash in `--selftest` JSON)  
 **Host Environment:** AMD Ryzen 9 8945HX (16C / 32T), `32,560 MB` RAM, Windows 11 (`10.0.26300`), built-in display `2560 x 1600` (Windows Settings exposes `60 Hz` and `240 Hz` only; `NVIDIA GeForce RTX 5070 Laptop GPU`), `rustc 1.99.1` (`x86_64-pc-windows-gnu`, `rust-lld`, LLVM `23.1.1`)  
 **Release Profile (`Cargo.toml`):** `opt-level = 3`, `lto = "fat"`, `codegen-units = 1`, `panic = "abort"`, `strip = "symbols"`  
-**Test ROMs (never committed):** `C:\Users\My Laptop\Downloads\Summon Night - Swordcraft Story (USA).gba` (read-only external ROM with deterministic `3,600f` replay `perf/replays/summon_night.txt` + `perf/replays/summon_night.sav`), `9` git-ignored stress ROMs + `13` `jsmolka/gba-tests` ROMs in `roms/homebrew/`, and embedded MIT/Apache `STRESS_SELF` (`stress_rom.rs`).
+**Test ROMs (never committed):** `Summon Night - Swordcraft Story (USA).gba` (read-only external ROM with deterministic `3,600f` replay `perf/replays/summon_night.txt` + `perf/replays/summon_night.sav`), `9` git-ignored stress ROMs + `13` `jsmolka/gba-tests` ROMs in `roms/homebrew/`, and embedded MIT/Apache `STRESS_SELF` (`stress_rom.rs`).
 
 ---
 

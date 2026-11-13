@@ -18,6 +18,8 @@ Thumbs.db
 
 # Commercial ROMs, BIOS dumps, and game saves (keep repository clean and legal)
 *.gba
+*.gb
+*.gbc
 *.bin
 *.sav
 *.srm
@@ -36,6 +38,7 @@ Thumbs.db
 *.cfg
 *.ini
 frame_*.png
+covers/
 test_output/
 test-roms/
 roms/
@@ -56,6 +59,8 @@ perf/selftest-*.json
 perf/softbuffer-*.json
 perf/weak_hardware.json
 perf/phase*
+perf/*.png
+perf/REPORT*.bak*
 PresentMon*.csv
 
 

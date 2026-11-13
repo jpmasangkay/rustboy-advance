@@ -7,7 +7,7 @@ param(
 $ErrorActionPreference = "Stop"
 
 $exe = (Resolve-Path "target\release\rustboy-advance.exe").Path
-$rom = "C:\Users\My Laptop\Downloads\Summon Night - Swordcraft Story (USA).gba"
+$rom = if ($env:GBA_BENCH_ROM) { $env:GBA_BENCH_ROM } else { "roms/summon_night.gba" }
 $replay = "perf/replays/summon_night.txt"
 $sav = "perf/replays/summon_night.sav"
 $gbaFps = 59.72750056960583

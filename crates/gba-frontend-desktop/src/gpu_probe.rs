@@ -1,5 +1,6 @@
 use std::io::{BufRead, BufReader, Write};
 use std::process::{Command, Stdio};
+use std::sync::atomic::{AtomicBool, AtomicIsize, AtomicUsize, Ordering};
 use std::sync::{Arc, mpsc};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
@@ -10,11 +11,14 @@ use winit::event::WindowEvent;
 use winit::event_loop::{ActiveEventLoop, EventLoop};
 use winit::window::{Window, WindowId};
 
-use crate::config::{AppConfig, BlockedGpuAdapterEntry};
+use crate::config::{AppConfig, BlockedGpuAdapterEntry, VerifiedGpuAdapterEntry};
 use crate::headless::CliConfig;
 use crate::shaders::{discover_software_cpu_adapter_with_backends, select_preferred_adapter};
 
 pub const DEFAULT_GPU_PROBE_TIMEOUT_MS: u64 = 7000;
+pub const RETRY_GPU_PROBE_TIMEOUT_MS: u64 = 20_000;
+pub const GPU_BLOCKLIST_FAILURE_THRESHOLD: u32 = 2;
+pub const GPU_BLOCKLIST_TTL_SECS: u64 = 30 * 24 * 60 * 60;
 const ADAPTER_ENUM_SENTINEL_KEY: &str = "adapter-enum";
 const PREFIX_ADAPTER: &str = "GPU_PROBE_ADAPTER:";
 const PREFIX_STAGE: &str = "GPU_PROBE_STAGE:";
@@ -94,12 +98,33 @@ struct ProbeExecResult {
     detail: String,
 }
 
-fn utc_epoch_label() -> String {
-    let secs = SystemTime::now()
+fn utc_epoch_secs() -> u64 {
+    SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map(|d| d.as_secs())
-        .unwrap_or(0);
+        .unwrap_or(0)
+}
+
+fn utc_epoch_label(secs: u64) -> String {
     format!("unix:{secs}")
+}
+
+fn is_blocked_entry_expired(
+    entry: &BlockedGpuAdapterEntry,
+    meta: Option<&ProbeAdapterMeta>,
+    now_secs: u64,
+) -> Option<&'static str> {
+    if entry.recorded_epoch_secs > 0
+        && now_secs.saturating_sub(entry.recorded_epoch_secs) >= GPU_BLOCKLIST_TTL_SECS
+    {
+        return Some("30-day expiry elapsed");
+    }
+    if let Some(m) = meta
+        && (entry.driver != m.driver || entry.driver_info != m.driver_info)
+    {
+        return Some("driver version changed");
+    }
+    None
 }
 
 fn emit_probe_line(prefix: &str, payload: &str) {
@@ -494,53 +519,549 @@ fn run_probe_subprocess(
     }
 }
 
-fn evaluate_guard_with_runner<F>(
+#[cfg(target_os = "windows")]
+mod checking_splash {
+    use std::thread::JoinHandle;
+    use super::*;
+
+    const WM_DESTROY: u32 = 0x0002;
+    const WM_PAINT: u32 = 0x000F;
+    const WM_CLOSE: u32 = 0x0010;
+    const WM_ERASEBKGND: u32 = 0x0014;
+    const WS_POPUP: u32 = 0x8000_0000;
+    const WS_VISIBLE: u32 = 0x1000_0000;
+    const WS_EX_TOPMOST: u32 = 0x0000_0008;
+    const WS_EX_TOOLWINDOW: u32 = 0x0000_0080;
+    const WS_EX_NOACTIVATE: u32 = 0x0800_0000;
+    const SM_CXSCREEN: i32 = 0;
+    const SM_CYSCREEN: i32 = 1;
+    const TRANSPARENT: i32 = 1;
+    const DEFAULT_GUI_FONT: i32 = 17;
+    const DT_CENTER: u32 = 0x0001;
+    const DT_SINGLELINE: u32 = 0x0020;
+    const DT_VCENTER: u32 = 0x0004;
+    const DT_NOPREFIX: u32 = 0x0800;
+
+    static CLASS_SEQ: AtomicUsize = AtomicUsize::new(1);
+
+    #[repr(C)]
+    #[derive(Clone, Copy)]
+    struct Rect {
+        left: i32,
+        top: i32,
+        right: i32,
+        bottom: i32,
+    }
+
+    #[repr(C)]
+    struct PaintStruct {
+        hdc: isize,
+        f_erase: i32,
+        rc_paint: Rect,
+        f_restore: i32,
+        f_inc_update: i32,
+        rgb_reserved: [u8; 32],
+    }
+
+    #[repr(C)]
+    struct Point {
+        x: i32,
+        y: i32,
+    }
+
+    #[repr(C)]
+    struct Msg {
+        hwnd: isize,
+        message: u32,
+        w_param: usize,
+        l_param: isize,
+        time: u32,
+        pt: Point,
+    }
+
+    #[repr(C)]
+    struct WndClassExW {
+        cb_size: u32,
+        style: u32,
+        lpfn_wnd_proc: unsafe extern "system" fn(isize, u32, usize, isize) -> isize,
+        cb_cls_extra: i32,
+        cb_wnd_extra: i32,
+        h_instance: isize,
+        h_icon: isize,
+        h_cursor: isize,
+        hbr_background: isize,
+        lpsz_menu_name: *const u16,
+        lpsz_class_name: *const u16,
+        h_icon_sm: isize,
+    }
+
+    #[link(name = "kernel32")]
+    unsafe extern "system" {
+        fn GetModuleHandleW(lp_module_name: *const u16) -> isize;
+    }
+
+    #[link(name = "user32")]
+    unsafe extern "system" {
+        fn RegisterClassExW(lp_wnd_class: *const WndClassExW) -> u16;
+        fn UnregisterClassW(lp_class_name: *const u16, h_instance: isize) -> i32;
+        fn CreateWindowExW(
+            dw_ex_style: u32,
+            lp_class_name: *const u16,
+            lp_window_name: *const u16,
+            dw_style: u32,
+            x: i32,
+            y: i32,
+            n_width: i32,
+            n_height: i32,
+            h_wnd_parent: isize,
+            h_menu: isize,
+            h_instance: isize,
+            lp_param: isize,
+        ) -> isize;
+        fn DestroyWindow(hwnd: isize) -> i32;
+        fn DefWindowProcW(hwnd: isize, msg: u32, w_param: usize, l_param: isize) -> isize;
+        fn GetMessageW(
+            lp_msg: *mut Msg,
+            hwnd: isize,
+            w_msg_filter_min: u32,
+            w_msg_filter_max: u32,
+        ) -> i32;
+        fn TranslateMessage(lp_msg: *const Msg) -> i32;
+        fn DispatchMessageW(lp_msg: *const Msg) -> isize;
+        fn PostMessageW(hwnd: isize, msg: u32, w_param: usize, l_param: isize) -> i32;
+        fn PostQuitMessage(n_exit_code: i32);
+        fn BeginPaint(hwnd: isize, lp_paint: *mut PaintStruct) -> isize;
+        fn EndPaint(hwnd: isize, lp_paint: *const PaintStruct) -> i32;
+        fn FillRect(hdc: isize, lprc: *const Rect, hbr: isize) -> i32;
+        fn DrawTextW(
+            hdc: isize,
+            lpch_text: *const u16,
+            cch_text: i32,
+            lprc: *mut Rect,
+            format: u32,
+        ) -> i32;
+        fn GetSystemMetrics(n_index: i32) -> i32;
+        fn GetClientRect(hwnd: isize, lp_rect: *mut Rect) -> i32;
+    }
+
+    #[link(name = "gdi32")]
+    unsafe extern "system" {
+        fn CreateSolidBrush(color: u32) -> isize;
+        fn DeleteObject(ho: isize) -> i32;
+        fn SetBkMode(hdc: isize, mode: i32) -> i32;
+        fn SetTextColor(hdc: isize, color: u32) -> u32;
+        fn SelectObject(hdc: isize, h: isize) -> isize;
+        fn GetStockObject(i: i32) -> isize;
+    }
+
+    fn to_wide_null(s: &str) -> Vec<u16> {
+        s.encode_utf16().chain(std::iter::once(0)).collect()
+    }
+
+    unsafe extern "system" fn splash_wndproc(
+        hwnd: isize,
+        msg: u32,
+        w_param: usize,
+        l_param: isize,
+    ) -> isize {
+        match msg {
+            WM_ERASEBKGND => 1,
+            WM_PAINT => {
+                let mut ps = std::mem::MaybeUninit::<PaintStruct>::zeroed();
+                let hdc = unsafe { BeginPaint(hwnd, ps.as_mut_ptr()) };
+                if hdc != 0 {
+                    let mut rc = Rect {
+                        left: 0,
+                        top: 0,
+                        right: 0,
+                        bottom: 0,
+                    };
+                    unsafe { GetClientRect(hwnd, &mut rc) };
+
+                    // Subtle 1px hairline border (#2B3340 -> 0x0040332B) and dark card (#141820 -> 0x00201814).
+                    let border_brush = unsafe { CreateSolidBrush(0x0040_332B) };
+                    let bg_brush = unsafe { CreateSolidBrush(0x0020_1814) };
+                    if border_brush != 0 {
+                        unsafe { FillRect(hdc, &rc, border_brush) };
+                    }
+                    let inner = Rect {
+                        left: rc.left + 1,
+                        top: rc.top + 1,
+                        right: (rc.right - 1).max(rc.left + 1),
+                        bottom: (rc.bottom - 1).max(rc.top + 1),
+                    };
+                    if bg_brush != 0 {
+                        unsafe { FillRect(hdc, &inner, bg_brush) };
+                    }
+
+                    unsafe { SetBkMode(hdc, TRANSPARENT) };
+                    let font = unsafe { GetStockObject(DEFAULT_GUI_FONT) };
+                    let prev_font = if font != 0 {
+                        unsafe { SelectObject(hdc, font) }
+                    } else {
+                        0
+                    };
+
+                    let mut title_rc = Rect {
+                        left: inner.left + 12,
+                        top: inner.top + 16,
+                        right: inner.right - 12,
+                        bottom: inner.top + 42,
+                    };
+                    let mut sub_rc = Rect {
+                        left: inner.left + 12,
+                        top: inner.top + 42,
+                        right: inner.right - 12,
+                        bottom: inner.bottom - 12,
+                    };
+
+                    let title = to_wide_null("Checking graphics...");
+                    let sub = to_wide_null("Verifying GPU adapter before startup");
+                    unsafe {
+                        SetTextColor(hdc, 0x00F9_F5F1);
+                        DrawTextW(
+                            hdc,
+                            title.as_ptr(),
+                            (title.len() - 1) as i32,
+                            &mut title_rc,
+                            DT_CENTER | DT_SINGLELINE | DT_VCENTER | DT_NOPREFIX,
+                        );
+                        SetTextColor(hdc, 0x00B8_A394);
+                        DrawTextW(
+                            hdc,
+                            sub.as_ptr(),
+                            (sub.len() - 1) as i32,
+                            &mut sub_rc,
+                            DT_CENTER | DT_SINGLELINE | DT_VCENTER | DT_NOPREFIX,
+                        );
+                    }
+
+                    if prev_font != 0 {
+                        unsafe { SelectObject(hdc, prev_font) };
+                    }
+                    if bg_brush != 0 {
+                        unsafe { DeleteObject(bg_brush) };
+                    }
+                    if border_brush != 0 {
+                        unsafe { DeleteObject(border_brush) };
+                    }
+                    unsafe { EndPaint(hwnd, ps.as_ptr()) };
+                }
+                0
+            }
+            WM_CLOSE => {
+                unsafe { DestroyWindow(hwnd) };
+                0
+            }
+            WM_DESTROY => {
+                unsafe { PostQuitMessage(0) };
+                0
+            }
+            _ => unsafe { DefWindowProcW(hwnd, msg, w_param, l_param) },
+        }
+    }
+
+    pub struct SplashGuard {
+        hwnd: Arc<AtomicIsize>,
+        closed: Arc<AtomicBool>,
+        finished: Arc<AtomicBool>,
+        thread: Option<JoinHandle<()>>,
+    }
+
+    impl SplashGuard {
+        pub fn spawn() -> Self {
+            let hwnd = Arc::new(AtomicIsize::new(0));
+            let closed = Arc::new(AtomicBool::new(false));
+            let finished = Arc::new(AtomicBool::new(false));
+
+            let hwnd_c = Arc::clone(&hwnd);
+            let closed_c = Arc::clone(&closed);
+            let finished_c = Arc::clone(&finished);
+
+            let thread = std::thread::Builder::new()
+                .name("rba-gpu-probe-splash".to_string())
+                .spawn(move || {
+                    let seq = CLASS_SEQ.fetch_add(1, Ordering::Relaxed);
+                    let class_name = to_wide_null(&format!("RbaGpuProbeSplash_{seq}"));
+                    let title = to_wide_null("Checking graphics...");
+                    let hinstance = unsafe { GetModuleHandleW(std::ptr::null()) };
+
+                    let wc = WndClassExW {
+                        cb_size: std::mem::size_of::<WndClassExW>() as u32,
+                        style: 0,
+                        lpfn_wnd_proc: splash_wndproc,
+                        cb_cls_extra: 0,
+                        cb_wnd_extra: 0,
+                        h_instance: hinstance,
+                        h_icon: 0,
+                        h_cursor: 0,
+                        hbr_background: 0,
+                        lpsz_menu_name: std::ptr::null(),
+                        lpsz_class_name: class_name.as_ptr(),
+                        h_icon_sm: 0,
+                    };
+
+                    if unsafe { RegisterClassExW(&wc) } != 0 {
+                        let w = 320;
+                        let h = 84;
+                        let sx = unsafe { GetSystemMetrics(SM_CXSCREEN) }.max(w);
+                        let sy = unsafe { GetSystemMetrics(SM_CYSCREEN) }.max(h);
+                        let x = (sx - w) / 2;
+                        let y = (sy - h) / 2;
+
+                        let handle = unsafe {
+                            CreateWindowExW(
+                                WS_EX_TOPMOST | WS_EX_TOOLWINDOW | WS_EX_NOACTIVATE,
+                                class_name.as_ptr(),
+                                title.as_ptr(),
+                                WS_POPUP | WS_VISIBLE,
+                                x,
+                                y,
+                                w,
+                                h,
+                                0,
+                                0,
+                                hinstance,
+                                0,
+                            )
+                        };
+                        if handle != 0 {
+                            hwnd_c.store(handle, Ordering::Release);
+                            if closed_c.load(Ordering::Acquire) {
+                                unsafe { PostMessageW(handle, WM_CLOSE, 0, 0) };
+                            }
+                            let mut msg = std::mem::MaybeUninit::<Msg>::zeroed();
+                            while unsafe { GetMessageW(msg.as_mut_ptr(), 0, 0, 0) } > 0 {
+                                let m = unsafe { msg.assume_init_ref() };
+                                unsafe {
+                                    TranslateMessage(m);
+                                    DispatchMessageW(m);
+                                }
+                            }
+                        }
+                        unsafe { UnregisterClassW(class_name.as_ptr(), hinstance) };
+                    }
+                    finished_c.store(true, Ordering::Release);
+                })
+                .ok();
+
+            Self {
+                hwnd,
+                closed,
+                finished,
+                thread,
+            }
+        }
+    }
+
+    impl Drop for SplashGuard {
+        fn drop(&mut self) {
+            self.closed.store(true, Ordering::Release);
+            let deadline = Instant::now() + Duration::from_millis(500);
+            while self.hwnd.load(Ordering::Acquire) == 0
+                && !self.finished.load(Ordering::Acquire)
+                && Instant::now() < deadline
+            {
+                std::thread::sleep(Duration::from_millis(5));
+            }
+            let hwnd = self.hwnd.load(Ordering::Acquire);
+            if hwnd != 0 {
+                unsafe { PostMessageW(hwnd, WM_CLOSE, 0, 0) };
+            }
+            if let Some(handle) = self.thread.take() {
+                let _ = handle.join();
+            }
+        }
+    }
+}
+
+#[cfg(not(target_os = "windows"))]
+mod checking_splash {
+    pub struct SplashGuard;
+    impl SplashGuard {
+        pub fn spawn() -> Self {
+            Self
+        }
+    }
+}
+
+fn evaluate_guard_with_runner_at<F>(
     cli: &CliConfig,
     config: &mut AppConfig,
     persist: bool,
+    now_secs: u64,
     peek_meta: Option<ProbeAdapterMeta>,
     run_probe: F,
 ) -> GpuGuardOutcome
 where
     F: FnOnce(Duration) -> ProbeExecResult,
 {
+    let mut config_dirty = false;
+
     if cli.retry_gpu {
+        let had_verified = !config.verified_gpu_adapters.is_empty();
         let cleared = config.clear_blocked_gpu_adapters();
-        if persist {
-            config.save();
+        if cleared > 0 || had_verified {
+            config_dirty = true;
         }
         println!(
             "[gpu-guard] --retry-gpu cleared {cleared} blocked adapter record(s); re-probing GPU"
         );
     }
 
-    if let Some(entry) = config.blocked_gpu_adapter(ADAPTER_ENUM_SENTINEL_KEY).cloned() {
-        let reason = format!(
-            "Skipped GPU initialization: previous `{}` failure recorded for `{}` ({}); pass --retry-gpu to retry",
-            entry.failed_stage, entry.adapter_name, entry.reason
-        );
-        println!("[gpu-guard] {reason}");
-        return GpuGuardOutcome::UseNoGpu { reason };
+    if let Some(entry) = config
+        .blocked_gpu_adapters
+        .get(ADAPTER_ENUM_SENTINEL_KEY)
+        .cloned()
+    {
+        if let Some(why) = is_blocked_entry_expired(&entry, None, now_secs) {
+            config
+                .blocked_gpu_adapters
+                .remove(ADAPTER_ENUM_SENTINEL_KEY);
+            config_dirty = true;
+            println!(
+                "[gpu-guard] Expired blocklist entry for `{ADAPTER_ENUM_SENTINEL_KEY}` ({why}); re-probing"
+            );
+        } else if entry.consecutive_failures >= GPU_BLOCKLIST_FAILURE_THRESHOLD {
+            if persist && config_dirty {
+                config.save();
+            }
+            let reason = format!(
+                "Skipped GPU initialization: previous `{}` failure ({} consecutive) recorded for `{}` ({}); pass --retry-gpu to retry",
+                entry.failed_stage, entry.consecutive_failures, entry.adapter_name, entry.reason
+            );
+            println!("[gpu-guard] {reason}");
+            return GpuGuardOutcome::UseNoGpu { reason };
+        }
     }
 
     if let Some(ref meta) = peek_meta
-        && let Some(entry) = config.blocked_gpu_adapter(&meta.block_key).cloned()
+        && let Some(entry) = config.blocked_gpu_adapters.get(&meta.block_key).cloned()
     {
-        let reason = format!(
-            "Skipped blocked GPU adapter `{}` (failed at `{}`: {}); pass --retry-gpu to retry",
-            meta.block_key, entry.failed_stage, entry.reason
-        );
-        println!("[gpu-guard] {reason}");
-        return GpuGuardOutcome::UseNoGpu { reason };
+        if let Some(why) = is_blocked_entry_expired(&entry, Some(meta), now_secs) {
+            config.blocked_gpu_adapters.remove(&meta.block_key);
+            config_dirty = true;
+            println!(
+                "[gpu-guard] Expired blocklist entry for `{}` ({why}); re-probing",
+                meta.block_key
+            );
+        } else if entry.consecutive_failures >= GPU_BLOCKLIST_FAILURE_THRESHOLD {
+            if persist && config_dirty {
+                config.save();
+            }
+            let reason = format!(
+                "Skipped blocked GPU adapter `{}` ({} consecutive failures; latest `{}`: {}); pass --retry-gpu to retry",
+                meta.block_key, entry.consecutive_failures, entry.failed_stage, entry.reason
+            );
+            println!("[gpu-guard] {reason}");
+            return GpuGuardOutcome::UseNoGpu { reason };
+        }
     }
 
+    // Check prior active failures (if 1st failure occurred without hitting the 2-failure blocklist).
+    let prior_failures = peek_meta
+        .as_ref()
+        .and_then(|meta| config.blocked_gpu_adapters.get(&meta.block_key))
+        .or_else(|| config.blocked_gpu_adapters.get(ADAPTER_ENUM_SENTINEL_KEY))
+        .map(|e| e.consecutive_failures)
+        .unwrap_or(0);
+
+    // Verified cache lookup: only valid when adapter + driver match cleanly, no retry/fault flags,
+    // and no active un-recovered failures remain.
+    if !cli.retry_gpu
+        && cli.probe_fail_stage.is_none()
+        && prior_failures == 0
+        && let Some(ref meta) = peek_meta
+    {
+        if config
+            .verified_gpu_adapter(&meta.block_key, &meta.driver, &meta.driver_info)
+            .is_some()
+        {
+            if persist && config_dirty {
+                config.save();
+            }
+            println!(
+                "[gpu-guard] Using cached GPU probe result for `{}` (driver `{}` / `{}`); skipping child probe",
+                meta.block_key, meta.driver, meta.driver_info
+            );
+            return GpuGuardOutcome::AllowGpu;
+        }
+        if config.verified_gpu_adapters.remove(&meta.block_key).is_some() {
+            config_dirty = true;
+            println!(
+                "[gpu-guard] Cached GPU probe invalidated for `{}` (driver changed to `{}` / `{}`); re-probing",
+                meta.block_key, meta.driver, meta.driver_info
+            );
+        }
+    }
+
+    let default_timeout_ms = if prior_failures >= 1 {
+        RETRY_GPU_PROBE_TIMEOUT_MS
+    } else {
+        DEFAULT_GPU_PROBE_TIMEOUT_MS
+    };
     let timeout = Duration::from_millis(
         cli.gpu_probe_timeout_ms
-            .unwrap_or(DEFAULT_GPU_PROBE_TIMEOUT_MS)
+            .unwrap_or(default_timeout_ms)
             .max(200),
     );
+    if prior_failures >= 1 {
+        let target_label = peek_meta
+            .as_ref()
+            .map(|m| m.block_key.as_str())
+            .unwrap_or(ADAPTER_ENUM_SENTINEL_KEY);
+        println!(
+            "[gpu-guard] Retrying GPU probe for `{target_label}` after {prior_failures} failure(s) with {} ms timeout",
+            timeout.as_millis()
+        );
+    }
+
+    let probe_start = Instant::now();
     let result = run_probe(timeout);
+    let probe_elapsed_ms = probe_start.elapsed().as_secs_f64() * 1000.0;
     if result.success {
+        let resolved_meta = result.adapter.or(peek_meta);
+        if config
+            .blocked_gpu_adapters
+            .remove(ADAPTER_ENUM_SENTINEL_KEY)
+            .is_some()
+        {
+            config_dirty = true;
+        }
+        if let Some(ref meta) = resolved_meta {
+            if config
+                .blocked_gpu_adapters
+                .remove(&meta.block_key)
+                .is_some()
+            {
+                config_dirty = true;
+            }
+            if cli.probe_fail_stage.is_none() {
+                config.record_verified_gpu_adapter(
+                    meta.block_key.clone(),
+                    VerifiedGpuAdapterEntry {
+                        adapter_name: meta.name.clone(),
+                        backend: meta.backend.clone(),
+                        device_type: meta.device_type.clone(),
+                        vendor: meta.vendor,
+                        device: meta.device,
+                        driver: meta.driver.clone(),
+                        driver_info: meta.driver_info.clone(),
+                        verified_epoch_secs: now_secs,
+                    },
+                );
+                config_dirty = true;
+            }
+            println!(
+                "[gpu-guard] GPU probe passed in {probe_elapsed_ms:.1} ms for `{}` (driver `{}` / `{}`)",
+                meta.block_key, meta.driver, meta.driver_info
+            );
+        } else {
+            println!("[gpu-guard] GPU probe passed in {probe_elapsed_ms:.1} ms (no adapter)");
+        }
+        if persist && config_dirty {
+            config.save();
+        }
         return GpuGuardOutcome::AllowGpu;
     }
 
@@ -552,7 +1073,8 @@ where
             .clone()
             .unwrap_or_else(|| "adapter".to_string())
     };
-    let (key, entry) = if let Some(meta) = result.adapter.or(peek_meta) {
+    let resolved_meta = result.adapter.or(peek_meta);
+    let (key, mut entry) = if let Some(meta) = resolved_meta {
         let key = meta.block_key.clone();
         let e = BlockedGpuAdapterEntry {
             adapter_name: meta.name,
@@ -564,7 +1086,9 @@ where
             driver_info: meta.driver_info,
             failed_stage: stage.clone(),
             reason: result.detail.clone(),
-            recorded_utc: utc_epoch_label(),
+            recorded_utc: utc_epoch_label(now_secs),
+            consecutive_failures: 0,
+            recorded_epoch_secs: now_secs,
         };
         (key, e)
     } else {
@@ -580,20 +1104,42 @@ where
                 driver_info: String::new(),
                 failed_stage: stage.clone(),
                 reason: result.detail.clone(),
-                recorded_utc: utc_epoch_label(),
+                recorded_utc: utc_epoch_label(now_secs),
+                consecutive_failures: 0,
+                recorded_epoch_secs: now_secs,
             },
         )
     };
 
+    let prior_for_key = config
+        .blocked_gpu_adapters
+        .get(&key)
+        .filter(|prev| {
+            key == ADAPTER_ENUM_SENTINEL_KEY
+                || (prev.driver == entry.driver && prev.driver_info == entry.driver_info)
+        })
+        .map(|prev| prev.consecutive_failures)
+        .unwrap_or(0);
+    let new_failures = prior_for_key.saturating_add(1);
+    entry.consecutive_failures = new_failures;
+
+    config.verified_gpu_adapters.remove(&key);
     config.record_blocked_gpu_adapter(key.clone(), entry);
     if persist {
         config.save();
     }
 
-    let reason = format!(
-        "GPU startup guard caught failure at `{stage}` for `{key}` ({}); starting No-GPU window (pass --retry-gpu to re-enable GPU)",
-        result.detail
-    );
+    let reason = if new_failures < GPU_BLOCKLIST_FAILURE_THRESHOLD {
+        format!(
+            "GPU startup guard caught failure #{new_failures} at `{stage}` for `{key}` in {probe_elapsed_ms:.1} ms ({}); starting No-GPU window and will retry GPU on next launch with {} ms timeout",
+            result.detail, RETRY_GPU_PROBE_TIMEOUT_MS
+        )
+    } else {
+        format!(
+            "GPU startup guard blocklisted `{key}` after {new_failures} consecutive failures (latest `{stage}`: {}); starting No-GPU window (expires after 30 days, driver change, or --retry-gpu)",
+            result.detail
+        )
+    };
     println!("[gpu-guard] {reason}");
     GpuGuardOutcome::UseNoGpu { reason }
 }
@@ -604,7 +1150,12 @@ pub fn ensure_gpu_startup_safe(cli: &CliConfig, config: &mut AppConfig) -> GpuGu
     if cli.no_gpu || cli.simulate_no_adapter {
         return GpuGuardOutcome::AllowGpu;
     }
-    let peek_meta = if cli.retry_gpu || !config.blocked_gpu_adapters.contains_key(ADAPTER_ENUM_SENTINEL_KEY) {
+    let guard_start = Instant::now();
+    let peek_meta = if cli.retry_gpu
+        || !config
+            .blocked_gpu_adapters
+            .contains_key(ADAPTER_ENUM_SENTINEL_KEY)
+    {
         peek_primary_adapter_meta(cli.software_adapter)
     } else {
         None
@@ -617,9 +1168,20 @@ pub fn ensure_gpu_startup_safe(cli: &CliConfig, config: &mut AppConfig) -> GpuGu
             };
         }
     };
-    evaluate_guard_with_runner(cli, config, true, peek_meta, |timeout| {
-        run_probe_subprocess(&exe, cli.software_adapter, cli.probe_fail_stage, timeout)
-    })
+    let outcome = evaluate_guard_with_runner_at(
+        cli,
+        config,
+        true,
+        utc_epoch_secs(),
+        peek_meta,
+        |timeout| {
+            let _splash = checking_splash::SplashGuard::spawn();
+            run_probe_subprocess(&exe, cli.software_adapter, cli.probe_fail_stage, timeout)
+        },
+    );
+    let total_ms = guard_start.elapsed().as_secs_f64() * 1000.0;
+    println!("[gpu-guard] Startup GPU guard completed in {total_ms:.1} ms");
+    outcome
 }
 
 #[cfg(test)]
@@ -639,76 +1201,285 @@ mod tests {
         }
     }
 
+    fn ok_result(meta: &ProbeAdapterMeta) -> ProbeExecResult {
+        ProbeExecResult {
+            success: true,
+            timed_out: false,
+            adapter: Some(meta.clone()),
+            last_stage: None,
+            detail: String::new(),
+        }
+    }
+
+    fn fail_result(meta: &ProbeAdapterMeta, stage: &str, timed_out: bool) -> ProbeExecResult {
+        ProbeExecResult {
+            success: false,
+            timed_out,
+            adapter: Some(meta.clone()),
+            last_stage: Some(if timed_out {
+                "first_frame".into()
+            } else {
+                stage.into()
+            }),
+            detail: format!("simulated {stage} failure"),
+        }
+    }
+
     #[test]
-    fn guard_records_each_failure_stage_skips_next_launch_and_recovers_with_retry() {
+    fn guard_requires_two_consecutive_failures_retries_at_20s_and_recovers_with_retry_gpu() {
+        let base_time = 1_700_000_000u64;
         for (stage, timed_out) in [("device", false), ("surface", false), ("hang", true)] {
             let mut config = AppConfig::default();
             let cli = CliConfig::default();
             let meta = sample_meta();
 
-            // First launch fails at `stage` -> fallback to No-GPU + recorded in config.
-            let outcome1 =
-                evaluate_guard_with_runner(&cli, &mut config, false, Some(meta.clone()), |_| {
-                    ProbeExecResult {
-                        success: false,
-                        timed_out,
-                        adapter: Some(meta.clone()),
-                        last_stage: Some(if timed_out {
-                            "first_frame".into()
-                        } else {
-                            stage.into()
-                        }),
-                        detail: format!("simulated {stage} failure"),
-                    }
-                });
+            // Launch 1 fails (count = 1 < 2): falls back to No-GPU for this launch, NOT blocklisted yet.
+            let mut t1 = None;
+            let outcome1 = evaluate_guard_with_runner_at(
+                &cli,
+                &mut config,
+                false,
+                base_time,
+                Some(meta.clone()),
+                |timeout| {
+                    t1 = Some(timeout);
+                    fail_result(&meta, stage, timed_out)
+                },
+            );
+            assert_eq!(t1, Some(Duration::from_millis(DEFAULT_GPU_PROBE_TIMEOUT_MS)));
             assert!(matches!(outcome1, GpuGuardOutcome::UseNoGpu { .. }));
-            let recorded = config
-                .blocked_gpu_adapter(&meta.block_key)
-                .expect("adapter should be recorded in blocked_gpu_adapters");
-            assert_eq!(recorded.failed_stage, stage);
+            let recorded1 = config
+                .blocked_gpu_adapters
+                .get(&meta.block_key)
+                .expect("failure #1 recorded");
+            assert_eq!(recorded1.consecutive_failures, 1);
+            assert_eq!(recorded1.failed_stage, stage);
 
-            // Second launch skips spawning the GPU probe entirely.
-            let mut probed_second_time = false;
-            let outcome2 =
-                evaluate_guard_with_runner(&cli, &mut config, false, Some(meta.clone()), |_| {
-                    probed_second_time = true;
-                    ProbeExecResult {
-                        success: true,
-                        timed_out: false,
-                        adapter: Some(meta.clone()),
-                        last_stage: None,
-                        detail: String::new(),
-                    }
-                });
-            assert!(
-                !probed_second_time,
-                "blocked adapter must skip probe next launch"
+            // Launch 2 MUST retry the GPU probe with the longer 20s timeout; second consecutive failure blocklists.
+            let mut t2 = None;
+            let outcome2 = evaluate_guard_with_runner_at(
+                &cli,
+                &mut config,
+                false,
+                base_time + 60,
+                Some(meta.clone()),
+                |timeout| {
+                    t2 = Some(timeout);
+                    fail_result(&meta, stage, timed_out)
+                },
+            );
+            assert_eq!(
+                t2,
+                Some(Duration::from_millis(RETRY_GPU_PROBE_TIMEOUT_MS)),
+                "retry after 1st failure must use 20s timeout"
             );
             assert!(matches!(outcome2, GpuGuardOutcome::UseNoGpu { .. }));
+            let recorded2 = config
+                .blocked_gpu_adapters
+                .get(&meta.block_key)
+                .expect("failure #2 recorded");
+            assert_eq!(recorded2.consecutive_failures, 2);
 
-            // Launch with --retry-gpu clears blocked entry and re-enables GPU when probe succeeds.
+            // Launch 3 now skips spawning the GPU probe entirely.
+            let mut probed_third_time = false;
+            let outcome3 = evaluate_guard_with_runner_at(
+                &cli,
+                &mut config,
+                false,
+                base_time + 120,
+                Some(meta.clone()),
+                |_| {
+                    probed_third_time = true;
+                    ok_result(&meta)
+                },
+            );
+            assert!(
+                !probed_third_time,
+                "adapter blocklisted after 2 failures must skip probe next launch"
+            );
+            assert!(matches!(outcome3, GpuGuardOutcome::UseNoGpu { .. }));
+
+            // Launch 4 with --retry-gpu clears blocklist, probes again, and caches success.
             let mut retry_cli = CliConfig::default();
             retry_cli.retry_gpu = true;
             let mut probed_after_retry = false;
-            let outcome3 = evaluate_guard_with_runner(
+            let outcome4 = evaluate_guard_with_runner_at(
                 &retry_cli,
                 &mut config,
                 false,
+                base_time + 180,
                 Some(meta.clone()),
                 |_| {
                     probed_after_retry = true;
-                    ProbeExecResult {
-                        success: true,
-                        timed_out: false,
-                        adapter: Some(meta.clone()),
-                        last_stage: None,
-                        detail: String::new(),
-                    }
+                    ok_result(&meta)
                 },
             );
             assert!(probed_after_retry);
-            assert_eq!(outcome3, GpuGuardOutcome::AllowGpu);
+            assert_eq!(outcome4, GpuGuardOutcome::AllowGpu);
             assert!(config.blocked_gpu_adapters.is_empty());
+            assert!(
+                config
+                    .verified_gpu_adapter(&meta.block_key, &meta.driver, &meta.driver_info)
+                    .is_some()
+            );
         }
+    }
+
+    #[test]
+    fn single_failure_that_recovers_on_20s_retry_clears_count_and_caches_adapter() {
+        let mut config = AppConfig::default();
+        let cli = CliConfig::default();
+        let meta = sample_meta();
+        let now = 1_700_000_000u64;
+
+        // First launch times out -> 1 consecutive failure, not blocklisted.
+        let o1 = evaluate_guard_with_runner_at(
+            &cli,
+            &mut config,
+            false,
+            now,
+            Some(meta.clone()),
+            |_| fail_result(&meta, "hang", true),
+        );
+        assert!(matches!(o1, GpuGuardOutcome::UseNoGpu { .. }));
+        assert_eq!(config.blocked_gpu_adapters[&meta.block_key].consecutive_failures, 1);
+
+        // Second launch retries with 20s timeout and succeeds -> resets failure state and caches verified adapter.
+        let mut retry_timeout = None;
+        let o2 = evaluate_guard_with_runner_at(
+            &cli,
+            &mut config,
+            false,
+            now + 10,
+            Some(meta.clone()),
+            |t| {
+                retry_timeout = Some(t);
+                ok_result(&meta)
+            },
+        );
+        assert_eq!(retry_timeout, Some(Duration::from_millis(RETRY_GPU_PROBE_TIMEOUT_MS)));
+        assert_eq!(o2, GpuGuardOutcome::AllowGpu);
+        assert!(config.blocked_gpu_adapters.is_empty());
+        assert!(
+            config
+                .verified_gpu_adapter(&meta.block_key, &meta.driver, &meta.driver_info)
+                .is_some()
+        );
+    }
+
+    #[test]
+    fn blocklist_expires_after_30_days_or_driver_change_and_verified_cache_tracks_driver() {
+        let mut config = AppConfig::default();
+        let cli = CliConfig::default();
+        let meta = sample_meta();
+        let t0 = 1_700_000_000u64;
+
+        // Two failures blocklist the GPU.
+        for i in 0..2 {
+            let _ = evaluate_guard_with_runner_at(
+                &cli,
+                &mut config,
+                false,
+                t0 + i,
+                Some(meta.clone()),
+                |_| fail_result(&meta, "hang", true),
+            );
+        }
+        assert_eq!(config.blocked_gpu_adapters[&meta.block_key].consecutive_failures, 2);
+
+        // At +29 days with same driver: still blocked (probe skipped).
+        let mut probed_day29 = false;
+        let o_day29 = evaluate_guard_with_runner_at(
+            &cli,
+            &mut config,
+            false,
+            t0 + 1 + (29 * 86_400),
+            Some(meta.clone()),
+            |_| {
+                probed_day29 = true;
+                ok_result(&meta)
+            },
+        );
+        assert!(!probed_day29);
+        assert!(matches!(o_day29, GpuGuardOutcome::UseNoGpu { .. }));
+
+        // At +30 days: expired -> re-probes and allows GPU + caches verified result.
+        let mut probed_day30 = false;
+        let mut t_day30 = None;
+        let o_day30 = evaluate_guard_with_runner_at(
+            &cli,
+            &mut config,
+            false,
+            t0 + 1 + GPU_BLOCKLIST_TTL_SECS,
+            Some(meta.clone()),
+            |t| {
+                probed_day30 = true;
+                t_day30 = Some(t);
+                ok_result(&meta)
+            },
+        );
+        assert!(probed_day30);
+        assert_eq!(t_day30, Some(Duration::from_millis(DEFAULT_GPU_PROBE_TIMEOUT_MS)));
+        assert_eq!(o_day30, GpuGuardOutcome::AllowGpu);
+
+        // Next warm launch with same driver skips child probe via verified cache.
+        let mut probed_warm = false;
+        let o_warm = evaluate_guard_with_runner_at(
+            &cli,
+            &mut config,
+            false,
+            t0 + 2 + GPU_BLOCKLIST_TTL_SECS,
+            Some(meta.clone()),
+            |_| {
+                probed_warm = true;
+                ok_result(&meta)
+            },
+        );
+        assert!(!probed_warm, "verified cache should skip child probe");
+        assert_eq!(o_warm, GpuGuardOutcome::AllowGpu);
+
+        // Driver update invalidates verified cache AND expires any blocklist immediately.
+        let mut updated_meta = meta.clone();
+        updated_meta.driver_info = "2.0".to_string();
+        let mut probed_new_driver = false;
+        let o_drv = evaluate_guard_with_runner_at(
+            &cli,
+            &mut config,
+            false,
+            t0 + 3 + GPU_BLOCKLIST_TTL_SECS,
+            Some(updated_meta.clone()),
+            |_| {
+                probed_new_driver = true;
+                ok_result(&updated_meta)
+            },
+        );
+        assert!(probed_new_driver, "driver change must invalidate verified cache");
+        assert_eq!(o_drv, GpuGuardOutcome::AllowGpu);
+
+        // Block with old driver -> driver change also immediately expires blocklist.
+        for i in 0..2 {
+            let _ = evaluate_guard_with_runner_at(
+                &cli,
+                &mut config,
+                false,
+                t0 + i,
+                Some(meta.clone()),
+                |_| fail_result(&meta, "device", false),
+            );
+        }
+        let mut probed_after_drv_update = false;
+        let o_unblocked = evaluate_guard_with_runner_at(
+            &cli,
+            &mut config,
+            false,
+            t0 + 5,
+            Some(updated_meta.clone()),
+            |_| {
+                probed_after_drv_update = true;
+                ok_result(&updated_meta)
+            },
+        );
+        assert!(probed_after_drv_update, "driver change must expire blocklist");
+        assert_eq!(o_unblocked, GpuGuardOutcome::AllowGpu);
     }
 }

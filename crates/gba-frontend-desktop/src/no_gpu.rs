@@ -136,6 +136,32 @@ mod win32_gdi {
             i_usage: u32,
             rop: u32,
         ) -> i32;
+        fn CreateCompatibleDC(hdc: isize) -> isize;
+        fn CreateCompatibleBitmap(hdc: isize, cx: i32, cy: i32) -> isize;
+        fn SelectObject(hdc: isize, h: isize) -> isize;
+        fn BitBlt(
+            hdc: isize,
+            x: i32,
+            y: i32,
+            cx: i32,
+            cy: i32,
+            hdc_src: isize,
+            x1: i32,
+            y1: i32,
+            rop: u32,
+        ) -> i32;
+        fn GetDIBits(
+            hdc: isize,
+            hbm: isize,
+            start: u32,
+            c_lines: u32,
+            lpv_bits: *mut core::ffi::c_void,
+            lpbmi: *mut BitmapInfo,
+            usage: u32,
+        ) -> i32;
+        fn DeleteObject(ho: isize) -> i32;
+        fn DeleteDC(hdc: isize) -> i32;
+        fn GdiFlush() -> i32;
     }
 
     /// Presents a compact top-down `0x00RRGGBB` bitmap (at most `720x480`) to a Win32 window via
@@ -245,6 +271,121 @@ mod win32_gdi {
             ReleaseDC(hwnd, hdc);
         }
         copied > 0
+    }
+
+    pub(super) fn capture_window_client_png(
+        window: &Window,
+        dst_w: usize,
+        dst_h: usize,
+        path: &std::path::Path,
+    ) -> Result<(), String> {
+        if dst_w == 0 || dst_h == 0 {
+            return Err("capture dimensions must be > 0".to_string());
+        }
+        let handle = window
+            .window_handle()
+            .map_err(|e| format!("window_handle failed: {e}"))?;
+        let hwnd = match handle.as_raw() {
+            RawWindowHandle::Win32(h) => h.hwnd.get(),
+            _ => return Err("non-Win32 window handle".to_string()),
+        };
+        unsafe { GdiFlush() };
+        let hdc = unsafe { GetDC(hwnd) };
+        if hdc == 0 {
+            return Err("GetDC(hwnd) returned null".to_string());
+        }
+        let mem_dc = unsafe { CreateCompatibleDC(hdc) };
+        if mem_dc == 0 {
+            unsafe { ReleaseDC(hwnd, hdc) };
+            return Err("CreateCompatibleDC failed".to_string());
+        }
+        let hbmp = unsafe { CreateCompatibleBitmap(hdc, dst_w as i32, dst_h as i32) };
+        if hbmp == 0 {
+            unsafe {
+                DeleteDC(mem_dc);
+                ReleaseDC(hwnd, hdc);
+            }
+            return Err("CreateCompatibleBitmap failed".to_string());
+        }
+        let old = unsafe { SelectObject(mem_dc, hbmp) };
+        let blt_ok = unsafe {
+            BitBlt(
+                mem_dc,
+                0,
+                0,
+                dst_w as i32,
+                dst_h as i32,
+                hdc,
+                0,
+                0,
+                SRCCOPY,
+            )
+        };
+        if blt_ok == 0 {
+            unsafe {
+                SelectObject(mem_dc, old);
+                DeleteObject(hbmp);
+                DeleteDC(mem_dc);
+                ReleaseDC(hwnd, hdc);
+            }
+            return Err("BitBlt from window DC failed".to_string());
+        }
+
+        let mut bmi = BitmapInfo {
+            bmi_header: BitmapInfoHeader {
+                bi_size: std::mem::size_of::<BitmapInfoHeader>() as u32,
+                bi_width: dst_w as i32,
+                bi_height: -(dst_h as i32),
+                bi_planes: 1,
+                bi_bit_count: 32,
+                bi_compression: BI_RGB,
+                bi_size_image: 0,
+                bi_x_pels_per_meter: 0,
+                bi_y_pels_per_meter: 0,
+                bi_clr_used: 0,
+                bi_clr_important: 0,
+            },
+            bmi_colors: [0],
+        };
+        let mut rgba = vec![0u8; dst_w * dst_h * 4];
+        let lines = unsafe {
+            GetDIBits(
+                mem_dc,
+                hbmp,
+                0,
+                dst_h as u32,
+                rgba.as_mut_ptr().cast(),
+                &mut bmi,
+                DIB_RGB_COLORS,
+            )
+        };
+        unsafe {
+            SelectObject(mem_dc, old);
+            DeleteObject(hbmp);
+            DeleteDC(mem_dc);
+            ReleaseDC(hwnd, hdc);
+        }
+        if lines <= 0 {
+            return Err("GetDIBits returned 0 scanlines".to_string());
+        }
+        for px in rgba.chunks_exact_mut(4) {
+            px.swap(0, 2);
+            px[3] = 255;
+        }
+        if let Some(parent) = path.parent()
+            && !parent.as_os_str().is_empty()
+        {
+            let _ = std::fs::create_dir_all(parent);
+        }
+        image::save_buffer_with_format(
+            path,
+            &rgba,
+            dst_w as u32,
+            dst_h as u32,
+            image::ColorType::Rgba8,
+            image::ImageFormat::Png,
+        )
+        .map_err(|e| format!("failed to save screenshot {}: {e}", path.display()))
     }
 }
 
@@ -870,6 +1011,7 @@ struct NoGpuApp {
     sync_60hz: bool,
     slowdown: usize,
     drc_pacer: crate::emu_thread::DrcPacer,
+    phase_lock: crate::display_timing::VblankPhaseLock,
     #[cfg(windows)]
     #[allow(dead_code)]
     high_res_timer: Option<crate::emu_thread::win_timer::HighResSleepTimer>,
@@ -879,6 +1021,10 @@ struct NoGpuApp {
     perf_logger: Option<crate::bench::DesktopPerfLogger>,
     perf_seconds: Option<f64>,
     perf_start_wall: Instant,
+    capture_png: Option<PathBuf>,
+    capture_frame: u64,
+    total_emu_frames: u64,
+    capture_done: bool,
     startup_err: Option<String>,
 }
 
@@ -914,6 +1060,11 @@ impl NoGpuApp {
         let mut drc_pacer = crate::emu_thread::DrcPacer::new(audio_cap);
         if sync_60hz {
             drc_pacer.set_base_fps(60.0);
+        }
+        let phase_lock =
+            crate::display_timing::VblankPhaseLock::new(sync_60hz, display_refresh_hz);
+        if phase_lock.is_enabled() {
+            audio.set_rate_offset_ppm(phase_lock.audio_rate_offset_ppm());
         }
         #[cfg(windows)]
         let high_res_timer = if sync_60hz {
@@ -1064,6 +1215,7 @@ impl NoGpuApp {
             sync_60hz,
             slowdown: cli.slowdown.max(1),
             drc_pacer,
+            phase_lock,
             #[cfg(windows)]
             high_res_timer,
             replay,
@@ -1072,6 +1224,10 @@ impl NoGpuApp {
             perf_logger,
             perf_seconds: cli.perf_seconds,
             perf_start_wall: Instant::now(),
+            capture_png: cli.capture_png,
+            capture_frame: cli.capture_frame.unwrap_or(1245),
+            total_emu_frames: 0,
+            capture_done: false,
             startup_err: None,
         }
     }
@@ -1096,6 +1252,7 @@ impl NoGpuApp {
             .unwrap_or_else(|| "ROM".to_string());
         self.paused = false;
         self.next_frame_due = Instant::now();
+        self.phase_lock.reset_schedule();
         self.sink.frame_dirty = true;
     }
 
@@ -1111,6 +1268,14 @@ impl NoGpuApp {
     }
 
     fn present_current_frame(&mut self) {
+        self.present_frame_inner(false);
+    }
+
+    fn present_paced_and_record(&mut self) {
+        self.present_frame_inner(true);
+    }
+
+    fn present_frame_inner(&mut self, use_phase_lock: bool) {
         let Some(window) = self.window.as_ref() else {
             return;
         };
@@ -1118,7 +1283,8 @@ impl NoGpuApp {
         if dst_w == 0 || dst_h == 0 {
             return;
         }
-        let t0 = Instant::now();
+        let prep_t0 = Instant::now();
+        let prep_qpc_t0 = crate::display_timing::qpc_now();
         let green_swap = self
             .core
             .as_ref()
@@ -1132,8 +1298,22 @@ impl NoGpuApp {
             self.config.lcd_grid_intensity,
         );
         let linear = self.config.display_filter.texture_options() == egui::TextureOptions::LINEAR;
-        let used_os_stretch = if self.governor.is_resolution_capped() {
-            self.blitter.present_capped_os_stretch(
+        let use_capped_os_stretch = self.governor.is_resolution_capped();
+
+        let (bitblt_ms, present_start_qpc, present_end_qpc, prep_ms) = if use_capped_os_stretch {
+            let prep_ms = prep_t0.elapsed().as_secs_f64() * 1000.0;
+            if let (Some(t0), Some(t1)) = (prep_qpc_t0, crate::display_timing::qpc_now()) {
+                self.phase_lock.record_prep_ticks(t1.saturating_sub(t0));
+            }
+            if use_phase_lock
+                && self.phase_lock.is_enabled()
+                && let Some(target_start) = self.phase_lock.target_present_start_qpc()
+            {
+                crate::display_timing::wait_until_qpc(target_start);
+            }
+            let ps_qpc = crate::display_timing::qpc_now().unwrap_or(0);
+            let ps_t0 = Instant::now();
+            let used = self.blitter.present_capped_os_stretch(
                 window,
                 &img.pixels,
                 img.size[0],
@@ -1141,11 +1321,36 @@ impl NoGpuApp {
                 dst_w,
                 dst_h,
                 false,
-            )
+            );
+            let pe_t = ps_t0.elapsed().as_secs_f64() * 1000.0;
+            let pe_qpc = crate::display_timing::qpc_now().unwrap_or(ps_qpc);
+            if used {
+                (pe_t, ps_qpc, pe_qpc, prep_ms)
+            } else {
+                // Fallback if OS StretchDIBits failed
+                let Some(surface) = self.surface.as_mut() else {
+                    return;
+                };
+                let Ok(mut buf) = surface.buffer_mut() else {
+                    return;
+                };
+                self.blitter.blit_rgba_to_slice(
+                    &img.pixels,
+                    img.size[0],
+                    img.size[1],
+                    &mut buf,
+                    dst_w,
+                    dst_h,
+                    linear,
+                );
+                let fps_qpc = crate::display_timing::qpc_now().unwrap_or(0);
+                let ft0 = Instant::now();
+                let _ = buf.present();
+                let fdt = ft0.elapsed().as_secs_f64() * 1000.0;
+                let fpe_qpc = crate::display_timing::qpc_now().unwrap_or(fps_qpc);
+                (fdt, fps_qpc, fpe_qpc, prep_ms + pe_t)
+            }
         } else {
-            false
-        };
-        if !used_os_stretch {
             let Some(surface) = self.surface.as_mut() else {
                 return;
             };
@@ -1161,10 +1366,79 @@ impl NoGpuApp {
                 dst_h,
                 linear,
             );
+            let prep_ms = prep_t0.elapsed().as_secs_f64() * 1000.0;
+            if let (Some(t0), Some(t1)) = (prep_qpc_t0, crate::display_timing::qpc_now()) {
+                self.phase_lock.record_prep_ticks(t1.saturating_sub(t0));
+            }
+            if use_phase_lock
+                && self.phase_lock.is_enabled()
+                && let Some(target_start) = self.phase_lock.target_present_start_qpc()
+            {
+                crate::display_timing::wait_until_qpc(target_start);
+            }
+            let ps_qpc = crate::display_timing::qpc_now().unwrap_or(0);
+            let ps_t0 = Instant::now();
             let _ = buf.present();
-        }
-        self.last_present_ms = t0.elapsed().as_secs_f64() * 1000.0;
+            let pe_t = ps_t0.elapsed().as_secs_f64() * 1000.0;
+            let pe_qpc = crate::display_timing::qpc_now().unwrap_or(ps_qpc);
+            (pe_t, ps_qpc, pe_qpc, prep_ms)
+        };
+
+        self.last_present_ms = prep_ms + bitblt_ms;
         self.sink.frame_dirty = false;
+
+        if let Some(ref cap_path) = self.capture_png
+            && self.total_emu_frames >= self.capture_frame
+            && (!self.config.auto_quality_governor
+                || self.slowdown <= 1
+                || self.governor.is_resolution_capped())
+        {
+            #[cfg(target_os = "windows")]
+            {
+                match win32_gdi::capture_window_client_png(window, dst_w, dst_h, cap_path) {
+                    Ok(()) => println!(
+                        "[capture] Saved {dst_w}x{dst_h} screenshot -> {} (frame={}, filter={}, capped_720x480={}, mode={})",
+                        cap_path.display(),
+                        self.total_emu_frames,
+                        self.config.display_filter.label(),
+                        self.governor.is_resolution_capped(),
+                        if use_capped_os_stretch { "StretchDIBits" } else { "softbuffer" }
+                    ),
+                    Err(e) => eprintln!("[capture] Screenshot capture failed: {e}"),
+                }
+            }
+            self.capture_png = None;
+            self.capture_done = true;
+        }
+
+        if use_phase_lock {
+            if let Some(ref mut logger) = self.perf_logger
+                && self.core.is_some()
+            {
+                logger.record_present(
+                    self.pending_emu_ms,
+                    self.last_present_ms,
+                    self.sink.audio.underruns(),
+                    self.config.display_filter.label(),
+                    self.frames_stepped_since_present,
+                    self.size.0,
+                    self.size.1,
+                    self.is_fullscreen,
+                );
+                self.pending_emu_ms = 0.0;
+                self.frames_stepped_since_present = 0;
+            }
+            if self.phase_lock.is_enabled() && present_end_qpc > 0 {
+                let snap = crate::display_timing::query_dwm_timing();
+                self.phase_lock
+                    .observe_and_advance(present_start_qpc, present_end_qpc, snap);
+                self.sink
+                    .audio
+                    .set_rate_offset_ppm(self.phase_lock.audio_rate_offset_ppm());
+            } else {
+                self.sink.audio.set_rate_offset_ppm(0);
+            }
+        }
     }
 }
 
@@ -1302,6 +1576,7 @@ impl ApplicationHandler for NoGpuApp {
                         || self.size.1 as usize > GOVERNOR_MAX_CAP_HEIGHT,
                     Some(capped_costs),
                 );
+                self.phase_lock.reset_schedule();
                 self.sink.frame_dirty = true;
                 if let Some(w) = &self.window {
                     w.request_redraw();
@@ -1359,29 +1634,41 @@ impl ApplicationHandler for NoGpuApp {
                 }
             }
             WindowEvent::RedrawRequested => {
-                self.present_current_frame();
-                if let Some(ref mut logger) = self.perf_logger
-                    && self.core.is_some()
-                {
-                    logger.record_present(
-                        self.pending_emu_ms,
-                        self.last_present_ms,
-                        self.sink.audio.underruns(),
-                        self.config.display_filter.label(),
-                        self.frames_stepped_since_present,
-                        self.size.0,
-                        self.size.1,
-                        self.is_fullscreen,
-                    );
+                if self.paused || self.core.is_none() || !self.phase_lock.is_enabled() {
+                    self.present_current_frame();
+                    if !self.phase_lock.is_enabled()
+                        && let Some(ref mut logger) = self.perf_logger
+                        && self.core.is_some()
+                        && self.frames_stepped_since_present > 0
+                    {
+                        logger.record_present(
+                            self.pending_emu_ms,
+                            self.last_present_ms,
+                            self.sink.audio.underruns(),
+                            self.config.display_filter.label(),
+                            self.frames_stepped_since_present,
+                            self.size.0,
+                            self.size.1,
+                            self.is_fullscreen,
+                        );
+                        self.pending_emu_ms = 0.0;
+                        self.frames_stepped_since_present = 0;
+                    }
+                } else if self.sink.frame_dirty {
+                    // Expose/resize during live phase-locked run: repaint without advancing phase lock
+                    self.present_current_frame();
                 }
-                self.pending_emu_ms = 0.0;
-                self.frames_stepped_since_present = 0;
             }
             _ => {}
         }
     }
 
     fn about_to_wait(&mut self, event_loop: &ActiveEventLoop) {
+        if self.capture_done && self.perf_seconds.is_none() {
+            self.flush_save();
+            event_loop.exit();
+            return;
+        }
         if let Some(limit_secs) = self.perf_seconds
             && self.perf_start_wall.elapsed().as_secs_f64() >= limit_secs
         {
@@ -1394,16 +1681,39 @@ impl ApplicationHandler for NoGpuApp {
         }
 
         let mut now = Instant::now();
-        if self.sync_60hz && !self.paused && now < self.next_frame_due {
-            let remaining = self.next_frame_due.saturating_duration_since(now);
-            if remaining <= Duration::from_micros(2200) {
-                while Instant::now() < self.next_frame_due {
-                    std::hint::spin_loop();
+        let ready_to_step = if self.paused || self.core.is_none() {
+            false
+        } else if self.phase_lock.is_enabled() {
+            match (
+                crate::display_timing::qpc_now(),
+                self.phase_lock.prework_wake_qpc(),
+            ) {
+                (Some(cur), Some(wake)) => {
+                    let freq = self.phase_lock.qpc_freq().max(1) as f64;
+                    let rem_ms = if wake > cur {
+                        (wake - cur) as f64 / freq * 1000.0
+                    } else {
+                        0.0
+                    };
+                    // Enter prework within 1.5 ms of target wake (avoid another WaitUntil round-trip).
+                    rem_ms <= 1.5
                 }
-                now = Instant::now();
+                _ => true,
             }
-        }
-        if !self.paused && now >= self.next_frame_due {
+        } else {
+            if self.sync_60hz && now < self.next_frame_due {
+                let remaining = self.next_frame_due.saturating_duration_since(now);
+                if remaining <= Duration::from_micros(2200) {
+                    while Instant::now() < self.next_frame_due {
+                        std::hint::spin_loop();
+                    }
+                    now = Instant::now();
+                }
+            }
+            now >= self.next_frame_due
+        };
+
+        if ready_to_step {
             if let Some(ref replay) = self.replay {
                 let eff = replay.effective_frame(self.replay_frame, self.loop_replay);
                 self.sink.keypad = replay.keyinput_at(eff);
@@ -1412,6 +1722,7 @@ impl ApplicationHandler for NoGpuApp {
             if let Some(core) = &mut self.core {
                 let t0 = Instant::now();
                 core.run_frame(&mut self.sink);
+                self.total_emu_frames += 1;
                 self.last_core_ms = t0.elapsed().as_secs_f64() * 1000.0;
                 if self.slowdown > 1 {
                     let extra_ms =
@@ -1445,22 +1756,30 @@ impl ApplicationHandler for NoGpuApp {
                     );
                 }
             }
-            let frame_period = if self.sync_60hz {
-                let occ = self.sink.audio.occupied_len();
-                self.drc_pacer.set_target(self.sink.audio.target_fill());
-                self.drc_pacer
-                    .next_period_duration(occ, self.sink.audio.has_device())
+            if self.phase_lock.is_enabled() {
+                if self.sink.frame_dirty {
+                    self.present_paced_and_record();
+                }
+                now = Instant::now();
+                self.next_frame_due = now + Duration::from_millis(16);
             } else {
-                GBA_FRAME_DURATION
-            };
-            self.next_frame_due += frame_period;
-            if self.next_frame_due + frame_period < now {
-                self.next_frame_due = now + frame_period;
-            }
-            if self.sink.frame_dirty
-                && let Some(w) = &self.window
-            {
-                w.request_redraw();
+                let frame_period = if self.sync_60hz {
+                    let occ = self.sink.audio.occupied_len();
+                    self.drc_pacer.set_target(self.sink.audio.target_fill());
+                    self.drc_pacer
+                        .next_period_duration(occ, self.sink.audio.has_device())
+                } else {
+                    GBA_FRAME_DURATION
+                };
+                self.next_frame_due += frame_period;
+                if self.next_frame_due + frame_period < now {
+                    self.next_frame_due = now + frame_period;
+                }
+                if self.sink.frame_dirty
+                    && let Some(w) = &self.window
+                {
+                    w.request_redraw();
+                }
             }
         }
 
@@ -1488,6 +1807,19 @@ impl ApplicationHandler for NoGpuApp {
 
         let wait_until = if self.paused {
             now + Duration::from_millis(16)
+        } else if self.phase_lock.is_enabled() {
+            match (
+                crate::display_timing::qpc_now(),
+                self.phase_lock.prework_wake_qpc(),
+            ) {
+                (Some(cur), Some(wake)) if wake > cur => {
+                    let freq = self.phase_lock.qpc_freq().max(1) as f64;
+                    let rem_secs = (wake - cur) as f64 / freq;
+                    let sleep_secs = (rem_secs - 0.0012).clamp(0.0, 0.025);
+                    now + Duration::from_secs_f64(sleep_secs)
+                }
+                _ => now + Duration::from_millis(1),
+            }
         } else if self.sync_60hz {
             self.next_frame_due
                 .checked_sub(Duration::from_millis(1))
@@ -1870,4 +2202,59 @@ pub fn bench_softbuffer_sizes(
         return Err(e);
     }
     Ok(runner.results)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::filters::{
+        GOVERNOR_BASE_LOCKOUT_FRAMES, GOVERNOR_DOWN_SUSTAIN_FRAMES,
+        GOVERNOR_RECOVERY_SUSTAIN_FRAMES, GOVERNOR_WINDOW_FRAMES, GovernorTransitionKind,
+    };
+
+    #[test]
+    fn nogpu_res_cap_triggers_and_lifts_when_load_drops() {
+        let mut postproc = VideoPostProcessor::new();
+        let mut blitter = NoGpuCpuPresenter::new(2560, 1600);
+        let uncapped_costs =
+            blitter.measure_filter_costs(&mut postproc, false, false, 0.08, 2560, 1600);
+        let capped_costs = blitter.measure_capped_filter_costs(
+            &mut postproc,
+            false,
+            false,
+            0.08,
+            2560,
+            1600,
+            None,
+        );
+        // Simulate a weaker CPU where 2560x1600 softbuffer MyBoySmooth exceeds budget under overload,
+        // while <=720x480 capped MyBoySmooth still fits easily.
+        let mut scaled_uncapped = uncapped_costs;
+        for c in &mut scaled_uncapped {
+            c.cost_ms *= 8.0;
+        }
+        let mut gov = QualityGovernor::with_measured_costs(
+            DisplayFilter::MyBoySmooth,
+            true,
+            scaled_uncapped,
+        );
+        gov.set_resolution_cap_support(true, Some(capped_costs));
+
+        let cap_tr = (0..(GOVERNOR_WINDOW_FRAMES + GOVERNOR_DOWN_SUSTAIN_FRAMES))
+            .find_map(|_| gov.record_frame(14.5))
+            .expect("sustained 2560x1600 overload must activate 720x480 cap");
+        assert_eq!(cap_tr.kind, GovernorTransitionKind::CapResolution);
+        assert!(gov.is_resolution_capped());
+
+        // When load drops back down after lockout, sustained low work time lifts the cap.
+        for _ in 0..GOVERNOR_BASE_LOCKOUT_FRAMES {
+            assert!(gov.record_frame(1.5).is_none());
+        }
+        let uncap_tr = (0..GOVERNOR_RECOVERY_SUSTAIN_FRAMES)
+            .find_map(|_| gov.record_frame(1.5))
+            .expect("sustained idle after lockout must lift 720x480 cap");
+        assert_eq!(uncap_tr.kind, GovernorTransitionKind::UncapResolution);
+        assert_eq!(uncap_tr.to, DisplayFilter::MyBoySmooth);
+        assert!(!gov.is_resolution_capped());
+    }
 }

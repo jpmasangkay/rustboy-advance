@@ -1784,6 +1784,85 @@ mod tests {
         assert!(!gov.is_resolution_capped());
         assert_eq!(gov.max_output_size(), None);
     }
+
+    #[test]
+    fn quality_governor_lifts_720x480_cap_when_load_drops_and_backs_off_on_flap() {
+        let large_costs = vec![
+            FilterCost { filter: DisplayFilter::Sharp1x, cost_ms: 8.0 },
+            FilterCost { filter: DisplayFilter::MyBoySmooth, cost_ms: 12.0 },
+            FilterCost { filter: DisplayFilter::XbrSmooth3x, cost_ms: 20.0 },
+        ];
+        let capped_costs = vec![
+            FilterCost { filter: DisplayFilter::Sharp1x, cost_ms: 0.4 },
+            FilterCost { filter: DisplayFilter::MyBoySmooth, cost_ms: 1.5 },
+            FilterCost { filter: DisplayFilter::XbrSmooth3x, cost_ms: 7.0 },
+        ];
+        let mut gov =
+            QualityGovernor::with_measured_costs(DisplayFilter::MyBoySmooth, true, large_costs);
+        gov.set_resolution_cap_support(true, Some(capped_costs));
+
+        // 1. Overload activates <= 720x480 cap while preserving MyBoySmooth.
+        let cap_tr = (0..(GOVERNOR_WINDOW_FRAMES + GOVERNOR_DOWN_SUSTAIN_FRAMES))
+            .find_map(|_| gov.record_frame(15.0))
+            .expect("overload should activate 720x480 cap");
+        assert_eq!(cap_tr.kind, GovernorTransitionKind::CapResolution);
+        assert!(gov.is_resolution_capped());
+
+        // 2. Intermediate load (p95 = 5.0 ms < 35%, est_emu = 3.5 ms) stays capped if uncapping
+        // would push predicted total (3.5 + 12.0 = 15.5 ms) over 50% budget (8.37 ms).
+        let premature = (0..(GOVERNOR_BASE_LOCKOUT_FRAMES + GOVERNOR_RECOVERY_SUSTAIN_FRAMES + 200))
+            .find_map(|_| gov.record_frame(5.0));
+        assert!(
+            premature.is_none(),
+            "must not uncap when uncapped work exceeds 50% target"
+        );
+        assert!(gov.is_resolution_capped());
+
+        // Reset lockout cycle via a clean fresh overloaded state, then drop load to idle (0.5 ms).
+        let mut gov2 = QualityGovernor::with_measured_costs(
+            DisplayFilter::MyBoySmooth,
+            true,
+            vec![
+                FilterCost { filter: DisplayFilter::Sharp1x, cost_ms: 2.0 },
+                FilterCost { filter: DisplayFilter::MyBoySmooth, cost_ms: 3.0 },
+            ],
+        );
+        gov2.set_resolution_cap_support(
+            true,
+            Some(vec![
+                FilterCost { filter: DisplayFilter::Sharp1x, cost_ms: 0.2 },
+                FilterCost { filter: DisplayFilter::MyBoySmooth, cost_ms: 0.4 },
+            ]),
+        );
+        let cap2 = (0..(GOVERNOR_WINDOW_FRAMES + GOVERNOR_DOWN_SUSTAIN_FRAMES))
+            .find_map(|_| gov2.record_frame(14.0))
+            .expect("should cap resolution");
+        assert_eq!(cap2.kind, GovernorTransitionKind::CapResolution);
+
+        // Lockout prevents immediate uncap while load is low.
+        for _ in 0..GOVERNOR_BASE_LOCKOUT_FRAMES {
+            assert!(gov2.record_frame(0.8).is_none());
+        }
+        assert!(gov2.is_resolution_capped());
+
+        // Once lockout expires and sustained low load (< 35%) holds, UncapResolution lifts the cap.
+        let uncap = (0..GOVERNOR_RECOVERY_SUSTAIN_FRAMES)
+            .find_map(|_| gov2.record_frame(0.8))
+            .expect("low sustained load after lockout should lift 720x480 cap");
+        assert_eq!(uncap.kind, GovernorTransitionKind::UncapResolution);
+        assert_eq!(uncap.to, DisplayFilter::MyBoySmooth);
+        assert!(!gov2.is_resolution_capped());
+        assert_eq!(gov2.max_output_size(), None);
+        assert_eq!(gov2.current_lockout_frames(), GOVERNOR_BASE_LOCKOUT_FRAMES);
+
+        // If overload returns within the flap window, it re-caps immediately and doubles lockout.
+        let flap = (0..GOVERNOR_WINDOW_FRAMES)
+            .find_map(|_| gov2.record_frame(14.0))
+            .expect("re-overload inside flap window should immediately re-cap");
+        assert_eq!(flap.kind, GovernorTransitionKind::CapResolution);
+        assert!(gov2.is_resolution_capped());
+        assert_eq!(gov2.current_lockout_frames(), GOVERNOR_BASE_LOCKOUT_FRAMES * 2);
+    }
 }
 
 pub const GOVERNOR_BUDGET_MS: f64 = 1000.0 * 280_896.0 / 16_777_216.0;

@@ -1072,6 +1072,10 @@ fn default_auto_quality_governor() -> bool {
     true
 }
 
+fn default_legacy_consecutive_failures() -> u32 {
+    2
+}
+
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct BlockedGpuAdapterEntry {
     pub adapter_name: String,
@@ -1084,6 +1088,23 @@ pub struct BlockedGpuAdapterEntry {
     pub failed_stage: String,
     pub reason: String,
     pub recorded_utc: String,
+    #[serde(default = "default_legacy_consecutive_failures")]
+    pub consecutive_failures: u32,
+    #[serde(default)]
+    pub recorded_epoch_secs: u64,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct VerifiedGpuAdapterEntry {
+    pub adapter_name: String,
+    pub backend: String,
+    pub device_type: String,
+    pub vendor: u32,
+    pub device: u32,
+    pub driver: String,
+    pub driver_info: String,
+    #[serde(default)]
+    pub verified_epoch_secs: u64,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -1110,6 +1131,8 @@ pub struct AppConfig {
     pub governor_settled_filters: BTreeMap<String, DisplayFilter>,
     #[serde(default)]
     pub blocked_gpu_adapters: BTreeMap<String, BlockedGpuAdapterEntry>,
+    #[serde(default)]
+    pub verified_gpu_adapters: BTreeMap<String, VerifiedGpuAdapterEntry>,
     #[serde(default)]
     pub shader_preset: ShaderPreset,
     #[serde(default)]
@@ -1176,6 +1199,7 @@ impl Default for AppConfig {
             auto_quality_governor: default_auto_quality_governor(),
             governor_settled_filters: BTreeMap::new(),
             blocked_gpu_adapters: BTreeMap::new(),
+            verified_gpu_adapters: BTreeMap::new(),
             shader_preset: ShaderPreset::Nearest,
             frame_blending: false,
             dot_accurate_ppu: false,
@@ -1368,6 +1392,7 @@ impl AppConfig {
         )
     }
 
+    #[cfg_attr(not(test), allow(dead_code))]
     pub fn blocked_gpu_adapter(&self, key: &str) -> Option<&BlockedGpuAdapterEntry> {
         self.blocked_gpu_adapters
             .get(key)
@@ -1381,7 +1406,23 @@ impl AppConfig {
     pub fn clear_blocked_gpu_adapters(&mut self) -> usize {
         let n = self.blocked_gpu_adapters.len();
         self.blocked_gpu_adapters.clear();
+        self.verified_gpu_adapters.clear();
         n
+    }
+
+    pub fn verified_gpu_adapter(
+        &self,
+        key: &str,
+        driver: &str,
+        driver_info: &str,
+    ) -> Option<&VerifiedGpuAdapterEntry> {
+        self.verified_gpu_adapters
+            .get(key)
+            .filter(|e| e.driver == driver && e.driver_info == driver_info)
+    }
+
+    pub fn record_verified_gpu_adapter(&mut self, key: String, entry: VerifiedGpuAdapterEntry) {
+        self.verified_gpu_adapters.insert(key, entry);
     }
 }
 
@@ -1553,5 +1594,53 @@ mod tests {
         assert_eq!(back.settled_filter_for(&k1), Some(DisplayFilter::MyBoySmooth));
         assert_eq!(back.settled_filter_for(&k2), Some(DisplayFilter::Sharp1x));
         assert_eq!(back.settled_filter_for(&k3), None);
+    }
+
+    #[test]
+    fn gpu_adapter_entries_roundtrip_and_queries() {
+        let mut cfg = AppConfig::default();
+        let key = AppConfig::gpu_adapter_block_key("Test GPU", "Vulkan", 0x10de, 0x2800);
+        cfg.record_blocked_gpu_adapter(
+            key.clone(),
+            BlockedGpuAdapterEntry {
+                adapter_name: "Test GPU".to_string(),
+                backend: "Vulkan".to_string(),
+                device_type: "DiscreteGpu".to_string(),
+                vendor: 0x10de,
+                device: 0x2800,
+                driver: "nvidia".to_string(),
+                driver_info: "560.1".to_string(),
+                failed_stage: "device".to_string(),
+                reason: "test".to_string(),
+                recorded_utc: "unix:1700000000".to_string(),
+                consecutive_failures: 1,
+                recorded_epoch_secs: 1_700_000_000,
+            },
+        );
+        assert_eq!(
+            cfg.blocked_gpu_adapter(&key)
+                .map(|e| e.consecutive_failures),
+            Some(1)
+        );
+
+        cfg.record_verified_gpu_adapter(
+            key.clone(),
+            VerifiedGpuAdapterEntry {
+                adapter_name: "Test GPU".to_string(),
+                backend: "Vulkan".to_string(),
+                device_type: "DiscreteGpu".to_string(),
+                vendor: 0x10de,
+                device: 0x2800,
+                driver: "nvidia".to_string(),
+                driver_info: "560.1".to_string(),
+                verified_epoch_secs: 1_700_000_050,
+            },
+        );
+        assert!(cfg.verified_gpu_adapter(&key, "nvidia", "560.1").is_some());
+        assert!(cfg.verified_gpu_adapter(&key, "nvidia", "560.2").is_none());
+
+        assert_eq!(cfg.clear_blocked_gpu_adapters(), 1);
+        assert!(cfg.blocked_gpu_adapter(&key).is_none());
+        assert!(cfg.verified_gpu_adapter(&key, "nvidia", "560.1").is_none());
     }
 }

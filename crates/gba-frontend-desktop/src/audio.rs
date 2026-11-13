@@ -1,5 +1,5 @@
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicI32, AtomicU64, AtomicUsize, Ordering};
 use std::thread::{self, JoinHandle, Thread};
 use std::time::Duration;
 
@@ -308,6 +308,7 @@ struct AudioConsumer {
     #[cfg_attr(not(test), allow(dead_code))]
     occupancy: Arc<AtomicUsize>,
     target_fill: Arc<AtomicUsize>,
+    rate_offset_ppm: Arc<AtomicI32>,
     was_underrunning: bool,
 }
 
@@ -319,6 +320,7 @@ impl AudioConsumer {
         underruns: Arc<AtomicU64>,
         occupancy: Arc<AtomicUsize>,
         target_fill: Arc<AtomicUsize>,
+        rate_offset_ppm: Arc<AtomicI32>,
     ) -> Self {
         let base_ratio = (SAMPLE_RATE_HZ as f64) / out_rate.max(8000.0);
         let start_muted = muted.load(Ordering::Relaxed);
@@ -337,6 +339,7 @@ impl AudioConsumer {
             underruns,
             occupancy,
             target_fill,
+            rate_offset_ppm,
             was_underrunning: true,
         }
     }
@@ -391,9 +394,15 @@ impl AudioConsumer {
         // Smooth fill-level EMA suppresses callback-burst pitch wobble while locking latency.
         self.avg_fill += 0.0005 * (fill_f - self.avg_fill);
         let fill_delta = ((self.avg_fill - target) / target).clamp(-1.0, 1.0);
-        // Dynamic Rate Control (DRC): skew input step by up to +/-1.0% keeping ring buffer centered at target_fill.
+        // Dynamic Rate Control (DRC): skew input step by up to +/-1.0% keeping ring buffer centered at target_fill,
+        // and fold vblank phase-lock rate adjustments seamlessly into audio resampling.
         let drc_adjust = (fill_delta * 0.010).clamp(-0.010, 0.010);
-        let r_dynamic = self.base_ratio * (1.0 + drc_adjust);
+        let ppm = self
+            .rate_offset_ppm
+            .load(Ordering::Relaxed)
+            .clamp(-10_000, 10_000);
+        let rate_scale = 1.0 + (ppm as f64) * 1e-6;
+        let r_dynamic = self.base_ratio * rate_scale * (1.0 + drc_adjust);
 
         while self.phase >= 1.0 {
             self.phase -= 1.0;
@@ -626,6 +635,7 @@ pub struct AudioOutput {
     underruns: Arc<AtomicU64>,
     occupancy: Arc<AtomicUsize>,
     target_fill: Arc<AtomicUsize>,
+    rate_offset_ppm: Arc<AtomicI32>,
     // Drop `_stream` before `_worker` so the OS audio callback stops prior to worker shutdown.
     _stream: Option<cpal::Stream>,
     _worker: Option<AudioWorkerHandle>,
@@ -643,6 +653,7 @@ impl AudioOutput {
         let occupancy = Arc::new(AtomicUsize::new(0));
         let play_gba_equiv = Arc::new(AtomicUsize::new(0));
         let target_fill = Arc::new(AtomicUsize::new(INITIAL_TARGET_FILL_SAMPLES));
+        let rate_offset_ppm = Arc::new(AtomicI32::new(0));
 
         let (stream, worker, wake_worker, host_sample_rate) = Self::init_cpal(
             cons,
@@ -651,6 +662,7 @@ impl AudioOutput {
             occupancy.clone(),
             play_gba_equiv.clone(),
             target_fill.clone(),
+            rate_offset_ppm.clone(),
         );
         let has_device = stream.is_some();
         Self {
@@ -666,6 +678,7 @@ impl AudioOutput {
             underruns,
             occupancy,
             target_fill,
+            rate_offset_ppm,
             _stream: stream,
             _worker: worker,
             host_sample_rate,
@@ -691,6 +704,7 @@ impl AudioOutput {
             underruns: Arc::new(AtomicU64::new(0)),
             occupancy: Arc::new(AtomicUsize::new(0)),
             target_fill,
+            rate_offset_ppm: Arc::new(AtomicI32::new(0)),
             _stream: None,
             _worker: None,
             host_sample_rate: 48_000,
@@ -709,6 +723,12 @@ impl AudioOutput {
 
     pub fn set_muted(&self, muted: bool) {
         self.muted.store(muted, Ordering::Relaxed);
+    }
+
+    #[inline]
+    pub fn set_rate_offset_ppm(&self, ppm: i32) {
+        self.rate_offset_ppm
+            .store(ppm.clamp(-10_000, 10_000), Ordering::Relaxed);
     }
 
     #[inline]
@@ -770,6 +790,7 @@ impl AudioOutput {
         occupancy: Arc<AtomicUsize>,
         play_gba_equiv: Arc<AtomicUsize>,
         target_fill: Arc<AtomicUsize>,
+        rate_offset_ppm: Arc<AtomicI32>,
     ) -> (
         Option<cpal::Stream>,
         Option<AudioWorkerHandle>,
@@ -805,6 +826,7 @@ impl AudioOutput {
                     underruns,
                     occupancy,
                     target_fill,
+                    rate_offset_ppm,
                 );
                 while !stop_thread.load(Ordering::Acquire) {
                     let mut out_occ = play_prod.occupied_len();
@@ -914,6 +936,7 @@ mod tests {
             underruns.clone(),
             occupancy,
             target_fill.clone(),
+            Arc::new(AtomicI32::new(0)),
         );
 
         // Push 100ms of 1 kHz stereo sine wave at SAMPLE_RATE_HZ

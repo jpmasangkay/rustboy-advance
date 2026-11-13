@@ -437,6 +437,301 @@ impl DwmScanoutTracker {
     }
 }
 
+#[cfg(target_os = "windows")]
+pub fn qpc_frequency() -> Option<u64> {
+    static FREQ: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
+    let f = *FREQ.get_or_init(|| {
+        #[link(name = "kernel32")]
+        unsafe extern "system" {
+            fn QueryPerformanceFrequency(lp_frequency: *mut i64) -> i32;
+        }
+        let mut freq: i64 = 0;
+        // SAFETY: Valid stack pointer for i64 frequency output.
+        if unsafe { QueryPerformanceFrequency(&mut freq) } != 0 && freq > 0 {
+            freq as u64
+        } else {
+            0
+        }
+    });
+    (f > 0).then_some(f)
+}
+
+#[cfg(not(target_os = "windows"))]
+pub fn qpc_frequency() -> Option<u64> {
+    None
+}
+
+#[cfg(target_os = "windows")]
+pub fn qpc_now() -> Option<u64> {
+    #[link(name = "kernel32")]
+    unsafe extern "system" {
+        fn QueryPerformanceCounter(lp_performance_count: *mut i64) -> i32;
+    }
+    let mut count: i64 = 0;
+    // SAFETY: Valid stack pointer for i64 counter output.
+    if unsafe { QueryPerformanceCounter(&mut count) } != 0 && count > 0 {
+        Some(count as u64)
+    } else {
+        None
+    }
+}
+
+#[cfg(not(target_os = "windows"))]
+pub fn qpc_now() -> Option<u64> {
+    None
+}
+
+/// Sleeps cleanly (relying on an active high-resolution OS timer when available) then yields
+/// briefly on QPC until `target_qpc` is reached, ignoring absurd future deadlines (>25 ms).
+pub fn wait_until_qpc(target_qpc: u64) {
+    let Some(freq) = qpc_frequency() else {
+        return;
+    };
+    let Some(now) = qpc_now() else {
+        return;
+    };
+    if now >= target_qpc {
+        return;
+    }
+    let rem_secs = (target_qpc - now) as f64 / (freq as f64);
+    if rem_secs > 0.025 {
+        return;
+    }
+    if rem_secs > 0.0020 {
+        std::thread::sleep(std::time::Duration::from_secs_f64(rem_secs - 0.0014));
+    }
+    while let Some(cur) = qpc_now() {
+        if cur >= target_qpc {
+            break;
+        }
+        std::hint::spin_loop();
+    }
+}
+
+/// Phase-locks frame presentation to the middle (`target_phase = 0.50`) of a DWM refresh
+/// interval using `DwmGetCompositionTimingInfo` (`qpc_vblank`, `qpc_refresh_period`) and QPC,
+/// steering cadence gently within ±0.20% per frame so corrections fold seamlessly into audio DRC.
+#[derive(Clone, Debug)]
+pub struct VblankPhaseLock {
+    enabled: bool,
+    target_phase: f64,
+    qpc_freq: u64,
+    vblanks_per_frame: u64,
+    target_finish_qpc: Option<u64>,
+    ema_present_qpc: f64,
+    ema_prep_qpc: f64,
+    ema_phase_err_norm: f64,
+    ema_step_qpc: f64,
+    last_present_end_qpc: Option<u64>,
+    drift_realign_count: u64,
+    last_rate_offset_ppm: i32,
+}
+
+impl VblankPhaseLock {
+    pub fn new(sync_60hz: bool, display_refresh_hz: Option<f64>) -> Self {
+        Self::with_freq(sync_60hz, display_refresh_hz, qpc_frequency().unwrap_or(10_000_000))
+    }
+
+    pub fn with_freq(sync_60hz: bool, display_refresh_hz: Option<f64>, qpc_freq: u64) -> Self {
+        let freq = qpc_freq.max(1);
+        let refresh = display_refresh_hz.unwrap_or(60.0);
+        let vblanks_per_frame = if sync_60hz && refresh >= 55.0 {
+            ((refresh / 60.0).round() as u64).max(1)
+        } else {
+            1
+        };
+        let nominal_frame = (freq as f64) / 60.0;
+        Self {
+            enabled: sync_60hz && qpc_freq > 0,
+            target_phase: 0.50,
+            qpc_freq: freq,
+            vblanks_per_frame,
+            target_finish_qpc: None,
+            ema_present_qpc: (freq as f64) * 0.0008, // 0.8 ms initial BitBlt/present estimate
+            ema_prep_qpc: (freq as f64) * 0.0020,    // 2.0 ms initial filter+blit estimate
+            ema_phase_err_norm: 0.0,
+            ema_step_qpc: nominal_frame,
+            last_present_end_qpc: None,
+            drift_realign_count: 0,
+            last_rate_offset_ppm: if sync_60hz {
+                (((60.0 / NATIVE_GBA_HZ) - 1.0) * 1_000_000.0).round() as i32
+            } else {
+                0
+            },
+        }
+    }
+
+    #[inline]
+    pub fn is_enabled(&self) -> bool {
+        self.enabled
+    }
+
+    #[inline]
+    pub fn qpc_freq(&self) -> u64 {
+        self.qpc_freq
+    }
+
+    #[inline]
+    #[allow(dead_code)]
+    pub fn target_finish_qpc(&self) -> Option<u64> {
+        self.target_finish_qpc
+    }
+
+    /// Expected start QPC timestamp so `present()` completes right around `target_finish_qpc`.
+    #[inline]
+    pub fn target_present_start_qpc(&self) -> Option<u64> {
+        self.target_finish_qpc
+            .map(|fin| fin.saturating_sub(self.ema_present_qpc.round() as u64))
+    }
+
+    /// Pre-present wake QPC timestamp allowing emulation + filter + blit to complete comfortably
+    /// before `target_present_start_qpc`.
+    #[inline]
+    pub fn prework_wake_qpc(&self) -> Option<u64> {
+        let start = self.target_present_start_qpc()?;
+        let min_headroom = (self.qpc_freq as f64) * 0.0040; // >= 4.0 ms buffer for OS timer + prep
+        let cap_headroom = (self.qpc_freq as f64) * 0.0115; // <= 11.5 ms so we still WaitUntil idle
+        let lead = (self.ema_prep_qpc + (self.qpc_freq as f64) * 0.0025)
+            .clamp(min_headroom, cap_headroom);
+        Some(start.saturating_sub(lead.round() as u64))
+    }
+
+    #[inline]
+    pub fn record_prep_ticks(&mut self, prep_qpc: u64) {
+        let cap = (self.qpc_freq as f64) * 0.012;
+        let clamped = (prep_qpc as f64).min(cap);
+        self.ema_prep_qpc = self.ema_prep_qpc * 0.85 + clamped * 0.15;
+    }
+
+    #[inline]
+    pub fn reset_schedule(&mut self) {
+        self.target_finish_qpc = None;
+        self.last_present_end_qpc = None;
+        self.ema_phase_err_norm = 0.0;
+    }
+
+    #[inline]
+    pub fn audio_rate_offset_ppm(&self) -> i32 {
+        self.last_rate_offset_ppm
+    }
+
+    #[inline]
+    #[allow(dead_code)]
+    pub fn drift_realign_count(&self) -> u64 {
+        self.drift_realign_count
+    }
+
+    /// Observes the completed present (`present_start_qpc..present_end_qpc`) and latest DWM timing
+    /// snapshot, advancing `target_finish_qpc` toward `qpc_vblank + 0.50 * qpc_refresh_period`.
+    pub fn observe_and_advance(
+        &mut self,
+        present_start_qpc: u64,
+        present_end_qpc: u64,
+        snap: Option<DwmCompositionSnapshot>,
+    ) -> u64 {
+        if !self.enabled {
+            let step = ((self.qpc_freq as f64) / NATIVE_GBA_HZ).round() as u64;
+            let next = present_end_qpc.saturating_add(step);
+            self.target_finish_qpc = Some(next);
+            self.last_rate_offset_ppm = 0;
+            return next;
+        }
+
+        let Some(snap) = snap.filter(|s| s.qpc_refresh_period > 0) else {
+            let step = ((self.qpc_freq as f64) / 60.0).round() as u64;
+            let next = match self.target_finish_qpc {
+                Some(prev) if prev + step > present_end_qpc + step / 4 => prev + step,
+                _ => present_end_qpc.saturating_add(step),
+            };
+            self.target_finish_qpc = Some(next);
+            self.last_rate_offset_ppm =
+                (((60.0 / NATIVE_GBA_HZ) - 1.0) * 1_000_000.0).round() as i32;
+            return next;
+        };
+
+        let p = snap.qpc_refresh_period.max(1);
+        let refresh_hz = if snap.refresh_hz >= 55.0 {
+            snap.refresh_hz
+        } else {
+            (self.qpc_freq as f64) / (p as f64)
+        };
+        if refresh_hz >= 55.0 {
+            self.vblanks_per_frame = ((refresh_hz / 60.0).round() as u64).max(1);
+        }
+        let step_qpc = p.saturating_mul(self.vblanks_per_frame);
+        let mid_offset = ((p as f64) * self.target_phase).round() as i128;
+
+        // Track only the BitBlt/present submission latency so present completes at target_phase.
+        let dur_ticks = present_end_qpc.saturating_sub(present_start_qpc) as f64;
+        let max_present_lead = (p as f64) * if self.vblanks_per_frame == 1 { 0.45 } else { 0.55 };
+        self.ema_present_qpc = (self.ema_present_qpc * 0.90 + dur_ticks * 0.10).min(max_present_lead);
+
+        // Actual phase error of present completion within its DWM refresh interval [-0.5, +0.5).
+        let end_mod = ((present_end_qpc as i128 - snap.qpc_vblank as i128)
+            .rem_euclid(p as i128)) as f64
+            / (p as f64);
+        let end_err_norm = end_mod - self.target_phase;
+        self.ema_phase_err_norm = self.ema_phase_err_norm * 0.92 + end_err_norm * 0.08;
+
+        let min_headroom = (step_qpc / 2).max(p / 2);
+        let snap_to_grid = |base_target: u64| -> u64 {
+            let mut m = ((base_target as i128 - (snap.qpc_vblank as i128 + mid_offset)) as f64
+                / (p as f64))
+                .round() as i128;
+            let mut cand = snap.qpc_vblank as i128 + m * (p as i128) + mid_offset;
+            let floor = present_end_qpc as i128 + ((step_qpc as i128 * 3) / 4);
+            while cand < floor {
+                m += 1;
+                cand = snap.qpc_vblank as i128 + m * (p as i128) + mid_offset;
+            }
+            cand.max(0) as u64
+        };
+
+        let next = match self.target_finish_qpc {
+            None => snap_to_grid(present_end_qpc.saturating_add(step_qpc)),
+            Some(prev_target) => {
+                // Nominal target modulo p vs true DWM midpoint grid -> crystal drift term.
+                let grid_mod = ((prev_target as i128 - snap.qpc_vblank as i128)
+                    .rem_euclid(p as i128)) as f64
+                    / (p as f64);
+                let grid_err_norm = grid_mod - self.target_phase;
+                // Blend DWM grid drift + smoothed actual present completion offset.
+                let combined_err_norm = 0.70 * grid_err_norm + 0.30 * self.ema_phase_err_norm;
+                let max_slew = (step_qpc as f64) * 0.0020; // ±0.20% per frame max (~3.4 cents)
+                let delta_ticks =
+                    (-(combined_err_norm * (p as f64)) * 0.10).clamp(-max_slew, max_slew);
+                let cand = (prev_target as i128 + step_qpc as i128 + delta_ticks.round() as i128)
+                    .max(0) as u64;
+                if cand < present_end_qpc.saturating_add(min_headroom)
+                    || cand > present_end_qpc.saturating_add(step_qpc * 2)
+                {
+                    self.drift_realign_count += 1;
+                    snap_to_grid(present_end_qpc.saturating_add(step_qpc))
+                } else {
+                    cand
+                }
+            }
+        };
+
+        if let Some(prev) = self.target_finish_qpc {
+            let applied_step = next.saturating_sub(prev) as f64;
+            if applied_step > (step_qpc as f64) * 0.5 && applied_step < (step_qpc as f64) * 1.5 {
+                self.ema_step_qpc = self.ema_step_qpc * 0.90 + applied_step * 0.10;
+            }
+        } else {
+            self.ema_step_qpc = step_qpc as f64;
+        }
+        let eff_fps = (self.qpc_freq as f64) / self.ema_step_qpc.max(1.0);
+        let ppm = (((eff_fps / NATIVE_GBA_HZ) - 1.0) * 1_000_000.0)
+            .round()
+            .clamp(-10_000.0, 10_000.0) as i32;
+        self.last_rate_offset_ppm = ppm;
+        self.last_present_end_qpc = Some(present_end_qpc);
+        self.target_finish_qpc = Some(next);
+        next
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -475,6 +770,117 @@ mod tests {
         assert!(hz.is_some(), "expected detected display refresh Hz on Windows");
         let dwm = query_dwm_timing();
         assert!(dwm.is_some(), "DwmGetCompositionTimingInfo must succeed with 292-byte pack(1) struct");
+    }
+
+    #[test]
+    fn phase_lock_targets_midpoint_and_corrects_crystal_drift() {
+        let freq = 10_000_000u64;
+        let nominal_p = 166_666u64; // ~60.00 Hz
+        let true_p_float = 166_666.0 * 1.0005; // +500 ppm clock drift on panel vs reported period
+        let mut lock = VblankPhaseLock::with_freq(true, Some(60.0), freq);
+        let base_vblank = 1_000_000_000u64;
+        let bitblt_dur = 8_000u64; // 0.8 ms
+
+        // Frame 0 starts near a vblank edge (0.12 phase)
+        let mut end_qpc = base_vblank + 20_000;
+        let snap0 = DwmCompositionSnapshot {
+            c_refresh: 1,
+            qpc_vblank: base_vblank,
+            qpc_refresh_period: nominal_p,
+            refresh_hz: 60.0,
+            ..Default::default()
+        };
+        let mut next_target = lock.observe_and_advance(end_qpc - bitblt_dur, end_qpc, Some(snap0));
+
+        let mut steady_phases = Vec::new();
+        for frame in 1..400u64 {
+            let vblank_k = base_vblank + ((frame as f64) * true_p_float).round() as u64;
+            end_qpc = next_target;
+            let snap = DwmCompositionSnapshot {
+                c_refresh: frame + 1,
+                qpc_vblank: vblank_k,
+                qpc_refresh_period: nominal_p,
+                refresh_hz: 60.0,
+                ..Default::default()
+            };
+            next_target = lock.observe_and_advance(end_qpc - bitblt_dur, end_qpc, Some(snap));
+            if frame >= 150 {
+                let phase = ((end_qpc as i128 - vblank_k as i128).rem_euclid(nominal_p as i128))
+                    as f64
+                    / (nominal_p as f64);
+                steady_phases.push(phase);
+            }
+        }
+        let max_err = steady_phases
+            .iter()
+            .map(|&ph| (ph - 0.50).abs())
+            .fold(0.0f64, f64::max);
+        assert!(
+            max_err < 0.05,
+            "steady-state phase should hold within ±0.05 of 0.50 midpoint despite crystal drift, max_err={max_err:.4}"
+        );
+        let ppm = lock.audio_rate_offset_ppm();
+        assert!(
+            (4000..=5500).contains(&ppm),
+            "expected audio rate offset around +4562 ppm at 60 Hz, got {ppm}"
+        );
+    }
+
+    #[test]
+    fn phase_lock_tracks_240hz_4v_cadence_and_recovers_from_stall() {
+        let freq = 10_000_000u64;
+        let p = 41_667u64; // 240 Hz
+        let mut lock = VblankPhaseLock::with_freq(true, Some(240.0), freq);
+        let base_v = 2_000_000_000u64;
+        let mut target = lock.observe_and_advance(
+            base_v + 1_000,
+            base_v + 9_000,
+            Some(DwmCompositionSnapshot {
+                qpc_vblank: base_v,
+                qpc_refresh_period: p,
+                refresh_hz: 240.0,
+                ..Default::default()
+            }),
+        );
+        for f in 1..20u64 {
+            let vb = base_v + f * 4 * p;
+            let prev_end = target;
+            target = lock.observe_and_advance(
+                prev_end - 4_000,
+                prev_end,
+                Some(DwmCompositionSnapshot {
+                    qpc_vblank: vb,
+                    qpc_refresh_period: p,
+                    refresh_hz: 240.0,
+                    ..Default::default()
+                }),
+            );
+            let step_vblanks = ((target as f64) - (prev_end as f64)) / (p as f64);
+            assert!(
+                (step_vblanks - 4.0).abs() < 0.05,
+                "expected ~4v step at 240Hz, got {step_vblanks:.3}"
+            );
+        }
+        // Inject a 35 ms stall (missed ~8 refreshes): should snap back onto 0.50 grid cleanly.
+        let stall_end = target + 350_000;
+        let stall_vb = stall_end - 8_000;
+        let recovered = lock.observe_and_advance(
+            stall_end - 4_000,
+            stall_end,
+            Some(DwmCompositionSnapshot {
+                qpc_vblank: stall_vb,
+                qpc_refresh_period: p,
+                refresh_hz: 240.0,
+                ..Default::default()
+            }),
+        );
+        assert_eq!(lock.drift_realign_count(), 1);
+        let rec_phase =
+            ((recovered as i128 - stall_vb as i128).rem_euclid(p as i128)) as f64 / (p as f64);
+        assert!(
+            (rec_phase - 0.50).abs() < 0.02,
+            "recovered target must snap right to 0.50 midpoint, got {rec_phase:.4}"
+        );
     }
 }
 

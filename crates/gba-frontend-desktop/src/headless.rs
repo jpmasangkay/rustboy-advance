@@ -142,6 +142,8 @@ pub struct CliConfig {
     pub retry_gpu: bool,
     pub probe_fail_stage: Option<crate::gpu_probe::ProbeFailStage>,
     pub gpu_probe_timeout_ms: Option<u64>,
+    pub capture_png: Option<PathBuf>,
+    pub capture_frame: Option<u64>,
 }
 
 impl Default for CliConfig {
@@ -192,6 +194,8 @@ impl Default for CliConfig {
             retry_gpu: false,
             probe_fail_stage: None,
             gpu_probe_timeout_ms: None,
+            capture_png: None,
+            capture_frame: None,
         }
     }
 }
@@ -331,6 +335,15 @@ impl CliConfig {
                     let v = args.next().ok_or("missing value for --gpu-probe-timeout-ms")?;
                     let ms: u64 = v.parse().map_err(|_| "invalid --gpu-probe-timeout-ms number")?;
                     cfg.gpu_probe_timeout_ms = Some(ms.max(200));
+                }
+                "--capture-png" => {
+                    let v = args.next().ok_or("missing value for --capture-png")?;
+                    cfg.capture_png = Some(PathBuf::from(v));
+                }
+                "--capture-frame" => {
+                    let v = args.next().ok_or("missing value for --capture-frame")?;
+                    let f: u64 = v.parse().map_err(|_| "invalid --capture-frame number")?;
+                    cfg.capture_frame = Some(f);
                 }
                 "--governor" => cfg.governor = Some(true),
                 "--no-governor" => cfg.governor = Some(false),

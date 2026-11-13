@@ -200,7 +200,11 @@ impl Ppu {
 
     #[inline]
     pub fn read_stat(&self) -> u8 {
-        let mode_bits = if self.lcd_enabled() { self.mode & 0x03 } else { 0 };
+        let mode_bits = if self.lcd_enabled() {
+            self.mode & 0x03
+        } else {
+            0
+        };
         let lyc_bit = if self.ly_eq_lyc { 0x04 } else { 0 };
         0x80 | (self.stat & 0x78) | lyc_bit | mode_bits
     }
@@ -404,8 +408,16 @@ impl Ppu {
             && self.wx <= 166
             && (is_cgb || bg_enabled_dmg);
 
-        let bg_map_base: usize = if (self.lcdc & 0x08) != 0 { 0x1C00 } else { 0x1800 };
-        let win_map_base: usize = if (self.lcdc & 0x40) != 0 { 0x1C00 } else { 0x1800 };
+        let bg_map_base: usize = if (self.lcdc & 0x08) != 0 {
+            0x1C00
+        } else {
+            0x1800
+        };
+        let win_map_base: usize = if (self.lcdc & 0x40) != 0 {
+            0x1C00
+        } else {
+            0x1800
+        };
         let unsigned_tiles = (self.lcdc & 0x10) != 0;
         let wx_start = (self.wx as i16) - 7;
 
@@ -421,7 +433,11 @@ impl Ppu {
                     window_rendered = true;
                     (win_map_base, ((x as i16) - wx_start) as u8, self.win_line)
                 } else {
-                    (bg_map_base, (x as u8).wrapping_add(self.scx), ly.wrapping_add(self.scy))
+                    (
+                        bg_map_base,
+                        (x as u8).wrapping_add(self.scx),
+                        ly.wrapping_add(self.scy),
+                    )
                 };
 
                 let tile_col = (map_x >> 3) as usize;
@@ -531,7 +547,11 @@ impl Ppu {
                     s.tile
                 };
                 let row = (ty & 7) as usize;
-                let vram_bank = if is_cgb && (s.flags & 0x08) != 0 { 1 } else { 0 };
+                let vram_bank = if is_cgb && (s.flags & 0x08) != 0 {
+                    1
+                } else {
+                    0
+                };
                 let addr = vram_bank * 0x2000 + (tile as usize) * 16 + row * 2;
                 let lo = self.vram[addr];
                 let hi = self.vram[addr + 1];

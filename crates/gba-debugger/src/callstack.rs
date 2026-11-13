@@ -111,9 +111,7 @@ pub fn is_call_instruction(core: &GbaCore, pc: u32, thumb: bool) -> Option<u32> 
                 return Some(pc.wrapping_add(8));
             }
         }
-        if (is_arm_bx_non_lr(op) || is_arm_b(op))
-            && (core.cpu.gpr[14] & !1) == pc.wrapping_add(4)
-        {
+        if (is_arm_bx_non_lr(op) || is_arm_b(op)) && (core.cpu.gpr[14] & !1) == pc.wrapping_add(4) {
             return Some(pc.wrapping_add(4));
         }
         None

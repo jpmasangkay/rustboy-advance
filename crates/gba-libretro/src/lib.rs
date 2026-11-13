@@ -20,7 +20,6 @@ use crate::ffi::{
 
 const LIBRARY_VERSION_Z: &str = concat!(env!("CARGO_PKG_VERSION"), "\0");
 const GBA_FPS: f64 = 59.7275;
-const GBA_ASPECT_RATIO: f32 = 3.0 / 2.0;
 
 pub struct LibretroAdapter {
     pub xrgb1555: [u16; LCD_WIDTH * LCD_HEIGHT],
@@ -100,7 +99,7 @@ pub unsafe extern "C" fn retro_get_system_info(info: *mut retro_system_info) {
             *info = retro_system_info {
                 library_name: c"Rustboy Advance".as_ptr(),
                 library_version: LIBRARY_VERSION_Z.as_ptr().cast::<c_char>(),
-                valid_extensions: c"gba|agb|bin".as_ptr(),
+                valid_extensions: c"gba|agb|gb|gbc|bin".as_ptr(),
                 need_fullpath: false,
                 block_extract: false,
             };
@@ -116,14 +115,15 @@ pub unsafe extern "C" fn retro_get_system_av_info(info: *mut retro_system_av_inf
         if info.is_null() {
             return;
         }
+        let (width, height, aspect_ratio) = state::active_geometry();
         unsafe {
             *info = retro_system_av_info {
                 geometry: retro_game_geometry {
-                    base_width: LCD_WIDTH as c_uint,
-                    base_height: LCD_HEIGHT as c_uint,
-                    max_width: LCD_WIDTH as c_uint,
-                    max_height: LCD_HEIGHT as c_uint,
-                    aspect_ratio: GBA_ASPECT_RATIO,
+                    base_width: width as c_uint,
+                    base_height: height as c_uint,
+                    max_width: width as c_uint,
+                    max_height: height as c_uint,
+                    aspect_ratio,
                 },
                 timing: retro_system_timing {
                     fps: GBA_FPS,
@@ -204,12 +204,7 @@ pub extern "C" fn retro_cheat_reset() {}
 /// # Safety
 /// `code` must be null or point to a valid NUL-terminated C string.
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn retro_cheat_set(
-    _index: c_uint,
-    _enabled: bool,
-    _code: *const c_char,
-) {
-}
+pub unsafe extern "C" fn retro_cheat_set(_index: c_uint, _enabled: bool, _code: *const c_char) {}
 
 /// # Safety
 /// `game` must be null or point to a valid `retro_game_info` struct.

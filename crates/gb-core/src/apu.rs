@@ -435,11 +435,7 @@ impl NoiseChannel {
     fn period(&self) -> u32 {
         let div = NOISE_DIVISORS[(self.nr_poly & 0x07) as usize];
         let shift = (self.nr_poly >> 4) & 0x0F;
-        if shift >= 14 {
-            u32::MAX
-        } else {
-            div << shift
-        }
+        if shift >= 14 { u32::MAX } else { div << shift }
     }
 
     pub fn write_len(&mut self, val: u8) {

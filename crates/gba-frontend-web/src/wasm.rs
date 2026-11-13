@@ -40,7 +40,9 @@ impl Emulator {
 
     /// Loads a GBA ROM image (`Uint8Array`) and initializes the core.
     pub fn load_rom(&mut self, bytes: &[u8]) -> Result<(), JsValue> {
-        self.inner.load_rom(bytes).map_err(|e| JsValue::from_str(&e))
+        self.inner
+            .load_rom(bytes)
+            .map_err(|e| JsValue::from_str(&e))
     }
 
     /// Loads a 16 KiB GBA BIOS image (`Uint8Array`).

@@ -3,9 +3,7 @@ use std::fs;
 use std::path::PathBuf;
 use std::process;
 
-use gb_core::{
-    DmgPalette, GbConfig, GbCore, GbHostFrontend, GbModel, LCD_HEIGHT, LCD_WIDTH,
-};
+use gb_core::{DmgPalette, GbConfig, GbCore, GbHostFrontend, GbModel, LCD_HEIGHT, LCD_WIDTH};
 use image::{ImageBuffer, Rgb};
 
 struct HeadlessFrontend {

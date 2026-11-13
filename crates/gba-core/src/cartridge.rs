@@ -289,7 +289,13 @@ impl EepromState {
         }
     }
 
-    pub fn write_bit(&mut self, sram: &mut [u8; 0x20000], dirty: &mut bool, val: u16, dma_count: u32) {
+    pub fn write_bit(
+        &mut self,
+        sram: &mut [u8; 0x20000],
+        dirty: &mut bool,
+        val: u16,
+        dma_count: u32,
+    ) {
         let bit = (val & 1) as u64;
         match self.stage {
             EepromStage::Idle => {
@@ -588,7 +594,16 @@ impl GpioRtc {
         }
     }
 
-    pub fn set_datetime(&mut self, year: u8, month: u8, day: u8, dow: u8, hour: u8, min: u8, sec: u8) {
+    pub fn set_datetime(
+        &mut self,
+        year: u8,
+        month: u8,
+        day: u8,
+        dow: u8,
+        hour: u8,
+        min: u8,
+        sec: u8,
+    ) {
         fn to_bcd(v: u8) -> u8 {
             ((v / 10) << 4) | (v % 10)
         }
@@ -714,29 +729,44 @@ impl Cartridge {
             None
         };
         let sig_save_type = Self::detect_save_type(&rom);
-        let (save_type, has_rtc, solar_enabled, tilt_enabled, gyro_enabled, rumble_enabled, idle_loop_addr) =
-            if let Some(entry) = db_entry {
-                (
-                    if sig_save_type != SaveType::None { sig_save_type } else { entry.save_type },
-                    entry.has_rtc,
-                    entry.solar,
-                    entry.tilt,
-                    entry.gyro,
-                    entry.rumble,
-                    entry.idle_loop_addr,
-                )
+        let (
+            save_type,
+            has_rtc,
+            solar_enabled,
+            tilt_enabled,
+            gyro_enabled,
+            rumble_enabled,
+            idle_loop_addr,
+        ) = if let Some(entry) = db_entry {
+            (
+                if sig_save_type != SaveType::None {
+                    sig_save_type
+                } else {
+                    entry.save_type
+                },
+                entry.has_rtc,
+                entry.solar,
+                entry.tilt,
+                entry.gyro,
+                entry.rumble,
+                entry.idle_loop_addr,
+            )
+        } else {
+            let code3 = if orig_len >= 0xB0 {
+                &rom[0xAC..0xAF]
             } else {
-                let code3 = if orig_len >= 0xB0 { &rom[0xAC..0xAF] } else { b"---" };
-                (
-                    sig_save_type,
-                    Self::detect_rtc(&rom),
-                    matches!(code3, b"U3I" | b"U32" | b"U33"),
-                    code3 == b"KYG",
-                    code3 == b"RZW",
-                    code3 == b"RZW" || code3 == b"V49",
-                    None,
-                )
+                b"---"
             };
+            (
+                sig_save_type,
+                Self::detect_rtc(&rom),
+                matches!(code3, b"U3I" | b"U32" | b"U33"),
+                code3 == b"KYG",
+                code3 == b"RZW",
+                code3 == b"RZW" || code3 == b"V49",
+                None,
+            )
+        };
 
         // Pad non-power-of-two small test ROMs cleanly up to >= 16KB or next power/multiple if tiny,
         // preserving exact ROM bounds behavior for open-bus / mirrored reads.
@@ -883,9 +913,21 @@ impl Cartridge {
         // Pokémon Ruby/Sapphire/Emerald, Boktai, WarioWare Twisted, etc.
         matches!(
             code,
-            b"AXVE" | b"AXPE" | b"AXVJ" | b"AXPJ"
-                | b"BPEE" | b"BPEJ" | b"BPED" | b"BPEF" | b"BPEI" | b"BPES"
-                | b"U3IE" | b"U3IJ" | b"U32E" | b"U32J" | b"U33J"
+            b"AXVE"
+                | b"AXPE"
+                | b"AXVJ"
+                | b"AXPJ"
+                | b"BPEE"
+                | b"BPEJ"
+                | b"BPED"
+                | b"BPEF"
+                | b"BPEI"
+                | b"BPES"
+                | b"U3IE"
+                | b"U3IJ"
+                | b"U32E"
+                | b"U32J"
+                | b"U33J"
         )
     }
 
@@ -910,9 +952,15 @@ impl Cartridge {
         if region != 0x0D {
             return false;
         }
-        matches!(self.effective_save_type(), SaveType::Eeprom512B | SaveType::Eeprom8K)
-            || (self.save_type_override.is_none() && self.rom.len() <= 0x0100_0000 && addr >= 0x0D00_0000)
-            || (self.save_type_override.is_none() && self.rom.len() > 0x0100_0000 && addr >= 0x0DFF_FF00)
+        matches!(
+            self.effective_save_type(),
+            SaveType::Eeprom512B | SaveType::Eeprom8K
+        ) || (self.save_type_override.is_none()
+            && self.rom.len() <= 0x0100_0000
+            && addr >= 0x0D00_0000)
+            || (self.save_type_override.is_none()
+                && self.rom.len() > 0x0100_0000
+                && addr >= 0x0DFF_FF00)
     }
 
     #[inline]
@@ -922,9 +970,7 @@ impl Cartridge {
                 || self.solar_enabled
                 || self.gyro_enabled
                 || self.rumble_enabled;
-            if gpio_allowed
-                && let Some(gpio_val) = self.rtc.read(addr)
-            {
+            if gpio_allowed && let Some(gpio_val) = self.rtc.read(addr) {
                 return gpio_val;
             }
         }
@@ -1070,4 +1116,3 @@ impl Cartridge {
         }
     }
 }
-

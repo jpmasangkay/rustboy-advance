@@ -96,10 +96,8 @@ impl HostFrontend for WebFrontend {
                 let off = idx * 4;
                 let mapped = lut[(px & 0x7FFF) as usize];
                 let r = ((mapped[0] as u16 * 166 + self.prev_rgba[off] as u16 * 90) >> 8) as u8;
-                let g =
-                    ((mapped[1] as u16 * 166 + self.prev_rgba[off + 1] as u16 * 90) >> 8) as u8;
-                let b =
-                    ((mapped[2] as u16 * 166 + self.prev_rgba[off + 2] as u16 * 90) >> 8) as u8;
+                let g = ((mapped[1] as u16 * 166 + self.prev_rgba[off + 1] as u16 * 90) >> 8) as u8;
+                let b = ((mapped[2] as u16 * 166 + self.prev_rgba[off + 2] as u16 * 90) >> 8) as u8;
                 self.rgba_frame[off] = r;
                 self.rgba_frame[off + 1] = g;
                 self.rgba_frame[off + 2] = b;

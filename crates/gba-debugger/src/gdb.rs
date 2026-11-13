@@ -131,11 +131,7 @@ impl GdbStub {
     /// Single-step packets (`s` / `vCont;s`) are executed immediately against `core` and reply
     /// synchronously with their stop reason. Continuous execution (`c` / `vCont;c`) returns
     /// `pause_request = Some(false)` so the host run-loop resumes emulation.
-    pub fn poll_network(
-        &mut self,
-        core: &mut GbaCore,
-        user_ctrl: &DebugControl,
-    ) -> GdbPollOutcome {
+    pub fn poll_network(&mut self, core: &mut GbaCore, user_ctrl: &DebugControl) -> GdbPollOutcome {
         let mut outcome = GdbPollOutcome::default();
 
         self.accept_pending_client(&mut outcome);

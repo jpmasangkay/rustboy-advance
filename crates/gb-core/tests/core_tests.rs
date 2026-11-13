@@ -40,7 +40,14 @@ impl GbHostFrontend for TestFrontend {
     }
 }
 
-fn make_test_rom(program: &[u8], title: &str, cgb_flag: u8, cart_type: u8, rom_banks: usize, ram_code: u8) -> Vec<u8> {
+fn make_test_rom(
+    program: &[u8],
+    title: &str,
+    cgb_flag: u8,
+    cart_type: u8,
+    rom_banks: usize,
+    ram_code: u8,
+) -> Vec<u8> {
     let size = (rom_banks.max(2)) * 0x4000;
     let mut rom = vec![0x00; size];
     // Entry point at 0x0100: JP 0x0150
@@ -49,7 +56,11 @@ fn make_test_rom(program: &[u8], title: &str, cgb_flag: u8, cart_type: u8, rom_b
     rom[0x0102] = 0x01;
 
     let title_bytes = title.as_bytes();
-    let max_title = if cgb_flag == 0x80 || cgb_flag == 0xC0 { 15 } else { 16 };
+    let max_title = if cgb_flag == 0x80 || cgb_flag == 0xC0 {
+        15
+    } else {
+        16
+    };
     let copy_len = title_bytes.len().min(max_title);
     rom[0x0134..0x0134 + copy_len].copy_from_slice(&title_bytes[..copy_len]);
     if cgb_flag != 0 {
@@ -109,7 +120,11 @@ fn save_fb_png(path: &Path, fb: &[u16; LCD_WIDTH * LCD_HEIGHT]) {
     let mut img = ImageBuffer::<Rgb<u8>, Vec<u8>>::new(LCD_WIDTH as u32, LCD_HEIGHT as u32);
     for y in 0..LCD_HEIGHT {
         for x in 0..LCD_WIDTH {
-            img.put_pixel(x as u32, y as u32, Rgb(bgr555_to_rgb8(fb[y * LCD_WIDTH + x])));
+            img.put_pixel(
+                x as u32,
+                y as u32,
+                Rgb(bgr555_to_rgb8(fb[y * LCD_WIDTH + x])),
+            );
         }
     }
     img.save(path).expect("failed to save test screenshot");
@@ -311,7 +326,11 @@ fn run_blargg_serial_test(rel_path: &str, model: GbModel, max_frames: usize) {
         core.run_frame(&mut fe);
         let text = core.serial_output_str();
         if text.contains("Passed") {
-            eprintln!("[{rel_path} @ {model:?}] passed in {} frames:\n{}", frame + 1, text.trim());
+            eprintln!(
+                "[{rel_path} @ {model:?}] passed in {} frames:\n{}",
+                frame + 1,
+                text.trim()
+            );
             return;
         }
         assert!(
@@ -342,14 +361,24 @@ fn run_blargg_cart_ram_test(rel_path: &str, model: GbModel, max_frames: usize) {
             saw_magic = true;
             let status = ram[0];
             if status != 0x80 {
-                let end = ram[4..].iter().position(|&b| b == 0).unwrap_or(ram.len() - 4);
+                let end = ram[4..]
+                    .iter()
+                    .position(|&b| b == 0)
+                    .unwrap_or(ram.len() - 4);
                 let text = String::from_utf8_lossy(&ram[4..4 + end]).into_owned();
                 assert_eq!(
                     status, 0x00,
                     "{rel_path} failed with status 0x{status:02X}! Output:\n{text}"
                 );
-                assert!(text.contains("Passed"), "{rel_path} unexpected output:\n{text}");
-                eprintln!("[{rel_path} @ {model:?}] passed in {} frames:\n{}", frame + 1, text.trim());
+                assert!(
+                    text.contains("Passed"),
+                    "{rel_path} unexpected output:\n{text}"
+                );
+                eprintln!(
+                    "[{rel_path} @ {model:?}] passed in {} frames:\n{}",
+                    frame + 1,
+                    text.trim()
+                );
                 return;
             }
         }
@@ -444,7 +473,8 @@ fn dmg_acid2_visual_and_reference() {
             }
         }
         assert_eq!(
-            mismatches, 0,
+            mismatches,
+            0,
             "dmg-acid2 had {mismatches} mismatched pixels vs reference (dumped {})",
             out_png.display()
         );
@@ -491,7 +521,8 @@ fn cgb_acid2_visual_and_reference() {
             }
         }
         assert_eq!(
-            mismatches, 0,
+            mismatches,
+            0,
             "cgb-acid2 had {mismatches} mismatched pixels vs reference (dumped {})",
             out_png.display()
         );

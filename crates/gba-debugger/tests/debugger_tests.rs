@@ -53,7 +53,10 @@ fn disassembles_arm_and_thumb_instructions_and_formats_registers() {
     core.cpu.flush_pipeline(&mut core.bus, 0x0200_0000);
     let reg_dump = format_registers(&core);
     assert!(reg_dump.contains("12345678"), "reg_dump: {reg_dump}");
-    assert!(reg_dump.to_uppercase().contains("R15") || reg_dump.to_uppercase().contains("PC"), "reg_dump: {reg_dump}");
+    assert!(
+        reg_dump.to_uppercase().contains("R15") || reg_dump.to_uppercase().contains("PC"),
+        "reg_dump: {reg_dump}"
+    );
     assert!(reg_dump.contains("0200000"), "reg_dump: {reg_dump}");
 }
 
@@ -63,21 +66,33 @@ fn detects_arm_and_thumb_call_and_return_instructions() {
 
     // ARM BL -> returns pc + 4
     core.poke32(0x0200_0000, 0xEB00_0004);
-    assert_eq!(is_call_instruction(&core, 0x0200_0000, false), Some(0x0200_0004));
+    assert_eq!(
+        is_call_instruction(&core, 0x0200_0000, false),
+        Some(0x0200_0004)
+    );
 
     // ARM MOV LR, PC followed by BX R0 -> returns pc + 8
     core.poke32(0x0200_0010, 0xE1A0_E00F); // MOV LR, PC
     core.poke32(0x0200_0014, 0xE12F_FF10); // BX R0
-    assert_eq!(is_call_instruction(&core, 0x0200_0010, false), Some(0x0200_0018));
+    assert_eq!(
+        is_call_instruction(&core, 0x0200_0010, false),
+        Some(0x0200_0018)
+    );
 
     // Sitting directly on BX R0 with LR == pc + 4 also counts as linked call
     core.cpu.gpr[14] = 0x0200_0018;
-    assert_eq!(is_call_instruction(&core, 0x0200_0014, false), Some(0x0200_0018));
+    assert_eq!(
+        is_call_instruction(&core, 0x0200_0014, false),
+        Some(0x0200_0018)
+    );
 
     // ARM MOV LR, PC followed by unconditional B -> returns pc + 8
     core.poke32(0x0200_0020, 0xE1A0_E00F); // MOV LR, PC
     core.poke32(0x0200_0024, 0xEA00_0010); // B +...
-    assert_eq!(is_call_instruction(&core, 0x0200_0020, false), Some(0x0200_0028));
+    assert_eq!(
+        is_call_instruction(&core, 0x0200_0020, false),
+        Some(0x0200_0028)
+    );
 
     // Plain ADD is not a call; cond == 0xF (NV) is not a call
     core.poke32(0x0200_0030, 0xE280_0001); // ADD R0, R0, #1
@@ -88,7 +103,10 @@ fn detects_arm_and_thumb_call_and_return_instructions() {
     // Thumb 2-halfword BL -> returns pc + 4
     core.poke16(0x0300_0000, 0xF000);
     core.poke16(0x0300_0002, 0xF808);
-    assert_eq!(is_call_instruction(&core, 0x0300_0000, true), Some(0x0300_0004));
+    assert_eq!(
+        is_call_instruction(&core, 0x0300_0000, true),
+        Some(0x0300_0004)
+    );
 
     // Broken Thumb 0xF000 not followed by 0xF800..0xFFFF -> None
     core.poke16(0x0300_0010, 0xF000);
@@ -98,7 +116,10 @@ fn detects_arm_and_thumb_call_and_return_instructions() {
     // Thumb MOV LR, PC (0x46FE) + BX R1 (0x4708) -> returns pc + 4
     core.poke16(0x0300_0020, 0x46FE);
     core.poke16(0x0300_0022, 0x4708);
-    assert_eq!(is_call_instruction(&core, 0x0300_0020, true), Some(0x0300_0024));
+    assert_eq!(
+        is_call_instruction(&core, 0x0300_0020, true),
+        Some(0x0300_0024)
+    );
 
     // Return instruction detection (ARM + Thumb + conditional flags)
     core.poke32(0x0200_0100, 0xE12F_FF1E); // BX LR
@@ -107,13 +128,48 @@ fn detects_arm_and_thumb_call_and_return_instructions() {
     core.poke32(0x0200_010C, 0x012F_FF1E); // BXEQ LR
     core.poke32(0x0200_0110, 0xE49D_F004); // LDR PC, [SP], #4
     core.poke32(0x0200_0114, 0xE51F_F004); // LDR PC, [PC, #-4] (jump veneer, NOT return!)
-    assert!(is_return_instruction(&core, 0x0200_0100, false, 0x0000_001F));
-    assert!(is_return_instruction(&core, 0x0200_0104, false, 0x0000_001F));
-    assert!(is_return_instruction(&core, 0x0200_0108, false, 0x0000_001F));
-    assert!(!is_return_instruction(&core, 0x0200_010C, false, 0x0000_001F)); // Z=0
-    assert!(is_return_instruction(&core, 0x0200_010C, false, 0x4000_001F)); // Z=1
-    assert!(is_return_instruction(&core, 0x0200_0110, false, 0x0000_001F));
-    assert!(!is_return_instruction(&core, 0x0200_0114, false, 0x0000_001F));
+    assert!(is_return_instruction(
+        &core,
+        0x0200_0100,
+        false,
+        0x0000_001F
+    ));
+    assert!(is_return_instruction(
+        &core,
+        0x0200_0104,
+        false,
+        0x0000_001F
+    ));
+    assert!(is_return_instruction(
+        &core,
+        0x0200_0108,
+        false,
+        0x0000_001F
+    ));
+    assert!(!is_return_instruction(
+        &core,
+        0x0200_010C,
+        false,
+        0x0000_001F
+    )); // Z=0
+    assert!(is_return_instruction(
+        &core,
+        0x0200_010C,
+        false,
+        0x4000_001F
+    )); // Z=1
+    assert!(is_return_instruction(
+        &core,
+        0x0200_0110,
+        false,
+        0x0000_001F
+    ));
+    assert!(!is_return_instruction(
+        &core,
+        0x0200_0114,
+        false,
+        0x0000_001F
+    ));
 
     core.poke16(0x0300_0100, 0x4770); // Thumb BX LR
     core.poke16(0x0300_0102, 0xBD10); // Thumb POP {R4, PC}
@@ -234,7 +290,12 @@ fn decodes_gba_mmio_registers_and_bitfields() {
     assert!(dispcnt.summary.contains("Mode 3"));
     assert!(dispcnt.summary.contains("BG2"));
     assert!(dispcnt.summary.contains("OBJ"));
-    assert!(dispcnt.fields.iter().any(|f| f.name == "BG Mode" && f.value == 3));
+    assert!(
+        dispcnt
+            .fields
+            .iter()
+            .any(|f| f.name == "BG Mode" && f.value == 3)
+    );
 
     // Active-low keypad: bit 0 (A) = 0, bit 3 (Start) = 0 => A and Start pressed
     let keyinput = decode_io_reg(0x0400_0130, 0x03FF ^ ((1 << 0) | (1 << 3))).unwrap();
@@ -294,7 +355,10 @@ fn rsp_framing_parser_and_protocol_commands_work() {
     core.cpu.flush_pipeline(&mut core.bus, 0x0200_0100);
 
     let mut session = GdbSession::new();
-    assert_eq!(session.handle_packet(&mut core, "?").reply.as_deref(), Some("S05"));
+    assert_eq!(
+        session.handle_packet(&mut core, "?").reply.as_deref(),
+        Some("S05")
+    );
 
     let sup = session.handle_packet(&mut core, "qSupported:multiprocess+");
     assert!(sup.reply.unwrap().contains("qXfer:features:read+"));
@@ -471,35 +535,32 @@ fn tcp_gdb_stub_handles_handshake_watchpoint_continue_and_stop_reply() {
     let mut client = TcpStream::connect(("127.0.0.1", port)).expect("connect to stub");
     client.set_nonblocking(true).unwrap();
 
-    let send_recv = |stub: &mut GdbStub,
-                     core: &mut GbaCore,
-                     client: &mut TcpStream,
-                     pkt: &str|
-     -> String {
-        let framed = encode_rsp_packet(pkt);
-        client.write_all(framed.as_bytes()).unwrap();
-        let mut collected = String::new();
-        let deadline = Instant::now() + Duration::from_secs(2);
-        let mut tmp = [0u8; 1024];
-        while Instant::now() < deadline {
-            stub.step_protocol(core);
-            match client.read(&mut tmp) {
-                Ok(n) if n > 0 => {
-                    collected.push_str(&String::from_utf8_lossy(&tmp[..n]));
-                    if collected.contains('#') {
-                        // Drain trailing checksum 2 hex digits if already buffered
-                        if let Some(hash_idx) = collected.rfind('#')
-                            && collected.len() >= hash_idx + 3
-                        {
-                            return collected;
+    let send_recv =
+        |stub: &mut GdbStub, core: &mut GbaCore, client: &mut TcpStream, pkt: &str| -> String {
+            let framed = encode_rsp_packet(pkt);
+            client.write_all(framed.as_bytes()).unwrap();
+            let mut collected = String::new();
+            let deadline = Instant::now() + Duration::from_secs(2);
+            let mut tmp = [0u8; 1024];
+            while Instant::now() < deadline {
+                stub.step_protocol(core);
+                match client.read(&mut tmp) {
+                    Ok(n) if n > 0 => {
+                        collected.push_str(&String::from_utf8_lossy(&tmp[..n]));
+                        if collected.contains('#') {
+                            // Drain trailing checksum 2 hex digits if already buffered
+                            if let Some(hash_idx) = collected.rfind('#')
+                                && collected.len() >= hash_idx + 3
+                            {
+                                return collected;
+                            }
                         }
                     }
+                    _ => std::thread::sleep(Duration::from_millis(2)),
                 }
-                _ => std::thread::sleep(Duration::from_millis(2)),
             }
-        }
-        collected
-    };
+            collected
+        };
 
     let sup = send_recv(&mut stub, &mut core, &mut client, "qSupported");
     assert!(sup.contains("qXfer:features:read+"), "reply was: {sup}");

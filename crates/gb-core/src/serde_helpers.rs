@@ -134,8 +134,7 @@ pub mod fixed_bytes {
             }
 
             fn visit_bytes<E: de::Error>(self, v: &[u8]) -> Result<Self::Value, E> {
-                v.try_into()
-                    .map_err(|_| E::invalid_length(v.len(), &self))
+                v.try_into().map_err(|_| E::invalid_length(v.len(), &self))
             }
 
             fn visit_seq<A: SeqAccess<'de>>(self, mut seq: A) -> Result<Self::Value, A::Error> {

@@ -27,7 +27,11 @@ impl OutputPixelFormat {
     }
 
     pub const fn pitch_bytes(self) -> usize {
-        LCD_WIDTH * self.bytes_per_pixel()
+        self.pitch_bytes_for_width(LCD_WIDTH)
+    }
+
+    pub const fn pitch_bytes_for_width(self, width: usize) -> usize {
+        width * self.bytes_per_pixel()
     }
 }
 
@@ -158,10 +162,10 @@ pub fn pixel_lut(fmt: OutputPixelFormat, cc: ColorCorrection) -> &'static [u16; 
     }
 }
 
-/// Converts a 240x160 GBA `BGR555` framebuffer into `RGB565` or `0RGB1555` via a 32K LUT.
-pub fn convert_framebuffer(
-    src_bgr555: &[u16; LCD_WIDTH * LCD_HEIGHT],
-    dst: &mut [u16; LCD_WIDTH * LCD_HEIGHT],
+/// Converts a slice of `BGR555` pixels into `RGB565` or `0RGB1555` via a 32K LUT.
+pub fn convert_pixels(
+    src_bgr555: &[u16],
+    dst: &mut [u16],
     fmt: OutputPixelFormat,
     cc: ColorCorrection,
 ) {
@@ -169,6 +173,16 @@ pub fn convert_framebuffer(
     for (dst_px, &src_px) in dst.iter_mut().zip(src_bgr555.iter()) {
         *dst_px = lut[(src_px & 0x7FFF) as usize];
     }
+}
+
+/// Converts a 240x160 GBA `BGR555` framebuffer into `RGB565` or `0RGB1555` via a 32K LUT.
+pub fn convert_framebuffer(
+    src_bgr555: &[u16; LCD_WIDTH * LCD_HEIGHT],
+    dst: &mut [u16; LCD_WIDTH * LCD_HEIGHT],
+    fmt: OutputPixelFormat,
+    cc: ColorCorrection,
+) {
+    convert_pixels(src_bgr555, dst, fmt, cc);
 }
 
 #[cfg(test)]

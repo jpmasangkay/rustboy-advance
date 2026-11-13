@@ -5,7 +5,7 @@
 //! if JIT initialization or memory allocation fails.
 
 use crate::bus::SysBus;
-use crate::cpu::{Arm7tdmi, ARM_LUT, THUMB_LUT};
+use crate::cpu::{ARM_LUT, Arm7tdmi, THUMB_LUT};
 use std::collections::HashMap;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
@@ -76,12 +76,16 @@ impl JitEngine {
             Ok(b) => match b.finish(settings::Flags::new(flag_builder)) {
                 Ok(isa) => isa,
                 Err(e) => {
-                    log::warn!("JIT: Failed to create target ISA: {e}; falling back to interpreter");
+                    log::warn!(
+                        "JIT: Failed to create target ISA: {e}; falling back to interpreter"
+                    );
                     return Self::disabled();
                 }
             },
             Err(e) => {
-                log::warn!("JIT: Host architecture unsupported by Cranelift: {e}; falling back to interpreter");
+                log::warn!(
+                    "JIT: Host architecture unsupported by Cranelift: {e}; falling back to interpreter"
+                );
                 return Self::disabled();
             }
         };
@@ -232,7 +236,7 @@ impl JitEngine {
 
     #[cfg(feature = "jit")]
     fn codegen_block(&mut self, instrs: &[u32], is_thumb: bool) -> Option<JitCompiledFn> {
-        use cranelift_codegen::ir::{types, AbiParam, InstBuilder};
+        use cranelift_codegen::ir::{AbiParam, InstBuilder, types};
         use cranelift_frontend::FunctionBuilder;
         use cranelift_module::{FuncId, Linkage, Module};
 
@@ -291,10 +295,18 @@ impl JitEngine {
             let sig_ref = builder.import_signature(call_sig);
 
             for &instr in instrs {
-                let instr_val = builder.ins().iconst(types::I32, instr as i64);
-                let call_inst = builder.ins().call_indirect(sig_ref, helper_imm, &[cpu_val, bus_val, instr_val]);
-                let step_cyc = builder.inst_results(call_inst)[0];
-                total_cyc_val = builder.ins().iadd(total_cyc_val, step_cyc);
+                if let Some(cyc) = try_lower_ir(&mut builder, cpu_val, instr, is_thumb) {
+                    total_cyc_val = builder.ins().iadd_imm(total_cyc_val, cyc);
+                } else {
+                    let instr_val = builder.ins().iconst(types::I32, instr as i64);
+                    let call_inst = builder.ins().call_indirect(
+                        sig_ref,
+                        helper_imm,
+                        &[cpu_val, bus_val, instr_val],
+                    );
+                    let step_cyc = builder.inst_results(call_inst)[0];
+                    total_cyc_val = builder.ins().iadd(total_cyc_val, step_cyc);
+                }
             }
 
             builder.ins().return_(&[total_cyc_val]);
@@ -326,46 +338,235 @@ impl JitEngine {
     }
 }
 
-// C-ABI helper entrypoints for JIT execution
-pub extern "C" fn run_arm_instr(cpu_ptr: *mut Arm7tdmi, bus_ptr: *mut SysBus, instr: u32) -> u64 {
-    unsafe {
-        let cpu = &mut *cpu_ptr;
-        let bus = &mut *bus_ptr;
+#[cfg(feature = "jit")]
+fn try_lower_ir(
+    builder: &mut cranelift_frontend::FunctionBuilder,
+    cpu_val: cranelift_codegen::ir::Value,
+    instr: u32,
+    is_thumb: bool,
+) -> Option<i64> {
+    use cranelift_codegen::ir::{InstBuilder, MemFlags, Value, types};
 
-        if cpu.halted || cpu.stopped || bus.hw.halt_requested || bus.hw.stop_requested {
-            return 0;
+    let load_gpr = |builder: &mut cranelift_frontend::FunctionBuilder, reg: usize| -> Value {
+        let offset = (reg * 4) as i32;
+        builder
+            .ins()
+            .load(types::I32, MemFlags::trusted(), cpu_val, offset)
+    };
+
+    let store_gpr = |builder: &mut cranelift_frontend::FunctionBuilder, reg: usize, val: Value| {
+        let offset = (reg * 4) as i32;
+        builder
+            .ins()
+            .store(MemFlags::trusted(), val, cpu_val, offset);
+    };
+
+    let advance_pc = |builder: &mut cranelift_frontend::FunctionBuilder, delta: i64| {
+        let offset = 60i32; // gpr[15]
+        let old_pc = builder
+            .ins()
+            .load(types::I32, MemFlags::trusted(), cpu_val, offset);
+        let new_pc = builder.ins().iadd_imm(old_pc, delta);
+        builder
+            .ins()
+            .store(MemFlags::trusted(), new_pc, cpu_val, offset);
+    };
+
+    if is_thumb {
+        let h = instr as u16;
+        // Format 5: Hi register ops (ADD Rd, Rs / MOV Rd, Rs where Rd != 15 and Rs != 15)
+        if (h & 0xFC00) == 0x4400 {
+            let op = (h >> 8) & 3;
+            let h1 = (h >> 7) & 1;
+            let h2 = (h >> 6) & 1;
+            let rd = ((h1 << 3) | (h & 7)) as usize;
+            let rs = ((h2 << 3) | ((h >> 3) & 7)) as usize;
+            if rd < 15 && rs < 15 {
+                match op {
+                    0 => {
+                        // ADD Rd, Rs
+                        let v_d = load_gpr(builder, rd);
+                        let v_s = load_gpr(builder, rs);
+                        let res = builder.ins().iadd(v_d, v_s);
+                        store_gpr(builder, rd, res);
+                        advance_pc(builder, 2);
+                        return Some(1);
+                    }
+                    2 => {
+                        // MOV Rd, Rs
+                        let v_s = load_gpr(builder, rs);
+                        store_gpr(builder, rd, v_s);
+                        advance_pc(builder, 2);
+                        return Some(1);
+                    }
+                    _ => {}
+                }
+            }
         }
-
+        // Format 13: ADD SP, #imm / SUB SP, #imm
+        if (h & 0xFF00) == 0xB000 {
+            let s_bit = (h >> 7) & 1;
+            let imm = ((h & 0x7F) as i64) * 4;
+            let sp = load_gpr(builder, 13);
+            let res = if s_bit == 0 {
+                builder.ins().iadd_imm(sp, imm)
+            } else {
+                builder.ins().iadd_imm(sp, -imm)
+            };
+            store_gpr(builder, 13, res);
+            advance_pc(builder, 2);
+            return Some(1);
+        }
+    } else {
+        // ARM: check condition AL (0xE)
         let cond = (instr >> 28) & 0xF;
-        if cond != 0xE && !cpu.check_cond(cond) {
-            cpu.gpr[15] = cpu.gpr[15].wrapping_add(4);
-            return 1;
+        if cond != 0xE {
+            return None;
         }
-        let lut_idx = (((instr >> 16) & 0xFF0) | ((instr >> 4) & 0x00F)) as usize;
-        let c = ARM_LUT[lut_idx](cpu, bus, instr);
-        if !cpu.pipeline_flushed {
-            cpu.gpr[15] = cpu.gpr[15].wrapping_add(4);
+
+        // Data processing: bits 27..26 == 00
+        if (instr & 0x0C00_0000) == 0 {
+            let s_bit = (instr & 0x0010_0000) != 0;
+            let i_bit = (instr & 0x0200_0000) != 0;
+            let opcode = (instr >> 21) & 0xF;
+            let rn = ((instr >> 16) & 0xF) as usize;
+            let rd = ((instr >> 12) & 0xF) as usize;
+
+            // Only lower if destination is not PC and S bit is 0 (flags unchanged)
+            if !s_bit && rd < 15 {
+                let op2: Value = if i_bit {
+                    let rot = ((instr >> 8) & 0xF) * 2;
+                    let imm8 = (instr & 0xFF) as u32;
+                    let imm_val = imm8.rotate_right(rot);
+                    builder.ins().iconst(types::I32, imm_val as i64)
+                } else {
+                    // Register with no shift (bits 11..4 == 0)
+                    if (instr & 0xFF0) == 0 {
+                        let rm = (instr & 0xF) as usize;
+                        if rm >= 15 {
+                            return None;
+                        }
+                        load_gpr(builder, rm)
+                    } else {
+                        return None;
+                    }
+                };
+
+                let res: Value = match opcode {
+                    0x0 => {
+                        // AND
+                        if rn >= 15 {
+                            return None;
+                        }
+                        let v_n = load_gpr(builder, rn);
+                        builder.ins().band(v_n, op2)
+                    }
+                    0x1 => {
+                        // EOR
+                        if rn >= 15 {
+                            return None;
+                        }
+                        let v_n = load_gpr(builder, rn);
+                        builder.ins().bxor(v_n, op2)
+                    }
+                    0x2 => {
+                        // SUB
+                        if rn >= 15 {
+                            return None;
+                        }
+                        let v_n = load_gpr(builder, rn);
+                        builder.ins().isub(v_n, op2)
+                    }
+                    0x4 => {
+                        // ADD
+                        if rn >= 15 {
+                            return None;
+                        }
+                        let v_n = load_gpr(builder, rn);
+                        builder.ins().iadd(v_n, op2)
+                    }
+                    0xC => {
+                        // ORR
+                        if rn >= 15 {
+                            return None;
+                        }
+                        let v_n = load_gpr(builder, rn);
+                        builder.ins().bor(v_n, op2)
+                    }
+                    0xD => {
+                        // MOV
+                        op2
+                    }
+                    0xE => {
+                        // BIC (Rn & ~op2)
+                        if rn >= 15 {
+                            return None;
+                        }
+                        let v_n = load_gpr(builder, rn);
+                        let not_op2 = builder.ins().bnot(op2);
+                        builder.ins().band(v_n, not_op2)
+                    }
+                    _ => return None,
+                };
+
+                store_gpr(builder, rd, res);
+                advance_pc(builder, 4);
+                return Some(1);
+            }
         }
-        c.max(1)
     }
+
+    None
 }
 
-pub extern "C" fn run_thumb_instr(cpu_ptr: *mut Arm7tdmi, bus_ptr: *mut SysBus, instr: u32) -> u64 {
-    unsafe {
-        let cpu = &mut *cpu_ptr;
-        let bus = &mut *bus_ptr;
+// C-ABI helper entrypoints for JIT execution
+/// # Safety
+/// `cpu_ptr` and `bus_ptr` must be valid, aligned, non-null pointers to live `Arm7tdmi` and `SysBus` instances.
+pub unsafe extern "C" fn run_arm_instr(
+    cpu_ptr: *mut Arm7tdmi,
+    bus_ptr: *mut SysBus,
+    instr: u32,
+) -> u64 {
+    let cpu = unsafe { &mut *cpu_ptr };
+    let bus = unsafe { &mut *bus_ptr };
 
-        if cpu.halted || cpu.stopped || bus.hw.halt_requested || bus.hw.stop_requested {
-            return 0;
-        }
-
-        let lut_idx = ((instr >> 6) & 0x3FF) as usize;
-        let c = THUMB_LUT[lut_idx](cpu, bus, instr as u16);
-        if !cpu.pipeline_flushed {
-            cpu.gpr[15] = cpu.gpr[15].wrapping_add(2);
-        }
-        c.max(1)
+    if cpu.halted || cpu.stopped || bus.hw.halt_requested || bus.hw.stop_requested {
+        return 0;
     }
+
+    let cond = (instr >> 28) & 0xF;
+    if cond != 0xE && !cpu.check_cond(cond) {
+        cpu.gpr[15] = cpu.gpr[15].wrapping_add(4);
+        return 1;
+    }
+    let lut_idx = (((instr >> 16) & 0xFF0) | ((instr >> 4) & 0x00F)) as usize;
+    let c = ARM_LUT[lut_idx](cpu, bus, instr);
+    if !cpu.pipeline_flushed {
+        cpu.gpr[15] = cpu.gpr[15].wrapping_add(4);
+    }
+    c.max(1)
+}
+
+/// # Safety
+/// `cpu_ptr` and `bus_ptr` must be valid, aligned, non-null pointers to live `Arm7tdmi` and `SysBus` instances.
+pub unsafe extern "C" fn run_thumb_instr(
+    cpu_ptr: *mut Arm7tdmi,
+    bus_ptr: *mut SysBus,
+    instr: u32,
+) -> u64 {
+    let cpu = unsafe { &mut *cpu_ptr };
+    let bus = unsafe { &mut *bus_ptr };
+
+    if cpu.halted || cpu.stopped || bus.hw.halt_requested || bus.hw.stop_requested {
+        return 0;
+    }
+
+    let lut_idx = ((instr >> 6) & 0x3FF) as usize;
+    let c = THUMB_LUT[lut_idx](cpu, bus, instr as u16);
+    if !cpu.pipeline_flushed {
+        cpu.gpr[15] = cpu.gpr[15].wrapping_add(2);
+    }
+    c.max(1)
 }
 
 #[inline]
@@ -437,10 +638,9 @@ fn is_thumb_block_boundary(instr: u16) -> bool {
     if (instr & 0xFC00) == 0x4400 && (instr & 0x0007) == 7 && (instr & 0x0080) != 0 {
         return true; // ADD/MOV with PC as destination
     }
-    // POP {..., PC} (top 9 bits: 1011110xx)
-    if (instr & 0xFE00) == 0xBD00 {
+    // POP {..., PC} (top 8 bits: 0xBD)
+    if (instr & 0xFF00) == 0xBD00 {
         return true;
     }
     false
 }
-

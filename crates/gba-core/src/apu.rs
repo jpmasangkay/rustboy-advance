@@ -245,7 +245,11 @@ impl PsgSquare {
         }
         self.timer_cycles = self.period_cycles();
         self.current_vol = self.env_init_vol;
-        self.env_timer = if self.env_period == 0 { 8 } else { self.env_period };
+        self.env_timer = if self.env_period == 0 {
+            8
+        } else {
+            self.env_period
+        };
 
         if self.has_sweep {
             self.sweep_shadow = self.freq;
@@ -599,7 +603,11 @@ impl PsgNoise {
             }
             self.lfsr = if self.width_7 { 0x007F } else { 0x7FFF };
             self.current_vol = self.env_init_vol;
-            self.env_timer = if self.env_period == 0 { 8 } else { self.env_period };
+            self.env_timer = if self.env_period == 0 {
+                8
+            } else {
+                self.env_period
+            };
             self.timer_cycles = self.calc_period();
         }
     }
@@ -718,7 +726,7 @@ fn default_scopes() -> [[i16; 128]; 6] {
 }
 
 #[derive(Clone)]
-struct ApuDspState {
+pub(crate) struct ApuDspState {
     blip: BlipBuf,
     last_mix_l: i32,
     last_mix_r: i32,
@@ -817,9 +825,20 @@ impl Apu {
             self.dsp.blip.reset(self.last_cycle);
             self.dsp.last_mix_l = 0;
             self.dsp.last_mix_r = 0;
-            self.dsp.next_scope_cycle = (self.last_cycle & !(SCOPE_INTERVAL_CYCLES - 1)) + SCOPE_INTERVAL_CYCLES;
+            self.dsp.next_scope_cycle =
+                (self.last_cycle & !(SCOPE_INTERVAL_CYCLES - 1)) + SCOPE_INTERVAL_CYCLES;
             self.dsp.initialized = true;
         }
+    }
+
+    #[inline]
+    pub(crate) fn take_dsp_state(&mut self) -> ApuDspState {
+        core::mem::replace(&mut self.dsp, default_dsp_state())
+    }
+
+    #[inline]
+    pub(crate) fn restore_dsp_state(&mut self, dsp: ApuDspState) {
+        self.dsp = dsp;
     }
 
     #[inline]
@@ -1140,10 +1159,26 @@ impl Apu {
 
     fn record_scopes(&mut self, cycle: u64) {
         let mask = self.channel_enable_mask;
-        let s1 = if (mask & 0x01) != 0 { self.sq1.sample() } else { 0 };
-        let s2 = if (mask & 0x02) != 0 { self.sq2.sample() } else { 0 };
-        let s3 = if (mask & 0x04) != 0 { self.wave.sample() } else { 0 };
-        let s4 = if (mask & 0x08) != 0 { self.noise.sample() } else { 0 };
+        let s1 = if (mask & 0x01) != 0 {
+            self.sq1.sample()
+        } else {
+            0
+        };
+        let s2 = if (mask & 0x02) != 0 {
+            self.sq2.sample()
+        } else {
+            0
+        };
+        let s3 = if (mask & 0x04) != 0 {
+            self.wave.sample()
+        } else {
+            0
+        };
+        let s4 = if (mask & 0x08) != 0 {
+            self.noise.sample()
+        } else {
+            0
+        };
         let (raw_a, raw_b) = self.fifo_samples(cycle);
 
         let cur = self.scope_cursor;
@@ -1163,10 +1198,26 @@ impl Apu {
         }
 
         let mask = self.channel_enable_mask;
-        let s1 = if (mask & 0x01) != 0 { self.sq1.sample() } else { 0 };
-        let s2 = if (mask & 0x02) != 0 { self.sq2.sample() } else { 0 };
-        let s3 = if (mask & 0x04) != 0 { self.wave.sample() } else { 0 };
-        let s4 = if (mask & 0x08) != 0 { self.noise.sample() } else { 0 };
+        let s1 = if (mask & 0x01) != 0 {
+            self.sq1.sample()
+        } else {
+            0
+        };
+        let s2 = if (mask & 0x02) != 0 {
+            self.sq2.sample()
+        } else {
+            0
+        };
+        let s3 = if (mask & 0x04) != 0 {
+            self.wave.sample()
+        } else {
+            0
+        };
+        let s4 = if (mask & 0x08) != 0 {
+            self.noise.sample()
+        } else {
+            0
+        };
 
         let mut psg_r = 0i32;
         let mut psg_l = 0i32;

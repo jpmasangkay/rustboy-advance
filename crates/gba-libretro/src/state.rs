@@ -5,6 +5,7 @@ use core::ptr;
 use std::path::Path;
 use std::sync::Mutex;
 
+use gb_core::{GbCore, GbHostFrontend, GbModel};
 use gba_core::cartridge::SaveType;
 use gba_core::{
     GbaCore, HostFrontend, KEY_A, KEY_B, KEY_DOWN, KEY_L, KEY_LEFT, KEY_R, KEY_RIGHT, KEY_SELECT,
@@ -29,8 +30,10 @@ use crate::ffi::{
     retro_log_callback, retro_log_level, retro_log_printf_t, retro_memory_descriptor,
     retro_memory_map, retro_rumble_interface, retro_set_rumble_state_t, retro_video_refresh_t,
 };
-use crate::options::{CONTROLLER_INFO, CORE_VARIABLES, CoreOptions, INPUT_DESCRIPTORS, read_core_options};
-use crate::video::{OutputPixelFormat, convert_framebuffer};
+use crate::options::{
+    CONTROLLER_INFO, CORE_VARIABLES, CoreOptions, INPUT_DESCRIPTORS, read_core_options,
+};
+use crate::video::{OutputPixelFormat, convert_framebuffer, convert_pixels};
 
 const STATE_MAGIC: [u8; 4] = *b"RBLS";
 const STATE_VERSION: u32 = 1;
@@ -64,8 +67,50 @@ pub struct LibretroCallbacks {
     pub log: retro_log_printf_t,
 }
 
+const GBA_ASPECT_RATIO: f32 = 3.0 / 2.0;
+const GB_ASPECT_RATIO: f32 = 10.0 / 9.0;
+const GB_WRAM_SIZE: usize = 0x8000;
+
+enum ActiveCore {
+    Gba(Box<GbaCore>),
+    Gb(Box<GbCore>),
+}
+
+impl ActiveCore {
+    fn dimensions(&self) -> (usize, usize, f32) {
+        match self {
+            Self::Gba(_) => (LCD_WIDTH, LCD_HEIGHT, GBA_ASPECT_RATIO),
+            Self::Gb(_) => (gb_core::LCD_WIDTH, gb_core::LCD_HEIGHT, GB_ASPECT_RATIO),
+        }
+    }
+
+    fn apply_options(&mut self, opts: CoreOptions) {
+        match self {
+            Self::Gba(core) => {
+                core.bus.cart.solar_lux = opts.solar_lux;
+                core.bus.set_save_type_override(opts.save_type_override);
+            }
+            Self::Gb(_) => {}
+        }
+    }
+
+    fn save_state_bytes(&self) -> Result<Vec<u8>, ()> {
+        match self {
+            Self::Gba(core) => core.save_state().map_err(|_| ()),
+            Self::Gb(core) => core.save_state().map_err(|_| ()),
+        }
+    }
+
+    fn is_rumble_active(&self) -> bool {
+        match self {
+            Self::Gba(core) => core.bus.cart.rumble_enabled && core.bus.cart.rumble_active,
+            Self::Gb(core) => core.is_rumble_active(),
+        }
+    }
+}
+
 struct LoadedCore {
-    core: GbaCore,
+    core: ActiveCore,
     pixel_format: OutputPixelFormat,
     options: CoreOptions,
     frame_buf: Option<Box<[u16; LCD_WIDTH * LCD_HEIGHT]>>,
@@ -74,6 +119,14 @@ struct LoadedCore {
     serialize_bound: usize,
     last_rumble_active: bool,
     memory_descriptors: Box<[retro_memory_descriptor; 4]>,
+}
+
+pub fn active_geometry() -> (usize, usize, f32) {
+    let state = lock_state();
+    match state.loaded.as_ref().map(|l| &l.core) {
+        Some(core) => core.dimensions(),
+        None => (LCD_WIDTH, LCD_HEIGHT, GBA_ASPECT_RATIO),
+    }
 }
 
 struct LibretroState {
@@ -206,6 +259,101 @@ fn build_memory_descriptors(core: &mut GbaCore) -> [retro_memory_descriptor; 4] 
     [ewram_desc, iwram_desc, rom_desc, sram_desc]
 }
 
+fn build_gb_memory_descriptors(core: &mut GbCore) -> [retro_memory_descriptor; 4] {
+    let empty_desc = retro_memory_descriptor {
+        flags: 0,
+        ptr: ptr::null_mut(),
+        offset: 0,
+        start: 0,
+        select: 0,
+        disconnect: 0,
+        len: 0,
+        addrspace: ptr::null(),
+    };
+
+    let wram_desc = retro_memory_descriptor {
+        flags: RETRO_MEMDESC_SYSTEM_RAM,
+        ptr: core.bus.wram.as_mut_ptr().cast(),
+        offset: 0,
+        start: 0xC000,
+        select: 0xFFFF_E000,
+        disconnect: 0,
+        len: 0x2000,
+        addrspace: ptr::null(),
+    };
+
+    let rom_desc = retro_memory_descriptor {
+        flags: RETRO_MEMDESC_CONST,
+        ptr: core.bus.cart.rom.as_mut_ptr().cast(),
+        offset: 0,
+        start: 0x0000,
+        select: 0xFFFF_8000,
+        disconnect: 0,
+        len: core.bus.cart.rom.len().min(0x8000),
+        addrspace: ptr::null(),
+    };
+
+    let sram_desc = if !core.bus.cart.ram.is_empty() {
+        retro_memory_descriptor {
+            flags: RETRO_MEMDESC_SAVE_RAM,
+            ptr: core.bus.cart.ram.as_mut_ptr().cast(),
+            offset: 0,
+            start: 0xA000,
+            select: 0xFFFF_E000,
+            disconnect: 0,
+            len: core.bus.cart.ram.len().min(0x2000),
+            addrspace: ptr::null(),
+        }
+    } else {
+        empty_desc
+    };
+
+    [wram_desc, rom_desc, sram_desc, empty_desc]
+}
+
+fn build_active_memory_descriptors(
+    core: &mut ActiveCore,
+) -> ([retro_memory_descriptor; 4], c_uint) {
+    let descs = match core {
+        ActiveCore::Gba(gba) => build_memory_descriptors(gba),
+        ActiveCore::Gb(gb) => build_gb_memory_descriptors(gb),
+    };
+    let count = descs.iter().take_while(|d| d.len > 0).count() as c_uint;
+    (descs, count)
+}
+
+fn preserve_gb_memory_buffers<E>(
+    core: &mut GbCore,
+    copy_ram_in: bool,
+    op: impl FnOnce(&mut GbCore) -> Result<(), E>,
+) -> Result<(), E> {
+    let mut orig_wram = alloc_boxed_u8_zeroed::<GB_WRAM_SIZE>();
+    let mut orig_ram = core::mem::take(&mut core.bus.cart.ram);
+    let orig_ram_len = orig_ram.len();
+
+    core::mem::swap(&mut core.bus.wram, &mut orig_wram);
+    if copy_ram_in {
+        core.bus.cart.ram = orig_ram.clone();
+    } else {
+        core.bus.cart.ram = vec![0u8; orig_ram_len];
+    }
+
+    let result = op(core);
+
+    if result.is_ok() {
+        orig_wram.copy_from_slice(&*core.bus.wram);
+        if orig_ram.len() == core.bus.cart.ram.len() {
+            orig_ram.copy_from_slice(&core.bus.cart.ram);
+        } else {
+            orig_ram = core.bus.cart.ram.clone();
+        }
+    }
+
+    core::mem::swap(&mut core.bus.wram, &mut orig_wram);
+    core.bus.cart.ram = orig_ram;
+    result
+}
+
 /// Runs `op(core)` while keeping the heap allocations of `ewram`, `iwram`, and
 /// `cart.sram` at their exact original addresses so frontend memory pointers remain valid.
 fn preserve_memory_buffers<E>(
@@ -241,9 +389,26 @@ fn preserve_memory_buffers<E>(
     result
 }
 
-fn apply_options_to_core(core: &mut GbaCore, opts: CoreOptions) {
-    core.bus.cart.solar_lux = opts.solar_lux;
-    core.bus.cart.set_save_type_override(opts.save_type_override);
+fn detect_is_gb(path: Option<&str>, rom_bytes: &[u8]) -> bool {
+    if let Some(p) = path
+        && let Some(ext) = Path::new(p).extension().and_then(|s| s.to_str())
+    {
+        if ext.eq_ignore_ascii_case("gb") || ext.eq_ignore_ascii_case("gbc") {
+            return true;
+        }
+        if ext.eq_ignore_ascii_case("gba") || ext.eq_ignore_ascii_case("agb") {
+            return false;
+        }
+    }
+
+    if rom_bytes.len() >= 0x150 {
+        const GB_LOGO_PREFIX: [u8; 8] = [0xCE, 0xED, 0x66, 0x66, 0xCC, 0x0D, 0x00, 0x0B];
+        let hdr = gb_core::CartridgeHeader::parse(rom_bytes);
+        if hdr.header_checksum_valid && rom_bytes.get(0x0104..0x010C) == Some(&GB_LOGO_PREFIX) {
+            return true;
+        }
+    }
+    false
 }
 
 fn read_bios_from_system_dir(
@@ -308,12 +473,22 @@ fn negotiate_pixel_format(environ_cb: retro_environment_t) -> OutputPixelFormat 
     };
 
     let mut fmt_565 = RETRO_PIXEL_FORMAT_RGB565;
-    if unsafe { env(RETRO_ENVIRONMENT_SET_PIXEL_FORMAT, (&raw mut fmt_565).cast()) } {
+    if unsafe {
+        env(
+            RETRO_ENVIRONMENT_SET_PIXEL_FORMAT,
+            (&raw mut fmt_565).cast(),
+        )
+    } {
         return OutputPixelFormat::Rgb565;
     }
 
     let mut fmt_1555 = RETRO_PIXEL_FORMAT_0RGB1555;
-    let _ = unsafe { env(RETRO_ENVIRONMENT_SET_PIXEL_FORMAT, (&raw mut fmt_1555).cast()) };
+    let _ = unsafe {
+        env(
+            RETRO_ENVIRONMENT_SET_PIXEL_FORMAT,
+            (&raw mut fmt_1555).cast(),
+        )
+    };
     OutputPixelFormat::Xrgb1555
 }
 
@@ -355,6 +530,35 @@ struct FrameHost<'a> {
 impl HostFrontend for FrameHost<'_> {
     fn present_frame(&mut self, fb_bgr555: &[u16; LCD_WIDTH * LCD_HEIGHT]) {
         convert_framebuffer(
+            fb_bgr555,
+            self.frame_buf,
+            self.pixel_format,
+            self.color_correction,
+        );
+        self.frame_presented = true;
+    }
+
+    fn push_audio_samples(&mut self, samples: &[i16]) {
+        self.audio_buf.extend_from_slice(samples);
+    }
+
+    fn poll_keypad(&mut self) -> u16 {
+        self.keyinput
+    }
+}
+
+struct GbFrameHost<'a> {
+    frame_buf: &'a mut [u16],
+    audio_buf: &'a mut Vec<i16>,
+    keyinput: u16,
+    pixel_format: OutputPixelFormat,
+    color_correction: crate::video::ColorCorrection,
+    frame_presented: bool,
+}
+
+impl GbHostFrontend for GbFrameHost<'_> {
+    fn present_frame(&mut self, fb_bgr555: &[u16; gb_core::LCD_WIDTH * gb_core::LCD_HEIGHT]) {
+        convert_pixels(
             fb_bgr555,
             self.frame_buf,
             self.pixel_format,
@@ -496,12 +700,15 @@ pub unsafe fn load_game(game: *const retro_game_info) -> bool {
     }
 
     let info = unsafe { &*game };
+    let path_str_opt = if !info.path.is_null() {
+        unsafe { CStr::from_ptr(info.path) }.to_str().ok()
+    } else {
+        None
+    };
+
     let rom_bytes = if !info.data.is_null() && info.size > 0 {
         unsafe { core::slice::from_raw_parts(info.data.cast::<u8>(), info.size) }.to_vec()
-    } else if !info.path.is_null() {
-        let Ok(path_str) = unsafe { CStr::from_ptr(info.path) }.to_str() else {
-            return false;
-        };
+    } else if let Some(path_str) = path_str_opt {
         match std::fs::read(path_str) {
             Ok(bytes) if !bytes.is_empty() => bytes,
             _ => return false,
@@ -515,13 +722,23 @@ pub unsafe fn load_game(game: *const retro_game_info) -> bool {
         (state.callbacks.environ, state.callbacks.log)
     };
 
-    let bios_bytes = read_bios_from_system_dir(environ_cb, log_cb);
-    let mut core = GbaCore::new(bios_bytes.as_deref(), rom_bytes);
+    let is_gb = detect_is_gb(path_str_opt, &rom_bytes);
+    let mut core = if is_gb {
+        frontend_log(
+            log_cb,
+            RETRO_LOG_INFO,
+            "Detected Game Boy / Game Boy Color ROM; launching gb-core",
+        );
+        ActiveCore::Gb(Box::new(GbCore::new(rom_bytes, None, GbModel::Auto)))
+    } else {
+        let bios_bytes = read_bios_from_system_dir(environ_cb, log_cb);
+        ActiveCore::Gba(Box::new(GbaCore::new(bios_bytes.as_deref(), rom_bytes)))
+    };
 
     let pixel_format = negotiate_pixel_format(environ_cb);
     let rumble_cb = query_rumble_interface(environ_cb);
     let options = read_core_options(environ_cb);
-    apply_options_to_core(&mut core, options);
+    core.apply_options(options);
 
     if let Some(env) = environ_cb {
         unsafe {
@@ -537,11 +754,12 @@ pub unsafe fn load_game(game: *const retro_game_info) -> bool {
         }
     }
 
-    let measured_state = core.save_state().map(|b| b.len()).unwrap_or(0);
-    let serialize_bound = (measured_state + STATE_HEADER_SIZE + STATE_MARGIN_BYTES)
-        .max(STATE_MIN_BOUND_BYTES);
+    let measured_state = core.save_state_bytes().map(|b| b.len()).unwrap_or(0);
+    let serialize_bound =
+        (measured_state + STATE_HEADER_SIZE + STATE_MARGIN_BYTES).max(STATE_MIN_BOUND_BYTES);
 
-    let descriptors = Box::new(build_memory_descriptors(&mut core));
+    let (descriptors, num_descriptors) = build_active_memory_descriptors(&mut core);
+    let descriptors = Box::new(descriptors);
 
     let loaded = LoadedCore {
         core,
@@ -557,11 +775,7 @@ pub unsafe fn load_game(game: *const retro_game_info) -> bool {
 
     let mut map = retro_memory_map {
         descriptors: loaded.memory_descriptors.as_ptr(),
-        num_descriptors: if loaded.memory_descriptors[3].len > 0 {
-            4
-        } else {
-            3
-        },
+        num_descriptors,
     };
     let map_ptr = (&raw mut map).cast();
 
@@ -596,10 +810,7 @@ pub fn reset() {
         (
             state.callbacks.environ,
             state.callbacks.rumble,
-            state
-                .loaded
-                .as_ref()
-                .is_some_and(|l| l.last_rumble_active),
+            state.loaded.as_ref().is_some_and(|l| l.last_rumble_active),
         )
     };
 
@@ -610,11 +821,21 @@ pub fn reset() {
     if let Some(ref mut loaded) = state.loaded {
         loaded.last_rumble_active = false;
         loaded.options = options;
-        let _ = preserve_memory_buffers(&mut loaded.core, true, |c| {
-            c.reset();
-            Ok::<(), ()>(())
-        });
-        apply_options_to_core(&mut loaded.core, options);
+        match loaded.core {
+            ActiveCore::Gba(ref mut gba) => {
+                let _ = preserve_memory_buffers(gba, true, |c| {
+                    c.reset();
+                    Ok::<(), ()>(())
+                });
+            }
+            ActiveCore::Gb(ref mut gb) => {
+                let _ = preserve_gb_memory_buffers(gb, true, |c| {
+                    c.reset();
+                    Ok::<(), ()>(())
+                });
+            }
+        }
+        loaded.core.apply_options(options);
     }
 }
 
@@ -649,13 +870,7 @@ pub fn run() {
     // Poll keypad before acquiring the core mutex so frontend input callbacks never deadlock.
     let keyinput = poll_port0_keypad(callbacks.input_poll, callbacks.input_state, port0_device);
 
-    let (
-        out_frame,
-        out_audio,
-        pixel_format,
-        rumble_change,
-        refresh_map,
-    ) = {
+    let (out_frame, out_audio, pixel_format, width, height, rumble_change, refresh_map) = {
         let mut state = lock_state();
         let Some(ref mut loaded) = state.loaded else {
             return;
@@ -665,8 +880,8 @@ pub fn run() {
         if let Some(opts) = updated_options {
             let save_changed = opts.save_type_override != loaded.options.save_type_override;
             loaded.options = opts;
-            apply_options_to_core(&mut loaded.core, opts);
-            refresh_map = save_changed;
+            loaded.core.apply_options(opts);
+            refresh_map = save_changed && matches!(loaded.core, ActiveCore::Gba(_));
         }
 
         let mut frame_buf = loaded
@@ -675,30 +890,54 @@ pub fn run() {
             .unwrap_or_else(alloc_boxed_u16_zeroed::<{ LCD_WIDTH * LCD_HEIGHT }>);
         loaded.audio_buf.clear();
 
-        let mut host = FrameHost {
-            frame_buf: &mut frame_buf,
-            audio_buf: &mut loaded.audio_buf,
-            keyinput,
-            pixel_format: loaded.pixel_format,
-            color_correction: loaded.options.color_correction,
-            frame_presented: false,
-        };
-        loaded.core.run_frame(&mut host);
-        if !host.frame_presented {
-            convert_framebuffer(
-                &loaded.core.bus.ppu.framebuffer,
-                &mut frame_buf,
-                loaded.pixel_format,
-                loaded.options.color_correction,
-            );
+        let (width, height, _) = loaded.core.dimensions();
+        match loaded.core {
+            ActiveCore::Gba(ref mut gba) => {
+                let mut host = FrameHost {
+                    frame_buf: &mut frame_buf,
+                    audio_buf: &mut loaded.audio_buf,
+                    keyinput,
+                    pixel_format: loaded.pixel_format,
+                    color_correction: loaded.options.color_correction,
+                    frame_presented: false,
+                };
+                gba.run_frame(&mut host);
+                if !host.frame_presented {
+                    convert_framebuffer(
+                        &gba.bus.ppu.framebuffer,
+                        &mut frame_buf,
+                        loaded.pixel_format,
+                        loaded.options.color_correction,
+                    );
+                }
+            }
+            ActiveCore::Gb(ref mut gb) => {
+                let gb_len = gb_core::LCD_WIDTH * gb_core::LCD_HEIGHT;
+                let mut host = GbFrameHost {
+                    frame_buf: &mut frame_buf[..gb_len],
+                    audio_buf: &mut loaded.audio_buf,
+                    keyinput,
+                    pixel_format: loaded.pixel_format,
+                    color_correction: loaded.options.color_correction,
+                    frame_presented: false,
+                };
+                gb.run_frame(&mut host);
+                if !host.frame_presented {
+                    convert_pixels(
+                        gb.framebuffer(),
+                        &mut frame_buf[..gb_len],
+                        loaded.pixel_format,
+                        loaded.options.color_correction,
+                    );
+                }
+            }
         }
 
         let mut out_audio = core::mem::take(&mut loaded.spare_audio_buf);
         out_audio.clear();
         core::mem::swap(&mut loaded.audio_buf, &mut out_audio);
 
-        let rumble_now =
-            loaded.core.bus.cart.rumble_enabled && loaded.core.bus.cart.rumble_active;
+        let rumble_now = loaded.core.is_rumble_active();
         let rumble_change = if rumble_now != loaded.last_rumble_active {
             loaded.last_rumble_active = rumble_now;
             Some(rumble_now)
@@ -708,21 +947,17 @@ pub fn run() {
 
         let mut map_descriptors = None;
         if refresh_map {
-            *loaded.memory_descriptors = build_memory_descriptors(&mut loaded.core);
-            map_descriptors = Some((
-                loaded.memory_descriptors.as_ptr(),
-                if loaded.memory_descriptors[3].len > 0 {
-                    4
-                } else {
-                    3
-                },
-            ));
+            let (descs, num_descs) = build_active_memory_descriptors(&mut loaded.core);
+            *loaded.memory_descriptors = descs;
+            map_descriptors = Some((loaded.memory_descriptors.as_ptr(), num_descs));
         }
 
         (
             frame_buf,
             out_audio,
             loaded.pixel_format,
+            width,
+            height,
             rumble_change,
             map_descriptors,
         )
@@ -744,9 +979,9 @@ pub fn run() {
         unsafe {
             video_cb(
                 out_frame.as_ptr().cast(),
-                LCD_WIDTH as c_uint,
-                LCD_HEIGHT as c_uint,
-                pixel_format.pitch_bytes(),
+                width as c_uint,
+                height as c_uint,
+                pixel_format.pitch_bytes_for_width(width),
             );
         }
     }
@@ -809,7 +1044,7 @@ pub unsafe fn serialize(data: *mut c_void, size: usize) -> bool {
         return false;
     };
 
-    let Ok(payload) = loaded.core.save_state() else {
+    let Ok(payload) = loaded.core.save_state_bytes() else {
         return false;
     };
     let needed = STATE_HEADER_SIZE + payload.len();
@@ -861,9 +1096,16 @@ pub unsafe fn unserialize(data: *const c_void, size: usize) -> bool {
         return false;
     };
 
-    let ok = preserve_memory_buffers(&mut loaded.core, false, |c| c.load_state(payload)).is_ok();
+    let ok = match loaded.core {
+        ActiveCore::Gba(ref mut gba) => {
+            preserve_memory_buffers(gba, false, |c| c.load_state(payload)).is_ok()
+        }
+        ActiveCore::Gb(ref mut gb) => {
+            preserve_gb_memory_buffers(gb, false, |c| c.load_state(payload)).is_ok()
+        }
+    };
     if ok {
-        apply_options_to_core(&mut loaded.core, loaded.options);
+        loaded.core.apply_options(loaded.options);
     }
     ok
 }
@@ -873,13 +1115,21 @@ pub fn get_memory_data(id: c_uint) -> *mut c_void {
     let Some(ref mut loaded) = state.loaded else {
         return ptr::null_mut();
     };
-    match id & RETRO_MEMORY_MASK {
-        RETRO_MEMORY_SYSTEM_RAM => loaded.core.bus.ewram.as_mut_ptr().cast(),
-        RETRO_MEMORY_SAVE_RAM => {
-            if save_ram_size_for_cart(&loaded.core) == 0 {
+    match (&mut loaded.core, id & RETRO_MEMORY_MASK) {
+        (ActiveCore::Gba(gba), RETRO_MEMORY_SYSTEM_RAM) => gba.bus.ewram.as_mut_ptr().cast(),
+        (ActiveCore::Gba(gba), RETRO_MEMORY_SAVE_RAM) => {
+            if save_ram_size_for_cart(gba) == 0 {
                 ptr::null_mut()
             } else {
-                loaded.core.bus.cart.sram.as_mut_ptr().cast()
+                gba.bus.cart.sram.as_mut_ptr().cast()
+            }
+        }
+        (ActiveCore::Gb(gb), RETRO_MEMORY_SYSTEM_RAM) => gb.bus.wram.as_mut_ptr().cast(),
+        (ActiveCore::Gb(gb), RETRO_MEMORY_SAVE_RAM) => {
+            if gb.bus.cart.ram.is_empty() {
+                ptr::null_mut()
+            } else {
+                gb.bus.cart.ram.as_mut_ptr().cast()
             }
         }
         _ => ptr::null_mut(),
@@ -891,9 +1141,11 @@ pub fn get_memory_size(id: c_uint) -> usize {
     let Some(ref loaded) = state.loaded else {
         return 0;
     };
-    match id & RETRO_MEMORY_MASK {
-        RETRO_MEMORY_SYSTEM_RAM => EWRAM_SIZE,
-        RETRO_MEMORY_SAVE_RAM => save_ram_size_for_cart(&loaded.core),
+    match (&loaded.core, id & RETRO_MEMORY_MASK) {
+        (ActiveCore::Gba(_), RETRO_MEMORY_SYSTEM_RAM) => EWRAM_SIZE,
+        (ActiveCore::Gba(gba), RETRO_MEMORY_SAVE_RAM) => save_ram_size_for_cart(gba),
+        (ActiveCore::Gb(_), RETRO_MEMORY_SYSTEM_RAM) => GB_WRAM_SIZE,
+        (ActiveCore::Gb(gb), RETRO_MEMORY_SAVE_RAM) => gb.bus.cart.ram.len(),
         _ => 0,
     }
 }

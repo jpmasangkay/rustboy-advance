@@ -10,18 +10,17 @@ use gba_libretro::ffi::{
     RETRO_ENVIRONMENT_GET_VARIABLE_UPDATE, RETRO_ENVIRONMENT_SET_CONTROLLER_INFO,
     RETRO_ENVIRONMENT_SET_INPUT_DESCRIPTORS, RETRO_ENVIRONMENT_SET_MEMORY_MAPS,
     RETRO_ENVIRONMENT_SET_PIXEL_FORMAT, RETRO_ENVIRONMENT_SET_SUPPORT_ACHIEVEMENTS,
-    RETRO_ENVIRONMENT_SET_SUPPORT_NO_GAME, RETRO_ENVIRONMENT_SET_VARIABLES,
-    RETRO_MEMORY_SAVE_RAM, RETRO_MEMORY_SYSTEM_RAM, RETRO_PIXEL_FORMAT_0RGB1555,
-    RETRO_PIXEL_FORMAT_RGB565, RETRO_REGION_NTSC, RETRO_RUMBLE_STRONG, retro_game_info,
-    retro_log_callback, retro_log_level, retro_memory_map, retro_pixel_format,
-    retro_rumble_effect, retro_rumble_interface, retro_system_av_info, retro_system_info,
-    retro_variable,
+    RETRO_ENVIRONMENT_SET_SUPPORT_NO_GAME, RETRO_ENVIRONMENT_SET_VARIABLES, RETRO_MEMORY_SAVE_RAM,
+    RETRO_MEMORY_SYSTEM_RAM, RETRO_PIXEL_FORMAT_0RGB1555, RETRO_PIXEL_FORMAT_RGB565,
+    RETRO_REGION_NTSC, RETRO_RUMBLE_STRONG, retro_game_info, retro_log_callback, retro_log_level,
+    retro_memory_map, retro_pixel_format, retro_rumble_effect, retro_rumble_interface,
+    retro_system_av_info, retro_system_info, retro_variable,
 };
 use gba_libretro::{
     retro_api_version, retro_cheat_reset, retro_cheat_set, retro_deinit, retro_get_memory_data,
     retro_get_memory_size, retro_get_region, retro_get_system_av_info, retro_get_system_info,
-    retro_init, retro_load_game, retro_load_game_special, retro_reset, retro_run,
-    retro_serialize, retro_serialize_size, retro_set_audio_sample, retro_set_audio_sample_batch,
+    retro_init, retro_load_game, retro_load_game_special, retro_reset, retro_run, retro_serialize,
+    retro_serialize_size, retro_set_audio_sample, retro_set_audio_sample_batch,
     retro_set_controller_port_device, retro_set_environment, retro_set_input_poll,
     retro_set_input_state, retro_set_video_refresh, retro_unload_game, retro_unserialize,
 };
@@ -95,11 +94,7 @@ unsafe extern "C" fn mock_log(_level: retro_log_level, _fmt: *const c_char, _: .
     lock_mock().log_messages += 1;
 }
 
-unsafe extern "C" fn mock_rumble(
-    port: c_uint,
-    effect: retro_rumble_effect,
-    strength: u16,
-) -> bool {
+unsafe extern "C" fn mock_rumble(port: c_uint, effect: retro_rumble_effect, strength: u16) -> bool {
     lock_mock().rumble_events.push((port, effect, strength));
     true
 }
@@ -213,8 +208,9 @@ unsafe extern "C" fn mock_environ(cmd: c_uint, data: *mut c_void) -> bool {
                 return false;
             }
             mock.memory_maps.clear();
-            let slice =
-                unsafe { core::slice::from_raw_parts(map.descriptors, map.num_descriptors as usize) };
+            let slice = unsafe {
+                core::slice::from_raw_parts(map.descriptors, map.num_descriptors as usize)
+            };
             for desc in slice {
                 mock.memory_maps.push((desc.start, desc.len, desc.flags));
             }
@@ -346,14 +342,16 @@ fn system_and_av_info_and_null_safety() {
     assert!(!sys.library_version.is_null());
     assert!(!sys.valid_extensions.is_null());
     assert_eq!(
-        unsafe { CStr::from_ptr(sys.library_name) }.to_str().unwrap(),
+        unsafe { CStr::from_ptr(sys.library_name) }
+            .to_str()
+            .unwrap(),
         "Rustboy Advance"
     );
     assert_eq!(
         unsafe { CStr::from_ptr(sys.valid_extensions) }
             .to_str()
             .unwrap(),
-        "gba|agb|bin"
+        "gba|agb|gb|gbc|bin"
     );
     assert!(!sys.need_fullpath);
     assert!(!sys.block_extract);
@@ -667,9 +665,7 @@ fn cart_rumble_triggers_libretro_rumble_callback() {
     assert!(
         mock.rumble_events
             .iter()
-            .any(|&(port, eff, str_val)| port == 0
-                && eff == RETRO_RUMBLE_STRONG
-                && str_val == 0)
+            .any(|&(port, eff, str_val)| port == 0 && eff == RETRO_RUMBLE_STRONG && str_val == 0)
     );
 }
 
@@ -759,4 +755,107 @@ fn serialize_rejects_short_buffers_and_gba_sp_color_correction_works() {
     let mut tiny = [0u8; 64];
     assert!(!unsafe { retro_serialize(tiny.as_mut_ptr().cast(), tiny.len()) });
     assert!(!unsafe { retro_unserialize(tiny.as_ptr().cast(), tiny.len()) });
+}
+
+fn synthetic_gb_rom() -> Vec<u8> {
+    let mut rom = vec![0u8; 0x8000];
+    // Entry point 0x0100: NOP; JR -2 (infinite loop at 0x0150)
+    rom[0x0100] = 0x00;
+    rom[0x0101] = 0xC3; // JP 0x0150
+    rom[0x0102] = 0x50;
+    rom[0x0103] = 0x01;
+    // Nintendo logo prefix at 0x0104..0x010C
+    rom[0x0104..0x010C].copy_from_slice(&[0xCE, 0xED, 0x66, 0x66, 0xCC, 0x0D, 0x00, 0x0B]);
+    rom[0x0134..0x013C].copy_from_slice(b"GBTEST01");
+    rom[0x0143] = 0x00; // DMG
+    rom[0x0147] = 0x03; // MBC1+RAM+BATT
+    rom[0x0148] = 0x00; // 32 KiB ROM
+    rom[0x0149] = 0x02; // 8 KiB RAM
+    let mut chk = 0u8;
+    for &b in &rom[0x0134..=0x014C] {
+        chk = chk.wrapping_sub(b).wrapping_sub(1);
+    }
+    rom[0x014D] = chk;
+    // Program at 0x0150: LD A, 0x80; LDH (0x26), A; JR -2 (enable APU + loop)
+    rom[0x0150] = 0x3E; // LD A, 0x80
+    rom[0x0151] = 0x80;
+    rom[0x0152] = 0xE0; // LDH (0xFF26), A
+    rom[0x0153] = 0x26;
+    rom[0x0154] = 0x18; // JR -2
+    rom[0x0155] = 0xFE;
+    rom
+}
+
+#[test]
+fn dual_core_dispatches_gb_rom_and_serializes_cleanly() {
+    let (_guard, _teardown) = TestGuard::acquire();
+
+    let rom = synthetic_gb_rom();
+    let game = retro_game_info {
+        path: ptr::null(),
+        data: rom.as_ptr().cast(),
+        size: rom.len(),
+        meta: ptr::null(),
+    };
+    assert!(unsafe { retro_load_game(&raw const game) });
+
+    let mut av = retro_system_av_info {
+        geometry: gba_libretro::ffi::retro_game_geometry {
+            base_width: 0,
+            base_height: 0,
+            max_width: 0,
+            max_height: 0,
+            aspect_ratio: 0.0,
+        },
+        timing: gba_libretro::ffi::retro_system_timing {
+            fps: 0.0,
+            sample_rate: 0.0,
+        },
+    };
+    unsafe { retro_get_system_av_info(&raw mut av) };
+    assert_eq!(av.geometry.base_width, gb_core::LCD_WIDTH as c_uint);
+    assert_eq!(av.geometry.base_height, gb_core::LCD_HEIGHT as c_uint);
+    assert!((av.geometry.aspect_ratio - (10.0 / 9.0)).abs() < 1e-5);
+
+    for _ in 0..3 {
+        retro_run();
+    }
+
+    {
+        let mock = lock_mock();
+        assert_eq!(mock.video_frames, 3);
+        assert_eq!(mock.last_width, gb_core::LCD_WIDTH as c_uint);
+        assert_eq!(mock.last_height, gb_core::LCD_HEIGHT as c_uint);
+        assert_eq!(mock.last_pitch, gb_core::LCD_WIDTH * 2);
+        assert_eq!(
+            mock.last_frame_pixels.len(),
+            gb_core::LCD_WIDTH * gb_core::LCD_HEIGHT
+        );
+        assert!(mock.audio_frames_received > 0);
+    }
+
+    let wram_ptr = retro_get_memory_data(RETRO_MEMORY_SYSTEM_RAM);
+    let wram_size = retro_get_memory_size(RETRO_MEMORY_SYSTEM_RAM);
+    assert!(!wram_ptr.is_null());
+    assert_eq!(wram_size, 0x8000);
+
+    let sram_ptr = retro_get_memory_data(RETRO_MEMORY_SAVE_RAM);
+    let sram_size = retro_get_memory_size(RETRO_MEMORY_SAVE_RAM);
+    assert!(!sram_ptr.is_null());
+    assert_eq!(sram_size, 0x2000);
+
+    let state_size = retro_serialize_size();
+    let mut state_buf = vec![0u8; state_size];
+    assert!(unsafe { retro_serialize(state_buf.as_mut_ptr().cast(), state_buf.len()) });
+
+    unsafe {
+        *wram_ptr.cast::<u8>().add(0x42) = 0x5A;
+    }
+    assert!(unsafe { retro_unserialize(state_buf.as_ptr().cast(), state_buf.len()) });
+    assert_eq!(retro_get_memory_data(RETRO_MEMORY_SYSTEM_RAM), wram_ptr);
+    assert_eq!(unsafe { *wram_ptr.cast::<u8>().add(0x42) }, 0x00);
+
+    retro_reset();
+    assert_eq!(retro_get_memory_data(RETRO_MEMORY_SYSTEM_RAM), wram_ptr);
+    retro_run();
 }

@@ -149,10 +149,7 @@ mod tests {
         assert_eq!(emu.game_code(), "RBAT");
         assert_eq!(emu.save_type_name(), "SRAM 32 KiB");
         assert_eq!(emu.rom_crc32(), crc32(&rom));
-        assert_eq!(
-            emu.storage_key(),
-            format!("RBAT_{:08X}", crc32(&rom))
-        );
+        assert_eq!(emu.storage_key(), format!("RBAT_{:08X}", crc32(&rom)));
         assert_eq!(emu.framebuffer().len(), RGBA_FRAME_BYTES);
 
         emu.set_keys(KEY_A | KEY_START);

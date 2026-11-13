@@ -267,7 +267,11 @@ impl GbBus {
         match addr {
             0x0000..=0x7FFF => self.cart.read_rom(addr),
             0x8000..=0x9FFF => {
-                let bank = if self.is_cgb { (self.ppu.vbk & 1) as usize } else { 0 };
+                let bank = if self.is_cgb {
+                    (self.ppu.vbk & 1) as usize
+                } else {
+                    0
+                };
                 self.ppu.vram[bank * 0x2000 + ((addr as usize) & 0x1FFF)]
             }
             0xA000..=0xBFFF => self.cart.read_ram(addr),
@@ -424,7 +428,8 @@ impl GbBus {
             0xFF4A => self.ppu.wy,
             0xFF4B => self.ppu.wx,
             0xFF4D if self.is_cgb => {
-                0x7E | (if self.double_speed { 0x80 } else { 0 }) | (if self.key1_arm { 1 } else { 0 })
+                0x7E | (if self.double_speed { 0x80 } else { 0 })
+                    | (if self.key1_arm { 1 } else { 0 })
             }
             0xFF4F if self.is_cgb => self.ppu.read_vbk(),
             0xFF55 if self.is_cgb => {
@@ -562,7 +567,11 @@ impl GbBus {
                 self.cart.read_rom(addr)
             }
             0x8000..=0x9FFF => {
-                let bank = if self.is_cgb { (self.ppu.vbk & 1) as usize } else { 0 };
+                let bank = if self.is_cgb {
+                    (self.ppu.vbk & 1) as usize
+                } else {
+                    0
+                };
                 self.ppu.vram[bank * 0x2000 + ((addr as usize) & 0x1FFF)]
             }
             0xA000..=0xBFFF => self.cart.read_ram(addr),
@@ -599,7 +608,11 @@ impl GbBus {
                 }
             }
             0x8000..=0x9FFF => {
-                let bank = if self.is_cgb { (self.ppu.vbk & 1) as usize } else { 0 };
+                let bank = if self.is_cgb {
+                    (self.ppu.vbk & 1) as usize
+                } else {
+                    0
+                };
                 self.ppu.vram[bank * 0x2000 + ((addr as usize) & 0x1FFF)] = val;
             }
             0xA000..=0xBFFF => self.cart.poke_ram_direct(addr, val),

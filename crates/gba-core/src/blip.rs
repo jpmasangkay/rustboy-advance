@@ -297,7 +297,8 @@ impl BlipBuf {
             self.base_cycle = end_cycle;
         }
 
-        let avail = ((self.offset >> 32) as usize).min(self.buf_l.len().saturating_sub(KERNEL_WIDTH));
+        let avail =
+            ((self.offset >> 32) as usize).min(self.buf_l.len().saturating_sub(KERNEL_WIDTH));
         if avail == 0 {
             return 0;
         }
@@ -423,8 +424,7 @@ mod tests {
             let mut im = 0.0f64;
             for (i, &x) in mono.iter().enumerate() {
                 let u = (i as f64) / ((n - 1) as f64);
-                let win = 0.355768
-                    - 0.487396 * cos_f64(TWO_PI * u)
+                let win = 0.355768 - 0.487396 * cos_f64(TWO_PI * u)
                     + 0.144232 * cos_f64(2.0 * TWO_PI * u)
                     - 0.012604 * cos_f64(3.0 * TWO_PI * u);
                 let angle = TWO_PI * (k as f64) * (i as f64) / (n as f64);

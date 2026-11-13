@@ -34,20 +34,8 @@ pub struct IoRegDesc {
 }
 
 const IRQ_FLAG_NAMES: [&str; 14] = [
-    "VBlank",
-    "HBlank",
-    "VCount",
-    "Timer0",
-    "Timer1",
-    "Timer2",
-    "Timer3",
-    "Serial",
-    "DMA0",
-    "DMA1",
-    "DMA2",
-    "DMA3",
-    "Keypad",
-    "GamePak",
+    "VBlank", "HBlank", "VCount", "Timer0", "Timer1", "Timer2", "Timer3", "Serial", "DMA0", "DMA1",
+    "DMA2", "DMA3", "Keypad", "GamePak",
 ];
 
 const KEY_NAMES: [&str; 10] = [
@@ -227,7 +215,13 @@ fn decode_dispcnt(addr: u32, v: u32) -> IoRegDesc {
         _ => "Prohibited Mode",
     };
     let mut enabled_layers = Vec::new();
-    for (idx, lbl) in [(8, "BG0"), (9, "BG1"), (10, "BG2"), (11, "BG3"), (12, "OBJ")] {
+    for (idx, lbl) in [
+        (8, "BG0"),
+        (9, "BG1"),
+        (10, "BG2"),
+        (11, "BG3"),
+        (12, "OBJ"),
+    ] {
         if bit(v, idx) {
             enabled_layers.push(lbl);
         }
@@ -568,7 +562,11 @@ fn decode_dmacnt_h(addr: u32, v: u32, ch: usize) -> IoRegDesc {
             name: "Src Ctrl",
             bit_range: "7..=8",
             value: src,
-            meaning: String::from(if src == 3 { "Prohibited" } else { addr_ctrl(src) }),
+            meaning: String::from(if src == 3 {
+                "Prohibited"
+            } else {
+                addr_ctrl(src)
+            }),
         },
         IoField {
             name: "Repeat",
@@ -838,7 +836,11 @@ pub fn decode_io_reg(addr: u32, val: u32) -> Option<IoRegDesc> {
             })
         }
         0x0400_0040 | 0x0400_0042 => {
-            let name = if addr == 0x0400_0040 { "WIN0H" } else { "WIN1H" };
+            let name = if addr == 0x0400_0040 {
+                "WIN0H"
+            } else {
+                "WIN1H"
+            };
             let x2 = bits(val, 0, 8);
             let x1 = bits(val, 8, 8);
             Some(IoRegDesc {
@@ -864,7 +866,11 @@ pub fn decode_io_reg(addr: u32, val: u32) -> Option<IoRegDesc> {
             })
         }
         0x0400_0044 | 0x0400_0046 => {
-            let name = if addr == 0x0400_0044 { "WIN0V" } else { "WIN1V" };
+            let name = if addr == 0x0400_0044 {
+                "WIN0V"
+            } else {
+                "WIN1V"
+            };
             let y2 = bits(val, 0, 8);
             let y1 = bits(val, 8, 8);
             Some(IoRegDesc {
@@ -1114,11 +1120,7 @@ pub fn decode_io_reg(addr: u32, val: u32) -> Option<IoRegDesc> {
                 name,
                 category: "Sound",
                 raw_value: val,
-                summary: format!(
-                    "Freq={} Timed={}",
-                    bits(val, 0, 11),
-                    on_off(bit(val, 14))
-                ),
+                summary: format!("Freq={} Timed={}", bits(val, 0, 11), on_off(bit(val, 14))),
                 fields: vec![
                     IoField {
                         name: "Rate / Freq",
@@ -1156,7 +1158,11 @@ pub fn decode_io_reg(addr: u32, val: u32) -> Option<IoRegDesc> {
                     name: "Dimension",
                     bit_range: "5",
                     value: bits(val, 5, 1),
-                    meaning: String::from(if bit(val, 5) { "Two Banks (64)" } else { "One Bank (32)" }),
+                    meaning: String::from(if bit(val, 5) {
+                        "Two Banks (64)"
+                    } else {
+                        "One Bank (32)"
+                    }),
                 },
                 IoField {
                     name: "Bank Select",
@@ -1219,7 +1225,11 @@ pub fn decode_io_reg(addr: u32, val: u32) -> Option<IoRegDesc> {
             name: "SOUND4CNT_H",
             category: "Sound",
             raw_value: val,
-            summary: format!("Shift={} Width={}", bits(val, 4, 4), if bit(val, 3) { "7-bit" } else { "15-bit" }),
+            summary: format!(
+                "Shift={} Width={}",
+                bits(val, 4, 4),
+                if bit(val, 3) { "7-bit" } else { "15-bit" }
+            ),
             fields: vec![
                 IoField {
                     name: "Dividing Ratio",
@@ -1593,7 +1603,11 @@ pub fn decode_io_reg(addr: u32, val: u32) -> Option<IoRegDesc> {
             name: "RCNT",
             category: "Serial",
             raw_value: val,
-            summary: format!("Mode bits=0b{:02b} Raw=0x{:04X}", bits(val, 14, 2), val & 0xFFFF),
+            summary: format!(
+                "Mode bits=0b{:02b} Raw=0x{:04X}",
+                bits(val, 14, 2),
+                val & 0xFFFF
+            ),
             fields: vec![IoField {
                 name: "SIO/GPIO Mode",
                 bit_range: "14..=15",
@@ -1691,7 +1705,11 @@ pub fn decode_io_reg(addr: u32, val: u32) -> Option<IoRegDesc> {
             name: "HALTCNT",
             category: "System",
             raw_value: val,
-            summary: String::from(if bit(val, 7) { "Stop Mode" } else { "Halt Mode" }),
+            summary: String::from(if bit(val, 7) {
+                "Stop Mode"
+            } else {
+                "Halt Mode"
+            }),
             fields: vec![IoField {
                 name: "Power-Down Mode",
                 bit_range: "7",

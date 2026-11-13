@@ -31,8 +31,9 @@ pub static CORE_VARIABLES: [retro_variable; 4] = [
     },
     retro_variable {
         key: OPT_SAVE_TYPE_KEY.as_ptr(),
-        value: c"Save Type Override; Auto|SRAM 32KB|Flash 64KB|Flash 128KB|EEPROM 512B|EEPROM 8KB|None"
-            .as_ptr(),
+        value:
+            c"Save Type Override; Auto|SRAM 32KB|Flash 64KB|Flash 128KB|EEPROM 512B|EEPROM 8KB|None"
+                .as_ptr(),
     },
     retro_variable {
         key: ptr::null(),
@@ -231,11 +232,26 @@ mod tests {
         assert_eq!(parse_solar_lux("200"), 200);
 
         assert_eq!(parse_save_type_override("Auto"), None);
-        assert_eq!(parse_save_type_override("SRAM 32KB"), Some(SaveType::Sram32K));
-        assert_eq!(parse_save_type_override("Flash 64KB"), Some(SaveType::Flash64K));
-        assert_eq!(parse_save_type_override("Flash 128KB"), Some(SaveType::Flash128K));
-        assert_eq!(parse_save_type_override("EEPROM 512B"), Some(SaveType::Eeprom512B));
-        assert_eq!(parse_save_type_override("EEPROM 8KB"), Some(SaveType::Eeprom8K));
+        assert_eq!(
+            parse_save_type_override("SRAM 32KB"),
+            Some(SaveType::Sram32K)
+        );
+        assert_eq!(
+            parse_save_type_override("Flash 64KB"),
+            Some(SaveType::Flash64K)
+        );
+        assert_eq!(
+            parse_save_type_override("Flash 128KB"),
+            Some(SaveType::Flash128K)
+        );
+        assert_eq!(
+            parse_save_type_override("EEPROM 512B"),
+            Some(SaveType::Eeprom512B)
+        );
+        assert_eq!(
+            parse_save_type_override("EEPROM 8KB"),
+            Some(SaveType::Eeprom8K)
+        );
         assert_eq!(parse_save_type_override("None"), Some(SaveType::None));
     }
 }

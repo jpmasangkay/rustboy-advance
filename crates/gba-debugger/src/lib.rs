@@ -629,10 +629,16 @@ mod tests {
         assert_eq!(disassemble_arm(0xE3A0_00FF, 0x0800_0000), "mov r0, #0xFF");
         assert_eq!(disassemble_arm(0xE081_2003, 0x0800_0000), "add r2, r1, r3");
         assert_eq!(disassemble_arm(0x0A00_0002, 0x0800_0000), "beq 0x08000010");
-        assert_eq!(disassemble_arm(0xE92D_401F, 0x0800_0000), "stmdb sp!, {r0-r4, lr}");
+        assert_eq!(
+            disassemble_arm(0xE92D_401F, 0x0800_0000),
+            "stmdb sp!, {r0-r4, lr}"
+        );
         assert_eq!(disassemble_arm(0xE12F_FF1E, 0x0800_0000), "bx lr");
         assert_eq!(disassemble_arm(0xE10F_0000, 0x0800_0000), "mrs r0, cpsr");
-        assert_eq!(disassemble_arm(0xE59F_1010, 0x0800_0000), "ldr r1, [pc, #0x10] ; =0x08000018");
+        assert_eq!(
+            disassemble_arm(0xE59F_1010, 0x0800_0000),
+            "ldr r1, [pc, #0x10] ; =0x08000018"
+        );
     }
 
     #[test]

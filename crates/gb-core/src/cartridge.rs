@@ -281,8 +281,18 @@ impl Cartridge {
             0x00 => (MbcType::RomOnly, false),
             0x08 => (MbcType::RomOnly, false),
             0x09 => (MbcType::RomOnly, true),
-            0x01 | 0x02 => (MbcType::Mbc1 { multicart: Self::detect_mbc1m(&rom) }, false),
-            0x03 => (MbcType::Mbc1 { multicart: Self::detect_mbc1m(&rom) }, true),
+            0x01 | 0x02 => (
+                MbcType::Mbc1 {
+                    multicart: Self::detect_mbc1m(&rom),
+                },
+                false,
+            ),
+            0x03 => (
+                MbcType::Mbc1 {
+                    multicart: Self::detect_mbc1m(&rom),
+                },
+                true,
+            ),
             0x05 => (MbcType::Mbc2, false),
             0x06 => (MbcType::Mbc2, true),
             0x0F | 0x10 => (MbcType::Mbc3 { has_rtc: true }, true),
@@ -293,7 +303,10 @@ impl Cartridge {
             0x1C | 0x1D => (MbcType::Mbc5 { has_rumble: true }, false),
             0x1E => (MbcType::Mbc5 { has_rumble: true }, true),
             _ => {
-                log::warn!("Unsupported GB cartridge type 0x{:02X}; falling back to MBC5", header.cart_type);
+                log::warn!(
+                    "Unsupported GB cartridge type 0x{:02X}; falling back to MBC5",
+                    header.cart_type
+                );
                 (MbcType::Mbc5 { has_rumble: false }, false)
             }
         };
@@ -369,18 +382,30 @@ impl Cartridge {
                 let lo_nz = if lo == 0 { 1 } else { lo };
                 let hi = (self.bank_hi as usize) & 0x03;
                 if multicart {
-                    let b0 = if self.banking_mode != 0 { (hi << 4) % total } else { 0 };
+                    let b0 = if self.banking_mode != 0 {
+                        (hi << 4) % total
+                    } else {
+                        0
+                    };
                     let b1 = ((hi << 4) | (lo_nz & 0x0F)) % total;
                     (b0, b1)
                 } else {
-                    let b0 = if self.banking_mode != 0 { (hi << 5) % total } else { 0 };
+                    let b0 = if self.banking_mode != 0 {
+                        (hi << 5) % total
+                    } else {
+                        0
+                    };
                     let b1 = ((hi << 5) | lo_nz) % total;
                     (b0, b1)
                 }
             }
             MbcType::Mbc2 => (0, ((self.rom_bank as usize & 0x0F).max(1)) % total),
             MbcType::Mbc3 { .. } => {
-                let mask = if self.rom.len() > 0x20_0000 { 0xFF } else { 0x7F };
+                let mask = if self.rom.len() > 0x20_0000 {
+                    0xFF
+                } else {
+                    0x7F
+                };
                 let b1 = ((self.rom_bank as usize & mask).max(1)) % total;
                 (0, b1)
             }

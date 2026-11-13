@@ -83,12 +83,12 @@ pub fn agb_srgb_lut() -> &'static [[u8; 4]; 32_768] {
             let lg = g.powf(2.4);
             let lb = b.powf(2.4);
 
-            let out_r = (255.0 * (lr * 0.845 + lg * 0.125 + lb * 0.030).powf(1.0 / 2.2))
-                .clamp(0.0, 255.0);
-            let out_g = (255.0 * (lr * 0.055 + lg * 0.675 + lb * 0.270).powf(1.0 / 2.2))
-                .clamp(0.0, 255.0);
-            let out_b = (255.0 * (lr * 0.000 + lg * 0.195 + lb * 0.805).powf(1.0 / 2.2))
-                .clamp(0.0, 255.0);
+            let out_r =
+                (255.0 * (lr * 0.845 + lg * 0.125 + lb * 0.030).powf(1.0 / 2.2)).clamp(0.0, 255.0);
+            let out_g =
+                (255.0 * (lr * 0.055 + lg * 0.675 + lb * 0.270).powf(1.0 / 2.2)).clamp(0.0, 255.0);
+            let out_b =
+                (255.0 * (lr * 0.000 + lg * 0.195 + lb * 0.805).powf(1.0 / 2.2)).clamp(0.0, 255.0);
 
             [out_r as u8, out_g as u8, out_b as u8, 255]
         })

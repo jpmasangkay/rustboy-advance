@@ -137,8 +137,7 @@ pub const RETRO_ENVIRONMENT_SET_MEMORY_MAPS: c_uint = 36 | RETRO_ENVIRONMENT_EXP
 pub const RETRO_ENVIRONMENT_SET_GEOMETRY: c_uint = 37;
 pub const RETRO_ENVIRONMENT_GET_USERNAME: c_uint = 38;
 pub const RETRO_ENVIRONMENT_GET_LANGUAGE: c_uint = 39;
-pub const RETRO_ENVIRONMENT_SET_SUPPORT_ACHIEVEMENTS: c_uint =
-    42 | RETRO_ENVIRONMENT_EXPERIMENTAL;
+pub const RETRO_ENVIRONMENT_SET_SUPPORT_ACHIEVEMENTS: c_uint = 42 | RETRO_ENVIRONMENT_EXPERIMENTAL;
 pub const RETRO_ENVIRONMENT_GET_INPUT_BITMASKS: c_uint = 51;
 
 // -----------------------------------------------------------------------------
@@ -154,9 +153,8 @@ pub type retro_input_poll_t = Option<unsafe extern "C" fn()>;
 pub type retro_input_state_t =
     Option<unsafe extern "C" fn(port: c_uint, device: c_uint, index: c_uint, id: c_uint) -> i16>;
 
-pub type retro_set_rumble_state_t = Option<
-    unsafe extern "C" fn(port: c_uint, effect: retro_rumble_effect, strength: u16) -> bool,
->;
+pub type retro_set_rumble_state_t =
+    Option<unsafe extern "C" fn(port: c_uint, effect: retro_rumble_effect, strength: u16) -> bool>;
 pub type retro_log_printf_t =
     Option<unsafe extern "C" fn(level: retro_log_level, fmt: *const c_char, ...)>;
 

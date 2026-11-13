@@ -58,6 +58,7 @@ pub(crate) static ARM_LUT: [ArmFn; 4096] = build_arm_lut();
 pub(crate) static THUMB_LUT: [ThumbFn; 1024] = build_thumb_lut();
 
 #[derive(Clone, Serialize, Deserialize)]
+#[repr(C)]
 pub struct Arm7tdmi {
     pub gpr: [u32; 16],
     pub cpsr: u32,
@@ -70,7 +71,7 @@ pub struct Arm7tdmi {
     pub halted: bool,
     #[serde(default)]
     pub stopped: bool,
-    pub intr_wait: Option<u16>,
+    pub intr_wait: Option<(u16, u32, u32)>,
     #[serde(default)]
     pub pipeline_flushed: bool,
     #[serde(default)]
@@ -81,7 +82,11 @@ impl Arm7tdmi {
     pub fn new(bus: &mut SysBus) -> Self {
         let mut cpu = Self {
             gpr: [0; 16],
-            cpsr: if bus.bios_present { 0x0000_00D3 } else { 0x0000_001F },
+            cpsr: if bus.bios_present {
+                0x0000_00D3
+            } else {
+                0x0000_001F
+            },
             banked_r8_12_usr: [0; 5],
             banked_r8_12_fiq: [0; 5],
             banked_r13: [0x0300_7F00, 0, 0x0300_7FA0, 0x0300_7FE0, 0, 0],
@@ -183,9 +188,8 @@ impl Arm7tdmi {
 
     #[inline]
     pub fn set_nz(&mut self, res: u32) {
-        self.cpsr = (self.cpsr & !(CPSR_N | CPSR_Z))
-            | (res & CPSR_N)
-            | if res == 0 { CPSR_Z } else { 0 };
+        self.cpsr =
+            (self.cpsr & !(CPSR_N | CPSR_Z)) | (res & CPSR_N) | if res == 0 { CPSR_Z } else { 0 };
     }
 
     #[inline]
@@ -236,6 +240,7 @@ impl Arm7tdmi {
 
     pub fn flush_pipeline(&mut self, bus: &mut SysBus, target_addr: u32) {
         self.pipeline_flushed = true;
+        bus.force_next_fetch_nseq = false;
         bus.invalidate_code_page();
         if self.is_thumb() {
             let pc = target_addr & !1;
@@ -315,6 +320,7 @@ impl Arm7tdmi {
             self.pipeline[1] = next_w;
             c
         };
+        bus.instr_fetch_cycles = fetch_cyc;
 
         let exec_cyc = if was_thumb {
             let lut_idx = ((instr >> 6) & 0x3FF) as usize;
@@ -323,11 +329,13 @@ impl Arm7tdmi {
             let cond = (instr >> 28) & 0xF;
             if cond != 0xE && !self.check_cond(cond) {
                 self.gpr[15] = self.gpr[15].wrapping_add(4);
+                bus.instr_fetch_cycles = 0;
                 return fetch_cyc;
             }
             let lut_idx = (((instr >> 16) & 0xFF0) | ((instr >> 4) & 0x00F)) as usize;
             ARM_LUT[lut_idx](self, bus, instr)
         };
+        bus.instr_fetch_cycles = 0;
 
         if !self.pipeline_flushed {
             self.gpr[15] = self.gpr[15].wrapping_add(if was_thumb { 2 } else { 4 });
@@ -393,7 +401,13 @@ impl Arm7tdmi {
     }
 
     #[inline]
-    fn barrel_shift(&self, val: u32, shift_type: u32, amount: u32, is_reg_shift: bool) -> (u32, bool) {
+    fn barrel_shift(
+        &self,
+        val: u32,
+        shift_type: u32,
+        amount: u32,
+        is_reg_shift: bool,
+    ) -> (u32, bool) {
         let c_in = self.carry_flag();
         if is_reg_shift && amount == 0 {
             return (val, c_in);
@@ -413,7 +427,11 @@ impl Arm7tdmi {
             }
             1 => {
                 // LSR
-                let amt = if !is_reg_shift && amount == 0 { 32 } else { amount };
+                let amt = if !is_reg_shift && amount == 0 {
+                    32
+                } else {
+                    amount
+                };
                 if amt < 32 {
                     (val >> amt, ((val >> (amt - 1)) & 1) != 0)
                 } else if amt == 32 {
@@ -424,7 +442,11 @@ impl Arm7tdmi {
             }
             2 => {
                 // ASR
-                let amt = if !is_reg_shift && amount == 0 { 32 } else { amount };
+                let amt = if !is_reg_shift && amount == 0 {
+                    32
+                } else {
+                    amount
+                };
                 if amt < 32 {
                     (((val as i32) >> amt) as u32, ((val >> (amt - 1)) & 1) != 0)
                 } else {
@@ -487,7 +509,13 @@ impl Arm7tdmi {
     }
 
     #[inline]
-    fn bus_read_32_rot(&self, bus: &mut SysBus, addr: u32, access: AccessType, is_thumb: bool) -> (u32, u64) {
+    fn bus_read_32_rot(
+        &self,
+        bus: &mut SysBus,
+        addr: u32,
+        access: AccessType,
+        is_thumb: bool,
+    ) -> (u32, u64) {
         let raw = bus.read_32(addr, access, self.gpr[15]);
         let cyc = bus.last_cycles;
         let rot = (addr & 3) * 8;
@@ -1169,11 +1197,7 @@ fn arm_single_transfer<const CFG: u8>(cpu: &mut Arm7tdmi, bus: &mut SysBus, inst
     cyc
 }
 
-fn arm_halfword_transfer<const CFG: u8>(
-    cpu: &mut Arm7tdmi,
-    bus: &mut SysBus,
-    instr: u32,
-) -> u64 {
+fn arm_halfword_transfer<const CFG: u8>(cpu: &mut Arm7tdmi, bus: &mut SysBus, instr: u32) -> u64 {
     let pre = (CFG & 64) != 0;
     let add = (CFG & 32) != 0;
     let imm = (CFG & 16) != 0;
@@ -1202,8 +1226,8 @@ fn arm_halfword_transfer<const CFG: u8>(
         let val: u32 = match sh {
             1 => {
                 // LDRH: unaligned rotates right by 8
-                let raw = bus.read_16(access_addr, AccessType::NonSequential, cpu.gpr[15], false)
-                    as u32;
+                let raw =
+                    bus.read_16(access_addr, AccessType::NonSequential, cpu.gpr[15], false) as u32;
                 cyc += bus.last_cycles;
                 if (access_addr & 1) != 0 {
                     raw.rotate_right(8)
@@ -1213,8 +1237,8 @@ fn arm_halfword_transfer<const CFG: u8>(
             }
             2 => {
                 // LDRSB
-                let v = bus.read_8(access_addr, AccessType::NonSequential, cpu.gpr[15], false)
-                    as i8 as i32 as u32;
+                let v = bus.read_8(access_addr, AccessType::NonSequential, cpu.gpr[15], false) as i8
+                    as i32 as u32;
                 cyc += bus.last_cycles;
                 v
             }
@@ -1226,9 +1250,8 @@ fn arm_halfword_transfer<const CFG: u8>(
                     cyc += bus.last_cycles;
                     v
                 } else {
-                    let v =
-                        bus.read_16(access_addr, AccessType::NonSequential, cpu.gpr[15], false)
-                            as i16 as i32 as u32;
+                    let v = bus.read_16(access_addr, AccessType::NonSequential, cpu.gpr[15], false)
+                        as i16 as i32 as u32;
                     cyc += bus.last_cycles;
                     v
                 }
@@ -1328,7 +1351,14 @@ fn arm_block_transfer<const CFG: u8>(cpu: &mut Arm7tdmi, bus: &mut SysBus, instr
     if load {
         let start_addr = addr & !3;
         let end_addr = start_addr.wrapping_add(total_bytes);
-        if !s_bit && !user_bank && !pc_in_list && !bus.watchpoint_active && !bus.bench_active && start_addr < 0x1000_0000 && (start_addr >> 14) == (end_addr.wrapping_sub(1) >> 14) {
+        if !s_bit
+            && !user_bank
+            && !pc_in_list
+            && !bus.watchpoint_active
+            && !bus.bench_active
+            && start_addr < 0x1000_0000
+            && (start_addr >> 14) == (end_addr.wrapping_sub(1) >> 14)
+        {
             let page = (start_addr >> 14) as usize;
             if let Some(ptr) = bus.fastmem_read[page] {
                 let region = (start_addr >> 24) & 0x0F;
@@ -1396,7 +1426,11 @@ fn arm_block_transfer<const CFG: u8>(cpu: &mut Arm7tdmi, bus: &mut SysBus, instr
     } else {
         let start_addr = addr & !3;
         let end_addr = start_addr.wrapping_add(total_bytes);
-        if !bus.watchpoint_active && !bus.bench_active && start_addr < 0x1000_0000 && (start_addr >> 14) == (end_addr.wrapping_sub(1) >> 14) {
+        if !bus.watchpoint_active
+            && !bus.bench_active
+            && start_addr < 0x1000_0000
+            && (start_addr >> 14) == (end_addr.wrapping_sub(1) >> 14)
+        {
             let page = (start_addr >> 14) as usize;
             if let Some(ptr) = bus.fastmem_write[page] {
                 let region = (start_addr >> 24) & 0x0F;
@@ -1507,7 +1541,11 @@ fn thumb_add_sub<const CFG: u8>(cpu: &mut Arm7tdmi, _bus: &mut SysBus, instr: u1
     let rd = (instr & 0x7) as usize;
 
     let op1 = cpu.gpr[rs];
-    let op2 = if imm { rn_imm } else { cpu.gpr[rn_imm as usize] };
+    let op2 = if imm {
+        rn_imm
+    } else {
+        cpu.gpr[rn_imm as usize]
+    };
 
     let (res, c, v) = if sub {
         Arm7tdmi::alu_add(op1, !op2, 1)
@@ -1711,7 +1749,8 @@ fn thumb_ldr_str_reg<const CFG: u8>(cpu: &mut Arm7tdmi, bus: &mut SysBus, instr:
         let val = if byte {
             bus.read_8(addr, AccessType::NonSequential, cpu.gpr[15], true) as u32
         } else {
-            cpu.bus_read_32_rot(bus, addr, AccessType::NonSequential, true).0
+            cpu.bus_read_32_rot(bus, addr, AccessType::NonSequential, true)
+                .0
         };
         let rc = bus.last_cycles;
         cpu.gpr[rd] = val;
@@ -1724,11 +1763,7 @@ fn thumb_ldr_str_reg<const CFG: u8>(cpu: &mut Arm7tdmi, bus: &mut SysBus, instr:
     }
 }
 
-fn thumb_ldr_str_half_sign<const OP: u8>(
-    cpu: &mut Arm7tdmi,
-    bus: &mut SysBus,
-    instr: u16,
-) -> u64 {
+fn thumb_ldr_str_half_sign<const OP: u8>(cpu: &mut Arm7tdmi, bus: &mut SysBus, instr: u16) -> u64 {
     let ro = ((instr >> 6) & 0x7) as usize;
     let rb = ((instr >> 3) & 0x7) as usize;
     let rd = (instr & 0x7) as usize;
@@ -1777,7 +1812,8 @@ fn thumb_ldr_str_imm<const CFG: u8>(cpu: &mut Arm7tdmi, bus: &mut SysBus, instr:
         let val = if byte {
             bus.read_8(addr, AccessType::NonSequential, cpu.gpr[15], true) as u32
         } else {
-            cpu.bus_read_32_rot(bus, addr, AccessType::NonSequential, true).0
+            cpu.bus_read_32_rot(bus, addr, AccessType::NonSequential, true)
+                .0
         };
         let rc = bus.last_cycles;
         cpu.gpr[rd] = val;
@@ -1876,7 +1912,12 @@ fn thumb_push_pop<const CFG: u8>(cpu: &mut Arm7tdmi, bus: &mut SysBus, instr: u1
         let total_bytes = count * 4;
         let start_addr = sp & !3;
         let end_addr = start_addr.wrapping_add(total_bytes);
-        if !p_r && !bus.watchpoint_active && !bus.bench_active && start_addr < 0x1000_0000 && (start_addr >> 14) == (end_addr.wrapping_sub(1) >> 14) {
+        if !p_r
+            && !bus.watchpoint_active
+            && !bus.bench_active
+            && start_addr < 0x1000_0000
+            && (start_addr >> 14) == (end_addr.wrapping_sub(1) >> 14)
+        {
             let page = (start_addr >> 14) as usize;
             if let Some(ptr) = bus.fastmem_read[page] {
                 let region = (start_addr >> 24) & 0x0F;
@@ -1887,7 +1928,8 @@ fn thumb_push_pop<const CFG: u8>(cpu: &mut Arm7tdmi, bus: &mut SysBus, instr: u1
                     for r in 0..8usize {
                         if (rlist & (1 << r)) != 0 {
                             let off = (sp & 0x3FFF) as usize;
-                            let v = unsafe { (ptr.as_ptr().add(off) as *const u32).read_unaligned() };
+                            let v =
+                                unsafe { (ptr.as_ptr().add(off) as *const u32).read_unaligned() };
                             cpu.gpr[r] = v;
                             sp = sp.wrapping_add(4);
                         }
@@ -1937,7 +1979,11 @@ fn thumb_push_pop<const CFG: u8>(cpu: &mut Arm7tdmi, bus: &mut SysBus, instr: u1
 
         let start_addr = sp & !3;
         let end_addr = start_addr.wrapping_add(total_bytes);
-        if !bus.watchpoint_active && !bus.bench_active && start_addr < 0x1000_0000 && (start_addr >> 14) == (end_addr.wrapping_sub(1) >> 14) {
+        if !bus.watchpoint_active
+            && !bus.bench_active
+            && start_addr < 0x1000_0000
+            && (start_addr >> 14) == (end_addr.wrapping_sub(1) >> 14)
+        {
             let page = (start_addr >> 14) as usize;
             if let Some(ptr) = bus.fastmem_write[page] {
                 let region = (start_addr >> 24) & 0x0F;
@@ -2028,7 +2074,11 @@ fn thumb_ldm_stm<const LOAD: bool>(cpu: &mut Arm7tdmi, bus: &mut SysBus, instr: 
         let total_bytes = count * 4;
         let start_addr = base & !3;
         let end_addr = start_addr.wrapping_add(total_bytes);
-        if !bus.watchpoint_active && !bus.bench_active && start_addr < 0x1000_0000 && (start_addr >> 14) == (end_addr.wrapping_sub(1) >> 14) {
+        if !bus.watchpoint_active
+            && !bus.bench_active
+            && start_addr < 0x1000_0000
+            && (start_addr >> 14) == (end_addr.wrapping_sub(1) >> 14)
+        {
             let page = (start_addr >> 14) as usize;
             if let Some(ptr) = bus.fastmem_read[page] {
                 let region = (start_addr >> 24) & 0x0F;
@@ -2079,7 +2129,11 @@ fn thumb_ldm_stm<const LOAD: bool>(cpu: &mut Arm7tdmi, bus: &mut SysBus, instr: 
         let total_bytes = count * 4;
         let start_addr = base & !3;
         let end_addr = start_addr.wrapping_add(total_bytes);
-        if !bus.watchpoint_active && !bus.bench_active && start_addr < 0x1000_0000 && (start_addr >> 14) == (end_addr.wrapping_sub(1) >> 14) {
+        if !bus.watchpoint_active
+            && !bus.bench_active
+            && start_addr < 0x1000_0000
+            && (start_addr >> 14) == (end_addr.wrapping_sub(1) >> 14)
+        {
             let page = (start_addr >> 14) as usize;
             if let Some(ptr) = bus.fastmem_write[page] {
                 let region = (start_addr >> 24) & 0x0F;

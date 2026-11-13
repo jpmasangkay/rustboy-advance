@@ -16,9 +16,9 @@ pub mod cartridge;
 pub mod cpu;
 pub mod gamedb;
 pub mod hw;
+pub mod jit;
 pub mod ppu;
 pub mod serde_helpers;
-pub mod jit;
 
 use alloc::{string::String, vec::Vec};
 use serde::{Deserialize, Serialize};
@@ -171,6 +171,27 @@ impl Scheduler {
         self.events[idx] = ScheduledEvent::empty();
         self.recompute_next();
         Some((best_cycle, kind))
+    }
+
+    #[inline]
+    pub fn pop_due_timer_until(&mut self, limit_cycle: u64) -> Option<(u64, u8)> {
+        if limit_cycle < self.next_event_cycle {
+            return None;
+        }
+        let mut best_idx = None;
+        let mut best_cycle = u64::MAX;
+        for idx in 3..7 {
+            let ev = &self.events[idx];
+            if ev.active && ev.cycle <= limit_cycle && ev.cycle < best_cycle {
+                best_cycle = ev.cycle;
+                best_idx = Some(idx);
+            }
+        }
+        let idx = best_idx?;
+        let ch = (idx - 3) as u8;
+        self.events[idx] = ScheduledEvent::empty();
+        self.recompute_next();
+        Some((best_cycle, ch))
     }
 
     fn recompute_next(&mut self) {
@@ -349,7 +370,7 @@ impl GbaCore {
         *self = Self::new(bios, rom);
         self.idle_skip_enabled = idle_skip_enabled;
         self.bus.cart.save_type = save_type;
-        self.bus.cart.set_save_type_override(save_type_override);
+        self.bus.set_save_type_override(save_type_override);
         self.bus.cart.set_flash_id_override(flash_id_override);
         self.bus.cart.idle_loop_addr = idle_loop_addr;
         self.bus.cart.rtc_override = rtc_override;
@@ -426,29 +447,30 @@ impl GbaCore {
     #[inline]
     pub fn step_jit(&mut self) -> u64 {
         let pc = self.cpu.current_exec_pc();
+        self.bus.debug_pc = pc;
         let is_thumb = self.cpu.is_thumb();
         let key = jit::BlockKey { pc, is_thumb };
 
-        if let Some(block) = self.jit.get_block(&key) {
-            let block_cyc = block.cycle_count;
+        let block = self
+            .jit
+            .get_block(&key)
+            .map(|b| (b.func_ptr, b.cycle_count))
+            .or_else(|| {
+                self.jit
+                    .compile_block(&mut self.cpu, &mut self.bus, key)
+                    .map(|b| (b.func_ptr, b.cycle_count))
+            });
+
+        if let Some((func_ptr, block_cyc)) = block {
             if self.bus.scheduler.current_cycle + block_cyc >= self.bus.scheduler.next_event_cycle
                 || self.bus.hw.active_dma.is_some()
-                || (self.bus.hw.ime != 0 && (self.bus.hw.ie & self.bus.hw.if_flag) != 0 && !self.cpu.is_irq_disabled())
+                || (self.bus.hw.ime != 0
+                    && (self.bus.hw.ie & self.bus.hw.if_flag) != 0
+                    && !self.cpu.is_irq_disabled())
             {
                 return self.cpu.step(&mut self.bus);
             }
-            let cycles = unsafe { (block.func_ptr)(&mut self.cpu as *mut _, &mut self.bus as *mut _) };
-            cycles
-        } else if let Some(block) = self.jit.compile_block(&mut self.cpu, &mut self.bus, key) {
-            let block_cyc = block.cycle_count;
-            if self.bus.scheduler.current_cycle + block_cyc >= self.bus.scheduler.next_event_cycle
-                || self.bus.hw.active_dma.is_some()
-                || (self.bus.hw.ime != 0 && (self.bus.hw.ie & self.bus.hw.if_flag) != 0 && !self.cpu.is_irq_disabled())
-            {
-                return self.cpu.step(&mut self.bus);
-            }
-            let cycles = unsafe { (block.func_ptr)(&mut self.cpu as *mut _, &mut self.bus as *mut _) };
-            cycles
+            unsafe { (func_ptr)(&mut self.cpu as *mut _, &mut self.bus as *mut _) }
         } else {
             self.cpu.step(&mut self.bus)
         }
@@ -538,8 +560,8 @@ impl GbaCore {
         }
 
         if self.bus.hw.active_dma.is_some() {
+            self.bus.debug_pc = self.cpu.current_exec_pc();
             if self.bus.watchpoint_active {
-                self.bus.debug_pc = self.cpu.current_exec_pc();
                 self.bus.watchpoint_hit = None;
             }
             let cycles = self.bus.step_active_dma();
@@ -639,11 +661,15 @@ impl GbaCore {
             return InternalStep::Continue;
         }
 
+        self.bus.debug_pc = exec_pc;
         if self.bus.watchpoint_active {
-            self.bus.debug_pc = exec_pc;
             self.bus.watchpoint_hit = None;
         }
-        let cycles = if self.jit.enabled && self.jit.available && breakpoints.is_empty() && !self.bus.watchpoint_active {
+        let cycles = if self.jit.enabled
+            && self.jit.available
+            && breakpoints.is_empty()
+            && !self.bus.watchpoint_active
+        {
             self.step_jit()
         } else {
             self.cpu.step(&mut self.bus)
@@ -875,8 +901,9 @@ impl GbaCore {
         self.bus.write_bench_cycles = 0;
         self.bus.dma_bench_cycles = 0;
 
+        let mut total_instructions = 0u64;
         let mut branch_flushes = 0u64;
-        let mut total_step_cycles = 0u64;
+        let mut present_bench_time = core::time::Duration::ZERO;
 
         let frame_start = std::time::Instant::now();
         let end_cycle = self.bus.scheduler.current_cycle + CYCLES_PER_FRAME;
@@ -902,7 +929,9 @@ impl GbaCore {
                 if (self.bus.hw.ie & self.bus.hw.if_flag & hw::IRQ_STOP_WAKE_MASK) != 0 {
                     self.cpu.stopped = false;
                 } else {
-                    let delta = end_cycle.saturating_sub(self.bus.scheduler.current_cycle).max(1);
+                    let delta = end_cycle
+                        .saturating_sub(self.bus.scheduler.current_cycle)
+                        .max(1);
                     self.bus.apu.flush(self.bus.scheduler.current_cycle);
                     self.bus.scheduler.shift_by(delta);
                     self.bus.hw.shift_timers_by(delta);
@@ -914,6 +943,7 @@ impl GbaCore {
             }
 
             if self.bus.hw.active_dma.is_some() {
+                self.pending_idle_check_pc = None;
                 let cycles = self.bus.step_active_dma();
                 self.bus.scheduler.current_cycle += cycles.max(1);
                 continue;
@@ -954,7 +984,7 @@ impl GbaCore {
             while cur_cycle < target_cycle {
                 let prev_flush = self.cpu.flush_cycles;
                 let cycles = self.cpu.step(&mut self.bus);
-                total_step_cycles += cycles;
+                total_instructions += 1;
                 branch_flushes += self.cpu.flush_cycles.saturating_sub(prev_flush);
                 cur_cycle += cycles.max(1);
 
@@ -971,12 +1001,15 @@ impl GbaCore {
             self.bus.scheduler.current_cycle = cur_cycle;
 
             if self.bus.ppu.frame_ready {
+                let p0 = std::time::Instant::now();
                 frontend.present_frame(&self.bus.ppu.framebuffer);
+                present_bench_time += p0.elapsed();
                 self.bus.ppu.frame_ready = false;
             }
         }
 
-        let total_time = frame_start.elapsed();
+        let raw_elapsed = frame_start.elapsed();
+        let total_time = raw_elapsed.saturating_sub(present_bench_time);
         self.bus.bench_active = false;
 
         let ppu_time = self.bus.ppu_bench_time;
@@ -984,13 +1017,14 @@ impl GbaCore {
         let dma_time = self.bus.dma_bench_time;
 
         let other_time = total_time.saturating_sub(ppu_time + apu_time + dma_time);
-        let bus_cycles = self.bus.fetch_bench_cycles + self.bus.read_bench_cycles + self.bus.write_bench_cycles;
-        let cpu_cycles = total_step_cycles.saturating_sub(bus_cycles);
-        let cpu_bus_total_cycles = (bus_cycles + cpu_cycles).max(1);
-
-        let bus_fraction = bus_cycles as f64 / cpu_bus_total_cycles as f64;
-        let bus_time = other_time.mul_f64(bus_fraction);
-        let cpu_time = other_time.saturating_sub(bus_time);
+        let cpu_weight = (total_instructions as f64 * 1.0) + (branch_flushes as f64 * 0.5);
+        let bus_weight = (self.bus.fetch_bench_cycles as f64 * 0.20)
+            + (self.bus.read_bench_cycles as f64 * 0.35)
+            + (self.bus.write_bench_cycles as f64 * 0.35);
+        let total_weight = (cpu_weight + bus_weight).max(1.0);
+        let cpu_fraction = (cpu_weight / total_weight).clamp(0.05, 0.95);
+        let cpu_time = other_time.mul_f64(cpu_fraction);
+        let bus_time = other_time.saturating_sub(cpu_time);
 
         let timing = SubsystemTiming {
             total_time,
@@ -1003,7 +1037,7 @@ impl GbaCore {
 
         let profile = FunctionProfile {
             fetch_cycles: self.bus.fetch_bench_cycles,
-            decode_exec_cycles: cpu_cycles,
+            decode_exec_cycles: total_instructions,
             mem_read_cycles: self.bus.read_bench_cycles,
             mem_write_cycles: self.bus.write_bench_cycles,
             branch_flush_cycles: branch_flushes,
@@ -1030,6 +1064,11 @@ impl GbaCore {
         }
         let allow_idle_skip =
             self.idle_skip_enabled && ctrl.breakpoints.is_empty() && !has_watchpoints;
+
+        if ctrl.breakpoints.is_empty() && !has_watchpoints {
+            self.run_frame_fast(frontend, allow_idle_skip);
+            return StopReason::FrameComplete;
+        }
 
         let end_cycle = self.bus.scheduler.current_cycle + CYCLES_PER_FRAME;
         while self.bus.scheduler.current_cycle < end_cycle {
@@ -1091,6 +1130,171 @@ impl GbaCore {
         StopReason::FrameComplete
     }
 
+    fn run_frame_fast<F: HostFrontend + ?Sized>(
+        &mut self,
+        frontend: &mut F,
+        allow_idle_skip: bool,
+    ) {
+        let end_cycle = self.bus.scheduler.current_cycle + CYCLES_PER_FRAME;
+        while self.bus.scheduler.current_cycle < end_cycle {
+            if self.jit.available
+                && let Some(page) = self.bus.code_page_invalidated.take()
+            {
+                self.jit.invalidate_page(page);
+            }
+
+            while let Some((ev_cycle, kind)) = self.bus.scheduler.pop_due() {
+                self.bus.dispatch_event(ev_cycle, kind);
+            }
+            if self.bus.ppu.frame_ready {
+                frontend.present_frame(&self.bus.ppu.framebuffer);
+                self.bus.ppu.frame_ready = false;
+            }
+
+            if self.bus.hw.stop_requested {
+                self.cpu.stopped = true;
+                self.cpu.halted = false;
+                self.bus.hw.stop_requested = false;
+            }
+            if self.bus.hw.halt_requested {
+                if !self.cpu.stopped {
+                    self.cpu.halted = true;
+                }
+                self.bus.hw.halt_requested = false;
+            }
+
+            if self.cpu.stopped {
+                if (self.bus.hw.ie & self.bus.hw.if_flag & hw::IRQ_STOP_WAKE_MASK) != 0 {
+                    self.cpu.stopped = false;
+                } else {
+                    let delta = end_cycle
+                        .saturating_sub(self.bus.scheduler.current_cycle)
+                        .max(1);
+                    self.bus.apu.flush(self.bus.scheduler.current_cycle);
+                    self.bus.scheduler.shift_by(delta);
+                    self.bus.hw.shift_timers_by(delta);
+                    self.bus.apu.on_stop_shift(self.bus.scheduler.current_cycle);
+                    self.bus.ppu.framebuffer.fill(0x7FFF);
+                    frontend.present_frame(&self.bus.ppu.framebuffer);
+                    if !self.bus.apu.output_buffer.is_empty() {
+                        frontend.push_audio_samples(&self.bus.apu.output_buffer);
+                        self.bus.apu.output_buffer.clear();
+                    }
+                    let silence_samples = ((delta * u64::from(SAMPLE_RATE_HZ))
+                        / u64::from(CPU_CLOCK_HZ))
+                    .max(1) as usize
+                        * 2;
+                    let silence = alloc::vec![0i16; silence_samples];
+                    frontend.push_audio_samples(&silence);
+                    return;
+                }
+            }
+
+            if self.bus.hw.active_dma.is_some() {
+                self.pending_idle_check_pc = None;
+                let cycles = self.bus.step_active_dma();
+                self.bus.scheduler.current_cycle += cycles.max(1);
+                continue;
+            }
+
+            if self.cpu.halted {
+                if (self.bus.hw.ie & self.bus.hw.if_flag) != 0 {
+                    self.cpu.halted = false;
+                } else {
+                    let next = self.bus.scheduler.next_event_cycle.min(end_cycle);
+                    if next != u64::MAX && next > self.bus.scheduler.current_cycle {
+                        self.bus.scheduler.current_cycle = next;
+                    } else {
+                        self.bus.scheduler.current_cycle += 4;
+                    }
+                    continue;
+                }
+            }
+
+            if self.bus.hw.ime != 0
+                && (self.bus.hw.ie & self.bus.hw.if_flag) != 0
+                && !self.cpu.is_irq_disabled()
+                && self.bus.irq_sync_delay == 0
+            {
+                self.pending_idle_check_pc = None;
+                self.cpu.trigger_irq(&mut self.bus);
+                self.bus.scheduler.current_cycle += 3;
+                continue;
+            }
+
+            let use_jit = self.jit.enabled && self.jit.available;
+
+            while self.bus.scheduler.current_cycle
+                < self.bus.scheduler.next_event_cycle.min(end_cycle)
+            {
+                if self.bus.irq_sync_delay > 0 {
+                    self.bus.irq_sync_delay = self.bus.irq_sync_delay.saturating_sub(1);
+                }
+
+                let exec_pc = self.cpu.current_exec_pc();
+                if allow_idle_skip
+                    && let Some(check_pc) = self.pending_idle_check_pc.take()
+                    && check_pc == exec_pc
+                    && self.is_safe_idle_loop(exec_pc)
+                {
+                    self.bus.scheduler.current_cycle =
+                        self.bus.scheduler.next_event_cycle.min(end_cycle);
+                    break;
+                }
+                self.bus.debug_pc = exec_pc;
+
+                let cycles = if use_jit {
+                    if let Some(page) = self.bus.code_page_invalidated.take() {
+                        self.jit.invalidate_page(page);
+                    }
+                    self.step_jit()
+                } else {
+                    self.cpu.step(&mut self.bus)
+                };
+                self.bus.scheduler.current_cycle += cycles.max(1);
+
+                if allow_idle_skip
+                    && self.cpu.pipeline_flushed
+                    && !self.cpu.halted
+                    && !self.cpu.stopped
+                {
+                    let next_pc = self.cpu.current_exec_pc();
+                    if next_pc <= exec_pc {
+                        self.pending_idle_check_pc = Some(next_pc);
+                    }
+                }
+
+                if self.bus.hw.active_dma.is_some()
+                    || self.bus.hw.halt_requested
+                    || self.bus.hw.stop_requested
+                    || self.cpu.halted
+                    || self.cpu.stopped
+                    || (self.bus.hw.ime != 0
+                        && (self.bus.hw.ie & self.bus.hw.if_flag) != 0
+                        && !self.cpu.is_irq_disabled()
+                        && self.bus.irq_sync_delay == 0)
+                {
+                    break;
+                }
+            }
+        }
+
+        while let Some((ev_cycle, kind)) = self.bus.scheduler.pop_due() {
+            self.bus.dispatch_event(ev_cycle, kind);
+        }
+
+        if self.bus.ppu.frame_ready {
+            frontend.present_frame(&self.bus.ppu.framebuffer);
+            self.bus.ppu.frame_ready = false;
+        }
+
+        self.bus.apu.flush(self.bus.scheduler.current_cycle);
+        if !self.bus.apu.output_buffer.is_empty() {
+            frontend.push_audio_samples(&self.bus.apu.output_buffer);
+            self.bus.apu.output_buffer.clear();
+        }
+    }
+
     /// Runs a single GBA frame, stopping early if an instruction PC matches `breakpoints`.
     /// Returns `Some(hit_pc)` when halted at a breakpoint, or `None` after completing the frame.
     pub fn run_frame_with_breakpoints<F: HostFrontend + ?Sized>(
@@ -1132,6 +1336,26 @@ impl GbaCore {
             return Err(SaveStateError::Corrupt);
         }
         self.apply_payload(raw)
+    }
+
+    /// Executes 1 speculative Run-Ahead frame and rolls back persistent state while keeping
+    /// the live APU DSP state intact so audio remains continuous and click-free.
+    pub fn speculate_run_ahead_frame<F: HostFrontend + ?Sized>(
+        &mut self,
+        frontend: &mut F,
+    ) -> Result<(), SaveStateError> {
+        let snapshot = self.serialize_payload()?;
+        let saved_dsp = self.bus.apu.take_dsp_state();
+        let saved_scopes = self.bus.apu.chan_scopes;
+        let saved_cursor = self.bus.apu.scope_cursor;
+
+        let _ = self.run_frame_debug(frontend, &DebugControl::default());
+
+        self.apply_payload(&snapshot)?;
+        self.bus.apu.restore_dsp_state(saved_dsp);
+        self.bus.apu.chan_scopes = saved_scopes;
+        self.bus.apu.scope_cursor = saved_cursor;
+        Ok(())
     }
 
     pub fn save_state(&self) -> Result<Vec<u8>, SaveStateError> {
@@ -1189,6 +1413,9 @@ impl GbaCore {
         payload.bus.cart.rom = rom;
         core::mem::swap(&mut payload.bus.cart.sram, &mut self.bus.cart.sram);
         payload.bus.rebuild_fastmem();
+        payload.bus.rebuild_waitstate_table();
+        payload.bus.invalidate_code_page();
+        payload.bus.code_page_invalidated = None;
         payload.bus.clear_watchpoints();
         self.cpu = payload.cpu;
         self.bus = payload.bus;
@@ -1334,12 +1561,7 @@ fn is_safe_idle_poll_addr(addr: u32) -> bool {
         0x02 | 0x03 => true,
         0x04 => matches!(
             addr & 0xFFFF_FFFE,
-            0x0400_0004
-                | 0x0400_0006
-                | 0x0400_0128
-                | 0x0400_0130
-                | 0x0400_0200
-                | 0x0400_0202
+            0x0400_0004 | 0x0400_0006 | 0x0400_0128 | 0x0400_0130 | 0x0400_0200 | 0x0400_0202
         ),
         _ => false,
     }
@@ -1403,5 +1625,3 @@ pub fn state_info(bytes: &[u8]) -> Result<StateHeader, SaveStateError> {
         payload_len,
     })
 }
-
-

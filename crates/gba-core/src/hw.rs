@@ -34,6 +34,7 @@ pub struct DmaChannel {
     pub int_count: u32,
     pub active: bool,
     pub first_unit: bool,
+    pub latch: u32,
 }
 
 impl DmaChannel {
@@ -48,6 +49,7 @@ impl DmaChannel {
             int_count: 0,
             active: false,
             first_unit: true,
+            latch: 0,
         }
     }
 
@@ -312,9 +314,7 @@ impl SysBus {
         let mut changed = false;
         for ch in 0..4 {
             let dma = &mut self.hw.dma[ch];
-            if dma.enabled() && dma.timing() == timing
-                && !dma.active
-            {
+            if dma.enabled() && dma.timing() == timing && !dma.active {
                 dma.int_count = if dma.count == 0 {
                     if ch == 3 { 0x10000 } else { 0x4000 }
                 } else if ch < 3 {
@@ -351,7 +351,11 @@ impl SysBus {
 
     pub fn step_active_dma(&mut self) -> u64 {
         #[cfg(feature = "std")]
-        let t0 = if self.bench_active { Some(std::time::Instant::now()) } else { None };
+        let t0 = if self.bench_active {
+            Some(std::time::Instant::now())
+        } else {
+            None
+        };
 
         let Some(ch_u8) = self.hw.active_dma else {
             return 1;
@@ -374,15 +378,10 @@ impl SysBus {
         };
 
         let unit_bytes: i32 = if is_32bit { 4 } else { 2 };
-        let src_step: i32 = if (0x08..=0x0D).contains(&((sad >> 24) & 0x0F)) {
-            // GamePak ROM source ALWAYS increments regardless of src_ctrl
-            unit_bytes
-        } else {
-            match src_ctrl {
-                0 | 3 => unit_bytes,
-                1 => -unit_bytes,
-                _ => 0,
-            }
+        let src_step: i32 = match src_ctrl {
+            0 | 3 => unit_bytes,
+            1 => -unit_bytes,
+            _ => 0,
         };
         let dst_step: i32 = if is_sound_fifo {
             0
@@ -398,11 +397,10 @@ impl SysBus {
         self.prefetch.active = false;
         self.prefetch.count = 0;
 
-        let mut cycles = if access_kind == AccessType::NonSequential {
-            2u64
-        } else {
-            0u64
-        };
+        if access_kind == AccessType::NonSequential {
+            self.scheduler.current_cycle += 2;
+        }
+        let mut cycles = 0u64;
 
         if self.hw.dma[ch].int_count > 0 {
             if is_32bit {
@@ -410,11 +408,13 @@ impl SysBus {
                 let d_addr = dad & !3;
                 // DMA reading below 0x0200_0000 returns open bus (DMA latch) rather than touching BIOS/unmapped
                 let (val, rc) = if (s_addr >> 24) >= 0x02 {
-                    self.read_32_dma(s_addr, access_kind)
+                    let (v, c) = self.read_32_dma(s_addr, access_kind);
+                    self.hw.dma[ch].latch = v;
+                    self.dma_latch = v;
+                    (v, c)
                 } else {
-                    (self.dma_latch, 1)
+                    (self.hw.dma[ch].latch, 1)
                 };
-                self.dma_latch = val;
                 self.last_access_was_dma = true;
                 let wc = self.write_32(d_addr, val, access_kind);
                 cycles += rc + wc;
@@ -422,15 +422,22 @@ impl SysBus {
                 let s_addr = sad & !1;
                 let d_addr = dad & !1;
                 let (val, rc) = if (s_addr >> 24) >= 0x02 {
-                    if self.cart.is_eeprom_addr(s_addr) {
-                        (self.cart.eeprom.read_bit(), self.rom_fetch_cycles(s_addr, access_kind))
+                    let (v, c) = if self.cart.is_eeprom_addr(s_addr) {
+                        (
+                            self.cart.eeprom.read_bit(),
+                            self.rom_fetch_cycles(s_addr, access_kind),
+                        )
                     } else {
                         self.read_16_dma(s_addr, access_kind)
-                    }
+                    };
+                    let full = (v as u32) | ((v as u32) << 16);
+                    self.hw.dma[ch].latch = full;
+                    self.dma_latch = full;
+                    (v, c)
                 } else {
-                    ((self.dma_latch >> ((s_addr & 2) * 8)) as u16, 1)
+                    let v = (self.hw.dma[ch].latch >> ((d_addr & 2) * 8)) as u16;
+                    (v, 1)
                 };
-                self.dma_latch = (val as u32) | ((val as u32) << 16);
                 self.last_access_was_dma = true;
                 let wc = if self.cart.is_eeprom_addr(d_addr) {
                     let total_len = if self.hw.dma[ch].count == 0 {
@@ -450,6 +457,7 @@ impl SysBus {
                         } else {
                             crate::cartridge::SaveType::Eeprom512B
                         };
+                        self.rebuild_fastmem();
                     }
                     self.rom_fetch_cycles(d_addr, access_kind)
                 } else {
@@ -465,6 +473,8 @@ impl SysBus {
 
         if self.hw.dma[ch].int_count == 0 {
             self.hw.dma[ch].active = false;
+            self.force_next_fetch_nseq = true;
+            self.invalidate_code_page();
             if self.hw.dma[ch].irq_enabled() {
                 self.hw.request_irq(IRQ_DMA0 << ch);
             }
@@ -496,21 +506,29 @@ impl SysBus {
             t.start_cycle = current_cycle;
             let rem_ticks = (0x1_0000u64 - (t.counter as u64)).max(1);
             let target = current_cycle + rem_ticks * t.prescaler();
-            self.scheduler.schedule(target, EventType::TimerOverflow(ch as u8));
+            self.scheduler
+                .schedule(target, EventType::TimerOverflow(ch as u8));
         }
     }
 
-    pub fn handle_timer_overflow(&mut self, ch: usize, ev_cycle: u64) {
-        // Reload and schedule next overflow if still enabled non-cascade
-        if self.hw.timers[ch].enabled() && !(ch > 0 && self.hw.timers[ch].cascade()) {
-            self.hw.timers[ch].counter = self.hw.timers[ch].reload;
-            self.hw.timers[ch].start_cycle = ev_cycle;
-            let period_ticks = (0x1_0000u64 - (self.hw.timers[ch].reload as u64)).max(1);
-            let next_target = ev_cycle + period_ticks * self.hw.timers[ch].prescaler();
-            self.scheduler
-                .schedule(next_target, EventType::TimerOverflow(ch as u8));
-        }
+    #[inline]
+    fn timer_read_cycle(&self) -> u64 {
+        self.scheduler.current_cycle + self.instr_fetch_cycles.saturating_sub(1)
+    }
 
+    #[inline]
+    fn timer_write_cycle(&self) -> u64 {
+        self.scheduler.current_cycle + self.instr_fetch_cycles
+    }
+
+    #[inline]
+    pub fn flush_timer_overflows_until(&mut self, limit_cycle: u64) {
+        while let Some((ev_cycle, ch)) = self.scheduler.pop_due_timer_until(limit_cycle) {
+            self.handle_timer_overflow(ch as usize, ev_cycle);
+        }
+    }
+
+    fn trigger_timer_overflow_effects(&mut self, ch: usize, ev_cycle: u64) {
         if self.hw.timers[ch].irq_enabled() {
             self.hw.request_irq(IRQ_TIMER0 << ch);
         }
@@ -553,6 +571,20 @@ impl SysBus {
             }
             break;
         }
+    }
+
+    pub fn handle_timer_overflow(&mut self, ch: usize, ev_cycle: u64) {
+        // Reload and schedule next overflow if still enabled non-cascade
+        if self.hw.timers[ch].enabled() && !(ch > 0 && self.hw.timers[ch].cascade()) {
+            self.hw.timers[ch].counter = self.hw.timers[ch].reload;
+            self.hw.timers[ch].start_cycle = ev_cycle;
+            let period_ticks = (0x1_0000u64 - (self.hw.timers[ch].reload as u64)).max(1);
+            let next_target = ev_cycle + period_ticks * self.hw.timers[ch].prescaler();
+            self.scheduler
+                .schedule(next_target, EventType::TimerOverflow(ch as u8));
+        }
+
+        self.trigger_timer_overflow_effects(ch, ev_cycle);
     }
 
     pub fn read_io_16(&mut self, addr: u32, pc: u32, is_thumb: bool) -> u16 {
@@ -616,13 +648,29 @@ impl SysBus {
             0x0400_00DE => self.hw.dma[3].cnt & 0xFFE0,
 
             // Timers
-            0x0400_0100 => self.hw.current_timer_counter(0, self.scheduler.current_cycle),
+            0x0400_0100 => {
+                let read_cycle = self.timer_read_cycle();
+                self.flush_timer_overflows_until(read_cycle);
+                self.hw.current_timer_counter(0, read_cycle)
+            }
             0x0400_0102 => self.hw.timers[0].cnt,
-            0x0400_0104 => self.hw.current_timer_counter(1, self.scheduler.current_cycle),
+            0x0400_0104 => {
+                let read_cycle = self.timer_read_cycle();
+                self.flush_timer_overflows_until(read_cycle);
+                self.hw.current_timer_counter(1, read_cycle)
+            }
             0x0400_0106 => self.hw.timers[1].cnt,
-            0x0400_0108 => self.hw.current_timer_counter(2, self.scheduler.current_cycle),
+            0x0400_0108 => {
+                let read_cycle = self.timer_read_cycle();
+                self.flush_timer_overflows_until(read_cycle);
+                self.hw.current_timer_counter(2, read_cycle)
+            }
             0x0400_010A => self.hw.timers[2].cnt,
-            0x0400_010C => self.hw.current_timer_counter(3, self.scheduler.current_cycle),
+            0x0400_010C => {
+                let read_cycle = self.timer_read_cycle();
+                self.flush_timer_overflows_until(read_cycle);
+                self.hw.current_timer_counter(3, read_cycle)
+            }
             0x0400_010E => self.hw.timers[3].cnt,
 
             // Serial I/O
@@ -640,7 +688,11 @@ impl SysBus {
 
             // Interrupts & System
             0x0400_0200 => self.hw.ie,
-            0x0400_0202 => self.hw.if_flag,
+            0x0400_0202 => {
+                let read_cycle = self.timer_read_cycle();
+                self.flush_timer_overflows_until(read_cycle);
+                self.hw.if_flag
+            }
             0x0400_0204 => self.hw.waitcnt & 0x7FFF,
             0x0400_0208 => self.hw.ime & 1,
             0x0400_0300 => self.hw.postflg as u16,
@@ -649,8 +701,8 @@ impl SysBus {
             // e.g. DMA_CNT_L paired with CNT_H reads 0).
             0x0400_00B8 | 0x0400_00C4 | 0x0400_00D0 | 0x0400_00DC => 0,
             0x0400_0066 | 0x0400_006A | 0x0400_006E | 0x0400_0076 | 0x0400_007A | 0x0400_007E
-            | 0x0400_0086 | 0x0400_008A | 0x0400_0136 | 0x0400_0142 | 0x0400_015A
-            | 0x0400_0206 | 0x0400_020A | 0x0400_0302 => 0,
+            | 0x0400_0086 | 0x0400_008A | 0x0400_0136 | 0x0400_0142 | 0x0400_015A | 0x0400_0206
+            | 0x0400_020A | 0x0400_0302 => 0,
             _ => return self.read_open_bus_16(addr, pc, is_thumb),
         };
         self.last_access_was_dma = false;
@@ -660,21 +712,27 @@ impl SysBus {
     pub fn write_io_8(&mut self, addr: u32, val: u8) {
         let off = addr & 0x0FFF_FFFF;
         if off == 0x0400_0300 {
-            self.hw.postflg = val;
+            if self.debug_pc < 0x4000 || self.last_access_was_dma {
+                self.hw.postflg = val;
+            }
             return;
         }
         if off == 0x0400_0301 {
-            if (val & 0x80) == 0 {
-                self.hw.halt_requested = true;
-            } else {
-                self.hw.stop_requested = true;
+            if self.debug_pc < 0x4000 || self.last_access_was_dma {
+                if (val & 0x80) == 0 {
+                    self.hw.halt_requested = true;
+                } else {
+                    self.hw.stop_requested = true;
+                }
             }
             return;
         }
         if (0x0400_0090..=0x0400_009F).contains(&off) {
             let cycle = self.scheduler.current_cycle;
             self.apu.sync(cycle);
-            self.apu.wave.write_wave_ram((off - 0x0400_0090) as usize, val);
+            self.apu
+                .wave
+                .write_wave_ram((off - 0x0400_0090) as usize, val);
             self.apu.commit_mix(cycle);
             return;
         }
@@ -817,6 +875,10 @@ impl SysBus {
                 self.hw.memcnt = (self.hw.memcnt & 0x0000_FFFF) | ((val as u32) << 16);
             }
             return;
+        }
+
+        if off <= 0x0400_0054 {
+            self.sync_ppu_hdraw();
         }
 
         let is_apu = (0x0400_0060..=0x0400_009E).contains(&off);
@@ -973,7 +1035,7 @@ impl SysBus {
                             };
 
                             if self.hw.dma[ch].timing() == 0 {
-                                // Immediate DMA starts after 2 cycles startup delay
+                                // Immediate DMA starts after 2 cycles startup/bus-arbitration latency
                                 self.scheduler.schedule(
                                     self.scheduler.current_cycle + 2,
                                     EventType::DmaActivate(ch as u8),
@@ -1007,23 +1069,32 @@ impl SysBus {
                 let rel = off - 0x0400_0100;
                 let ch = (rel / 4) as usize;
                 let is_cnt = (rel & 2) != 0;
+                let write_cycle = self.timer_write_cycle();
+                self.flush_timer_overflows_until(write_cycle);
                 if !is_cnt {
                     self.hw.timers[ch].reload = val;
                 } else {
-                    let now_cycle = self.scheduler.current_cycle;
                     let was_en = self.hw.timers[ch].enabled();
-                    let cur = self.hw.current_timer_counter(ch, now_cycle);
+                    let cur = self.hw.current_timer_counter(ch, write_cycle);
                     let mask = if ch == 0 { 0x00C3 } else { 0x00C7 };
                     self.hw.timers[ch].cnt = val & mask;
                     let now_en = self.hw.timers[ch].enabled();
 
                     if !was_en && now_en {
+                        // Tick-before-reload: on 0->1 enable, a stopped timer with counter=0xFFFF
+                        // ticks once on startup before the reload value overwrites the counter.
+                        if cur == 0xFFFF
+                            && !(ch > 0 && self.hw.timers[ch].cascade())
+                            && self.hw.timers[ch].prescaler() == 1
+                        {
+                            self.trigger_timer_overflow_effects(ch, write_cycle);
+                        }
                         self.hw.timers[ch].counter = self.hw.timers[ch].reload;
-                        // 2-cycle startup latency on 0->1 enable transition
-                        self.reschedule_timer(ch, now_cycle + 2);
+                        // 2-cycle startup latency from write phase (write_cycle + 1)
+                        self.reschedule_timer(ch, write_cycle + 1);
                     } else {
                         self.hw.timers[ch].counter = cur;
-                        self.reschedule_timer(ch, now_cycle);
+                        self.reschedule_timer(ch, write_cycle);
                     }
                 }
             }
@@ -1088,10 +1159,13 @@ impl SysBus {
                     self.irq_sync_delay = 1;
                 }
             }
-            0x0400_0300 => {
+            0x0400_0300 if self.debug_pc < 0x4000 || self.last_access_was_dma => {
                 self.hw.postflg = val as u8;
-                if (val & 0x8000) == 0 && (addr & 1) == 0 && val > 0x00FF {
-                    // Nothing; HALTCNT should be written via 8-bit STRB to 0x0400_0301
+                let halt_byte = (val >> 8) as u8;
+                if (halt_byte & 0x80) == 0 {
+                    self.hw.halt_requested = true;
+                } else {
+                    self.hw.stop_requested = true;
                 }
             }
             _ => {}
@@ -1102,9 +1176,10 @@ impl SysBus {
     }
 
     pub fn hle_swi(&mut self, cpu: &mut Arm7tdmi, comment: u8) {
+        self.debug_pc = 0x0100;
         // Magic internal HLE wait sentinel used by IntrWait / VBlankIntrWait loop at 0x0000_0140
         if comment == 0xFE {
-            if let Some(wait_flags) = cpu.intr_wait {
+            if let Some((wait_flags, saved_ret, saved_spsr)) = cpu.intr_wait {
                 let check = self.read_32(0x0300_7FF8, AccessType::NonSequential, 0);
                 let matched = (check as u16) & wait_flags;
                 if matched != 0 {
@@ -1114,7 +1189,11 @@ impl SysBus {
                         AccessType::NonSequential,
                     );
                     cpu.intr_wait = None;
-                    cpu.return_from_swi(self);
+                    if !self.bios_present {
+                        self.bios_latch = 0xE3A0_2004;
+                    }
+                    cpu.set_cpsr(saved_spsr);
+                    cpu.flush_pipeline(self, saved_ret);
                     return;
                 }
             }
@@ -1212,7 +1291,9 @@ impl SysBus {
                 }
 
                 // Enter SVC sleep loop at 0x0000_0140 with IRQ unmasked so user IRQ handler can run!
-                cpu.intr_wait = Some(flags);
+                let saved_ret = cpu.gpr[14];
+                let saved_spsr = cpu.get_spsr();
+                cpu.intr_wait = Some((flags, saved_ret, saved_spsr));
                 cpu.cpsr &= !((1 << 7) | (1 << 5)); // Enable IRQ, force ARM
                 cpu.flush_pipeline(self, 0x0000_0140);
                 cpu.halted = true;
@@ -1283,6 +1364,15 @@ impl SysBus {
                 let count = cnt & 0x001F_FFFF;
                 let fixed_src = (cnt & (1 << 24)) != 0;
                 let is_32 = (cnt & (1 << 26)) != 0;
+
+                // Model BIOS execution cycles: SWI dispatch, register stacking, and loop overhead
+                let caller_pc = cpu.gpr[14];
+                let bios_base_cycles = if caller_pc >= 0x0800_0000 {
+                    116u64
+                } else {
+                    104u64
+                };
+                self.scheduler.current_cycle += bios_base_cycles;
                 if is_32 {
                     src &= !3;
                     dst &= !3;
@@ -1340,8 +1430,10 @@ impl SysBus {
                 for _ in 0..count {
                     let orig_x = self.read_32(src, AccessType::Sequential, 0) as i32;
                     let orig_y = self.read_32(src + 4, AccessType::Sequential, 0) as i32;
-                    let disp_x = self.read_16(src + 8, AccessType::Sequential, 0, false) as i16 as i32;
-                    let disp_y = self.read_16(src + 10, AccessType::Sequential, 0, false) as i16 as i32;
+                    let disp_x =
+                        self.read_16(src + 8, AccessType::Sequential, 0, false) as i16 as i32;
+                    let disp_y =
+                        self.read_16(src + 10, AccessType::Sequential, 0, false) as i16 as i32;
                     let sx = self.read_16(src + 12, AccessType::Sequential, 0, false) as i16 as i32;
                     let sy = self.read_16(src + 14, AccessType::Sequential, 0, false) as i16 as i32;
                     let alpha = self.read_16(src + 16, AccessType::Sequential, 0, false);
@@ -1467,7 +1559,8 @@ impl SysBus {
             0x1F => {
                 // MidiKey2Freq(waveData, key, finePitch)
                 let wave_ptr = cpu.gpr[0];
-                let wave_freq = self.read_32(wave_ptr.wrapping_add(4), AccessType::NonSequential, 0);
+                let wave_freq =
+                    self.read_32(wave_ptr.wrapping_add(4), AccessType::NonSequential, 0);
                 let key = (cpu.gpr[1] & 0xFF) as u8;
                 let pitch = (cpu.gpr[2] & 0xFF) as u8;
                 cpu.gpr[0] = hle_midi_key_to_freq(wave_freq, key, pitch);
@@ -1566,7 +1659,14 @@ impl SysBus {
         }
     }
 
-    fn emit_decomp_byte(&mut self, dst: &mut u32, written: &mut usize, half_buf: &mut u16, is_16bit: bool, b: u8) {
+    fn emit_decomp_byte(
+        &mut self,
+        dst: &mut u32,
+        written: &mut usize,
+        half_buf: &mut u16,
+        is_16bit: bool,
+        b: u8,
+    ) {
         if is_16bit {
             if (*written & 1) == 0 {
                 *half_buf = b as u16;
@@ -1736,11 +1836,7 @@ fn hle_arctan2(x: i32, y: i32) -> u16 {
     } else {
         let cot = (x << 14) / y;
         let t = hle_arctan(cot);
-        if y > 0 {
-            0x4000 - t
-        } else {
-            0xC000 - t
-        }
+        if y > 0 { 0x4000 - t } else { 0xC000 - t }
     };
     (angle & 0xFFFF) as u16
 }

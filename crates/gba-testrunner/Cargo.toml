@@ -12,4 +12,4 @@ path = "src/main.rs"
 gba-core = { path = "../gba-core" }
 image = { version = "0.25", default-features = false, features = ["png"] }
 serde = { workspace = true, features = ["std"] }
-toml = "0.8"
+toml = { version = "0.8", default-features = false, features = ["parse"] }

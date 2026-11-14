@@ -1,4 +1,9 @@
 # Verifies every presented frame + core video + core audio hash against pre-Phase-4 baselines.
+[CmdletBinding()]
+param(
+    [switch]$AllowSkipped
+)
+
 $ErrorActionPreference = "Stop"
 
 $RepoRoot = Split-Path -Parent $PSScriptRoot
@@ -19,9 +24,13 @@ $checks = @(
     @{ Name="stress_bitmap_345.gba"; Ref="perf\baselines\stress_bitmap_345_600.hashes.json"; Rom="roms\homebrew\stress_bitmap_345.gba"; Replay="perf\replays\stress_bitmap_345.txt"; Sav=$null; Frames=600 }
 )
 
+$verified = 0
+$skipped = 0
+
 foreach ($c in $checks) {
     if (-not (Test-Path $c.Rom)) {
         Write-Warning "Skipping $($c.Name): ROM not found at $($c.Rom)"
+        $skipped++
         continue
     }
     $args = @("--headless", "--verify-hashes", $c.Ref, $c.Rom, "--frames", $c.Frames)
@@ -32,6 +41,27 @@ foreach ($c in $checks) {
         throw "Hash verification FAILED for $($c.Name): $out"
     }
     Write-Host $out
+    $verified++
 }
-Write-Host "ALL 10 HASH ARCHIVES VERIFIED CLEANLY!"
+
+$total = $checks.Count
+if ($total -gt 0 -and $verified -eq $total -and $skipped -eq 0) {
+    Write-Host "ALL $total HASH ARCHIVES VERIFIED CLEANLY!"
+} else {
+    $summary = "$verified of $total verified, $skipped skipped (ROM not found)"
+    if ($skipped -gt 0) {
+        Write-Host $summary
+    }
+    if ($verified -eq 0) {
+        if ($AllowSkipped) {
+            Write-Warning "No ROMs were verified; exiting 0 because -AllowSkipped was specified."
+            exit 0
+        }
+        Write-Warning "No ROMs were verified; failing instead of reporting false success. Pass -AllowSkipped to exit 0."
+        exit 1
+    }
+    if ($skipped -gt 0 -and $AllowSkipped) {
+        Write-Warning "Some ROMs were skipped; exiting 0 because -AllowSkipped was specified."
+    }
+}
 

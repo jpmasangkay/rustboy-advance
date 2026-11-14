@@ -1300,9 +1300,9 @@ impl AppConfig {
     pub fn app_data_dir() -> PathBuf {
         #[cfg(test)]
         {
-            return std::env::temp_dir()
+            std::env::temp_dir()
                 .join(format!("rustboy_unit_tests_{}", std::process::id()))
-                .join("RustboyAdvance");
+                .join("RustboyAdvance")
         }
         #[cfg(not(test))]
         {

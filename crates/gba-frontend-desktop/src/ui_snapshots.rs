@@ -630,7 +630,8 @@ fn capture_a2_ui_screenshots_if_requested() {
         configure_obsidian_style(&ctx);
         let mut app = make_isolated_app();
         load_synthetic_active_game(&mut app);
-        app.unsaved_frames_since_save = 240;
+        app.has_input_since_save = true;
+        app.unsaved_frames_since_save = 7200;
         app.request_hard_reset();
         renderer
             .render_app_to_png(&ctx, &mut app, None, &dir.join("fix9_confirm_unsaved.png"))

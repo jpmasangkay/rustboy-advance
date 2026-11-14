@@ -442,7 +442,7 @@ impl RustboyApp {
                 }
                 self.movie.record_state_bookmark(&path);
                 self.state_manager_error = None;
-                self.unsaved_frames_since_save = 0;
+                self.reset_unsaved_progress();
                 self.notify(&format!("Saved State Slot {slot}"));
             }
             Err(e) => {
@@ -485,7 +485,7 @@ impl RustboyApp {
                 self.rewinding = false;
                 self.undo_state_buffer = cur;
                 self.state_manager_error = None;
-                self.unsaved_frames_since_save = 0;
+                self.reset_unsaved_progress();
                 if let Some(core) = &self.core {
                     self.movie.on_undo_state_loaded(core);
                 }
@@ -517,7 +517,7 @@ impl RustboyApp {
                 Ok(container) => match fs::write(&path, container) {
                     Ok(()) => {
                         self.movie.record_state_bookmark(&path);
-                        self.unsaved_frames_since_save = 0;
+                        self.reset_unsaved_progress();
                         self.notify("Saved State to file");
                     }
                     Err(e) => self.notify_error(&format!("Failed writing state: {e}")),
@@ -573,7 +573,7 @@ impl RustboyApp {
                 self.rewinding = false;
                 self.show_pause_overlay = false;
                 self.state_manager_error = None;
-                self.unsaved_frames_since_save = 0;
+                self.reset_unsaved_progress();
                 self.sink.audio.reset_underruns();
                 if let Some(core) = &self.core {
                     self.movie.on_state_loaded_from_path(core, path);

@@ -175,6 +175,7 @@ pub(crate) struct RustboyApp {
     pub(crate) rewind_buffer: RewindBuffer,
     pub(crate) frame_counter: u64,
     pub(crate) unsaved_frames_since_save: u64,
+    pub(crate) has_input_since_save: bool,
     pub(crate) pending_confirm_action: Option<PendingConfirmAction>,
     pub(crate) rewinding: bool,
     pub(crate) show_rewind_settings: bool,
@@ -356,6 +357,7 @@ impl RustboyApp {
             rewind_buffer: RewindBuffer::new(rewind_budget_mb),
             frame_counter: 0,
             unsaved_frames_since_save: 0,
+            has_input_since_save: false,
             pending_confirm_action: None,
             rewinding: false,
             show_rewind_settings: false,
@@ -763,10 +765,9 @@ impl RustboyApp {
         self.rewind_buffer.clear();
         self.rewind_movie_frames.clear();
         self.frame_counter = 0;
-        self.unsaved_frames_since_save = 0;
+        self.reset_unsaved_progress();
         self.pending_confirm_action = None;
-        self.first_frame_cover_saved =
-            crate::library::has_user_cover_for_path(rom_path, &code);
+        self.first_frame_cover_saved = crate::library::has_user_cover_for_path(rom_path, &code);
         self.rewinding = false;
         self.autofire_state.clear_latches();
         self.base_pressed_mask = 0;
@@ -831,7 +832,7 @@ impl RustboyApp {
         self.rewind_buffer.clear();
         self.rewind_movie_frames.clear();
         self.frame_counter = 0;
-        self.unsaved_frames_since_save = 0;
+        self.reset_unsaved_progress();
         self.pending_confirm_action = None;
         self.first_frame_cover_saved = false;
         self.rewinding = false;
@@ -1129,7 +1130,7 @@ impl RustboyApp {
             self.rewind_buffer.clear();
             self.rewind_movie_frames.clear();
             self.frame_counter = 0;
-            self.unsaved_frames_since_save = 0;
+            self.reset_unsaved_progress();
             self.rewinding = false;
             self.last_step_time = Instant::now();
             self.time_accumulator = 0.0;
@@ -1150,7 +1151,7 @@ impl RustboyApp {
             self.rewind_buffer.clear();
             self.rewind_movie_frames.clear();
             self.frame_counter = 0;
-            self.unsaved_frames_since_save = 0;
+            self.reset_unsaved_progress();
             self.rewinding = false;
             self.last_step_time = Instant::now();
             self.time_accumulator = 0.0;
@@ -1176,7 +1177,7 @@ impl RustboyApp {
             self.rewind_buffer.clear();
             self.rewind_movie_frames.clear();
             self.frame_counter = 0;
-            self.unsaved_frames_since_save = 0;
+            self.reset_unsaved_progress();
             self.rewinding = false;
             self.postproc.reset();
             self.sink.clear_frames();
@@ -1200,7 +1201,7 @@ impl RustboyApp {
             self.rewind_buffer.clear();
             self.rewind_movie_frames.clear();
             self.frame_counter = 0;
-            self.unsaved_frames_since_save = 0;
+            self.reset_unsaved_progress();
             self.rewinding = false;
             self.last_step_time = Instant::now();
             self.time_accumulator = 0.0;
@@ -1214,14 +1215,44 @@ impl RustboyApp {
         }
     }
 
-    /// Returns true if an active game has unflushed battery writes or active uncheckpointed gameplay.
+    const MEANINGFUL_UNSAVED_FRAMES: u64 = 60 * 60;
+
+    /// Resets the unsaved-progress timer after boot, reset, save state, or in-game save write.
+    pub(crate) fn reset_unsaved_progress(&mut self) {
+        self.unsaved_frames_since_save = 0;
+        self.has_input_since_save = false;
+    }
+
+    pub(crate) fn is_battery_save_dirty(&self) -> bool {
+        self.core.as_ref().is_some_and(|c| c.bus.cart.save_dirty)
+            || self.gb.as_ref().is_some_and(|g| g.core.battery_dirty())
+    }
+
+    /// Tracks active gameplay frames once player input occurs and restarts the window on save-memory writes.
+    pub(crate) fn track_frame_unsaved_progress(
+        &mut self,
+        live_keypad: u16,
+        had_save_dirty_before: bool,
+    ) {
+        if live_keypad != 0x03FF {
+            self.has_input_since_save = true;
+        }
+        if self.has_input_since_save {
+            if self.is_battery_save_dirty() && !had_save_dirty_before {
+                self.reset_unsaved_progress();
+            } else {
+                self.unsaved_frames_since_save += 1;
+            }
+        }
+    }
+
+    /// Returns true if the player has meaningful gameplay with input since the last save state or save write.
     pub(crate) fn has_unsaved_progress(&self) -> bool {
         if !self.has_active_game() {
             return false;
         }
-        let battery_dirty = self.core.as_ref().is_some_and(|c| c.bus.cart.save_dirty)
-            || self.gb.as_ref().is_some_and(|g| g.core.battery_dirty());
-        battery_dirty || self.unsaved_frames_since_save >= 60
+        self.has_input_since_save
+            && self.unsaved_frames_since_save >= Self::MEANINGFUL_UNSAVED_FRAMES
     }
 
     /// Performs a Hard Reset immediately or opens a confirmation dialog when unsaved progress exists.
@@ -1307,6 +1338,8 @@ impl RustboyApp {
             }
         }
 
+        let had_save_dirty = self.is_battery_save_dirty();
+        let frame_keypad = self.sink.keypad;
         if let Some(core) = &mut self.core {
             apply_cheats_to_core(core, &self.active_cheats);
             if let Some(local) = &mut self.link.local {
@@ -1317,11 +1350,11 @@ impl RustboyApp {
                 let _ = core.run_frame_with_breakpoints(&mut self.sink, &[]);
             }
             self.frame_counter += 1;
-            self.unsaved_frames_since_save += 1;
+            self.track_frame_unsaved_progress(frame_keypad, had_save_dirty);
         } else if self.gb.is_some() {
             self.step_gb_frame(self.sink.keypad, false);
             self.frame_counter += 1;
-            self.unsaved_frames_since_save += 1;
+            self.track_frame_unsaved_progress(frame_keypad, had_save_dirty);
         }
 
         self.flush_frame_captures(true, color_corr, color_profile);
@@ -1776,6 +1809,7 @@ impl RustboyApp {
             let saved_prev_fb = run_ahead_eligible
                 .then(|| (self.sink.framebuffer.to_vec(), self.sink.has_prev_frame));
 
+            let had_save_dirty = self.is_battery_save_dirty();
             if let Some(core) = &mut self.core {
                 self.ra.tick_frame(core, &self.config);
                 self.lua.run_frame(
@@ -1813,7 +1847,7 @@ impl RustboyApp {
             executed += 1;
             self.frames_in_window += 1;
             self.frame_counter += 1;
-            self.unsaved_frames_since_save += 1;
+            self.track_frame_unsaved_progress(live_keypad, had_save_dirty);
 
             let frame_complete = matches!(stop_reason, gba_core::StopReason::FrameComplete);
             self.flush_frame_captures(frame_complete, color_corr, color_profile);
@@ -2428,7 +2462,9 @@ impl RustboyApp {
                 self.cover_textures.remove(&rom_path);
             }
             Ok(None) => {
-                if force_fallback || crate::library::has_user_cover_for_path(&rom_path, &self.rom_code) {
+                if force_fallback
+                    || crate::library::has_user_cover_for_path(&rom_path, &self.rom_code)
+                {
                     self.first_frame_cover_saved = true;
                 }
             }

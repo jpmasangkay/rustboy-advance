@@ -52,7 +52,13 @@ impl PerfCheckReport {
             .measured_ceiling
             .as_deref()
             .and_then(|s| s.split('=').nth(1))
-            .and_then(|rhs| rhs.trim().strip_suffix('x').or_else(|| rhs.split_whitespace().next().and_then(|t| t.strip_suffix('x'))))
+            .and_then(|rhs| {
+                rhs.trim().strip_suffix('x').or_else(|| {
+                    rhs.split_whitespace()
+                        .next()
+                        .and_then(|t| t.strip_suffix('x'))
+                })
+            })
             .and_then(|num| num.trim().parse::<u32>().ok())
             .is_some_and(|x| x == 0);
         if rec_sharp || zero_ceiling {
@@ -308,10 +314,8 @@ fn spawn_selftest_child(exe_path: PathBuf) -> (Arc<AtomicBool>, Receiver<PerfChe
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap_or_default()
             .as_nanos();
-        let temp_perf_dir = std::env::temp_dir().join(format!(
-            "rustboy_perf_check_{}_{nonce}",
-            std::process::id()
-        ));
+        let temp_perf_dir =
+            std::env::temp_dir().join(format!("rustboy_perf_check_{}_{nonce}", std::process::id()));
         let _ = std::fs::create_dir_all(&temp_perf_dir);
 
         let mut cmd = Command::new(&exe_path);
@@ -414,28 +418,21 @@ fn spawn_selftest_child(exe_path: PathBuf) -> (Arc<AtomicBool>, Receiver<PerfChe
             .and_then(|h| h.join().ok())
             .unwrap_or_default();
         let elapsed_ms = started.elapsed().as_millis() as u64;
-        let full_json = std::fs::read_dir(&temp_perf_dir)
-            .ok()
-            .and_then(|entries| {
-                entries
-                    .filter_map(|e| e.ok())
-                    .find(|e| {
-                        e.path()
-                            .extension()
-                            .and_then(|ext| ext.to_str())
-                            .is_some_and(|ext| ext.eq_ignore_ascii_case("json"))
-                    })
-                    .and_then(|e| std::fs::read_to_string(e.path()).ok())
-            });
+        let full_json = std::fs::read_dir(&temp_perf_dir).ok().and_then(|entries| {
+            entries
+                .filter_map(|e| e.ok())
+                .find(|e| {
+                    e.path()
+                        .extension()
+                        .and_then(|ext| ext.to_str())
+                        .is_some_and(|ext| ext.eq_ignore_ascii_case("json"))
+                })
+                .and_then(|e| std::fs::read_to_string(e.path()).ok())
+        });
         let _ = std::fs::remove_dir_all(&temp_perf_dir);
 
-        let mut report = parse_selftest_report_with_json(
-            &stdout,
-            &stderr,
-            full_json,
-            exit_success,
-            elapsed_ms,
-        );
+        let mut report =
+            parse_selftest_report_with_json(&stdout, &stderr, full_json, exit_success, elapsed_ms);
         if let Some(reason) = abort_reason {
             report.passed = false;
             report.exit_success = false;
@@ -1152,27 +1149,18 @@ impl RustboyApp {
         let (title, confirm_label, body) = match action {
             PendingConfirmAction::HardReset => (
                 "Restart game?",
-                "Restart Game",
-                format!(
-                    "\"{}\" has unsaved in-game progress since the last save state or in-game save. Battery save (.sav) will be flushed, and uncheckpointed RAM progress will be lost.",
-                    self.rom_title
-                ),
+                "Restart game",
+                "You may lose progress since your last save. Restart anyway?".to_string(),
             ),
             PendingConfirmAction::SoftReset => (
                 "Soft reset game?",
                 "Soft Reset",
-                format!(
-                    "\"{}\" has unsaved in-game progress. Soft resetting restarts the game from its BIOS entrypoint and clears unsaved RAM progress.",
-                    self.rom_title
-                ),
+                "You may lose progress since your last save. Restart anyway?".to_string(),
             ),
             PendingConfirmAction::CloseRom => (
-                "Stop game?",
-                "Stop & Return to Library",
-                format!(
-                    "\"{}\" has unsaved progress since your last save state. Battery save (.sav) will be saved to disk, while active console memory will be closed.",
-                    self.rom_title
-                ),
+                "Return to Library?",
+                "Return to Library",
+                "You may lose progress since your last save. Return to Library anyway?".to_string(),
             ),
         };
 
@@ -1187,7 +1175,12 @@ impl RustboyApp {
             .anchor(egui::Align2::CENTER_CENTER, egui::Vec2::ZERO)
             .fixed_size([410.0, 155.0])
             .show(ctx, |ui| {
-                ui.label(egui::RichText::new(title).strong().size(14.0).color(COLOR_TEXT));
+                ui.label(
+                    egui::RichText::new(title)
+                        .strong()
+                        .size(14.0)
+                        .color(COLOR_TEXT),
+                );
                 ui.add_space(6.0);
                 ui.label(egui::RichText::new(body).color(COLOR_TEXT_SECONDARY));
                 ui.add_space(12.0);
@@ -1286,7 +1279,13 @@ mod tests {
             report.measured_ceiling.as_deref(),
             Some("smooth (<0.5% over, 0 underruns) = 8x | zero-over-budget = 8x")
         );
-        assert!(report.recommended_filter.as_deref().unwrap().starts_with("smooth-bilinear"));
+        assert!(
+            report
+                .recommended_filter
+                .as_deref()
+                .unwrap()
+                .starts_with("smooth-bilinear")
+        );
         assert!(report.fail_reasons.is_none());
 
         let exported = report.export_json();
@@ -1365,41 +1364,103 @@ mod tests {
         assert!(!app.close_top_dialog_on_escape(&ctx));
     }
 
-    #[test]
-    fn confirm_dialog_guards_restart_and_stop_with_unsaved_progress() {
+    fn make_unsaved_prompt_test_app(temp_dir: &std::path::Path) -> ManuallyDrop<RustboyApp> {
         let mut app = ManuallyDrop::new(RustboyApp::new(CliConfig::default()));
         app.core = Some(gba_core::GbaCore::new(None, vec![0u8; 256]));
         app.rom_title = "Summon Night".to_string();
+        app.rom_code = "AB4E".to_string();
+        app.rom_path = Some(temp_dir.join("summon_night.gba"));
         app.sav_path = None;
+        app
+    }
 
+    #[test]
+    fn unsaved_progress_fresh_boot_and_idle_title_screen_never_prompt() {
+        let temp_dir = std::env::temp_dir().join("rba_test_unsaved_fresh_boot");
+        let mut app = make_unsaved_prompt_test_app(&temp_dir);
         let ctx = egui::Context::default();
 
-        // At 0 frames and clean save, Restart runs without opening a prompt.
-        app.unsaved_frames_since_save = 0;
-        app.core.as_mut().unwrap().bus.cart.save_dirty = false;
+        // Fresh boot at frame 0 -> no prompt.
         app.request_hard_reset();
         assert!(app.pending_confirm_action.is_none());
+        app.request_close_rom(&ctx);
+        assert!(app.pending_confirm_action.is_none());
 
-        // With unsaved gameplay frames, Restart and Stop request confirmation first.
-        app.unsaved_frames_since_save = 120;
+        // Simulating 2 minutes (7200 frames) idling on title screen with NO player input (0x03FF)
+        // must still NOT trigger the unsaved-progress confirmation dialog.
+        app.sink.keypad = 0x03FF;
+        for _ in 0..7200 {
+            app.track_frame_unsaved_progress(0x03FF, false);
+        }
+        assert!(!app.has_input_since_save);
+        assert!(!app.has_unsaved_progress());
+        app.request_hard_reset();
+        assert!(app.pending_confirm_action.is_none());
+        app.request_close_rom(&ctx);
+        assert!(app.pending_confirm_action.is_none());
+    }
+
+    #[test]
+    fn unsaved_progress_two_minutes_of_play_with_input_prompts_until_save_write() {
+        let temp_dir = std::env::temp_dir().join("rba_test_unsaved_two_minutes");
+        let mut app = make_unsaved_prompt_test_app(&temp_dir);
+        let ctx = egui::Context::default();
+
+        // Player presses Start once and plays for 2 minutes (7200 frames).
+        app.track_frame_unsaved_progress(0x03F7, false);
+        for _ in 1..7200 {
+            app.track_frame_unsaved_progress(0x03FF, false);
+        }
+        assert!(app.has_unsaved_progress());
+
         app.request_hard_reset();
         assert_eq!(
             app.pending_confirm_action,
             Some(PendingConfirmAction::HardReset)
         );
-        assert!(app.has_active_game());
-
         assert!(app.close_top_dialog_on_escape(&ctx));
         assert!(app.pending_confirm_action.is_none());
 
-        // With dirty battery save, Stop requests confirmation too.
-        app.unsaved_frames_since_save = 0;
-        app.core.as_mut().unwrap().bus.cart.save_dirty = true;
         app.request_close_rom(&ctx);
         assert_eq!(
             app.pending_confirm_action,
             Some(PendingConfirmAction::CloseRom)
         );
-        assert!(app.has_active_game());
+        assert!(app.close_top_dialog_on_escape(&ctx));
+
+        // An in-game save-memory write clears the unsaved-play timer.
+        app.core.as_mut().unwrap().bus.cart.save_dirty = true;
+        app.track_frame_unsaved_progress(0x03FF, false);
+        assert!(!app.has_unsaved_progress());
+        app.request_hard_reset();
+        assert!(app.pending_confirm_action.is_none());
+    }
+
+    #[test]
+    fn unsaved_progress_clears_after_save_state() {
+        let temp_dir = std::env::temp_dir().join("rba_test_unsaved_after_state");
+        let _ = std::fs::remove_dir_all(&temp_dir);
+        std::fs::create_dir_all(&temp_dir).unwrap();
+        let rom_file = temp_dir.join("summon_night.gba");
+        std::fs::write(&rom_file, vec![0u8; 256]).unwrap();
+
+        let mut app = make_unsaved_prompt_test_app(&temp_dir);
+        let ctx = egui::Context::default();
+
+        app.track_frame_unsaved_progress(0x03FE, false);
+        for _ in 1..7200 {
+            app.track_frame_unsaved_progress(0x03FF, false);
+        }
+        assert!(app.has_unsaved_progress());
+
+        // Saving a state checkpoints progress -> no prompt afterwards.
+        app.quick_save(1);
+        assert!(!app.has_unsaved_progress());
+        app.request_hard_reset();
+        assert!(app.pending_confirm_action.is_none());
+        app.request_close_rom(&ctx);
+        assert!(app.pending_confirm_action.is_none());
+
+        let _ = std::fs::remove_dir_all(&temp_dir);
     }
 }

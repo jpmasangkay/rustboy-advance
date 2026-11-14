@@ -2,7 +2,7 @@
 
 Rustboy Advance tracks compatibility across two tiers:
 1. **Automated Hardware & Test-ROM Suites** (executed locally and in CI via `cargo run -p gba-testrunner` and `cargo test -p gb-core`). See [`TEST_RESULTS.md`](TEST_RESULTS.md) for the exact per-ROM matrix and failure diagnosis.
-2. **Commercial GBA Database (`GAME_DB` & `REAL_BIOS_FALLBACK_GAMES`)** in [`crates/gba-core/src/gamedb.rs`](crates/gba-core/src/gamedb.rs).
+2. **Commercial GBA Database (`GAME_DB` & `REAL_BIOS_FALLBACK_GAMES`)** in [`crates/gba-core/src/gamedb.rs`](../crates/gba-core/src/gamedb.rs).
 
 > **Verification Policy:** No copyrighted commercial ROMs are included or executed in this repository's CI. The commercial table below documents the **verified cartridge database configuration** (save-type override, RTC/sensor wiring, and real-BIOS fallback recommendation). Live commercial gameplay status is listed honestly as **Pending Hardware/Community Verification** unless verified by community test reports on an official release tag.
 
@@ -12,7 +12,7 @@ Rustboy Advance tracks compatibility across two tiers:
 
 | Suite / Runner | Command | Observed Result | Notes |
 | :--- | :--- | :--- | :--- |
-| **`gba-testrunner` (CI Headless CRC / Pass-Code)** | `cargo run -p gba-testrunner -- --allow-failures --report TEST_RESULTS.md` | **43 passed, 9 failed, 2 skipped (missing ROM), 2 skipped (missing golden)** (`56` total) | Includes `jsmolka/gba-tests`, `FuzzARM`, `ARMWrestler`, `NanoBoyAdvance hw-test`, `Tonc`, `mGBA` (optional), `AGS` (optional); see [`TEST_RESULTS.md`](TEST_RESULTS.md) |
+| **`gba-testrunner` (CI Headless CRC / Pass-Code)** | `cargo run -p gba-testrunner -- --allow-failures --report docs/TEST_RESULTS.md` | **43 passed, 9 failed, 2 skipped (missing ROM), 2 skipped (missing golden)** (`56` total) | Includes `jsmolka/gba-tests`, `FuzzARM`, `ARMWrestler`, `NanoBoyAdvance hw-test`, `Tonc`, `mGBA` (optional), `AGS` (optional); see [`TEST_RESULTS.md`](TEST_RESULTS.md) |
 | **`gb-core` Unit + Harness Tests** | `cargo test -p gb-core` | **13 passed, 0 failed** | Includes CPU/APU/PPU/MBC unit checks and `mooneye_ld_bb_harness_and_optional_suite` (optional external `test-roms/gb/mooneye/` directory runs when populated) |
 
 ---

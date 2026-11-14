@@ -69,8 +69,8 @@ jobs:
         shell: pwsh
         run: ./scripts/fetch-test-roms.ps1
 
-      - name: Run GBA test ROM suite & generate TEST_RESULTS.md
-        run: cargo run -p gba-testrunner -- --report TEST_RESULTS.md --fail-on-unexpected
+      - name: Run GBA test ROM suite & generate docs/TEST_RESULTS.md
+        run: cargo run -p gba-testrunner -- --report docs/TEST_RESULTS.md --fail-on-unexpected
 
       - name: Verify stripped release build & zero leaked local paths (Unix)
         if: runner.os != 'Windows'
@@ -127,13 +127,13 @@ jobs:
             }
           }
 
-      - name: Upload TEST_RESULTS.md and test_output artifacts
+      - name: Upload docs/TEST_RESULTS.md and test_output artifacts
         if: always()
         uses: actions/upload-artifact@v4
         with:
           name: test-results-${{ matrix.os }}
           path: |
-            TEST_RESULTS.md
+            docs/TEST_RESULTS.md
             test_output/
           if-no-files-found: warn
 

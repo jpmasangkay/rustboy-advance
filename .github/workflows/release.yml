@@ -112,11 +112,12 @@ jobs:
         if: runner.os != 'Windows'
         shell: bash
         run: |
-          mkdir -p dist "${{ matrix.artifact_name }}"
+          mkdir -p dist "${{ matrix.artifact_name }}/docs"
           cp "target/${{ matrix.target }}/release/${{ matrix.exe_name }}" "${{ matrix.artifact_name }}/"
           cp "target/${{ matrix.target }}/release/${{ matrix.libretro_name }}" "${{ matrix.artifact_name }}/"
           chmod +x "${{ matrix.artifact_name }}/${{ matrix.exe_name }}"
-          cp LICENSE README.md CHANGELOG.md THIRD-PARTY-NOTICES.md COMPATIBILITY.md TEST_RESULTS.md "${{ matrix.artifact_name }}/"
+          cp LICENSE README.md CHANGELOG.md THIRD-PARTY-NOTICES.md "${{ matrix.artifact_name }}/"
+          cp docs/COMPATIBILITY.md docs/TEST_RESULTS.md "${{ matrix.artifact_name }}/docs/"
           tar -czf "dist/${{ matrix.artifact_name }}.tar.gz" "${{ matrix.artifact_name }}"
           zip -r "dist/${{ matrix.artifact_name }}.zip" "${{ matrix.artifact_name }}"
           (cd dist && shasum -a 256 "${{ matrix.artifact_name }}.tar.gz" "${{ matrix.artifact_name }}.zip" > "${{ matrix.artifact_name }}.sha256")
@@ -126,10 +127,11 @@ jobs:
         shell: pwsh
         run: |
           $stage = "${{ matrix.artifact_name }}"
-          New-Item -ItemType Directory -Force -Path "dist", $stage | Out-Null
+          New-Item -ItemType Directory -Force -Path "dist", "$stage/docs" | Out-Null
           Copy-Item "target\${{ matrix.target }}\release\${{ matrix.exe_name }}" $stage
           Copy-Item "target\${{ matrix.target }}\release\${{ matrix.libretro_name }}" $stage
-          Copy-Item LICENSE, README.md, CHANGELOG.md, THIRD-PARTY-NOTICES.md, COMPATIBILITY.md, TEST_RESULTS.md $stage
+          Copy-Item LICENSE, README.md, CHANGELOG.md, THIRD-PARTY-NOTICES.md $stage
+          Copy-Item docs/COMPATIBILITY.md, docs/TEST_RESULTS.md "$stage/docs"
           # Use bsdtar (`tar.exe -a`) instead of Compress-Archive so zip paths use '/' on Linux/macOS.
           tar.exe -a -cf "dist/$stage.zip" "$stage"
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }

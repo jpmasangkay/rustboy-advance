@@ -52,13 +52,13 @@ fn parse_args() -> Result<CliArgs, String> {
                 cli.bios_path = Some(PathBuf::from(v));
             }
             "--report" => {
-                // Support both `--report` (defaults to TEST_RESULTS.md) and `--report <path>`.
+                // Support both `--report` (defaults to docs/TEST_RESULTS.md) and `--report <path>`.
                 let next_is_path = args.peek().is_some_and(|s| !s.starts_with('-'));
                 if next_is_path {
                     let v = args.next().ok_or("missing path for --report")?;
                     cli.report_path = Some(PathBuf::from(v));
                 } else {
-                    cli.report_path = Some(PathBuf::from("TEST_RESULTS.md"));
+                    cli.report_path = Some(PathBuf::from("docs/TEST_RESULTS.md"));
                 }
             }
             "--out-dir" => {
@@ -87,7 +87,7 @@ fn parse_args() -> Result<CliArgs, String> {
                      \t--suite <name>          Run only tests in a given suite\n\
                      \t--filter <substr>       Run only tests matching substring\n\
                      \t--record                (Re)generate golden hashes/PNGs in golden/ (skips known_failure & interactive)\n\
-                     \t--report [path]         Write Markdown results (default: TEST_RESULTS.md)\n\
+                     \t--report [path]         Write Markdown results (default: docs/TEST_RESULTS.md)\n\
                      \t--out-dir <path>        Directory for failure PNGs (default: test_output)\n\
                      \t--dump-all              Save PNG screenshots for all executed ROMs\n\
                      \t--allow-failures        Exit 0 even if tests fail\n\

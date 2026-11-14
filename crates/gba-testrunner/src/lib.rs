@@ -823,7 +823,7 @@ pub fn render_markdown_table(results: &[TestResult]) -> String {
     out
 }
 
-/// Renders a full `TEST_RESULTS.md` document (preserving any existing `## Failure Diagnosis` section if `--preserve-diagnosis` is used, or generating a clean report).
+/// Renders a full `docs/TEST_RESULTS.md` document (preserving any existing `## Failure Diagnosis` section if `--preserve-diagnosis` is used, or generating a clean report).
 pub fn render_markdown_report(results: &[TestResult], bios_label: &str) -> String {
     let counts = summarize_results(results);
     let total = results.len();

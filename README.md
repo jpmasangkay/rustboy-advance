@@ -2,7 +2,7 @@
 
 **Cycle-Aware Game Boy Advance & Game Boy Emulator — Rust `no_std` Core, Desktop (`eframe`/`wgpu`), WebAssembly & Libretro**
 
-> **Accuracy Status:** `gba-core` uses **cycle-aware** CPU, pipeline, prefetch/waitstate, DMA, and timer scheduling alongside a built-in High-Level Emulation (HLE) BIOS and optional real 16 KB GBA BIOS support. It is **not** claimed to be 100% cycle-accurate; see [`TEST_RESULTS.md`](TEST_RESULTS.md) for current automated pass/fail counts and [`COMPATIBILITY.md`](COMPATIBILITY.md) for commercial database coverage and real-BIOS recommendations.
+> **Accuracy Status:** `gba-core` uses **cycle-aware** CPU, pipeline, prefetch/waitstate, DMA, and timer scheduling alongside a built-in High-Level Emulation (HLE) BIOS and optional real 16 KB GBA BIOS support. It is **not** claimed to be 100% cycle-accurate; see [`docs/TEST_RESULTS.md`](docs/TEST_RESULTS.md) for current automated pass/fail counts and [`docs/COMPATIBILITY.md`](docs/COMPATIBILITY.md) for commercial database coverage and real-BIOS recommendations.
 
 [![Rust](https://img.shields.io/badge/Rust-1.85+-DEA584?style=flat-square&logo=rust&logoColor=white)](https://www.rust-lang.org)
 [![Edition](https://img.shields.io/badge/Edition-2024-blue?style=flat-square)](https://www.rust-lang.org)
@@ -10,8 +10,8 @@
 
 - **Source Repository:** <https://github.com/jpmasangkay/rustboy-advance>
 - **Release Tag:** `v0.1.0`
-- **Test Results:** [`TEST_RESULTS.md`](TEST_RESULTS.md)
-- **Compatibility Database:** [`COMPATIBILITY.md`](COMPATIBILITY.md)
+- **Test Results:** [`docs/TEST_RESULTS.md`](docs/TEST_RESULTS.md)
+- **Compatibility Database:** [`docs/COMPATIBILITY.md`](docs/COMPATIBILITY.md)
 - **Changelog:** [`CHANGELOG.md`](CHANGELOG.md)
 - **Third-Party Notices:** [`THIRD-PARTY-NOTICES.md`](THIRD-PARTY-NOTICES.md)
 
@@ -78,22 +78,22 @@ Captured directly from the headless release renderer using freely-redistributabl
 
 ## Accuracy, Test Suites & Known Issues
 
-Automated accuracy checks run via `gba-testrunner` (comparing framebuffer CRC32 / pass registers) and `gb-core` unit/harness tests. See [`TEST_RESULTS.md`](TEST_RESULTS.md) for full details.
+Automated accuracy checks run via `gba-testrunner` (comparing framebuffer CRC32 / pass registers) and `gb-core` unit/harness tests. See [`docs/TEST_RESULTS.md`](docs/TEST_RESULTS.md) for full details.
 
 | Runner | Command | Observed Result |
 | :--- | :--- | :--- |
-| **`gba-testrunner`** | `cargo run -p gba-testrunner -- --allow-failures --report TEST_RESULTS.md` | **43 passed, 9 failed, 2 skipped (missing ROM), 2 skipped (missing golden)** (`56` entries) |
+| **`gba-testrunner`** | `cargo run -p gba-testrunner -- --allow-failures --report docs/TEST_RESULTS.md` | **43 passed, 9 failed, 2 skipped (missing ROM), 2 skipped (missing golden)** (`56` entries) |
 | **`gb-core`** | `cargo test -p gb-core` | **13 passed, 0 failed** (unit tests + optional `test-roms/gb/mooneye/` runner) |
 
 ### Known Issues
-- **GBA Hardware Edge-Case Failures (`9` failing `nba-hw-test` ROMs in [`TEST_RESULTS.md`](TEST_RESULTS.md)):**
+- **GBA Hardware Edge-Case Failures (`9` failing `nba-hw-test` ROMs in [`docs/TEST_RESULTS.md`](docs/TEST_RESULTS.md)):**
   - Bus, DMA & IRQ timing (`4`): `nba-hw-test/bus/128kb-boundary.gba`, `nba-hw-test/dma/burst-into-tears.gba`, `nba-hw-test/dma/force-nseq-access.gba`, and `nba-hw-test/irq/irq-delay.gba`.
   - PPU mid-scanline latches, mosaic & `GREENSWAP` (`5`): `nba-hw-test/ppu/bgpd.gba`, `nba-hw-test/ppu/bgx.gba`, `nba-hw-test/ppu/dispcnt-latch.gba`, `nba-hw-test/ppu/greenswap.gba`, and `nba-hw-test/ppu/sprite-hmosaic.gba`.
 - **Optional External Test Suites Not Redistributed in Repo:**
   - `mgba/suite.gba`, `ags/ags.gba`, and external `test-roms/gb/mooneye/` ROMs are skipped unless supplied locally (see [`scripts/README.md`](scripts/README.md)).
-- **HLE BIOS Timing & Open Bus:** Games checking exact BIOS ROM protected values, checksums, or `SoundDriver` SWI cycles (`REAL_BIOS_FALLBACK_GAMES` in [`COMPATIBILITY.md`](COMPATIBILITY.md)) should be run with a user-provided 16 KB GBA BIOS (`--bios`).
+- **HLE BIOS Timing & Open Bus:** Games checking exact BIOS ROM protected values, checksums, or `SoundDriver` SWI cycles (`REAL_BIOS_FALLBACK_GAMES` in [`docs/COMPATIBILITY.md`](docs/COMPATIBILITY.md)) should be run with a user-provided 16 KB GBA BIOS (`--bios`).
 - **Unsupported Cart Add-Ons:** **e-Reader**, **GBA Wireless Adapter**, **Play-Yan**, and **64 MiB GBA Video** bank-switching mappers are not implemented.
-- **Commercial Compatibility:** Commercial titles in [`COMPATIBILITY.md`](COMPATIBILITY.md) record verified `GAME_DB` / `REAL_BIOS_FALLBACK_GAMES` configurations, but live commercial playthrough verification is currently **Pending Hardware/Community Verification**.
+- **Commercial Compatibility:** Commercial titles in [`docs/COMPATIBILITY.md`](docs/COMPATIBILITY.md) record verified `GAME_DB` / `REAL_BIOS_FALLBACK_GAMES` configurations, but live commercial playthrough verification is currently **Pending Hardware/Community Verification**.
 - **Low-End ARM Benchmarks:** `aarch64` Linux and Apple Silicon builds are cross-checked in CI, but Raspberry Pi / low-power ARM laptop FPS benchmarks have not yet been recorded.
 
 ---
@@ -165,7 +165,7 @@ Verified numbers observed on an AMD Ryzen 9 8945HX laptop (`rustc 1.99.1`, relea
 | `gba-frontend-desktop` | Desktop GUI (`eframe`/`egui`/`wgpu`/`winit`+`softbuffer`/`cpal`/`gilrs`), Lua (`piccolo`), RetroAchievements (`keyring`), Netplay, `.rbm` TAS |
 | `gba-frontend-web` | WebAssembly bindings for `web/` (Canvas/WebGL + AudioWorklet) |
 | `gba-libretro` | Libretro v1 C ABI core (`gba_libretro.dll` / `.so` / `.dylib`) |
-| `gba-testrunner` | Automated headless test runner generating [`TEST_RESULTS.md`](TEST_RESULTS.md) |
+| `gba-testrunner` | Automated headless test runner generating [`docs/TEST_RESULTS.md`](docs/TEST_RESULTS.md) |
 
 ### CLI Usage & Headless Harness
 
@@ -193,8 +193,8 @@ rustboy-advance --version
 # Fetch freely-redistributable test suites locally (not committed to git)
 ./scripts/fetch-test-roms.sh    # Windows: .\scripts\fetch-test-roms.ps1
 
-# Run full automated suite and regenerate TEST_RESULTS.md
-cargo run -p gba-testrunner -- --report TEST_RESULTS.md --fail-on-unexpected
+# Run full automated suite and regenerate docs/TEST_RESULTS.md
+cargo run -p gba-testrunner -- --report docs/TEST_RESULTS.md --fail-on-unexpected
 ```
 
 ### Reproducible Clean Release Builds, Path Stripping & PGO

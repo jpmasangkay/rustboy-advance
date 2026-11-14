@@ -9,8 +9,8 @@ All notable changes to **Rustboy Advance** are documented in this file.
 - Added automated regression and accuracy test coverage across `gba-testrunner` and workspace crates:
   - `jsmolka/gba-tests`, `FuzzARM`, `ARMWrestler`, `NanoBoyAdvance hw-test`, `Tonc` smoke tests, and optional `mGBA` / `AGS` / `Blargg` / `acid2` / `Mooneye` suites.
   - Added HLE BIOS edge-case tests (BIOS open-bus reads, SWI timing, `SoundBias`) and dedicated tests for `WAITCNT` prefetch, DMA timing boundaries, and 4-stage timer cascade (`crates/gba-core/tests/core_tests.rs`).
-  - Published exact automated pass/fail/skip breakdown in [`TEST_RESULTS.md`](TEST_RESULTS.md) (`43 passed, 9 failed, 2 skipped (missing ROM), 2 skipped (missing golden)`).
-- Expanded [`crates/gba-core/src/gamedb.rs`](crates/gba-core/src/gamedb.rs) with per-game save-type / RTC / hardware-sensor overrides (`GAME_DB`) and `REAL_BIOS_FALLBACK_GAMES` diagnostics (`GbaCore::recommends_real_bios()`), documented across 60+ commercial titles in [`COMPATIBILITY.md`](COMPATIBILITY.md).
+  - Published exact automated pass/fail/skip breakdown in [`TEST_RESULTS.md`](docs/TEST_RESULTS.md) (`43 passed, 9 failed, 2 skipped (missing ROM), 2 skipped (missing golden)`).
+- Expanded [`crates/gba-core/src/gamedb.rs`](crates/gba-core/src/gamedb.rs) with per-game save-type / RTC / hardware-sensor overrides (`GAME_DB`) and `REAL_BIOS_FALLBACK_GAMES` diagnostics (`GbaCore::recommends_real_bios()`), documented across 60+ commercial titles in [`COMPATIBILITY.md`](docs/COMPATIBILITY.md).
 - Cited Jasper Vijn (`cearn`) MIT License terms for `tonc-bin.zip` in [`scripts/README.md`](scripts/README.md) and [`THIRD-PARTY-NOTICES.md`](THIRD-PARTY-NOTICES.md).
 
 ### Windows Polish, Storage & Privacy

@@ -18,15 +18,141 @@ pub(crate) struct PerfCheckReport {
     pub(crate) exit_success: bool,
     pub(crate) elapsed_ms: u64,
     pub(crate) status_label: String,
+    pub(crate) build_info: Option<String>,
+    pub(crate) enumerated_adapters: Vec<String>,
     pub(crate) chosen_adapter: Option<String>,
     pub(crate) calibration: Option<String>,
     pub(crate) headless: Option<String>,
     pub(crate) paced: Option<String>,
+    pub(crate) fixed_gpu_wait: Option<String>,
+    pub(crate) slowdown_sweep: Option<String>,
     pub(crate) measured_ceiling: Option<String>,
     pub(crate) recommended_filter: Option<String>,
     pub(crate) fail_reasons: Option<String>,
+    pub(crate) json_path: Option<String>,
+    pub(crate) full_json: Option<String>,
     pub(crate) raw_output: String,
     pub(crate) error_message: Option<String>,
+}
+
+impl PerfCheckReport {
+    pub(crate) fn verdict_headline(&self) -> &'static str {
+        if !self.passed {
+            return "May stutter: try Sharp Pixels";
+        }
+        let rec_lower = self
+            .recommended_filter
+            .as_deref()
+            .unwrap_or("")
+            .to_ascii_lowercase();
+        let rec_sharp = rec_lower.starts_with("sharp1x")
+            || rec_lower.starts_with("raw-nearest")
+            || rec_lower.starts_with("none");
+        let zero_ceiling = self
+            .measured_ceiling
+            .as_deref()
+            .and_then(|s| s.split('=').nth(1))
+            .and_then(|rhs| rhs.trim().strip_suffix('x').or_else(|| rhs.split_whitespace().next().and_then(|t| t.strip_suffix('x'))))
+            .and_then(|num| num.trim().parse::<u32>().ok())
+            .is_some_and(|x| x == 0);
+        if rec_sharp || zero_ceiling {
+            "May stutter: try Sharp Pixels"
+        } else {
+            "Runs smoothly on this PC"
+        }
+    }
+
+    pub(crate) fn plain_summary_line(&self) -> String {
+        if let Some(ref rec) = self.recommended_filter {
+            let filter_id = rec
+                .split(['—', '-'])
+                .next()
+                .map(str::trim)
+                .unwrap_or("")
+                .trim();
+            let friendly_filter = match filter_id.to_ascii_lowercase().as_str() {
+                "smooth-bilinear" | "bilinear" => "Soft & Balanced",
+                "sharp1x" | "raw-nearest" | "none" => "Sharp Pixels",
+                "authentic-gba-lcd" | "lcd-grid" => "Authentic GBA LCD",
+                "smooth-scale2x" | "hq2x" | "xbrz" => "Smooth Scale2x / Crisp HD",
+                _ => filter_id,
+            };
+            let headroom = self
+                .measured_ceiling
+                .as_deref()
+                .and_then(|c| c.split('=').nth(1))
+                .and_then(|rhs| rhs.split('|').next())
+                .map(str::trim)
+                .filter(|s| !s.is_empty());
+            match (friendly_filter.is_empty(), headroom) {
+                (false, Some(h)) => format!(
+                    "Recommended screen look: {friendly_filter} ({h} smooth speed headroom)"
+                ),
+                (false, None) => format!("Recommended screen look: {friendly_filter}"),
+                (true, Some(h)) => format!("Measured smooth headroom: {h}"),
+                (true, None) => "Performance check complete.".to_string(),
+            }
+        } else if let Some(ref reasons) = self.fail_reasons {
+            reasons.clone()
+        } else if let Some(ref err) = self.error_message {
+            err.clone()
+        } else {
+            "Check completed. Open Details below for adapter and benchmark timings.".to_string()
+        }
+    }
+
+    pub(crate) fn export_json(&self) -> String {
+        if let Some(ref json) = self.full_json {
+            return json.clone();
+        }
+        let build = self.build_info.as_deref().unwrap_or("");
+        let extract_kv = |key: &str| -> String {
+            build
+                .split('|')
+                .filter_map(|part| part.trim().strip_prefix(key))
+                .next()
+                .unwrap_or("")
+                .trim()
+                .to_string()
+        };
+        let payload = serde_json::json!({
+            "passed": self.passed,
+            "status_label": self.status_label,
+            "elapsed_ms": self.elapsed_ms,
+            "git_commit": extract_kv("commit="),
+            "build_time_utc": extract_kv("built="),
+            "exe_sha256": extract_kv("exe_sha256="),
+            "available_adapters": self.enumerated_adapters,
+            "chosen_adapter": self.chosen_adapter,
+            "calibration_ratio_vs_ref": self.calibration.as_deref().and_then(|c| {
+                c.split("ratio vs ref =")
+                    .nth(1)
+                    .and_then(|s| s.split('x').next())
+                    .and_then(|n| n.trim().parse::<f64>().ok())
+            }),
+            "calibration": self.calibration,
+            "headless": self.headless,
+            "paced": self.paced,
+            "fixed_gpu_wait": self.fixed_gpu_wait,
+            "slowdown_sweep": self.slowdown_sweep,
+            "measured_smooth_ceiling_x": self.measured_ceiling.as_deref().and_then(|c| {
+                c.split('=')
+                    .nth(1)
+                    .and_then(|s| s.split('x').next())
+                    .and_then(|n| n.trim().parse::<usize>().ok())
+            }),
+            "measured_zero_over_budget_x": self.measured_ceiling.as_deref().and_then(|c| {
+                c.split("zero-over-budget =")
+                    .nth(1)
+                    .and_then(|s| s.split('x').next())
+                    .and_then(|n| n.trim().parse::<usize>().ok())
+            }),
+            "measured_ceiling": self.measured_ceiling,
+            "recommended_filter": self.recommended_filter,
+            "fail_reasons": self.fail_reasons,
+        });
+        serde_json::to_string_pretty(&payload).unwrap_or_else(|_| self.raw_output.clone())
+    }
 }
 
 /// Asynchronous execution state for `Help -> Run performance check`.
@@ -43,27 +169,56 @@ pub(crate) enum PerfCheckState {
 }
 
 /// Parses `--selftest` stdout/stderr output into a structured summary + full raw report.
+#[cfg_attr(not(test), allow(dead_code))]
 pub(crate) fn parse_selftest_report(
     stdout: &str,
     stderr: &str,
     exit_success: bool,
     elapsed_ms: u64,
 ) -> PerfCheckReport {
+    parse_selftest_report_with_json(stdout, stderr, None, exit_success, elapsed_ms)
+}
+
+/// Parses `--selftest` stdout/stderr and optional verbatim `SelftestReportJson` file contents.
+pub(crate) fn parse_selftest_report_with_json(
+    stdout: &str,
+    stderr: &str,
+    full_json_override: Option<String>,
+    exit_success: bool,
+    elapsed_ms: u64,
+) -> PerfCheckReport {
     let mut header_pass = None;
+    let mut build_info = None;
+    let mut enumerated_adapters = Vec::new();
+    let mut in_enumerated_gpus = false;
     let mut chosen_adapter = None;
     let mut calibration = None;
     let mut headless = None;
     let mut paced = None;
+    let mut fixed_gpu_wait = None;
+    let mut slowdown_sweep = None;
     let mut measured_ceiling = None;
     let mut recommended_filter = None;
     let mut fail_reasons = None;
+    let mut json_path: Option<String> = None;
 
     for raw_line in stdout.lines() {
         let line = raw_line.trim();
+        if in_enumerated_gpus {
+            if line.starts_with('[') {
+                enumerated_adapters.push(line.to_string());
+                continue;
+            }
+            in_enumerated_gpus = false;
+        }
         if line.contains("--SELFTEST (PASS)") {
             header_pass = Some(true);
         } else if line.contains("--SELFTEST (FAIL)") {
             header_pass = Some(false);
+        } else if let Some(val) = line.strip_prefix("Build:") {
+            measured_filter_assign(&mut build_info, val);
+        } else if line.starts_with("Enumerated GPUs:") {
+            in_enumerated_gpus = true;
         } else if let Some(val) = line.strip_prefix("Chosen Adapter:") {
             chosen_adapter = Some(val.trim().to_string());
         } else if let Some(val) = line.strip_prefix("Calibration:") {
@@ -72,14 +227,29 @@ pub(crate) fn parse_selftest_report(
             headless = Some(val.trim().to_string());
         } else if let Some(val) = line.strip_prefix("Paced (600f +120w):") {
             paced = Some(val.trim().to_string());
+        } else if let Some(val) = line.strip_prefix("Fixed GPU Wait:") {
+            measured_filter_assign(&mut fixed_gpu_wait, val);
+        } else if let Some(val) = line.strip_prefix("Slowdown Sweep:") {
+            measured_filter_assign(&mut slowdown_sweep, val);
         } else if let Some(val) = line.strip_prefix("Measured Ceiling:") {
             measured_filter_assign(&mut measured_ceiling, val);
         } else if let Some(val) = line.strip_prefix("Recommended Filter:") {
             recommended_filter = Some(val.trim().to_string());
         } else if let Some(val) = line.strip_prefix("Fail Reasons:") {
             fail_reasons = Some(val.trim().to_string());
+        } else if let Some(val) = line.strip_prefix("JSON:") {
+            measured_filter_assign(&mut json_path, val);
         }
     }
+
+    let full_json = full_json_override.or_else(|| {
+        let p = json_path.as_deref()?;
+        if p.starts_with('{') {
+            Some(p.to_string())
+        } else {
+            std::fs::read_to_string(p).ok()
+        }
+    });
 
     let passed = exit_success && header_pass.unwrap_or(false) && fail_reasons.is_none();
     let status_label = if passed {
@@ -102,13 +272,19 @@ pub(crate) fn parse_selftest_report(
         exit_success,
         elapsed_ms,
         status_label,
+        build_info,
+        enumerated_adapters,
         chosen_adapter,
         calibration,
         headless,
         paced,
+        fixed_gpu_wait,
+        slowdown_sweep,
         measured_ceiling,
         recommended_filter,
         fail_reasons,
+        json_path,
+        full_json,
         raw_output,
         error_message: None,
     }
@@ -128,8 +304,20 @@ fn spawn_selftest_child(exe_path: PathBuf) -> (Arc<AtomicBool>, Receiver<PerfChe
 
     std::thread::spawn(move || {
         let started = Instant::now();
+        let nonce = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_nanos();
+        let temp_perf_dir = std::env::temp_dir().join(format!(
+            "rustboy_perf_check_{}_{nonce}",
+            std::process::id()
+        ));
+        let _ = std::fs::create_dir_all(&temp_perf_dir);
+
         let mut cmd = Command::new(&exe_path);
         cmd.arg("--selftest")
+            .arg("--perf-dir")
+            .arg(&temp_perf_dir)
             .stdin(Stdio::null())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped());
@@ -144,18 +332,25 @@ fn spawn_selftest_child(exe_path: PathBuf) -> (Arc<AtomicBool>, Receiver<PerfChe
         let mut child = match cmd.spawn() {
             Ok(child) => child,
             Err(err) => {
+                let _ = std::fs::remove_dir_all(&temp_perf_dir);
                 let _ = tx.send(PerfCheckReport {
                     passed: false,
                     exit_success: false,
                     elapsed_ms: started.elapsed().as_millis() as u64,
                     status_label: "ERROR".to_string(),
+                    build_info: None,
+                    enumerated_adapters: Vec::new(),
                     chosen_adapter: None,
                     calibration: None,
                     headless: None,
                     paced: None,
+                    fixed_gpu_wait: None,
+                    slowdown_sweep: None,
                     measured_ceiling: None,
                     recommended_filter: None,
                     fail_reasons: None,
+                    json_path: None,
+                    full_json: None,
                     raw_output: format!("Failed to start performance check: {err}"),
                     error_message: Some(format!("Failed to launch --selftest: {err}")),
                 });
@@ -219,8 +414,28 @@ fn spawn_selftest_child(exe_path: PathBuf) -> (Arc<AtomicBool>, Receiver<PerfChe
             .and_then(|h| h.join().ok())
             .unwrap_or_default();
         let elapsed_ms = started.elapsed().as_millis() as u64;
+        let full_json = std::fs::read_dir(&temp_perf_dir)
+            .ok()
+            .and_then(|entries| {
+                entries
+                    .filter_map(|e| e.ok())
+                    .find(|e| {
+                        e.path()
+                            .extension()
+                            .and_then(|ext| ext.to_str())
+                            .is_some_and(|ext| ext.eq_ignore_ascii_case("json"))
+                    })
+                    .and_then(|e| std::fs::read_to_string(e.path()).ok())
+            });
+        let _ = std::fs::remove_dir_all(&temp_perf_dir);
 
-        let mut report = parse_selftest_report(&stdout, &stderr, exit_success, elapsed_ms);
+        let mut report = parse_selftest_report_with_json(
+            &stdout,
+            &stderr,
+            full_json,
+            exit_success,
+            elapsed_ms,
+        );
         if let Some(reason) = abort_reason {
             report.passed = false;
             report.exit_success = false;
@@ -304,13 +519,19 @@ impl RustboyApp {
                     exit_success: false,
                     elapsed_ms: 0,
                     status_label: "ERROR".to_string(),
+                    build_info: None,
+                    enumerated_adapters: Vec::new(),
                     chosen_adapter: None,
                     calibration: None,
                     headless: None,
                     paced: None,
+                    fixed_gpu_wait: None,
+                    slowdown_sweep: None,
                     measured_ceiling: None,
                     recommended_filter: None,
                     fail_reasons: None,
+                    json_path: None,
+                    full_json: None,
                     raw_output: format!("Failed to locate executable: {err}"),
                     error_message: Some(format!("Failed to locate executable: {err}")),
                 }));
@@ -339,13 +560,19 @@ impl RustboyApp {
                     exit_success: false,
                     elapsed_ms: 0,
                     status_label: "ERROR".to_string(),
+                    build_info: None,
+                    enumerated_adapters: Vec::new(),
                     chosen_adapter: None,
                     calibration: None,
                     headless: None,
                     paced: None,
+                    fixed_gpu_wait: None,
+                    slowdown_sweep: None,
                     measured_ceiling: None,
                     recommended_filter: None,
                     fail_reasons: None,
+                    json_path: None,
+                    full_json: None,
                     raw_output: "Performance check worker terminated unexpectedly.".to_string(),
                     error_message: Some(
                         "Performance check worker terminated unexpectedly.".to_string(),
@@ -725,10 +952,11 @@ impl RustboyApp {
                     }
                 }
                 PerfCheckState::Finished(report) => {
-                    let badge_color = if report.passed {
+                    let verdict = report.verdict_headline();
+                    let badge_color = if verdict == "Runs smoothly on this PC" {
                         ACCENT_TEAL
                     } else {
-                        egui::Color32::from_rgb(220, 95, 95)
+                        egui::Color32::from_rgb(230, 175, 85)
                     };
                     egui::Frame::new()
                         .fill(COLOR_TILE)
@@ -739,7 +967,8 @@ impl RustboyApp {
                             ui.set_width(ui.available_width());
                             ui.horizontal(|ui| {
                                 ui.label(
-                                    egui::RichText::new(format!("Status: {}", report.status_label))
+                                    egui::RichText::new(verdict)
+                                        .size(15.0)
                                         .strong()
                                         .color(badge_color),
                                 );
@@ -748,7 +977,8 @@ impl RustboyApp {
                                     |ui| {
                                         ui.label(
                                             egui::RichText::new(format!(
-                                                "Completed in {:.2}s",
+                                                "{} · {:.2}s",
+                                                report.status_label,
                                                 report.elapsed_ms as f32 / 1000.0
                                             ))
                                             .small()
@@ -757,70 +987,111 @@ impl RustboyApp {
                                     },
                                 );
                             });
+                            ui.add_space(4.0);
+                            ui.label(
+                                egui::RichText::new(report.plain_summary_line()).color(COLOR_TEXT),
+                            );
 
                             if let Some(ref err) = report.error_message {
                                 ui.add_space(4.0);
-                                ui.label(egui::RichText::new(err).color(badge_color));
+                                ui.label(
+                                    egui::RichText::new(err)
+                                        .color(egui::Color32::from_rgb(220, 95, 95)),
+                                );
                             }
-
-                            ui.add_space(6.0);
-                            egui::Grid::new("perf_check_summary_grid")
-                                .num_columns(2)
-                                .spacing([12.0, 4.0])
-                                .show(ui, |ui| {
-                                    let rows: [(&str, Option<&str>); 7] = [
-                                        ("Adapter", report.chosen_adapter.as_deref()),
-                                        ("Calibration", report.calibration.as_deref()),
-                                        ("Headless", report.headless.as_deref()),
-                                        ("Paced", report.paced.as_deref()),
-                                        ("Ceiling", report.measured_ceiling.as_deref()),
-                                        ("Recommended", report.recommended_filter.as_deref()),
-                                        ("Issues", report.fail_reasons.as_deref()),
-                                    ];
-                                    for (label, value) in rows {
-                                        if let Some(val) = value {
-                                            ui.label(
-                                                egui::RichText::new(label)
-                                                    .color(COLOR_TEXT_SECONDARY),
-                                            );
-                                            ui.label(egui::RichText::new(val).color(COLOR_TEXT));
-                                            ui.end_row();
-                                        }
-                                    }
-                                });
                         });
 
                     ui.add_space(8.0);
-                    ui.label(
-                        egui::RichText::new("Full Report")
-                            .small()
-                            .color(COLOR_TEXT_SECONDARY),
-                    );
-                    egui::Frame::new()
-                        .fill(COLOR_TILE)
-                        .stroke(STROKE_BORDER)
-                        .corner_radius(2)
-                        .inner_margin(egui::Margin::same(8))
+                    egui::CollapsingHeader::new("Details")
+                        .default_open(false)
                         .show(ui, |ui| {
-                            egui::ScrollArea::vertical()
-                                .max_height(170.0)
+                            egui::Frame::new()
+                                .fill(COLOR_TILE)
+                                .stroke(STROKE_BORDER)
+                                .corner_radius(2)
+                                .inner_margin(egui::Margin::same(8))
                                 .show(ui, |ui| {
-                                    ui.add(
-                                        egui::TextEdit::multiline(&mut report.raw_output.as_str())
-                                            .font(egui::TextStyle::Monospace)
-                                            .desired_width(f32::INFINITY)
-                                            .frame(false),
-                                    );
+                                    ui.set_width(ui.available_width());
+                                    let adapters_joined = if report.enumerated_adapters.is_empty() {
+                                        None
+                                    } else {
+                                        Some(report.enumerated_adapters.join("\n"))
+                                    };
+                                    egui::Grid::new("perf_check_summary_grid")
+                                        .num_columns(2)
+                                        .spacing([12.0, 4.0])
+                                        .show(ui, |ui| {
+                                            let rows: [(&str, Option<&str>); 11] = [
+                                                ("Build", report.build_info.as_deref()),
+                                                ("Adapter", report.chosen_adapter.as_deref()),
+                                                ("Enumerated GPUs", adapters_joined.as_deref()),
+                                                ("Calibration", report.calibration.as_deref()),
+                                                ("Headless", report.headless.as_deref()),
+                                                ("Paced", report.paced.as_deref()),
+                                                ("Fixed GPU Wait", report.fixed_gpu_wait.as_deref()),
+                                                ("Slowdown Sweep", report.slowdown_sweep.as_deref()),
+                                                ("Measured Ceiling", report.measured_ceiling.as_deref()),
+                                                ("Recommended Filter", report.recommended_filter.as_deref()),
+                                                ("Issues", report.fail_reasons.as_deref()),
+                                            ];
+                                            for (label, value) in rows {
+                                                if let Some(val) = value {
+                                                    ui.label(
+                                                        egui::RichText::new(label)
+                                                            .color(COLOR_TEXT_SECONDARY),
+                                                    );
+                                                    ui.label(
+                                                        egui::RichText::new(val).color(COLOR_TEXT),
+                                                    );
+                                                    ui.end_row();
+                                                }
+                                            }
+                                        });
+                                });
+
+                            ui.add_space(6.0);
+                            ui.label(
+                                egui::RichText::new("Full --selftest Output")
+                                    .small()
+                                    .color(COLOR_TEXT_SECONDARY),
+                            );
+                            egui::Frame::new()
+                                .fill(COLOR_TILE)
+                                .stroke(STROKE_BORDER)
+                                .corner_radius(2)
+                                .inner_margin(egui::Margin::same(8))
+                                .show(ui, |ui| {
+                                    egui::ScrollArea::vertical()
+                                        .max_height(150.0)
+                                        .show(ui, |ui| {
+                                            ui.add(
+                                                egui::TextEdit::multiline(
+                                                    &mut report.raw_output.as_str(),
+                                                )
+                                                .font(egui::TextStyle::Monospace)
+                                                .desired_width(f32::INFINITY)
+                                                .frame(false),
+                                            );
+                                        });
                                 });
                         });
 
                     ui.add_space(8.0);
                     ui.horizontal(|ui| {
-                        if ui.button("Copy Report").clicked() {
-                            copy_text_payload = Some(report.raw_output.clone());
+                        let json_payload = report.export_json();
+                        if ui
+                            .button("Copy Report")
+                            .on_hover_text("Copy the full JSON performance report to the clipboard")
+                            .clicked()
+                        {
+                            copy_text_payload = Some(json_payload.clone());
                         }
-                        if ui.button("Save Report...").clicked() {
-                            save_text_payload = Some(report.raw_output.clone());
+                        if ui
+                            .button("Save Report...")
+                            .on_hover_text("Save the full JSON performance report to a file")
+                            .clicked()
+                        {
+                            save_text_payload = Some(json_payload);
                         }
                         if ui.button("Run Again").clicked() {
                             rerun_clicked = true;
@@ -843,12 +1114,12 @@ impl RustboyApp {
         }
         if let Some(text) = copy_text_payload {
             ctx.copy_text(text);
-            self.notify("Performance report copied to clipboard");
+            self.notify("Full JSON performance report copied to clipboard");
         }
         if let Some(text) = save_text_payload
             && let Some(path) = rfd::FileDialog::new()
-                .set_file_name("rustboy-selftest-report.txt")
-                .add_filter("Text Report", &["txt", "log"])
+                .set_file_name("rustboy-selftest-report.json")
+                .add_filter("JSON Report", &["json", "txt"])
                 .save_file()
         {
             match std::fs::write(&path, text) {
@@ -873,24 +1144,71 @@ mod tests {
     fn parses_selftest_pass_report_fields() {
         let sample = "\
 === RUSTBOY ADVANCE PORTABLE --SELFTEST (PASS) ===\n\
-  Chosen Adapter:    NVIDIA GeForce RTX (Vulkan)\n\
-  Calibration:       Present=0.45ms Blit=0.20ms Filter=1.10ms (xbr_fast=1.80ms)\n\
-  Headless (600f):   1.20s -> 498.5 fps | Jitter p99=0.08ms | Underruns=0\n\
-  Paced (600f +120w): 10.02s -> 59.88 fps | Missed=0\n\
-  Measured Ceiling:  filter=LCD Matrix\n\
-  Recommended Filter: LCD Matrix\n\
-  JSON:              {\"passed\":true}\n";
+  Build:             commit=072e4078c7b3 | built=2026-11-14T09:22:04Z | exe_sha256=9a11a338ca98028ee0dfd44d542f71e326ea49890979ad658938b201fbb98fb4\n\
+  Host:              AMD Ryzen 9 8945HX with Radeon Graphics (16c/32t) | RAM=32560 MB | OS=Windows 11 (10.0.26300)\n\
+  Embedded ROM:      embedded:STRESS_SELF (Mode0 4xBG + 128 Sprites + Alpha)\n\
+  Enumerated GPUs:   2 adapter(s) visible to wgpu\n\
+    [1] NVIDIA GeForce RTX 5070 Laptop GPU (Vulkan / DiscreteGpu) — driver: NVIDIA 616.92\n\
+    [2] Microsoft Basic Render Driver (Dx12 / Cpu) — driver: 10.0.26100.9818\n\
+  Chosen Adapter:    NVIDIA GeForce RTX 5070 Laptop GPU (Vulkan / DiscreteGpu) [gpu-shader]\n\
+  Calibration:       75.527 ms (ref 75.769 ms, ratio vs ref = 1.00x)\n\
+  Headless (600f):   998.1 FPS | headroom = 16.71x | emu_avg=0.836 ms | total avg=1.002 p95=1.317 worst=2.627 ms\n\
+  Paced (600f +120w): work avg=1.042 p95=1.368 p99.5=1.494 worst=2.031 ms | over_budget=0 (0.000%)\n\
+  Slowdown Sweep:    [1x(p99.5=1.91ms,PASS), 8x(p99.5=12.05ms,PASS), 12x(p99.5=18.28ms,FAIL)]\n\
+  Measured Ceiling:  smooth (<0.5% over, 0 underruns) = 8x | zero-over-budget = 8x\n\
+  Recommended Filter: smooth-bilinear — Hardware GPU shader path provides clean interpolation\n\
+  JSON:              perf/selftest-20261114-094156.json\n";
 
-        let report = parse_selftest_report(sample, "", true, 12450);
+        let full_json = serde_json::json!({
+            "schema_version": 3,
+            "exe_sha256": "9a11a338ca98028ee0dfd44d542f71e326ea49890979ad658938b201fbb98fb4",
+            "git_commit": "072e4078c7b3",
+            "build_time_utc": "2026-11-14T09:22:04Z",
+            "calibration_ratio_vs_ref": 1.0032,
+            "available_adapters": [
+                { "name": "NVIDIA GeForce RTX 5070 Laptop GPU", "backend": "Vulkan" }
+            ],
+            "slowdown_sweep": [
+                { "slowdown_x": 8, "smooth_passed": true }
+            ],
+            "measured_smooth_ceiling_x": 8,
+            "measured_zero_over_budget_x": 8,
+            "recommended_filter": "smooth-bilinear",
+            "passed": true
+        })
+        .to_string();
+
+        let report =
+            super::parse_selftest_report_with_json(sample, "", Some(full_json), true, 12450);
         assert!(report.passed);
         assert_eq!(report.status_label, "PASS");
+        assert_eq!(report.verdict_headline(), "Runs smoothly on this PC");
         assert_eq!(
             report.chosen_adapter.as_deref(),
-            Some("NVIDIA GeForce RTX (Vulkan)")
+            Some("NVIDIA GeForce RTX 5070 Laptop GPU (Vulkan / DiscreteGpu) [gpu-shader]")
         );
-        assert_eq!(report.recommended_filter.as_deref(), Some("LCD Matrix"));
+        assert_eq!(report.enumerated_adapters.len(), 2);
+        assert_eq!(
+            report.measured_ceiling.as_deref(),
+            Some("smooth (<0.5% over, 0 underruns) = 8x | zero-over-budget = 8x")
+        );
+        assert!(report.recommended_filter.as_deref().unwrap().starts_with("smooth-bilinear"));
         assert!(report.fail_reasons.is_none());
-        assert!(report.raw_output.contains("\"passed\":true"));
+
+        let exported = report.export_json();
+        for key in [
+            "exe_sha256",
+            "git_commit",
+            "build_time_utc",
+            "calibration_ratio_vs_ref",
+            "available_adapters",
+            "slowdown_sweep",
+            "measured_smooth_ceiling_x",
+            "measured_zero_over_budget_x",
+            "recommended_filter",
+        ] {
+            assert!(exported.contains(key), "exported JSON missing `{key}`");
+        }
     }
 
     #[test]
@@ -898,11 +1216,13 @@ mod tests {
         let sample = "\
 === RUSTBOY ADVANCE PORTABLE --SELFTEST (FAIL) ===\n\
   Chosen Adapter:    Basic Render Driver (Software)\n\
+  Recommended Filter: sharp1x — Step down for tighter frame budgets\n\
   Fail Reasons:      no hardware adapter; missed_frames=14\n";
 
         let report = parse_selftest_report(sample, "warn: slow path", false, 8200);
         assert!(!report.passed);
         assert_eq!(report.status_label, "FAILED");
+        assert_eq!(report.verdict_headline(), "May stutter: try Sharp Pixels");
         assert_eq!(
             report.fail_reasons.as_deref(),
             Some("no hardware adapter; missed_frames=14")

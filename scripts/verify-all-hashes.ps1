@@ -1,5 +1,9 @@
 # Verifies every presented frame + core video + core audio hash against pre-Phase-4 baselines.
 $ErrorActionPreference = "Stop"
+
+$RepoRoot = Split-Path -Parent $PSScriptRoot
+Set-Location $RepoRoot
+
 $exe = (Resolve-Path "target\release\rustboy-advance.exe").Path
 
 $checks = @(

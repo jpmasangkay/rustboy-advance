@@ -6,6 +6,9 @@ param(
 
 $ErrorActionPreference = "Stop"
 
+$RepoRoot = Split-Path -Parent $PSScriptRoot
+Set-Location $RepoRoot
+
 $exe = (Resolve-Path "target\release\rustboy-advance.exe").Path
 $rom = if ($env:GBA_BENCH_ROM) { $env:GBA_BENCH_ROM } else { "roms/summon_night.gba" }
 $replay = "perf/replays/summon_night.txt"

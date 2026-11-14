@@ -64,3 +64,12 @@ test-roms/ags/ags.gba
 ```
 
 When present, `gba-testrunner` will automatically execute its manifest entry; when absent, it cleanly reports `SKIP (missing ROM)`.
+
+## Performance & Verification Scripts
+
+The benchmark scripts resolve paths relative to the repository root and must write generated JSON outputs under `perf/` (which is gitignored). `run-phase3*.ps1` take a long time to complete, and `run-phase3.ps1` / `run-phase3b.ps1` modify the active Windows AC power plan via `powercfg` (restoring it on exit).
+
+- `scripts/verify-all-hashes.ps1` — Verifies presented video, core video, and core audio CRC32 hashes for 10 ROMs against `perf/baselines/` (skips missing ROMs).
+- `scripts/run-phase3.ps1` — Runs legacy single-iteration weak-hardware benchmarks (`powercfg` throttling + Core-0 contention) on *Summon Night* and writes `perf/weak_hardware.json`.
+- `scripts/run-phase3b.ps1` — Runs 5-iteration `powercfg` throttle validation, Core-0 contention, and `--slowdown` sweeps on *Summon Night* and writes `perf/phase3b_results.json`.
+- `scripts/run-phase3c.ps1` — Runs realtime homebrew/stress baselines across 9 ROMs and a 5-iteration `--slowdown` sweep on 2 ROMs, writing `perf/phase3c_realtime.json` and `perf/phase3c_slowdown_sweep.json`.

@@ -1,6 +1,9 @@
 # Phase 3 Weak Hardware Simulation Benchmark Runner
 $ErrorActionPreference = "Stop"
 
+$RepoRoot = Split-Path -Parent $PSScriptRoot
+Set-Location $RepoRoot
+
 $rom = if ($env:GBA_BENCH_ROM) { $env:GBA_BENCH_ROM } else { "roms/summon_night.gba" }
 $replay = "perf/replays/summon_night.txt"
 $sav = "perf/replays/summon_night.sav"

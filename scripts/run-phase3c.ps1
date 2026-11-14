@@ -6,6 +6,9 @@ param(
 
 $ErrorActionPreference = "Stop"
 
+$RepoRoot = Split-Path -Parent $PSScriptRoot
+Set-Location $RepoRoot
+
 $exe = (Resolve-Path "target\release\rustboy-advance.exe").Path
 if (Test-Path "perf/REPORT.md") {
     Copy-Item "perf/REPORT.md" "perf/REPORT.phase3_bak.md" -Force

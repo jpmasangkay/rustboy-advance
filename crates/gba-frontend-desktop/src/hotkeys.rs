@@ -93,7 +93,7 @@ impl RustboyApp {
             i.modifiers.ctrl && !i.modifiers.shift && !i.modifiers.alt && i.key_pressed(Key::W)
         });
         if stop_game && self.has_active_game() {
-            self.close_rom(ctx);
+            self.request_close_rom(ctx);
             return;
         }
 
@@ -230,7 +230,7 @@ impl RustboyApp {
             self.step_single_frame(ctx);
         }
         if hard_reset_trig {
-            self.hard_reset();
+            self.request_hard_reset();
         }
         if mute_trig {
             self.config.muted = !self.config.muted;
@@ -384,5 +384,50 @@ mod tests {
         });
         assert!(!app.show_pause_overlay);
         assert!(!app.paused);
+    }
+
+    #[test]
+    fn test_escape_cancels_pending_confirm_before_fullscreen_or_pause() {
+        let mut app = ManuallyDrop::new(RustboyApp::new(CliConfig::default()));
+        app.core = Some(gba_core::GbaCore::new(None, vec![0u8; 256]));
+        app.config.pause_overlay_enabled = true;
+        app.is_fullscreen = true;
+        app.paused = false;
+        app.show_pause_overlay = false;
+        app.pending_confirm_action = Some(crate::app::PendingConfirmAction::HardReset);
+
+        let ctx = egui::Context::default();
+        let esc_input = egui::RawInput {
+            events: vec![egui::Event::Key {
+                key: Key::Escape,
+                physical_key: None,
+                pressed: true,
+                repeat: false,
+                modifiers: egui::Modifiers::NONE,
+            }],
+            ..Default::default()
+        };
+
+        // 1st Esc closes confirmation dialog only
+        let _ = ctx.run(esc_input.clone(), |ctx| {
+            app.handle_global_shortcuts(ctx);
+        });
+        assert!(app.pending_confirm_action.is_none());
+        assert!(app.is_fullscreen);
+        assert!(!app.show_pause_overlay);
+
+        // 2nd Esc exits fullscreen only
+        let _ = ctx.run(esc_input.clone(), |ctx| {
+            app.handle_global_shortcuts(ctx);
+        });
+        assert!(!app.is_fullscreen);
+        assert!(!app.show_pause_overlay);
+
+        // 3rd Esc opens pause overlay
+        let _ = ctx.run(esc_input, |ctx| {
+            app.handle_global_shortcuts(ctx);
+        });
+        assert!(app.show_pause_overlay);
+        assert!(app.paused);
     }
 }

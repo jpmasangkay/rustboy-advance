@@ -1,4 +1,4 @@
-use crate::app::RustboyApp;
+use crate::app::{PendingConfirmAction, RustboyApp};
 use crate::config::{AppConfig, HotkeyAction};
 use crate::theme::{ACCENT_TEAL, COLOR_TEXT, COLOR_TEXT_SECONDARY, COLOR_TILE, STROKE_BORDER};
 use std::io::Read;
@@ -590,6 +590,9 @@ impl RustboyApp {
 
     /// Closes the top-most open UI popup or dialog on Esc. Returns true if one was closed.
     pub(crate) fn close_top_dialog_on_escape(&mut self, ctx: &egui::Context) -> bool {
+        if self.pending_confirm_action.take().is_some() {
+            return true;
+        }
         if self.show_volume_popup {
             self.show_volume_popup = false;
             return true;
@@ -679,34 +682,37 @@ impl RustboyApp {
         }
 
         let screen = ctx.screen_rect();
+        let popup_w = 176.0_f32;
         let default_pos = self
             .volume_popup_anchor
             .map(|p| {
                 egui::pos2(
-                    (p.x - 90.0).clamp(8.0, (screen.max.x - 230.0).max(8.0)),
-                    (p.y + 4.0).clamp(8.0, (screen.max.y - 120.0).max(8.0)),
+                    (p.x - 64.0).clamp(8.0, (screen.max.x - (popup_w + 20.0)).max(8.0)),
+                    (p.y + 4.0).clamp(8.0, (screen.max.y - 110.0).max(8.0)),
                 )
             })
-            .unwrap_or_else(|| egui::pos2((screen.max.x - 240.0).max(8.0), 60.0));
+            .unwrap_or_else(|| egui::pos2((screen.max.x - (popup_w + 28.0)).max(8.0), 60.0));
 
         let mute_key = self.config.keybindings.hotkeys.display(HotkeyAction::Mute);
         let resp = egui::Area::new(egui::Id::new("toolbar_volume_popup"))
             .order(egui::Order::Foreground)
             .fixed_pos(default_pos)
             .show(ctx, |ui| {
+                ui.set_max_width(popup_w + 20.0);
                 egui::Frame::window(ui.style())
                     .fill(COLOR_TILE)
                     .stroke(STROKE_BORDER)
-                    .inner_margin(egui::Margin::same(10))
+                    .inner_margin(egui::Margin::same(8))
                     .show(ui, |ui| {
-                        ui.set_min_width(210.0);
+                        ui.set_width(popup_w);
+                        ui.set_max_width(popup_w);
                         ui.horizontal(|ui| {
                             ui.strong("Sound");
                             ui.with_layout(
                                 egui::Layout::right_to_left(egui::Align::Center),
                                 |ui| {
                                     ui.label(
-                                        egui::RichText::new(format!("Mute: {mute_key}"))
+                                        egui::RichText::new(mute_key)
                                             .small()
                                             .color(COLOR_TEXT_SECONDARY),
                                     );
@@ -720,8 +726,9 @@ impl RustboyApp {
                         }
                         ui.add_space(4.0);
                         ui.horizontal(|ui| {
-                            ui.label("Volume:");
-                            let slider = ui.add_enabled(
+                            ui.spacing_mut().slider_width = 96.0;
+                            let slider = crate::theme::add_slider(
+                                ui,
                                 !self.config.muted,
                                 egui::Slider::new(&mut self.config.master_volume, 0..=100)
                                     .suffix("%"),
@@ -839,14 +846,14 @@ impl RustboyApp {
                                 config_dirty = true;
                             }
                             ui.add_space(8.0);
-                            if ui
-                                .add_enabled(
-                                    !self.config.muted,
-                                    egui::Slider::new(&mut self.config.master_volume, 0..=100)
-                                        .text("Volume")
-                                        .suffix("%"),
-                                )
-                                .changed()
+                            if crate::theme::add_slider(
+                                ui,
+                                !self.config.muted,
+                                egui::Slider::new(&mut self.config.master_volume, 0..=100)
+                                    .text("Volume")
+                                    .suffix("%"),
+                            )
+                            .changed()
                             {
                                 self.sync_audio_volume();
                                 config_dirty = true;
@@ -1131,12 +1138,99 @@ impl RustboyApp {
             self.start_performance_check();
         }
     }
+
+    /// Confirms before Restart game or Stop when unsaved in-game progress exists.
+    pub(crate) fn draw_confirm_action_dialog(&mut self, ctx: &egui::Context) {
+        let Some(action) = self.pending_confirm_action else {
+            return;
+        };
+        if !self.has_active_game() {
+            self.pending_confirm_action = None;
+            return;
+        }
+
+        let (title, confirm_label, body) = match action {
+            PendingConfirmAction::HardReset => (
+                "Restart game?",
+                "Restart Game",
+                format!(
+                    "\"{}\" has unsaved in-game progress since the last save state or in-game save. Battery save (.sav) will be flushed, and uncheckpointed RAM progress will be lost.",
+                    self.rom_title
+                ),
+            ),
+            PendingConfirmAction::SoftReset => (
+                "Soft reset game?",
+                "Soft Reset",
+                format!(
+                    "\"{}\" has unsaved in-game progress. Soft resetting restarts the game from its BIOS entrypoint and clears unsaved RAM progress.",
+                    self.rom_title
+                ),
+            ),
+            PendingConfirmAction::CloseRom => (
+                "Stop game?",
+                "Stop & Return to Library",
+                format!(
+                    "\"{}\" has unsaved progress since your last save state. Battery save (.sav) will be saved to disk, while active console memory will be closed.",
+                    self.rom_title
+                ),
+            ),
+        };
+
+        let mut open = true;
+        let mut confirmed = false;
+        let mut cancelled = false;
+
+        egui::Window::new("Unsaved Progress")
+            .open(&mut open)
+            .collapsible(false)
+            .resizable(false)
+            .anchor(egui::Align2::CENTER_CENTER, egui::Vec2::ZERO)
+            .fixed_size([410.0, 155.0])
+            .show(ctx, |ui| {
+                ui.label(egui::RichText::new(title).strong().size(14.0).color(COLOR_TEXT));
+                ui.add_space(6.0);
+                ui.label(egui::RichText::new(body).color(COLOR_TEXT_SECONDARY));
+                ui.add_space(12.0);
+                ui.horizontal(|ui| {
+                    if ui
+                        .add(
+                            egui::Button::new(
+                                egui::RichText::new(confirm_label)
+                                    .color(egui::Color32::from_rgb(255, 130, 130)),
+                            )
+                            .stroke(STROKE_BORDER),
+                        )
+                        .clicked()
+                    {
+                        confirmed = true;
+                    }
+                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        if ui.button("Cancel").clicked() {
+                            cancelled = true;
+                        }
+                    });
+                });
+            });
+
+        if confirmed {
+            self.pending_confirm_action = None;
+            self.show_pause_overlay = false;
+            self.paused = false;
+            match action {
+                PendingConfirmAction::HardReset => self.hard_reset(),
+                PendingConfirmAction::SoftReset => self.soft_reset(),
+                PendingConfirmAction::CloseRom => self.close_rom(ctx),
+            }
+        } else if !open || cancelled {
+            self.pending_confirm_action = None;
+        }
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::parse_selftest_report;
-    use crate::app::RustboyApp;
+    use crate::app::{PendingConfirmAction, RustboyApp};
     use crate::headless::CliConfig;
     use std::mem::ManuallyDrop;
 
@@ -1269,5 +1363,43 @@ mod tests {
 
         // No dialogs open -> returns false so Esc can fall through to fullscreen/pause.
         assert!(!app.close_top_dialog_on_escape(&ctx));
+    }
+
+    #[test]
+    fn confirm_dialog_guards_restart_and_stop_with_unsaved_progress() {
+        let mut app = ManuallyDrop::new(RustboyApp::new(CliConfig::default()));
+        app.core = Some(gba_core::GbaCore::new(None, vec![0u8; 256]));
+        app.rom_title = "Summon Night".to_string();
+        app.sav_path = None;
+
+        let ctx = egui::Context::default();
+
+        // At 0 frames and clean save, Restart runs without opening a prompt.
+        app.unsaved_frames_since_save = 0;
+        app.core.as_mut().unwrap().bus.cart.save_dirty = false;
+        app.request_hard_reset();
+        assert!(app.pending_confirm_action.is_none());
+
+        // With unsaved gameplay frames, Restart and Stop request confirmation first.
+        app.unsaved_frames_since_save = 120;
+        app.request_hard_reset();
+        assert_eq!(
+            app.pending_confirm_action,
+            Some(PendingConfirmAction::HardReset)
+        );
+        assert!(app.has_active_game());
+
+        assert!(app.close_top_dialog_on_escape(&ctx));
+        assert!(app.pending_confirm_action.is_none());
+
+        // With dirty battery save, Stop requests confirmation too.
+        app.unsaved_frames_since_save = 0;
+        app.core.as_mut().unwrap().bus.cart.save_dirty = true;
+        app.request_close_rom(&ctx);
+        assert_eq!(
+            app.pending_confirm_action,
+            Some(PendingConfirmAction::CloseRom)
+        );
+        assert!(app.has_active_game());
     }
 }

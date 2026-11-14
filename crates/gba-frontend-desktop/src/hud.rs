@@ -9,6 +9,22 @@ use crate::gb_bridge::{GB_VIEW_OFFSET_X, GB_VIEW_OFFSET_Y};
 use crate::rom_loader::RomPlatform;
 use crate::shaders::{ShaderRenderParams, color_profile_uniform};
 
+/// GBA nominal hardware frame rate (~59.7275 Hz) used for status-bar speed percentage.
+pub(crate) const GBA_NOMINAL_FPS: f32 = 59.7275;
+
+/// Computes rounded emulation speed percentage relative to native GBA 59.7275 FPS.
+pub(crate) fn status_bar_speed_percent(measured_fps: f32) -> u32 {
+    ((measured_fps / GBA_NOMINAL_FPS) * 100.0)
+        .round()
+        .max(0.0) as u32
+}
+
+/// Formats status-bar FPS and speed percentage readout (`FPS: 59.73 (100%)`).
+pub(crate) fn format_status_bar_fps(measured_fps: f32) -> String {
+    let pct = status_bar_speed_percent(measured_fps);
+    format!("FPS: {measured_fps:.2} ({pct}%)")
+}
+
 impl RustboyApp {
     pub(crate) fn draw_status_bar(&mut self, ctx: &egui::Context) {
         if let Some(t) = &self.toast
@@ -59,9 +75,7 @@ impl RustboyApp {
                         }
 
                         if self.has_active_game() && !self.paused {
-                            let pct =
-                                ((self.measured_fps / 59.7275) * 100.0).round().max(0.0) as u32;
-                            let fps_text = format!("FPS: {:.2} ({pct}%)", self.measured_fps);
+                            let fps_text = format_status_bar_fps(self.measured_fps);
                             ui.monospace(
                                 RichText::new(fps_text).color(crate::theme::COLOR_TEXT_SECONDARY),
                             );
@@ -352,13 +366,10 @@ impl RustboyApp {
             self.show_state_manager = true;
         }
         if hard_reset {
-            self.hard_reset();
-            self.show_pause_overlay = false;
-            self.paused = false;
+            self.request_hard_reset();
         }
         if close_game {
-            self.show_pause_overlay = false;
-            self.close_rom(ui.ctx());
+            self.request_close_rom(ui.ctx());
         }
     }
 
@@ -901,4 +912,30 @@ fn draw_status_pill(ui: &mut egui::Ui, label: &str, fg: Color32, border: Color32
                 ui.monospace(RichText::new(label).small().color(fg));
             });
         });
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{format_status_bar_fps, status_bar_speed_percent};
+
+    #[test]
+    fn status_bar_speed_percentage_at_1x_2x_and_fast_forward() {
+        assert_eq!(status_bar_speed_percent(0.0), 0);
+        assert_eq!(format_status_bar_fps(0.0), "FPS: 0.00 (0%)");
+
+        // 1x native GBA speed (59.7275 Hz)
+        assert_eq!(status_bar_speed_percent(59.7275), 100);
+        assert_eq!(status_bar_speed_percent(59.73), 100);
+        assert_eq!(format_status_bar_fps(59.73), "FPS: 59.73 (100%)");
+
+        // 2x speed preset
+        assert_eq!(status_bar_speed_percent(59.7275 * 2.0), 200);
+        assert_eq!(format_status_bar_fps(119.46), "FPS: 119.46 (200%)");
+
+        // Fast-forward presets (4x / 8x)
+        assert_eq!(status_bar_speed_percent(59.7275 * 4.0), 400);
+        assert_eq!(format_status_bar_fps(238.91), "FPS: 238.91 (400%)");
+        assert_eq!(status_bar_speed_percent(59.7275 * 8.0), 800);
+        assert_eq!(format_status_bar_fps(477.82), "FPS: 477.82 (800%)");
+    }
 }

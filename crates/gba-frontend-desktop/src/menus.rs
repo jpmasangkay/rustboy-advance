@@ -196,7 +196,7 @@ impl RustboyApp {
                 .clicked()
             {
                 ui.close_menu();
-                self.close_rom(ctx);
+                self.request_close_rom(ctx);
             }
             if ui
                 .button("Apply ROM Patch...")
@@ -354,7 +354,7 @@ impl RustboyApp {
                 .on_hover_text("Hard Reset — restart the console from boot")
                 .clicked()
             {
-                self.hard_reset();
+                self.request_hard_reset();
                 ui.close_menu();
             }
 
@@ -366,12 +366,12 @@ impl RustboyApp {
                     )
                     .clicked()
             {
-                self.soft_reset();
+                self.request_soft_reset();
                 ui.close_menu();
             }
 
             if ui.button("Stop & Return to Library (Ctrl+W)").clicked() {
-                self.close_rom(ctx);
+                self.request_close_rom(ctx);
                 ui.close_menu();
             }
         });
@@ -598,7 +598,9 @@ impl RustboyApp {
             ui.separator();
             ui.horizontal(|ui| {
                 ui.label("LCD Grid Intensity:");
-                let slider = ui.add(
+                let slider = crate::theme::add_slider(
+                    ui,
+                    true,
                     egui::Slider::new(&mut self.config.lcd_grid_intensity, 0.0..=0.25)
                         .custom_formatter(|n, _| format!("{:.0}%", n * 100.0)),
                 );
@@ -751,9 +753,12 @@ impl RustboyApp {
         }
 
         ui.separator();
-        if ui
-            .add(egui::Slider::new(&mut self.config.master_volume, 0..=100).text("Volume %"))
-            .changed()
+        if crate::theme::add_slider(
+            ui,
+            true,
+            egui::Slider::new(&mut self.config.master_volume, 0..=100).text("Volume %"),
+        )
+        .changed()
         {
             self.sync_audio_volume();
             self.config.save();
@@ -907,10 +912,13 @@ impl RustboyApp {
             ui.checkbox(&mut self.debugger.show_oam, "OAM Sprite Viewer");
             ui.checkbox(&mut self.debugger.show_audio, "Audio Channel Visualizer");
             ui.checkbox(&mut self.debugger.show_gdb, "GDB Remote Server...");
-            if ui.button("Lua Scripting Console...").clicked() {
-                self.lua.show_console = true;
-                ui.close_menu();
-            }
+            ui.horizontal(|ui| {
+                ui.add_space(20.0);
+                if ui.button("Lua Scripting Console...").clicked() {
+                    self.lua.show_console = true;
+                    ui.close_menu();
+                }
+            });
             let movie_lbl = if self.movie.is_recording() {
                 format!(
                     "Input Movies (TAS)... [REC {}f]",
@@ -925,20 +933,26 @@ impl RustboyApp {
             } else {
                 "Input Movies (TAS)...".to_string()
             };
-            if ui.button(movie_lbl).clicked() {
-                self.show_movies = true;
-                ui.close_menu();
-            }
-            if ui
-                .add_enabled(
-                    has_rom,
-                    egui::Button::new("Hardware Overrides & Sensors..."),
-                )
-                .clicked()
-            {
-                self.debugger.show_overrides = true;
-                ui.close_menu();
-            }
+            ui.horizontal(|ui| {
+                ui.add_space(20.0);
+                if ui.button(movie_lbl).clicked() {
+                    self.show_movies = true;
+                    ui.close_menu();
+                }
+            });
+            ui.horizontal(|ui| {
+                ui.add_space(20.0);
+                if ui
+                    .add_enabled(
+                        has_rom,
+                        egui::Button::new("Hardware Overrides & Sensors..."),
+                    )
+                    .clicked()
+                {
+                    self.debugger.show_overrides = true;
+                    ui.close_menu();
+                }
+            });
         }
     }
 
@@ -1019,7 +1033,7 @@ impl RustboyApp {
                         .on_hover_text(format!("Restart game / Hard Reset ({reset_key})"))
                         .clicked()
                     {
-                        self.hard_reset();
+                        self.request_hard_reset();
                     }
 
                     // 4. Fast-Forward

@@ -115,6 +115,13 @@ pub(crate) struct ToastMessage {
     pub(crate) expires_at: Instant,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum PendingConfirmAction {
+    HardReset,
+    SoftReset,
+    CloseRom,
+}
+
 pub(crate) struct RustboyApp {
     pub(crate) config: AppConfig,
     // WAVE-2 HOOK: Core emulator handle (`core.bus.*` memory, PPU, APU, Link/SIO)
@@ -166,6 +173,8 @@ pub(crate) struct RustboyApp {
     // Real-Time Rewind Buffer
     pub(crate) rewind_buffer: RewindBuffer,
     pub(crate) frame_counter: u64,
+    pub(crate) unsaved_frames_since_save: u64,
+    pub(crate) pending_confirm_action: Option<PendingConfirmAction>,
     pub(crate) rewinding: bool,
     pub(crate) show_rewind_settings: bool,
 
@@ -344,6 +353,8 @@ impl RustboyApp {
             cover_download_rx,
             rewind_buffer: RewindBuffer::new(rewind_budget_mb),
             frame_counter: 0,
+            unsaved_frames_since_save: 0,
+            pending_confirm_action: None,
             rewinding: false,
             show_rewind_settings: false,
             paused: false,
@@ -747,6 +758,8 @@ impl RustboyApp {
         self.rewind_buffer.clear();
         self.rewind_movie_frames.clear();
         self.frame_counter = 0;
+        self.unsaved_frames_since_save = 0;
+        self.pending_confirm_action = None;
         self.rewinding = false;
         self.autofire_state.clear_latches();
         self.base_pressed_mask = 0;
@@ -811,6 +824,8 @@ impl RustboyApp {
         self.rewind_buffer.clear();
         self.rewind_movie_frames.clear();
         self.frame_counter = 0;
+        self.unsaved_frames_since_save = 0;
+        self.pending_confirm_action = None;
         self.rewinding = false;
         self.autofire_state.clear_latches();
         self.base_pressed_mask = 0;
@@ -1098,11 +1113,15 @@ impl RustboyApp {
     }
 
     pub(crate) fn soft_reset(&mut self) {
+        self.pending_confirm_action = None;
+        self.flush_gb_battery_save_sync(true);
+        self.flush_battery_save_sync();
         if let Some(core) = &mut self.core {
             core.soft_reset();
             self.rewind_buffer.clear();
             self.rewind_movie_frames.clear();
             self.frame_counter = 0;
+            self.unsaved_frames_since_save = 0;
             self.rewinding = false;
             self.last_step_time = Instant::now();
             self.time_accumulator = 0.0;
@@ -1123,6 +1142,7 @@ impl RustboyApp {
             self.rewind_buffer.clear();
             self.rewind_movie_frames.clear();
             self.frame_counter = 0;
+            self.unsaved_frames_since_save = 0;
             self.rewinding = false;
             self.last_step_time = Instant::now();
             self.time_accumulator = 0.0;
@@ -1137,6 +1157,9 @@ impl RustboyApp {
     }
 
     pub(crate) fn hard_reset(&mut self) {
+        self.pending_confirm_action = None;
+        self.flush_gb_battery_save_sync(true);
+        self.flush_battery_save_sync();
         if let Some(core) = &mut self.core {
             let link_on = self.link.local_is_active()
                 || self.link.netplay.as_ref().is_some_and(|n| n.is_connected());
@@ -1145,6 +1168,7 @@ impl RustboyApp {
             self.rewind_buffer.clear();
             self.rewind_movie_frames.clear();
             self.frame_counter = 0;
+            self.unsaved_frames_since_save = 0;
             self.rewinding = false;
             self.postproc.reset();
             self.sink.clear_frames();
@@ -1168,6 +1192,7 @@ impl RustboyApp {
             self.rewind_buffer.clear();
             self.rewind_movie_frames.clear();
             self.frame_counter = 0;
+            self.unsaved_frames_since_save = 0;
             self.rewinding = false;
             self.last_step_time = Instant::now();
             self.time_accumulator = 0.0;
@@ -1178,6 +1203,45 @@ impl RustboyApp {
             } else {
                 self.notify("Hard Reset GB/GBC");
             }
+        }
+    }
+
+    /// Returns true if an active game has unflushed battery writes or active uncheckpointed gameplay.
+    pub(crate) fn has_unsaved_progress(&self) -> bool {
+        if !self.has_active_game() {
+            return false;
+        }
+        let battery_dirty = self.core.as_ref().is_some_and(|c| c.bus.cart.save_dirty)
+            || self.gb.as_ref().is_some_and(|g| g.core.battery_dirty());
+        battery_dirty || self.unsaved_frames_since_save >= 60
+    }
+
+    /// Performs a Hard Reset immediately or opens a confirmation dialog when unsaved progress exists.
+    pub(crate) fn request_hard_reset(&mut self) {
+        if self.has_unsaved_progress() {
+            self.pending_confirm_action = Some(PendingConfirmAction::HardReset);
+        } else {
+            self.show_pause_overlay = false;
+            self.paused = false;
+            self.hard_reset();
+        }
+    }
+
+    /// Performs a Soft Reset immediately or opens a confirmation dialog when unsaved progress exists.
+    pub(crate) fn request_soft_reset(&mut self) {
+        if self.has_unsaved_progress() {
+            self.pending_confirm_action = Some(PendingConfirmAction::SoftReset);
+        } else {
+            self.soft_reset();
+        }
+    }
+
+    /// Closes the active game immediately or opens a confirmation dialog when unsaved progress exists.
+    pub(crate) fn request_close_rom(&mut self, ctx: &egui::Context) {
+        if self.has_unsaved_progress() {
+            self.pending_confirm_action = Some(PendingConfirmAction::CloseRom);
+        } else {
+            self.close_rom(ctx);
         }
     }
 
@@ -1245,9 +1309,11 @@ impl RustboyApp {
                 let _ = core.run_frame_with_breakpoints(&mut self.sink, &[]);
             }
             self.frame_counter += 1;
+            self.unsaved_frames_since_save += 1;
         } else if self.gb.is_some() {
             self.step_gb_frame(self.sink.keypad, false);
             self.frame_counter += 1;
+            self.unsaved_frames_since_save += 1;
         }
 
         self.flush_frame_captures(true, color_corr, color_profile);
@@ -1739,6 +1805,7 @@ impl RustboyApp {
             executed += 1;
             self.frames_in_window += 1;
             self.frame_counter += 1;
+            self.unsaved_frames_since_save += 1;
 
             let frame_complete = matches!(stop_reason, gba_core::StopReason::FrameComplete);
             self.flush_frame_captures(frame_complete, color_corr, color_profile);
@@ -1997,6 +2064,7 @@ impl RustboyApp {
         self.draw_volume_popup(ctx);
         self.draw_settings_dialog(ctx);
         self.draw_perf_check_dialog(ctx);
+        self.draw_confirm_action_dialog(ctx);
         let hardcore = self.is_ra_hardcore_active();
         self.lua
             .show_lua_console(ctx, self.core.is_some(), hardcore);

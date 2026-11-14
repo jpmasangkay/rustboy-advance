@@ -102,6 +102,7 @@ pub fn configure_theme(ctx: &egui::Context) {
 
     visuals.selection.bg_fill = COLOR_HOVER_SELECTED;
     visuals.selection.stroke = STROKE_TEAL;
+    visuals.slider_trailing_fill = true;
 
     ctx.set_visuals(visuals);
 
@@ -131,4 +132,23 @@ pub fn configure_theme(ctx: &egui::Context) {
     );
 
     ctx.set_style(style);
+}
+
+/// Renders an `egui::Slider` with high-contrast Obsidian rail fill and teal trailing bar.
+pub(crate) fn add_slider(
+    ui: &mut egui::Ui,
+    enabled: bool,
+    slider: egui::Slider<'_>,
+) -> egui::Response {
+    ui.scope(|ui| {
+        let visuals = &mut ui.style_mut().visuals;
+        visuals.slider_trailing_fill = true;
+        visuals.widgets.inactive.bg_fill = Color32::from_rgb(0x36, 0x36, 0x3C);
+        visuals.widgets.inactive.bg_stroke = Stroke::new(1.0_f32, Color32::from_rgb(0x4A, 0x4A, 0x52));
+        visuals.widgets.hovered.bg_fill = Color32::from_rgb(0x44, 0x44, 0x4C);
+        visuals.widgets.active.bg_fill = Color32::from_rgb(0x4E, 0x4E, 0x56);
+        visuals.selection.bg_fill = Color32::from_rgb(0x22, 0x8E, 0x84);
+        ui.add_enabled(enabled, slider)
+    })
+    .inner
 }

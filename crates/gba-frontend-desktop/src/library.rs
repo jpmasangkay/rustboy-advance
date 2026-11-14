@@ -5,6 +5,7 @@ use std::sync::mpsc;
 use egui::{self, Align, Color32, CornerRadius, Layout, RichText, Sense, Stroke};
 
 use crate::app::RustboyApp;
+use crate::config::{HotkeyAction, KeyBindings};
 use crate::rom_loader::{
     RomPlatform, RomSourceKind, detect_rom_platform, gb_cart_type_label, gb_short_game_code,
     is_supported_rom_or_archive_extension, read_rom_header_summary,
@@ -362,15 +363,33 @@ fn parse_gba_cart_metadata(header: &[u8]) -> (String, String, &'static str, Stri
     )
 }
 
-/// Formats the region label shown in the library UI, labeling unheadered ROMs as `"Homebrew"`.
+/// Formats the region label shown in the library UI, labeling unheadered or homebrew GBA ROMs as `"Homebrew"`.
 pub(crate) fn library_region_label(entry: &RomLibraryEntry) -> &str {
     if !entry.region.is_empty() {
         entry.region
-    } else if entry.game_code == "HOME" {
+    } else if entry.game_code == "HOME" || entry.platform == RomPlatform::Gba {
         "Homebrew"
     } else {
         ""
     }
+}
+
+/// Formats the empty-state Controls summary line from live keybindings in config.
+pub(crate) fn format_empty_state_controls_hint(kb: &KeyBindings) -> String {
+    let dpad = if kb.up == "ArrowUp"
+        && kb.down == "ArrowDown"
+        && kb.left == "ArrowLeft"
+        && kb.right == "ArrowRight"
+    {
+        "Arrow Keys".to_string()
+    } else {
+        format!("{}/{}/{}/{}", kb.up, kb.down, kb.left, kb.right)
+    };
+    let pause_key = kb.hotkeys.display(HotkeyAction::Pause);
+    format!(
+        "3. Controls: {dpad} = D-Pad, {} / {} = B / A, {} / {} = L / R, {} = Start, {pause_key} / Esc = Pause.",
+        kb.b, kb.a, kb.l, kb.r, kb.start
+    )
 }
 
 impl RustboyApp {
@@ -917,7 +936,7 @@ impl RustboyApp {
                             if ui.button(RichText::new("Dismiss").small()).clicked() {
                                 self.library_scan_error = None;
                             }
-                            if ui.button(RichText::new("Retry").small()).clicked() {
+                            if ui.button(RichText::new("Rescan folders").small()).clicked() {
                                 self.rescan_rom_folders();
                             }
                         });
@@ -1018,10 +1037,12 @@ impl RustboyApp {
                                         .color(ACCENT_TEAL),
                                 );
                                 ui.add_space(6.0);
+                                let controls_tip =
+                                    format_empty_state_controls_hint(&self.config.keybindings);
                                 for tip in [
                                     "1. Click Add Game Folder above (or + Open in the toolbar) to pick your games.",
                                     "2. Double-click any title to start playing; progress saves automatically to .sav.",
-                                    "3. Controls: Arrow Keys = D-Pad, Z / X = B / A, A / S = L / R, Enter = Start, Esc = Pause.",
+                                    controls_tip.as_str(),
                                 ] {
                                     ui.label(
                                         RichText::new(tip)
@@ -1385,17 +1406,26 @@ impl RustboyApp {
                                     }
                                     ui.add_space(8.0);
 
-                                    // Title
-                                    let title_resp = ui.add_sized(
-                                        [title_w, 28.0],
-                                        egui::Label::new(
-                                            RichText::new(&entry.display_name)
-                                                .color(COLOR_TEXT)
-                                                .size(12.0),
+                                    // Title: left-aligned inside fixed title_w column
+                                    let title_resp = ui
+                                        .allocate_ui_with_layout(
+                                            egui::vec2(title_w, 28.0),
+                                            Layout::left_to_right(Align::Center),
+                                            |ui| {
+                                                ui.set_min_size(egui::vec2(title_w, 28.0));
+                                                ui.set_max_width(title_w);
+                                                ui.add(
+                                                    egui::Label::new(
+                                                        RichText::new(&entry.display_name)
+                                                            .color(COLOR_TEXT)
+                                                            .size(12.0),
+                                                    )
+                                                    .selectable(false)
+                                                    .truncate(),
+                                                )
+                                            },
                                         )
-                                        .selectable(false)
-                                        .truncate(),
-                                    );
+                                        .inner;
                                     if title_resp.clicked() {
                                         self.selected_rom_path = Some(entry.path.clone());
                                     }
@@ -1404,15 +1434,22 @@ impl RustboyApp {
                                     }
                                     title_resp.on_hover_text(&entry.display_name);
 
-                                    // Region: plain text ("Homebrew" for unheadered GBA ROMs, blank when unknown)
-                                    ui.add_sized(
-                                        [region_w, 28.0],
-                                        egui::Label::new(
-                                            RichText::new(library_region_label(entry))
-                                                .color(COLOR_TEXT_SECONDARY)
-                                                .size(12.0),
-                                        )
-                                        .selectable(false),
+                                    // Region: left-aligned inside fixed region_w column ("Homebrew" for homebrew/unheadered GBA ROMs)
+                                    ui.allocate_ui_with_layout(
+                                        egui::vec2(region_w, 28.0),
+                                        Layout::left_to_right(Align::Center),
+                                        |ui| {
+                                            ui.set_min_size(egui::vec2(region_w, 28.0));
+                                            ui.set_max_width(region_w);
+                                            ui.add(
+                                                egui::Label::new(
+                                                    RichText::new(library_region_label(entry))
+                                                        .color(COLOR_TEXT_SECONDARY)
+                                                        .size(12.0),
+                                                )
+                                                .selectable(false),
+                                            );
+                                        },
                                     );
 
                                     // Size: right-aligned
@@ -2128,5 +2165,40 @@ mod tests {
             last_delay > std::time::Duration::from_secs(60),
             "expected idle library frame to sleep for input only, got repaint_delay={last_delay:?}"
         );
+    }
+
+    #[test]
+    fn test_homebrew_region_label_and_live_empty_state_controls_hint() {
+        let gba_custom = RomLibraryEntry {
+            path: PathBuf::from("demo.gba"),
+            display_name: "Demo".into(),
+            internal_title: "MICRODEMO".into(),
+            game_code: "HOMZ".into(),
+            region: "",
+            size_mb: 0.125,
+            has_battery_sav: false,
+            source_kind: RomSourceKind::Raw,
+            platform: RomPlatform::Gba,
+            cart_type_label: String::new(),
+        };
+        assert_eq!(library_region_label(&gba_custom), "Homebrew");
+
+        let mut kb = KeyBindings::default();
+        let default_hint = format_empty_state_controls_hint(&kb);
+        assert!(default_hint.contains("Arrow Keys = D-Pad"));
+        assert!(default_hint.contains("X / Z = B / A"));
+        assert!(default_hint.contains("Q / E = L / R"));
+
+        kb.up = "W".into();
+        kb.down = "S".into();
+        kb.left = "A".into();
+        kb.right = "D".into();
+        kb.a = "J".into();
+        kb.b = "K".into();
+        kb.start = "Space".into();
+        let custom_hint = format_empty_state_controls_hint(&kb);
+        assert!(custom_hint.contains("W/S/A/D = D-Pad"));
+        assert!(custom_hint.contains("K / J = B / A"));
+        assert!(custom_hint.contains("Space = Start"));
     }
 }

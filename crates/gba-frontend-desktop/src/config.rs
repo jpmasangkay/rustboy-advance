@@ -28,6 +28,7 @@ pub fn init_portable_mode() {
 }
 
 /// Returns `true` when portable mode is active (`--portable` or `portable.txt`).
+#[cfg_attr(test, allow(dead_code))]
 pub fn is_portable_mode() -> bool {
     PORTABLE_MODE.load(Ordering::Relaxed)
 }
@@ -1297,15 +1298,25 @@ impl AppConfig {
     /// `$XDG_CONFIG_HOME/RustboyAdvance` or `~/.config/RustboyAdvance` on Unix), or the directory
     /// beside the executable when portable mode (`--portable` or `portable.txt`) is enabled.
     pub fn app_data_dir() -> PathBuf {
-        if is_portable_mode()
-            && let Ok(exe) = std::env::current_exe()
-            && let Some(dir) = exe.parent()
+        #[cfg(test)]
         {
-            return dir.to_path_buf();
+            return std::env::temp_dir()
+                .join(format!("rustboy_unit_tests_{}", std::process::id()))
+                .join("RustboyAdvance");
         }
-        Self::default_app_data_dir()
+        #[cfg(not(test))]
+        {
+            if is_portable_mode()
+                && let Ok(exe) = std::env::current_exe()
+                && let Some(dir) = exe.parent()
+            {
+                return dir.to_path_buf();
+            }
+            Self::default_app_data_dir()
+        }
     }
 
+    #[cfg_attr(test, allow(dead_code))]
     pub fn default_app_data_dir() -> PathBuf {
         #[cfg(target_os = "windows")]
         let base = std::env::var_os("APPDATA")

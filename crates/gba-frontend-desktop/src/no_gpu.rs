@@ -2311,18 +2311,49 @@ mod tests {
             1600,
             None,
         );
-        // Simulate a weaker CPU where 2560x1600 softbuffer SmoothBilinear exceeds budget under overload,
-        // while <=720x480 capped SmoothBilinear still fits easily.
+        assert!(
+            uncapped_costs
+                .iter()
+                .all(|c| c.cost_ms.is_finite() && c.cost_ms >= 0.0)
+        );
+        assert!(
+            capped_costs
+                .iter()
+                .all(|c| c.cost_ms.is_finite() && c.cost_ms >= 0.0)
+        );
+
+        // Normalize the measured 2560x1600 SmoothBilinear cost into a deterministic simulated slow-CPU
+        // profile (~4.8 ms uncapped, <= 0.6 ms capped) so `--test-threads=1` and host CPU jitter
+        // cannot push `est_emu_base + uncapped_cost` above the uncap hysteresis ceiling.
+        let smooth_uncapped = uncapped_costs
+            .iter()
+            .find(|c| c.filter == DisplayFilter::SmoothBilinear)
+            .map(|c| c.cost_ms)
+            .unwrap_or(0.6);
+        let scale = if smooth_uncapped > 1e-3 {
+            4.8 / smooth_uncapped
+        } else {
+            1.0
+        };
         let mut scaled_uncapped = uncapped_costs;
         for c in &mut scaled_uncapped {
-            c.cost_ms *= 8.0;
+            c.cost_ms = if smooth_uncapped > 1e-3 {
+                (c.cost_ms * scale).clamp(0.5, 6.0)
+            } else {
+                4.8
+            };
         }
+        let mut normalized_capped = capped_costs;
+        for c in &mut normalized_capped {
+            c.cost_ms = c.cost_ms.min(0.6);
+        }
+
         let mut gov = QualityGovernor::with_measured_costs(
             DisplayFilter::SmoothBilinear,
             true,
             scaled_uncapped,
         );
-        gov.set_resolution_cap_support(true, Some(capped_costs));
+        gov.set_resolution_cap_support(true, Some(normalized_capped));
 
         let cap_tr = (0..(GOVERNOR_WINDOW_FRAMES + GOVERNOR_DOWN_SUSTAIN_FRAMES))
             .find_map(|_| gov.record_frame(14.5))

@@ -621,12 +621,16 @@ impl RustboyApp {
                                             .strong()
                                             .color(COLOR_TEXT),
                                     );
+                                    let controls_summary = format_empty_state_controls_hint(
+                                        &app.config.keybindings,
+                                    );
+                                    let controls_summary = controls_summary
+                                        .strip_prefix("3. Controls: ")
+                                        .unwrap_or(&controls_summary);
                                     ui.label(
-                                        RichText::new(format_empty_state_controls_hint(
-                                            &app.config.keybindings,
-                                        ))
-                                        .size(11.5)
-                                        .color(COLOR_TEXT_SECONDARY),
+                                        RichText::new(controls_summary)
+                                            .size(11.5)
+                                            .color(COLOR_TEXT_SECONDARY),
                                     );
                                     let pads = app.connected_gamepad_names();
                                     let pad_text = if pads.is_empty() {

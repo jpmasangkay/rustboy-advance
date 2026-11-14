@@ -307,6 +307,9 @@ impl RustboyApp {
             gb.core.clear_battery_dirty();
             let path = sav_path.clone();
             std::thread::spawn(move || {
+                if let Some(parent) = path.parent() {
+                    let _ = fs::create_dir_all(parent);
+                }
                 let _ = fs::write(path, data);
             });
         }

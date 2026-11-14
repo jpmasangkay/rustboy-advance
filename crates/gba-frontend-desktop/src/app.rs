@@ -518,7 +518,11 @@ impl RustboyApp {
         for fav in &self.favorites {
             lines.push(format!("FAV={}", fav.display()));
         }
-        let _ = fs::write(CONFIG_FILE, lines.join("\n"));
+        let cfg_path = AppConfig::library_config_path();
+        if let Some(parent) = cfg_path.parent() {
+            let _ = fs::create_dir_all(parent);
+        }
+        let _ = fs::write(&cfg_path, lines.join("\n"));
 
         // Mirror to AppConfig
         self.config.rom_folders = self
@@ -542,8 +546,8 @@ impl RustboyApp {
         let mut loaded_folders = Vec::new();
         let mut loaded_favs = HashSet::new();
 
-        let cfg_path = Path::new(CONFIG_FILE);
-        let cfg_content = fs::read_to_string(cfg_path)
+        let cfg_content = fs::read_to_string(AppConfig::library_config_path())
+            .or_else(|_| fs::read_to_string(Path::new(CONFIG_FILE)))
             .or_else(|_| fs::read_to_string(AppConfig::app_data_dir().join(CONFIG_FILE)));
 
         if let Ok(content) = cfg_content {
@@ -621,28 +625,35 @@ impl RustboyApp {
         let archive_badge = loaded.source_kind.badge();
         let archive_inner = loaded.inner_name;
 
+        let load_sav_path = custom_sav
+            .map(PathBuf::from)
+            .or_else(|| AppConfig::find_existing_sav_path_for_rom(rom_path));
         let sav_path = custom_sav
             .map(PathBuf::from)
-            .unwrap_or_else(|| rom_path.with_extension("sav"));
+            .unwrap_or_else(|| AppConfig::resolve_sav_path_for_rom(rom_path));
 
         let platform = detect_rom_platform(rom_path, archive_inner.as_deref(), &rom_bytes);
         if matches!(platform, RomPlatform::Gb | RomPlatform::Gbc) {
+            let gb_load_sav = load_sav_path.as_deref().unwrap_or(&sav_path);
             self.open_gb_rom_loaded(
                 rom_path,
-                &sav_path,
+                gb_load_sav,
                 rom_bytes,
                 archive_badge,
                 archive_inner,
                 patch_applied,
                 ctx,
             );
+            self.sav_path = Some(sav_path);
             return Ok(());
         }
 
         self.gb = None;
         let rom_crc32 = crc32fast::hash(&rom_bytes);
         let mut core = GbaCore::new(self.bios_bytes.as_deref(), rom_bytes.clone());
-        if let Ok(sav) = fs::read(&sav_path) {
+        if let Some(src_sav) = &load_sav_path
+            && let Ok(sav) = fs::read(src_sav)
+        {
             core.bus.cart.load_save_data(&sav);
         }
 
@@ -679,6 +690,11 @@ impl RustboyApp {
             _ => String::new(),
         };
         self.notify(&format!("Playing {title} [{code}]{archive_tag}{patch_tag}"));
+        if let Some(reason) = self.core.as_ref().and_then(|c| c.recommends_real_bios()) {
+            self.notify_warn(&format!(
+                "{title}: HLE BIOS warning — {reason}. Load a 16KB GBA BIOS in Settings -> BIOS."
+            ));
+        }
         Ok(())
     }
 
@@ -827,6 +843,9 @@ impl RustboyApp {
             core.bus.cart.save_dirty = false;
             let path = sav_path.clone();
             std::thread::spawn(move || {
+                if let Some(parent) = path.parent() {
+                    let _ = fs::create_dir_all(parent);
+                }
                 let _ = fs::write(path, data);
             });
         }
@@ -1817,6 +1836,7 @@ impl RustboyApp {
         self.pump_gamepad_events(ctx);
         self.poll_gdb_server();
         if self.ra.poll_events(&mut self.config) {
+            self.config.save();
             ctx.request_repaint();
         }
         if self.title_dirty {
@@ -1897,7 +1917,9 @@ impl RustboyApp {
         let hardcore = self.is_ra_hardcore_active();
         self.lua
             .show_lua_console(ctx, self.core.is_some(), hardcore);
-        self.ra.show_retroachievements_window(ctx, &mut self.config);
+        if self.ra.show_retroachievements_window(ctx, &mut self.config) {
+            self.config.save();
+        }
 
         // Present dockable/floating Debugger & Tool windows
         let pads = self.connected_gamepad_names();

@@ -26,6 +26,7 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y --no-install-recommends \
             pkg-config \
+            libdbus-1-dev \
             libasound2-dev \
             libudev-dev \
             libxkbcommon-dev \
@@ -48,17 +49,12 @@ jobs:
 
       - name: Check formatting
         run: |
-          # Note: Workspace-wide `cargo fmt --check` currently fails on pre-existing
-          # crates on main (e.g., gba-core), so it is skipped here until formatted.
-          # Enforce strict formatting on the test runner crate:
-          cargo fmt -p gba-testrunner -- --check
+          rustfmt --edition 2024 --check crates/gba-testrunner/src/main.rs crates/gba-testrunner/src/lib.rs crates/gba-testrunner/tests/rom_suite.rs
 
       - name: Run Clippy
         run: |
-          # Existing crates on main emit clippy warnings, so run workspace clippy
-          # without -D warnings, and enforce -D warnings on gba-testrunner:
           cargo clippy --workspace --all-targets
-          cargo clippy -p gba-testrunner --all-targets --no-deps -- -D warnings
+          cargo clippy -p gba-testrunner --lib --bins --tests --no-deps -- -D warnings
 
       - name: Run workspace unit & harness tests (dev profile)
         run: cargo test --workspace
@@ -76,6 +72,61 @@ jobs:
       - name: Run GBA test ROM suite & generate TEST_RESULTS.md
         run: cargo run -p gba-testrunner -- --report TEST_RESULTS.md --fail-on-unexpected
 
+      - name: Verify stripped release build & zero leaked local paths (Unix)
+        if: runner.os != 'Windows'
+        shell: bash
+        run: |
+          CARGO_HOME_DIR="${CARGO_HOME:-$HOME/.cargo}"
+          RUSTUP_HOME_DIR="${RUSTUP_HOME:-$HOME/.rustup}"
+          SYSROOT_DIR="$(rustc --print sysroot)"
+          SEP=$'\x1f'
+          export CARGO_ENCODED_RUSTFLAGS="--remap-path-prefix=${CARGO_HOME_DIR}=/cargo${SEP}--remap-path-prefix=${RUSTUP_HOME_DIR}=/rustup${SEP}--remap-path-prefix=${SYSROOT_DIR}=/rustc${SEP}--remap-path-prefix=${HOME}=/user${SEP}--remap-path-prefix=${PWD}=/workspace"
+          cargo build --release -p gba-frontend-desktop -p gba-libretro
+          if grep -a -F "$HOME" target/release/rustboy-advance; then
+            echo "ERROR: leaked HOME path found in release binary"
+            exit 1
+          fi
+          if grep -a -F "$PWD" target/release/rustboy-advance; then
+            echo "ERROR: leaked workspace path found in release binary"
+            exit 1
+          fi
+
+      - name: Verify stripped release build, GUI subsystem & zero leaked local paths (Windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          $cargoHome = if ($env:CARGO_HOME) { $env:CARGO_HOME } else { Join-Path $env:USERPROFILE ".cargo" }
+          $rustupHome = if ($env:RUSTUP_HOME) { $env:RUSTUP_HOME } else { Join-Path $env:USERPROFILE ".rustup" }
+          $sysroot = (rustc --print sysroot).Trim()
+          $workspace = (Get-Location).Path
+          $flags = @(
+            "--remap-path-prefix=$($cargoHome)=/cargo",
+            "--remap-path-prefix=$($cargoHome -replace '\\','/')=/cargo",
+            "--remap-path-prefix=$($rustupHome)=/rustup",
+            "--remap-path-prefix=$($rustupHome -replace '\\','/')=/rustup",
+            "--remap-path-prefix=$($sysroot)=/rustc",
+            "--remap-path-prefix=$($sysroot -replace '\\','/')=/rustc",
+            "--remap-path-prefix=$($env:USERPROFILE)=/user",
+            "--remap-path-prefix=$($env:USERPROFILE -replace '\\','/')=/user",
+            "--remap-path-prefix=$($workspace)=/workspace",
+            "--remap-path-prefix=$($workspace -replace '\\','/')=/workspace"
+          )
+          $env:CARGO_ENCODED_RUSTFLAGS = ($flags -join ([char]0x1f))
+          cargo build --release -p gba-frontend-desktop -p gba-libretro
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          $exePath = "target\release\rustboy-advance.exe"
+          $bytes = [System.IO.File]::ReadAllBytes($exePath)
+          $peOffset = [BitConverter]::ToInt32($bytes, 0x3C)
+          $subsystem = [BitConverter]::ToUInt16($bytes, $peOffset + 24 + 68)
+          Write-Host "PE Subsystem = $subsystem (expected 2 = WINDOWS_GUI)"
+          if ($subsystem -ne 2) { throw "Expected WINDOWS_GUI subsystem (2), got $subsystem" }
+          $ascii = [System.Text.Encoding]::ASCII.GetString($bytes)
+          foreach ($needle in @($env:USERPROFILE, $workspace, $cargoHome, $rustupHome)) {
+            if ($needle -and ($ascii.IndexOf($needle, [System.StringComparison]::OrdinalIgnoreCase) -ge 0 -or $ascii.IndexOf(($needle -replace '\\','/'), [System.StringComparison]::OrdinalIgnoreCase) -ge 0)) {
+              throw "Leaked local path '$needle' found in $exePath"
+            }
+          }
+
       - name: Upload TEST_RESULTS.md and test_output artifacts
         if: always()
         uses: actions/upload-artifact@v4
@@ -85,3 +136,76 @@ jobs:
             TEST_RESULTS.md
             test_output/
           if-no-files-found: warn
+
+  cross-platform-linux:
+    name: Cross-Platform Checks (no_std, WASM, Android, Linux aarch64)
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Install cross-compilation dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends gcc-aarch64-linux-gnu libc6-dev-arm64-cross
+
+      - name: Install Rust targets
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: wasm32-unknown-unknown, aarch64-linux-android, aarch64-unknown-linux-gnu
+
+      - name: Cache Cargo registry and target directory
+        uses: Swatinem/rust-cache@v2
+
+      - name: Verify no_std + alloc core builds
+        run: |
+          cargo check -p gba-core --no-default-features
+          cargo check -p gb-core
+          cargo check -p gba-debugger --no-default-features
+
+      - name: Verify wasm32-unknown-unknown targets
+        run: |
+          cargo check --target wasm32-unknown-unknown -p gba-core --no-default-features
+          cargo check --target wasm32-unknown-unknown -p gb-core
+          cargo check --target wasm32-unknown-unknown -p gba-debugger --no-default-features
+          cargo check --target wasm32-unknown-unknown -p gba-frontend-web
+
+      - name: Verify aarch64-linux-android core & libretro check
+        run: |
+          cargo check --target aarch64-linux-android -p gba-core --no-default-features
+          cargo check --target aarch64-linux-android -p gb-core
+          cargo check --target aarch64-linux-android -p gba-debugger --no-default-features
+          cargo check --target aarch64-linux-android -p gba-libretro
+
+      - name: Verify aarch64-unknown-linux-gnu core & libretro build
+        env:
+          CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_LINKER: aarch64-linux-gnu-gcc
+        run: |
+          cargo check --target aarch64-unknown-linux-gnu -p gba-core -p gb-core -p gba-debugger
+          cargo build --release --target aarch64-unknown-linux-gnu -p gba-libretro
+
+  cross-platform-apple:
+    name: Cross-Platform Checks (iOS & Apple Silicon)
+    runs-on: macos-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Install Rust Apple targets
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: aarch64-apple-ios, aarch64-apple-darwin
+
+      - name: Cache Cargo registry and target directory
+        uses: Swatinem/rust-cache@v2
+
+      - name: Verify aarch64-apple-ios core & libretro check
+        run: |
+          cargo check --target aarch64-apple-ios -p gba-core --no-default-features
+          cargo check --target aarch64-apple-ios -p gb-core
+          cargo check --target aarch64-apple-ios -p gba-debugger --no-default-features
+          cargo check --target aarch64-apple-ios -p gba-libretro
+
+      - name: Verify aarch64-apple-darwin workspace check
+        run: |
+          cargo check --target aarch64-apple-darwin -p gba-core -p gb-core -p gba-debugger -p gba-libretro -p gba-frontend-desktop

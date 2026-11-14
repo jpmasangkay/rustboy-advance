@@ -456,3 +456,77 @@ pub fn lookup_bytes(game_code: &[u8]) -> Option<&'static GameDbEntry> {
     let s = core::str::from_utf8(game_code).ok()?;
     lookup(s)
 }
+
+/// Curated fallback list of commercial titles whose protection checks, intro sequences,
+/// BIOS open-bus reads, or HLE-sensitive SWI/IRQ timing benefit from a real GBA BIOS image.
+pub const REAL_BIOS_FALLBACK_GAMES: &[(&str, &str)] = &[
+    // Classic NES Series / Famicom Mini (read protected BIOS offsets / open-bus checks)
+    ("FSME", "Classic NES Series: reads protected BIOS data / open bus"),
+    ("FSMP", "Classic NES Series: reads protected BIOS data / open bus"),
+    ("FSMJ", "Famicom Mini: reads protected BIOS data / open bus"),
+    ("FZLE", "Classic NES Series: reads protected BIOS data / open bus"),
+    ("FZLP", "Classic NES Series: reads protected BIOS data / open bus"),
+    ("FZLJ", "Famicom Mini: reads protected BIOS data / open bus"),
+    ("FMRE", "Classic NES Series: reads protected BIOS data / open bus"),
+    ("FMRP", "Classic NES Series: reads protected BIOS data / open bus"),
+    ("FMRJ", "Famicom Mini: reads protected BIOS data / open bus"),
+    ("FDKE", "Classic NES Series: reads protected BIOS data / open bus"),
+    ("FDKP", "Classic NES Series: reads protected BIOS data / open bus"),
+    ("FDKJ", "Famicom Mini: reads protected BIOS data / open bus"),
+    ("FCLE", "Classic NES Series: reads protected BIOS data / open bus"),
+    ("FCLP", "Classic NES Series: reads protected BIOS data / open bus"),
+    ("FCLJ", "Famicom Mini: reads protected BIOS data / open bus"),
+    ("FBME", "Classic NES Series: reads protected BIOS data / open bus"),
+    ("FBMP", "Classic NES Series: reads protected BIOS data / open bus"),
+    ("FBMJ", "Famicom Mini: reads protected BIOS data / open bus"),
+    ("FICE", "Classic NES Series: reads protected BIOS data / open bus"),
+    ("FICP", "Classic NES Series: reads protected BIOS data / open bus"),
+    ("FICJ", "Famicom Mini: reads protected BIOS data / open bus"),
+    ("FEXE", "Classic NES Series: reads protected BIOS data / open bus"),
+    ("FEXP", "Classic NES Series: reads protected BIOS data / open bus"),
+    ("FEXJ", "Famicom Mini: reads protected BIOS data / open bus"),
+    ("FXEE", "Classic NES Series: reads protected BIOS data / open bus"),
+    ("FXEP", "Classic NES Series: reads protected BIOS data / open bus"),
+    ("FXEJ", "Famicom Mini: reads protected BIOS data / open bus"),
+    ("FP7E", "Classic NES Series: reads protected BIOS data / open bus"),
+    ("FP7P", "Classic NES Series: reads protected BIOS data / open bus"),
+    ("FP7J", "Famicom Mini: reads protected BIOS data / open bus"),
+    ("FGZE", "Classic NES Series: reads protected BIOS data / open bus"),
+    ("FGZP", "Classic NES Series: reads protected BIOS data / open bus"),
+    ("FGZJ", "Famicom Mini: reads protected BIOS data / open bus"),
+    // Intro / open-bus / SWI-timing sensitive titles
+    ("APNE", "Pinobee: relies on exact BIOS open-bus values after boot/SWI"),
+    ("APNP", "Pinobee: relies on exact BIOS open-bus values after boot/SWI"),
+    ("APNJ", "Pinobee: relies on exact BIOS open-bus values after boot/SWI"),
+    ("ALFE", "DBZ Legacy of Goku II: BIOS checksum & anti-piracy open-bus checks"),
+    ("ALFP", "DBZ Legacy of Goku II: BIOS checksum & anti-piracy open-bus checks"),
+    ("ALFJ", "DBZ Legacy of Goku II: BIOS checksum & anti-piracy open-bus checks"),
+    ("BG3E", "DBZ Buu's Fury: BIOS checksum & open-bus timing checks"),
+    ("B24E", "Pokemon Mystery Dungeon: HLE-sensitive IntrWait / SoundDriver timing"),
+    ("B24P", "Pokemon Mystery Dungeon: HLE-sensitive IntrWait / SoundDriver timing"),
+    ("B24J", "Pokemon Mystery Dungeon: HLE-sensitive IntrWait / SoundDriver timing"),
+    ("BUBE", "The Urbz: relies on real BIOS SWI/SoundDriver timing"),
+    ("BUBP", "The Urbz: relies on real BIOS SWI/SoundDriver timing"),
+    ("B42E", "The Sims 2: relies on real BIOS SWI/SoundDriver timing"),
+    ("B42P", "The Sims 2: relies on real BIOS SWI/SoundDriver timing"),
+    ("BY6E", "Yu-Gi-Oh! WCT 2006: sensitive to BIOS SWI timing"),
+    ("BY6P", "Yu-Gi-Oh! WCT 2006: sensitive to BIOS SWI timing"),
+    ("BY6J", "Yu-Gi-Oh! WCT 2006: sensitive to BIOS SWI timing"),
+    ("AI2E", "Iridion II: intro sequence sensitive to BIOS state & SWI timing"),
+    ("AI2P", "Iridion II: intro sequence sensitive to BIOS state & SWI timing"),
+];
+
+/// Returns a human-readable reason if a commercial title is known to require or strongly
+/// prefer a real GBA BIOS image rather than HLE BIOS.
+pub fn real_bios_fallback_reason(game_code: &str) -> Option<&'static str> {
+    if let Some((_, reason)) = REAL_BIOS_FALLBACK_GAMES
+        .iter()
+        .find(|&&(code, _)| code == game_code)
+    {
+        return Some(reason);
+    }
+    if game_code.len() == 4 && game_code.starts_with('F') {
+        return Some("Famicom Mini / Classic NES Series: reads protected BIOS data / open bus");
+    }
+    None
+}

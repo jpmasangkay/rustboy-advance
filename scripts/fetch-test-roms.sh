@@ -91,7 +91,7 @@ for f in \
   download_file "$NBA_BASE/$f" "$OUT_ROOT/nba-hw-test/$f"
 done
 
-echo "==> Fetching Tonc prebuilt demos (tonc-bin.zip)"
+echo "==> Fetching Tonc prebuilt demos (tonc-bin.zip, Copyright (c) Jasper Vijn / cearn, MIT License)"
 TONC_DIR="$OUT_ROOT/tonc"
 if [[ "$FORCE" -eq 1 || ! -s "$TONC_DIR/win_demo.gba" ]]; then
   mkdir -p "$TONC_DIR"

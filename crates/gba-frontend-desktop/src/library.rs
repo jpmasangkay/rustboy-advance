@@ -111,20 +111,13 @@ pub(crate) fn find_cover_image(entry: &RomLibraryEntry) -> Option<PathBuf> {
     let stem = entry.path.file_stem()?.to_string_lossy();
     let display = &entry.display_name;
 
-    // 1. In ./covers/, %APPDATA%/RustboyAdvance/covers/, and near executable
+    // 1. In AppData/portable covers/, near executable, or alongside ROM
     let mut search_dirs = Vec::new();
-    search_dirs.push(PathBuf::from("covers"));
-    search_dirs.push(crate::config::AppConfig::app_data_dir().join("covers"));
+    search_dirs.push(crate::config::AppConfig::covers_dir());
     if let Ok(exe) = std::env::current_exe()
         && let Some(exe_dir) = exe.parent()
     {
         search_dirs.push(exe_dir.join("covers"));
-        if let Some(target_dir) = exe_dir.parent() {
-            search_dirs.push(target_dir.join("covers"));
-            if let Some(proj_root) = target_dir.parent() {
-                search_dirs.push(proj_root.join("covers"));
-            }
-        }
     }
 
     for dir in &search_dirs {
@@ -217,13 +210,9 @@ pub(crate) fn trigger_cover_download(entry: &RomLibraryEntry) {
         }
 
         if let Some(bytes) = downloaded_bytes {
-            let appdata_covers = crate::config::AppConfig::app_data_dir().join("covers");
+            let appdata_covers = crate::config::AppConfig::covers_dir();
             let _ = std::fs::create_dir_all(&appdata_covers);
             let _ = std::fs::write(appdata_covers.join(format!("{display_name}.png")), &bytes);
-
-            let cwd_covers = PathBuf::from("covers");
-            let _ = std::fs::create_dir_all(&cwd_covers);
-            let _ = std::fs::write(cwd_covers.join(format!("{display_name}.png")), &bytes);
 
             if let Ok(exe) = std::env::current_exe()
                 && let Some(exe_dir) = exe.parent()
@@ -378,7 +367,7 @@ impl RustboyApp {
             }
         };
 
-        let has_battery_sav = path.with_extension("sav").exists();
+        let has_battery_sav = crate::config::AppConfig::find_existing_sav_path_for_rom(path).is_some();
 
         Some(RomLibraryEntry {
             path: path.to_path_buf(),
@@ -548,6 +537,17 @@ impl RustboyApp {
                             .min_size(egui::vec2(0.0, 26.0));
                     if ui.add_enabled(refresh_enabled, refresh_btn).clicked() {
                         self.rescan_rom_folders();
+                    }
+
+                    ui.add_space(6.0);
+                    if ui
+                        .checkbox(&mut self.config.auto_download_covers, "Download Covers")
+                        .on_hover_text(
+                            "Opt-in: download missing box art thumbnails from thumbnails.libretro.com via GitHub.",
+                        )
+                        .changed()
+                    {
+                        self.config.save();
                     }
 
                     ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
@@ -1168,7 +1168,9 @@ impl RustboyApp {
                                 );
                                 self.cover_textures.insert(entry.path.clone(), tex);
                             }
-                        } else if !self.pending_cover_downloads.contains(&entry.path) {
+                        } else if self.config.auto_download_covers
+                            && !self.pending_cover_downloads.contains(&entry.path)
+                        {
                             self.pending_cover_downloads.insert(entry.path.clone());
                             trigger_cover_download(entry);
                         }

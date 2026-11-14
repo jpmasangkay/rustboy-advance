@@ -6,9 +6,9 @@
 
 use crate::bus::SysBus;
 use crate::cpu::{ARM_LUT, Arm7tdmi, THUMB_LUT};
-use std::collections::HashMap;
+use alloc::{collections::BTreeMap, vec::Vec};
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct BlockKey {
     pub pc: u32,
     pub is_thumb: bool,
@@ -29,8 +29,8 @@ pub struct JitBlock {
 pub struct JitEngine {
     pub available: bool,
     pub enabled: bool,
-    blocks: HashMap<BlockKey, JitBlock>,
-    page_to_blocks: HashMap<u32, Vec<BlockKey>>,
+    blocks: BTreeMap<BlockKey, JitBlock>,
+    page_to_blocks: BTreeMap<u32, Vec<BlockKey>>,
     #[cfg(feature = "jit")]
     module: Option<cranelift_jit::JITModule>,
     #[cfg(feature = "jit")]
@@ -54,8 +54,8 @@ impl JitEngine {
             Self {
                 available: false,
                 enabled: false,
-                blocks: HashMap::new(),
-                page_to_blocks: HashMap::new(),
+                blocks: BTreeMap::new(),
+                page_to_blocks: BTreeMap::new(),
                 block_counter: 0,
             }
         }
@@ -101,8 +101,8 @@ impl JitEngine {
         Self {
             available: true,
             enabled: true,
-            blocks: HashMap::new(),
-            page_to_blocks: HashMap::new(),
+            blocks: BTreeMap::new(),
+            page_to_blocks: BTreeMap::new(),
             module: Some(module),
             ctx: Some(ctx),
             func_ctx: Some(func_ctx),
@@ -116,8 +116,8 @@ impl JitEngine {
             Self {
                 available: false,
                 enabled: false,
-                blocks: HashMap::new(),
-                page_to_blocks: HashMap::new(),
+                blocks: BTreeMap::new(),
+                page_to_blocks: BTreeMap::new(),
                 module: None,
                 ctx: None,
                 func_ctx: None,
@@ -129,8 +129,8 @@ impl JitEngine {
             Self {
                 available: false,
                 enabled: false,
-                blocks: HashMap::new(),
-                page_to_blocks: HashMap::new(),
+                blocks: BTreeMap::new(),
+                page_to_blocks: BTreeMap::new(),
                 block_counter: 0,
             }
         }
@@ -328,7 +328,7 @@ impl JitEngine {
 
         let code_ptr = module.get_finalized_function(func_id);
         // SAFETY: Cranelift finalized the function into executable memory with valid C ABI.
-        let compiled_fn: JitCompiledFn = unsafe { std::mem::transmute(code_ptr) };
+        let compiled_fn: JitCompiledFn = unsafe { core::mem::transmute(code_ptr) };
         Some(compiled_fn)
     }
 

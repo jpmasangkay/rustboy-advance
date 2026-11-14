@@ -1633,6 +1633,7 @@ impl RetroAchievementsManager {
                 } => {
                     config.ra_username = username.clone();
                     config.ra_token = token;
+                    AppConfig::store_ra_token(&config.ra_token);
                     config.ra_enabled = true;
                     config_dirty = true;
                     self.username_input = username;
@@ -1864,6 +1865,7 @@ impl RetroAchievementsManager {
                             if ui.button("Sign Out").clicked() {
                                 config.ra_username.clear();
                                 config.ra_token.clear();
+                                AppConfig::clear_ra_token();
                                 config_changed = true;
                                 self.password_input.clear();
                                 self.connection_state = RaConnectionState::LoggedOut;
@@ -2611,7 +2613,10 @@ mod tests {
     #[test]
     fn demo_set_achievement_progression_across_frames() {
         let mut core = test_core();
-        let cfg = AppConfig::default();
+        let cfg = AppConfig {
+            ra_enabled: true,
+            ..Default::default()
+        };
         let mut mgr = RetroAchievementsManager::new(&cfg);
         mgr.load_sample_demo_set();
         assert_eq!(mgr.achievements.len(), 3);

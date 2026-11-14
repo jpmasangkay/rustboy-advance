@@ -360,14 +360,17 @@ fn format_saved_timestamp(ts_secs: u64) -> (String, String) {
 impl RustboyApp {
     pub(crate) fn slot_path(&self, slot: usize) -> Option<PathBuf> {
         let rom_path = self.rom_path.as_ref()?;
-        let stem = rom_path.file_stem()?.to_string_lossy();
-        Some(rom_path.with_file_name(format!("{stem}.slot{slot}.state")))
+        crate::config::AppConfig::resolve_state_slot_path(rom_path, slot)
+    }
+
+    pub(crate) fn existing_slot_path(&self, slot: usize) -> Option<PathBuf> {
+        let rom_path = self.rom_path.as_ref()?;
+        crate::config::AppConfig::find_existing_state_slot_path(rom_path, slot)
     }
 
     pub(crate) fn slot_thumb_path(&self, slot: usize) -> Option<PathBuf> {
         let rom_path = self.rom_path.as_ref()?;
-        let stem = rom_path.file_stem()?.to_string_lossy();
-        Some(rom_path.with_file_name(format!("{stem}.slot{slot}.png")))
+        crate::config::AppConfig::resolve_state_thumb_path(rom_path, slot)
     }
 
     fn current_thumbnail_png(&mut self) -> Vec<u8> {
@@ -412,7 +415,8 @@ impl RustboyApp {
         }
 
         // Backup existing slot state (decoded core bytes) for Ctrl+Z undo
-        if let Ok(old_bytes) = fs::read(&path)
+        if let Some(existing) = self.existing_slot_path(slot)
+            && let Ok(old_bytes) = fs::read(&existing)
             && let Ok(decoded) = decode_container(
                 &old_bytes,
                 Some(self.rom_crc32),
@@ -424,6 +428,9 @@ impl RustboyApp {
         }
 
         let res = self.build_current_state_container().and_then(|container| {
+            if let Some(parent) = path.parent() {
+                fs::create_dir_all(parent).map_err(|e| SaveStateError::Io(e.to_string()))?;
+            }
             fs::write(&path, container).map_err(|e| SaveStateError::Io(e.to_string()))
         });
 
@@ -446,7 +453,7 @@ impl RustboyApp {
     }
 
     pub(crate) fn quick_load(&mut self, slot: usize) {
-        let Some(path) = self.slot_path(slot) else {
+        let Some(path) = self.existing_slot_path(slot).or_else(|| self.slot_path(slot)) else {
             return;
         };
         // Backup current core state before loading for instant undo
@@ -583,15 +590,11 @@ impl RustboyApp {
         if self.slot_meta[idx].is_some() {
             return;
         }
-        let Some(state_file) = self.slot_path(slot) else {
-            self.slot_meta[idx] = Some(SlotMetaEntry::Empty);
-            return;
-        };
-        if !state_file.exists() {
+        let Some(state_file) = self.existing_slot_path(slot) else {
             self.slot_thumbnails[idx] = None;
             self.slot_meta[idx] = Some(SlotMetaEntry::Empty);
             return;
-        }
+        };
 
         let bytes = match fs::read(&state_file) {
             Ok(b) => b,
@@ -918,6 +921,9 @@ impl RustboyApp {
         if let Some(s) = delete_slot {
             if let Some(sp) = self.slot_path(s) {
                 let _ = fs::remove_file(sp);
+            }
+            if let Some(legacy_sp) = self.existing_slot_path(s) {
+                let _ = fs::remove_file(legacy_sp);
             }
             if let Some(tp) = self.slot_thumb_path(s) {
                 let _ = fs::remove_file(tp);

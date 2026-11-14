@@ -20,7 +20,7 @@ pub mod jit;
 pub mod ppu;
 pub mod serde_helpers;
 
-use alloc::{string::String, vec::Vec};
+use alloc::{format, string::String, vec::Vec};
 use serde::{Deserialize, Serialize};
 
 pub use crate::bus::{SysBus, Watchpoint, WatchpointHit, WatchpointKind};
@@ -1520,6 +1520,17 @@ impl GbaCore {
     #[inline]
     pub fn game_code(&self) -> String {
         self.bus.cart.game_code()
+    }
+
+    /// If the core is running under HLE BIOS and the loaded cartridge is on the real-BIOS
+    /// fallback list, returns the reason a real `gba_bios.bin` is recommended.
+    #[inline]
+    pub fn recommends_real_bios(&self) -> Option<&'static str> {
+        if self.bus.bios_present {
+            None
+        } else {
+            gamedb::real_bios_fallback_reason(&self.game_code())
+        }
     }
 
     /// Returns whether an external link cable is attached for SIO transfers.

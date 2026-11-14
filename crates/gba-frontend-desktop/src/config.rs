@@ -1,12 +1,39 @@
 use std::collections::BTreeMap;
 use std::fs;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, Ordering};
 
 use egui::Key;
 use gba_core::cartridge::SaveType;
 use serde::{Deserialize, Serialize};
 
 use crate::cheats::CheatEntry;
+
+#[cfg(not(test))]
+const KEYRING_SERVICE: &str = "RustboyAdvance";
+#[cfg(not(test))]
+const KEYRING_RA_USER: &str = "retroachievements_token";
+
+static PORTABLE_MODE: AtomicBool = AtomicBool::new(false);
+
+/// Initializes portable mode (`--portable` CLI flag or `portable.txt` next to the executable).
+/// Must be called early during startup before resolving configuration or log paths.
+pub fn init_portable_mode() {
+    let cli_portable = std::env::args_os().any(|a| a == "--portable");
+    let marker_portable = std::env::current_exe()
+        .ok()
+        .and_then(|exe| exe.parent().map(|dir| dir.join("portable.txt").is_file()))
+        .unwrap_or(false);
+    PORTABLE_MODE.store(cli_portable || marker_portable, Ordering::Relaxed);
+}
+
+/// Returns `true` when portable mode is active (`--portable` or `portable.txt`).
+pub fn is_portable_mode() -> bool {
+    PORTABLE_MODE.load(Ordering::Relaxed)
+}
+
+#[cfg(test)]
+static TEST_KEYRING_TOKEN: std::sync::Mutex<Option<String>> = std::sync::Mutex::new(None);
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct RecentRomEntry {
@@ -733,7 +760,7 @@ impl ViewportScale {
 #[derive(Copy, Clone, PartialEq, Eq, Debug, Serialize, Deserialize, Default)]
 pub enum DisplayFilter {
     #[default]
-    MyBoySmooth, // 1x (240x160) Native Linear ("MyBoy Smooth")
+    SmoothBilinear, // 1x (240x160) Native Linear ("Smooth Bilinear")
     Sharp1x,         // 1x (240x160) Native Nearest ("Sharp 1x")
     XbrSmooth3x,     // 3x (720x480) xBR 3x edge smoothing (Laptop HD)
     AuthenticGbaLcd, // 3x (720x480) LCD Subpixel Dot-Matrix
@@ -745,7 +772,7 @@ pub enum DisplayFilter {
 
 impl DisplayFilter {
     pub const ALL: [Self; 7] = [
-        Self::MyBoySmooth,
+        Self::SmoothBilinear,
         Self::Sharp1x,
         Self::XbrSmooth3x,
         Self::AuthenticGbaLcd,
@@ -756,7 +783,7 @@ impl DisplayFilter {
 
     pub fn label(self) -> &'static str {
         match self {
-            Self::MyBoySmooth => "MyBoy Smooth",
+            Self::SmoothBilinear => "Smooth Bilinear",
             Self::Sharp1x | Self::RawNearest => "Sharp 1x",
             Self::XbrSmooth3x => "xBR 3x",
             Self::AuthenticGbaLcd => "LCD Matrix",
@@ -768,7 +795,7 @@ impl DisplayFilter {
 
     pub fn description(self) -> &'static str {
         match self {
-            Self::MyBoySmooth => "MyBoy Smooth (240x160 native linear)",
+            Self::SmoothBilinear => "Smooth Bilinear (240x160 native linear)",
             Self::Sharp1x | Self::RawNearest => "Sharp 1x (240x160 native nearest)",
             Self::XbrSmooth3x => "xBR 3x (Laptop HD)",
             Self::AuthenticGbaLcd => "LCD Matrix (3x subpixel grid)",
@@ -780,19 +807,19 @@ impl DisplayFilter {
 
     pub fn next(self) -> Self {
         match self {
-            Self::MyBoySmooth => Self::Sharp1x,
+            Self::SmoothBilinear => Self::Sharp1x,
             Self::Sharp1x | Self::RawNearest => Self::XbrSmooth3x,
             Self::XbrSmooth3x => Self::AuthenticGbaLcd,
             Self::AuthenticGbaLcd => Self::SoftHandheld,
             Self::SoftHandheld => Self::SmoothScale2x,
             Self::SmoothScale2x => Self::CrtScanlines,
-            Self::CrtScanlines => Self::MyBoySmooth,
+            Self::CrtScanlines => Self::SmoothBilinear,
         }
     }
 
     pub fn texture_options(self) -> egui::TextureOptions {
         match self {
-            Self::MyBoySmooth => egui::TextureOptions::LINEAR,
+            Self::SmoothBilinear => egui::TextureOptions::LINEAR,
             Self::Sharp1x | Self::RawNearest => egui::TextureOptions::NEAREST,
             Self::XbrSmooth3x | Self::AuthenticGbaLcd | Self::SoftHandheld => {
                 egui::TextureOptions::LINEAR
@@ -803,7 +830,7 @@ impl DisplayFilter {
 
     pub fn target_dimensions(self) -> (usize, usize) {
         match self {
-            Self::MyBoySmooth | Self::Sharp1x | Self::RawNearest => {
+            Self::SmoothBilinear | Self::Sharp1x | Self::RawNearest => {
                 (gba_core::LCD_WIDTH, gba_core::LCD_HEIGHT)
             }
             Self::XbrSmooth3x | Self::AuthenticGbaLcd => {
@@ -817,7 +844,7 @@ impl DisplayFilter {
 
     pub const fn default_shader_preset(self) -> ShaderPreset {
         match self {
-            Self::MyBoySmooth | Self::SoftHandheld => ShaderPreset::SharpBilinear,
+            Self::SmoothBilinear | Self::SoftHandheld => ShaderPreset::SharpBilinear,
             Self::Sharp1x | Self::RawNearest | Self::XbrSmooth3x => ShaderPreset::Nearest,
             Self::AuthenticGbaLcd => ShaderPreset::LcdGrid,
             Self::SmoothScale2x => ShaderPreset::ScaleEdge,
@@ -828,7 +855,7 @@ impl DisplayFilter {
     pub const fn quality_tier(self) -> u8 {
         match self {
             Self::Sharp1x | Self::RawNearest => 0,
-            Self::MyBoySmooth => 1,
+            Self::SmoothBilinear => 1,
             Self::SoftHandheld => 2,
             Self::CrtScanlines | Self::AuthenticGbaLcd => 3,
             Self::SmoothScale2x => 4,
@@ -1045,7 +1072,7 @@ fn default_fast_forward_speed() -> f32 {
 }
 
 fn default_ra_enabled() -> bool {
-    true
+    false
 }
 
 fn default_ra_rich_presence() -> bool {
@@ -1178,7 +1205,10 @@ pub struct AppConfig {
     #[serde(default = "default_ra_rich_presence")]
     pub ra_rich_presence: bool,
     pub ra_username: String,
+    #[serde(default, skip_serializing)]
     pub ra_token: String,
+    #[serde(default)]
+    pub auto_download_covers: bool,
 }
 
 impl Default for AppConfig {
@@ -1195,7 +1225,7 @@ impl Default for AppConfig {
             scanline_grid: false,
             lcd_grid_intensity: 0.08,
             viewport_scale: ViewportScale::FitWindow,
-            display_filter: DisplayFilter::MyBoySmooth,
+            display_filter: DisplayFilter::SmoothBilinear,
             auto_quality_governor: default_auto_quality_governor(),
             governor_settled_filters: BTreeMap::new(),
             blocked_gpu_adapters: BTreeMap::new(),
@@ -1233,12 +1263,26 @@ impl Default for AppConfig {
             ra_rich_presence: default_ra_rich_presence(),
             ra_username: String::new(),
             ra_token: String::new(),
+            auto_download_covers: false,
         }
     }
 }
 
 impl AppConfig {
+    /// Returns the OS user configuration/data directory (`%APPDATA%\RustboyAdvance` on Windows,
+    /// `$XDG_CONFIG_HOME/RustboyAdvance` or `~/.config/RustboyAdvance` on Unix), or the directory
+    /// beside the executable when portable mode (`--portable` or `portable.txt`) is enabled.
     pub fn app_data_dir() -> PathBuf {
+        if is_portable_mode()
+            && let Ok(exe) = std::env::current_exe()
+            && let Some(dir) = exe.parent()
+        {
+            return dir.to_path_buf();
+        }
+        Self::default_app_data_dir()
+    }
+
+    pub fn default_app_data_dir() -> PathBuf {
         #[cfg(target_os = "windows")]
         let base = std::env::var_os("APPDATA")
             .map(PathBuf::from)
@@ -1255,12 +1299,157 @@ impl AppConfig {
         Self::app_data_dir().join("config.json")
     }
 
+    pub fn library_config_path() -> PathBuf {
+        Self::app_data_dir().join("rustboy_library.cfg")
+    }
+
+    pub fn saves_dir() -> PathBuf {
+        Self::app_data_dir().join("saves")
+    }
+
+    pub fn states_dir() -> PathBuf {
+        Self::app_data_dir().join("states")
+    }
+
+    pub fn covers_dir() -> PathBuf {
+        Self::app_data_dir().join("covers")
+    }
+
     pub fn screenshots_dir() -> PathBuf {
         Self::app_data_dir().join("screenshots")
     }
 
+    pub fn crash_log_path() -> PathBuf {
+        Self::app_data_dir().join("rustboy-advance-crash.log")
+    }
+
+    pub fn startup_error_log_path() -> PathBuf {
+        Self::app_data_dir().join("rustboy-advance-startup-error.log")
+    }
+
+    /// Canonical battery save write path (`<data_dir>/saves/<rom_stem>.sav`).
+    pub fn resolve_sav_path_for_rom(rom_path: &Path) -> PathBuf {
+        let stem = rom_path
+            .file_stem()
+            .and_then(|s| s.to_str())
+            .filter(|s| !s.is_empty())
+            .unwrap_or("save");
+        Self::saves_dir().join(format!("{stem}.sav"))
+    }
+
+    /// Locates an existing `.sav` file, checking canonical `<data_dir>/saves/<stem>.sav` first and
+    /// falling back to legacy sibling `<rom_dir>/<stem>.sav`.
+    pub fn find_existing_sav_path_for_rom(rom_path: &Path) -> Option<PathBuf> {
+        let primary = Self::resolve_sav_path_for_rom(rom_path);
+        if primary.is_file() {
+            return Some(primary);
+        }
+        let legacy = rom_path.with_extension("sav");
+        if legacy.is_file() {
+            return Some(legacy);
+        }
+        None
+    }
+
+    /// Canonical save-state slot write path (`<data_dir>/states/<rom_stem>.slot<slot>.state`).
+    pub fn resolve_state_slot_path(rom_path: &Path, slot: usize) -> Option<PathBuf> {
+        let stem = rom_path.file_stem()?.to_string_lossy();
+        Some(Self::states_dir().join(format!("{stem}.slot{slot}.state")))
+    }
+
+    /// Locates an existing save-state slot, checking `<data_dir>/states/` first then legacy
+    /// ROM-adjacent `<rom_dir>/<stem>.slot<slot>.state`.
+    pub fn find_existing_state_slot_path(rom_path: &Path, slot: usize) -> Option<PathBuf> {
+        let primary = Self::resolve_state_slot_path(rom_path, slot)?;
+        if primary.is_file() {
+            return Some(primary);
+        }
+        let stem = rom_path.file_stem()?.to_string_lossy();
+        let legacy = rom_path.with_file_name(format!("{stem}.slot{slot}.state"));
+        if legacy.is_file() {
+            return Some(legacy);
+        }
+        None
+    }
+
+    /// Canonical save-state thumbnail path (`<data_dir>/states/<rom_stem>.slot<slot>.png`).
+    pub fn resolve_state_thumb_path(rom_path: &Path, slot: usize) -> Option<PathBuf> {
+        let stem = rom_path.file_stem()?.to_string_lossy();
+        Some(Self::states_dir().join(format!("{stem}.slot{slot}.png")))
+    }
+
+    pub fn store_ra_token(token: &str) {
+        #[cfg(test)]
+        {
+            if let Ok(mut guard) = TEST_KEYRING_TOKEN.lock() {
+                *guard = (!token.is_empty()).then(|| token.to_string());
+            }
+        }
+        #[cfg(not(test))]
+        {
+            if token.is_empty() {
+                Self::clear_ra_token();
+                return;
+            }
+            match keyring::Entry::new(KEYRING_SERVICE, KEYRING_RA_USER) {
+                Ok(entry) => {
+                    if let Err(err) = entry.set_password(token) {
+                        log::warn!("Failed storing RetroAchievements token in OS keyring: {err}");
+                    }
+                }
+                Err(err) => {
+                    log::warn!("Failed opening OS keyring entry for RetroAchievements: {err}");
+                }
+            }
+        }
+    }
+
+    pub fn load_ra_token() -> String {
+        #[cfg(test)]
+        {
+            return TEST_KEYRING_TOKEN
+                .lock()
+                .ok()
+                .and_then(|g| g.clone())
+                .unwrap_or_default();
+        }
+        #[cfg(not(test))]
+        {
+            match keyring::Entry::new(KEYRING_SERVICE, KEYRING_RA_USER) {
+                Ok(entry) => entry.get_password().unwrap_or_default(),
+                Err(_) => String::new(),
+            }
+        }
+    }
+
+    pub fn clear_ra_token() {
+        #[cfg(test)]
+        {
+            if let Ok(mut guard) = TEST_KEYRING_TOKEN.lock() {
+                *guard = None;
+            }
+        }
+        #[cfg(not(test))]
+        {
+            if let Ok(entry) = keyring::Entry::new(KEYRING_SERVICE, KEYRING_RA_USER) {
+                let _ = entry.delete_credential();
+            }
+        }
+    }
+
     pub fn from_json_str(raw: &str) -> Self {
-        let mut cfg: Self = serde_json::from_str(raw).unwrap_or_default();
+        let mut cfg: Self = match serde_json::from_str(raw) {
+            Ok(parsed) => parsed,
+            Err(_) => {
+                // Upgrade configs whose `display_filter` used a removed legacy variant name.
+                if let Ok(mut map) = serde_json::from_str::<serde_json::Map<String, serde_json::Value>>(raw) {
+                    map.remove("display_filter");
+                    serde_json::from_value(serde_json::Value::Object(map)).unwrap_or_default()
+                } else {
+                    Self::default()
+                }
+            }
+        };
         if let Ok(val) = serde_json::from_str::<serde_json::Value>(raw) {
             if val.get("display_filter").is_none()
                 && (val.get("scanline_grid").is_some() || val.get("shader_preset").is_some())
@@ -1298,7 +1487,15 @@ impl AppConfig {
         let Ok(raw) = fs::read_to_string(&path) else {
             return Self::default();
         };
-        Self::from_json_str(&raw)
+        let mut cfg = Self::from_json_str(&raw);
+        // Migrate legacy plaintext `ra_token` from config.json into the OS credential store.
+        if !cfg.ra_token.is_empty() {
+            Self::store_ra_token(&cfg.ra_token);
+            cfg.save();
+        } else if !cfg.ra_username.is_empty() {
+            cfg.ra_token = Self::load_ra_token();
+        }
+        cfg
     }
 
     pub fn save(&self) {
@@ -1544,9 +1741,11 @@ mod tests {
         assert!((modern.lcd_grid_intensity - 0.08).abs() < 1e-4);
 
         let default_cfg = AppConfig::from_json_str("{}");
-        assert_eq!(default_cfg.display_filter, DisplayFilter::MyBoySmooth);
+        assert_eq!(default_cfg.display_filter, DisplayFilter::SmoothBilinear);
         assert_eq!(default_cfg.viewport_scale, ViewportScale::FitWindow);
         assert!((default_cfg.lcd_grid_intensity - 0.08).abs() < 1e-4);
+        assert!(!default_cfg.ra_enabled);
+        assert!(!default_cfg.auto_download_covers);
     }
 
     #[test]
@@ -1587,11 +1786,11 @@ mod tests {
         assert_eq!(k2, "Vulkan|RTX 5070|1080p");
         assert_eq!(k3, "NoGpu|softbuffer|720x480");
 
-        cfg.set_settled_filter(k1.clone(), DisplayFilter::MyBoySmooth);
+        cfg.set_settled_filter(k1.clone(), DisplayFilter::SmoothBilinear);
         cfg.set_settled_filter(k2.clone(), DisplayFilter::Sharp1x);
         let raw = serde_json::to_string(&cfg).expect("serialize config");
         let back = AppConfig::from_json_str(&raw);
-        assert_eq!(back.settled_filter_for(&k1), Some(DisplayFilter::MyBoySmooth));
+        assert_eq!(back.settled_filter_for(&k1), Some(DisplayFilter::SmoothBilinear));
         assert_eq!(back.settled_filter_for(&k2), Some(DisplayFilter::Sharp1x));
         assert_eq!(back.settled_filter_for(&k3), None);
     }
@@ -1642,5 +1841,45 @@ mod tests {
         assert_eq!(cfg.clear_blocked_gpu_adapters(), 1);
         assert!(cfg.blocked_gpu_adapter(&key).is_none());
         assert!(cfg.verified_gpu_adapter(&key, "nvidia", "560.1").is_none());
+    }
+
+    #[test]
+    fn ra_token_is_excluded_from_json_and_paths_target_data_dirs() {
+        AppConfig::clear_ra_token();
+        let mut cfg = AppConfig::default();
+        cfg.ra_username = "player1".to_string();
+        cfg.ra_token = "super_secret_token".to_string();
+        let json = serde_json::to_string(&cfg).expect("serialize");
+        assert!(
+            !json.contains("super_secret_token"),
+            "ra_token must never be serialized to config.json"
+        );
+        assert!(!json.contains("\"ra_token\""));
+
+        // Legacy plaintext migration path
+        let legacy_raw = r#"{"ra_username":"player1","ra_token":"legacy_tok_99"}"#;
+        let migrated = AppConfig::from_json_str(legacy_raw);
+        assert_eq!(migrated.ra_token, "legacy_tok_99");
+        AppConfig::store_ra_token(&migrated.ra_token);
+        assert_eq!(AppConfig::load_ra_token(), "legacy_tok_99");
+        AppConfig::clear_ra_token();
+        assert!(AppConfig::load_ra_token().is_empty());
+
+        let fake_rom = PathBuf::from("roms/GoldenSun.gba");
+        let sav = AppConfig::resolve_sav_path_for_rom(&fake_rom);
+        assert_eq!(
+            sav.parent().unwrap().file_name().unwrap(),
+            "saves",
+            "default battery save path should live in AppData/portable saves/ directory"
+        );
+        assert_eq!(sav.file_name().unwrap(), "GoldenSun.sav");
+
+        let slot = AppConfig::resolve_state_slot_path(&fake_rom, 2).expect("slot path");
+        assert_eq!(
+            slot.parent().unwrap().file_name().unwrap(),
+            "states",
+            "default save-state path should live in AppData/portable states/ directory"
+        );
+        assert_eq!(slot.file_name().unwrap(), "GoldenSun.slot2.state");
     }
 }

@@ -1217,26 +1217,36 @@ impl SysBus {
                 cpu.gpr[13] = 0x0300_7F00;
                 cpu.intr_wait = None;
                 let entry = if flag != 0 { 0x0200_0000 } else { 0x0800_0000 };
+                if !self.bios_present {
+                    self.bios_latch = 0xE129_F000;
+                }
+                cpu.flush_cycles += 64;
                 cpu.flush_pipeline(self, entry);
             }
             0x01 => {
                 // RegisterRamReset
                 let flags = cpu.gpr[0];
+                let mut reset_cycles = 96u64;
                 if (flags & 0x01) != 0 {
                     self.ewram.fill(0);
+                    reset_cycles += 4_096;
                 }
                 if (flags & 0x02) != 0 {
                     // Clears all IWRAM except last 0x200 bytes (SP area)
                     self.iwram[..0x7E00].fill(0);
+                    reset_cycles += 512;
                 }
                 if (flags & 0x04) != 0 {
                     self.ppu.pram.fill(0);
+                    reset_cycles += 128;
                 }
                 if (flags & 0x08) != 0 {
                     self.ppu.vram.fill(0);
+                    reset_cycles += 2_048;
                 }
                 if (flags & 0x10) != 0 {
                     self.ppu.oam.fill(0);
+                    reset_cycles += 128;
                 }
                 if (flags & 0x20) != 0 {
                     self.hw.siocnt = 0;
@@ -1257,6 +1267,7 @@ impl SysBus {
                     self.ppu.dispstat = 0;
                     self.ppu.bldcnt = 0;
                 }
+                cpu.flush_cycles += reset_cycles;
                 cpu.return_from_swi(self);
             }
             0x02 => {
@@ -1309,16 +1320,21 @@ impl SysBus {
                     cpu.gpr[0] = if num < 0 { u32::MAX } else { 1 };
                     cpu.gpr[1] = num as u32;
                     cpu.gpr[3] = 1;
+                    cpu.flush_cycles += 80;
                 } else if num == i32::MIN && den == -1 {
                     cpu.gpr[0] = i32::MIN as u32;
                     cpu.gpr[1] = 0;
                     cpu.gpr[3] = i32::MIN as u32;
+                    cpu.flush_cycles += 260;
                 } else {
                     let q = num / den;
                     let r = num % den;
                     cpu.gpr[0] = q as u32;
                     cpu.gpr[1] = r as u32;
                     cpu.gpr[3] = q.wrapping_abs() as u32;
+                    // Model BIOS iterative division loop (~68 overhead + shift-subtract iterations)
+                    let q_bits = 32 - cpu.gpr[3].leading_zeros() as u64;
+                    cpu.flush_cycles += 68 + q_bits.max(1) * 6;
                 }
                 cpu.return_from_swi(self);
             }
@@ -1341,12 +1357,14 @@ impl SysBus {
                     bit >>= 2;
                 }
                 cpu.gpr[0] = res;
+                cpu.flush_cycles += 140;
                 cpu.return_from_swi(self);
             }
             0x09 => {
                 // ArcTan(i16 tan_q14) -> i16 in (-0x4000..0x4000)
                 let i = (cpu.gpr[0] as i16) as i32;
                 cpu.gpr[0] = (hle_arctan(i) as i16 as i32) as u32;
+                cpu.flush_cycles += 96;
                 cpu.return_from_swi(self);
             }
             0x0A => {
@@ -1354,6 +1372,7 @@ impl SysBus {
                 let x = (cpu.gpr[0] as i16) as i32;
                 let y = (cpu.gpr[1] as i16) as i32;
                 cpu.gpr[0] = hle_arctan2(x, y) as u32;
+                cpu.flush_cycles += 132;
                 cpu.return_from_swi(self);
             }
             0x0B => {
@@ -1365,14 +1384,13 @@ impl SysBus {
                 let fixed_src = (cnt & (1 << 24)) != 0;
                 let is_32 = (cnt & (1 << 26)) != 0;
 
-                // Model BIOS execution cycles: SWI dispatch, register stacking, and loop overhead
+                // Model BIOS execution cycles: SWI dispatch, register stacking, and loop overhead.
                 let caller_pc = cpu.gpr[14];
                 let bios_base_cycles = if caller_pc >= 0x0800_0000 {
                     116u64
                 } else {
                     104u64
                 };
-                self.scheduler.current_cycle += bios_base_cycles;
                 if is_32 {
                     src &= !3;
                     dst &= !3;
@@ -1396,6 +1414,7 @@ impl SysBus {
                         dst = dst.wrapping_add(2);
                     }
                 }
+                cpu.flush_cycles += bios_base_cycles;
                 cpu.return_from_swi(self);
             }
             0x0C => {
@@ -1403,23 +1422,26 @@ impl SysBus {
                 let mut src = cpu.gpr[0] & !3;
                 let mut dst = cpu.gpr[1] & !3;
                 let cnt = cpu.gpr[2];
-                let words = (cnt & 0x001F_FFFC).max(if (cnt & 0x001F_FFFF) == 0 { 0 } else { 8 });
                 let count = ((cnt & 0x001F_FFFF) + 7) & !7;
-                let _ = words;
                 let fixed_src = (cnt & (1 << 24)) != 0;
+                let mut transfer_cycles = 88u64;
                 for _ in 0..count {
                     let v = self.read_32(src, AccessType::Sequential, 0);
-                    self.write_32(dst, v, AccessType::Sequential);
+                    transfer_cycles += self.last_cycles;
+                    transfer_cycles += self.write_32(dst, v, AccessType::Sequential);
                     if !fixed_src {
                         src = src.wrapping_add(4);
                     }
                     dst = dst.wrapping_add(4);
                 }
+                transfer_cycles += (u64::from(count) / 8).saturating_mul(16);
+                cpu.flush_cycles += transfer_cycles;
                 cpu.return_from_swi(self);
             }
             0x0D => {
                 // GetBiosChecksum
                 cpu.gpr[0] = 0xBAAE_187F;
+                cpu.flush_cycles += 60;
                 cpu.return_from_swi(self);
             }
             0x0E => {
@@ -1455,6 +1477,7 @@ impl SysBus {
                     self.write_32(dst + 12, ry as u32, AccessType::Sequential);
                     dst += 16;
                 }
+                cpu.flush_cycles += 64 + u64::from(count.min(0x1_0000)).saturating_mul(110);
                 cpu.return_from_swi(self);
             }
             0x0F => {
@@ -1484,6 +1507,7 @@ impl SysBus {
                     self.write_16(dst, pd as u16, AccessType::Sequential);
                     dst += stride;
                 }
+                cpu.flush_cycles += 64 + u64::from(count.min(0x1_0000)).saturating_mul(90);
                 cpu.return_from_swi(self);
             }
             0x10 => {
@@ -1525,35 +1549,45 @@ impl SysBus {
                         }
                     }
                 }
+                cpu.flush_cycles += 64 + (src_len.min(0x4_0000) as u64).saturating_mul(10);
                 cpu.return_from_swi(self);
             }
             0x11 | 0x12 => {
                 // LZ77UnCompWram (8-bit) / LZ77UnCompVram (16-bit)
                 let is_vram = comment == 0x12;
+                let decomp_len = (self.read_32(cpu.gpr[0], AccessType::Sequential, 0) >> 8) as u64;
                 self.hle_lz77_uncomp(cpu.gpr[0], cpu.gpr[1], is_vram);
+                cpu.flush_cycles += 64 + decomp_len.min(0x4_0000).saturating_mul(8);
                 cpu.return_from_swi(self);
             }
             0x13 => {
                 // HuffUnComp
+                let decomp_len = (self.read_32(cpu.gpr[0], AccessType::Sequential, 0) >> 8) as u64;
                 self.hle_huff_uncomp(cpu.gpr[0], cpu.gpr[1]);
+                cpu.flush_cycles += 64 + decomp_len.min(0x4_0000).saturating_mul(12);
                 cpu.return_from_swi(self);
             }
             0x14 | 0x15 => {
                 // RLUnCompWram / RLUnCompVram
                 let is_vram = comment == 0x15;
+                let decomp_len = (self.read_32(cpu.gpr[0], AccessType::Sequential, 0) >> 8) as u64;
                 self.hle_rl_uncomp(cpu.gpr[0], cpu.gpr[1], is_vram);
+                cpu.flush_cycles += 64 + decomp_len.min(0x4_0000).saturating_mul(8);
                 cpu.return_from_swi(self);
             }
             0x16..=0x18 => {
                 // Diff8bitUnFilterWram / Diff8bitUnFilterVram / Diff16bitUnFilter
+                let len = (self.read_32(cpu.gpr[0], AccessType::Sequential, 0) >> 8) as u64;
                 self.hle_diff_unfilter(cpu.gpr[0], cpu.gpr[1], comment);
+                cpu.flush_cycles += 64 + len.min(0x4_0000).saturating_mul(6);
                 cpu.return_from_swi(self);
             }
             0x19 => {
-                // SoundBias: level in r0 (bits 1-9)
-                let bias_level = (cpu.gpr[0] & 0x03FE) as u16;
+                // SoundBias: r0 == 0 sets bias level 0x000, non-zero r0 sets 0x200 (preserving bits 14-15)
+                let bias_level = if cpu.gpr[0] == 0 { 0x0000 } else { 0x0200 };
                 let cur = self.apu.soundbias & !0x03FE;
                 self.write_io_16(0x0400_0088, cur | bias_level);
+                cpu.flush_cycles += 128;
                 cpu.return_from_swi(self);
             }
             0x1F => {
@@ -1564,11 +1598,13 @@ impl SysBus {
                 let key = (cpu.gpr[1] & 0xFF) as u8;
                 let pitch = (cpu.gpr[2] & 0xFF) as u8;
                 cpu.gpr[0] = hle_midi_key_to_freq(wave_freq, key, pitch);
+                cpu.flush_cycles += 96;
                 cpu.return_from_swi(self);
             }
             0x1A..=0x1E | 0x20..=0x29 => {
                 // SoundDriverInit, SoundDriverMode, SoundDriverMain, SoundDriverVSync,
                 // SoundChannelClear, SoundDriverVSyncOff, SoundDriverVSyncOn, etc.
+                cpu.flush_cycles += 48;
                 cpu.return_from_swi(self);
             }
             0x2A => {

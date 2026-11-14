@@ -1,0 +1,211 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - "v*"
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  build-release:
+    name: Package (${{ matrix.artifact_name }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - artifact_name: rustboy-advance-windows-x86_64-msvc
+            os: windows-latest
+            target: x86_64-pc-windows-msvc
+            exe_name: rustboy-advance.exe
+            libretro_name: gba_libretro.dll
+          - artifact_name: rustboy-advance-linux-x86_64
+            os: ubuntu-latest
+            target: x86_64-unknown-linux-gnu
+            exe_name: rustboy-advance
+            libretro_name: libgba_libretro.so
+          - artifact_name: rustboy-advance-macos-aarch64
+            os: macos-latest
+            target: aarch64-apple-darwin
+            exe_name: rustboy-advance
+            libretro_name: libgba_libretro.dylib
+          - artifact_name: rustboy-advance-macos-x86_64
+            os: macos-latest
+            target: x86_64-apple-darwin
+            exe_name: rustboy-advance
+            libretro_name: libgba_libretro.dylib
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Install Linux dependencies
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            pkg-config \
+            zip \
+            libdbus-1-dev \
+            libasound2-dev \
+            libudev-dev \
+            libxkbcommon-dev \
+            libwayland-dev \
+            libx11-dev \
+            libxcursor-dev \
+            libxi-dev \
+            libxrandr-dev \
+            libgl-dev \
+            libgl1-mesa-dev \
+            libegl-dev
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+
+      - name: Cache Cargo registry and target directory
+        uses: Swatinem/rust-cache@v2
+
+      - name: Build release binaries with path-prefix stripping (Unix)
+        if: runner.os != 'Windows'
+        shell: bash
+        run: |
+          CARGO_HOME_DIR="${CARGO_HOME:-$HOME/.cargo}"
+          RUSTUP_HOME_DIR="${RUSTUP_HOME:-$HOME/.rustup}"
+          SYSROOT_DIR="$(rustc --print sysroot)"
+          SEP=$'\x1f'
+          export CARGO_ENCODED_RUSTFLAGS="--remap-path-prefix=${CARGO_HOME_DIR}=/cargo${SEP}--remap-path-prefix=${RUSTUP_HOME_DIR}=/rustup${SEP}--remap-path-prefix=${SYSROOT_DIR}=/rustc${SEP}--remap-path-prefix=${HOME}=/user${SEP}--remap-path-prefix=${PWD}=/workspace"
+          cargo build --release --target "${{ matrix.target }}" -p gba-frontend-desktop -p gba-libretro
+
+      - name: Build release binaries with path-prefix stripping (Windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          $cargoHome = if ($env:CARGO_HOME) { $env:CARGO_HOME } else { Join-Path $env:USERPROFILE ".cargo" }
+          $rustupHome = if ($env:RUSTUP_HOME) { $env:RUSTUP_HOME } else { Join-Path $env:USERPROFILE ".rustup" }
+          $sysroot = (rustc --print sysroot).Trim()
+          $workspace = (Get-Location).Path
+          $flags = @(
+            "--remap-path-prefix=$($cargoHome)=/cargo",
+            "--remap-path-prefix=$($cargoHome -replace '\\','/')=/cargo",
+            "--remap-path-prefix=$($rustupHome)=/rustup",
+            "--remap-path-prefix=$($rustupHome -replace '\\','/')=/rustup",
+            "--remap-path-prefix=$($sysroot)=/rustc",
+            "--remap-path-prefix=$($sysroot -replace '\\','/')=/rustc",
+            "--remap-path-prefix=$($env:USERPROFILE)=/user",
+            "--remap-path-prefix=$($env:USERPROFILE -replace '\\','/')=/user",
+            "--remap-path-prefix=$($workspace)=/workspace",
+            "--remap-path-prefix=$($workspace -replace '\\','/')=/workspace"
+          )
+          $env:CARGO_ENCODED_RUSTFLAGS = ($flags -join ([char]0x1f))
+          cargo build --release --target "${{ matrix.target }}" -p gba-frontend-desktop -p gba-libretro
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+
+      - name: Stage & package archive with forward-slash paths (Unix)
+        if: runner.os != 'Windows'
+        shell: bash
+        run: |
+          mkdir -p dist "${{ matrix.artifact_name }}"
+          cp "target/${{ matrix.target }}/release/${{ matrix.exe_name }}" "${{ matrix.artifact_name }}/"
+          cp "target/${{ matrix.target }}/release/${{ matrix.libretro_name }}" "${{ matrix.artifact_name }}/"
+          chmod +x "${{ matrix.artifact_name }}/${{ matrix.exe_name }}"
+          cp LICENSE README.md CHANGELOG.md THIRD-PARTY-NOTICES.md COMPATIBILITY.md TEST_RESULTS.md "${{ matrix.artifact_name }}/"
+          tar -czf "dist/${{ matrix.artifact_name }}.tar.gz" "${{ matrix.artifact_name }}"
+          zip -r "dist/${{ matrix.artifact_name }}.zip" "${{ matrix.artifact_name }}"
+          (cd dist && shasum -a 256 "${{ matrix.artifact_name }}.tar.gz" "${{ matrix.artifact_name }}.zip" > "${{ matrix.artifact_name }}.sha256")
+
+      - name: Stage & package zip with tar.exe (Windows forward slashes)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          $stage = "${{ matrix.artifact_name }}"
+          New-Item -ItemType Directory -Force -Path "dist", $stage | Out-Null
+          Copy-Item "target\${{ matrix.target }}\release\${{ matrix.exe_name }}" $stage
+          Copy-Item "target\${{ matrix.target }}\release\${{ matrix.libretro_name }}" $stage
+          Copy-Item LICENSE, README.md, CHANGELOG.md, THIRD-PARTY-NOTICES.md, COMPATIBILITY.md, TEST_RESULTS.md $stage
+          # Use bsdtar (`tar.exe -a`) instead of Compress-Archive so zip paths use '/' on Linux/macOS.
+          tar.exe -a -cf "dist/$stage.zip" "$stage"
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          $hash = (Get-FileHash "dist/$stage.zip" -Algorithm SHA256).Hash.ToLowerInvariant()
+          "$hash  $stage.zip" | Out-File -Encoding ascii "dist/$stage.sha256"
+
+      - name: Upload packaged release artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.artifact_name }}
+          path: dist/*
+
+  build-wasm-bundle:
+    name: Package (rustboy-advance-web-wasm32)
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Install Rust wasm32 target
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: wasm32-unknown-unknown
+
+      - name: Cache Cargo artifacts
+        uses: Swatinem/rust-cache@v2
+
+      - name: Install matching wasm-bindgen-cli
+        run: |
+          WBG_VER=$(awk '/^name = "wasm-bindgen"$/{getline; gsub(/"/, "", $3); print $3; exit}' Cargo.lock)
+          cargo install wasm-bindgen-cli --version "$WBG_VER" --locked
+
+      - name: Build WASM release bundle
+        run: |
+          CARGO_HOME_DIR="${CARGO_HOME:-$HOME/.cargo}"
+          RUSTUP_HOME_DIR="${RUSTUP_HOME:-$HOME/.rustup}"
+          SYSROOT_DIR="$(rustc --print sysroot)"
+          SEP=$'\x1f'
+          export CARGO_ENCODED_RUSTFLAGS="--remap-path-prefix=${CARGO_HOME_DIR}=/cargo${SEP}--remap-path-prefix=${RUSTUP_HOME_DIR}=/rustup${SEP}--remap-path-prefix=${SYSROOT_DIR}=/rustc${SEP}--remap-path-prefix=${HOME}=/user${SEP}--remap-path-prefix=${PWD}=/workspace"
+          cargo build --release --target wasm32-unknown-unknown -p gba-frontend-web
+          wasm-bindgen --target web --out-dir web/pkg target/wasm32-unknown-unknown/release/gba_frontend_web.wasm
+          mkdir -p dist rustboy-advance-web-wasm32
+          cp -r web/* rustboy-advance-web-wasm32/
+          cp LICENSE README.md THIRD-PARTY-NOTICES.md rustboy-advance-web-wasm32/
+          zip -r dist/rustboy-advance-web-wasm32.zip rustboy-advance-web-wasm32
+          (cd dist && sha256sum rustboy-advance-web-wasm32.zip > rustboy-advance-web-wasm32.sha256)
+
+      - name: Upload WASM release artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: rustboy-advance-web-wasm32
+          path: dist/*
+
+  publish-release:
+    name: Publish GitHub Release
+    if: startsWith(github.ref, 'refs/tags/v')
+    needs: [build-release, build-wasm-bundle]
+    runs-on: ubuntu-latest
+    steps:
+      - name: Download all artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: release-assets
+          merge-multiple: true
+
+      - name: Generate combined SHA256SUMS.txt
+        run: |
+          cd release-assets
+          cat *.sha256 | sort > SHA256SUMS.txt
+          cat SHA256SUMS.txt
+
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          generate_release_notes: true
+          files: |
+            release-assets/*.zip
+            release-assets/*.tar.gz
+            release-assets/SHA256SUMS.txt

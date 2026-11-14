@@ -606,3 +606,110 @@ fn cgb_banking_hdma_stat_blocking_apu_and_reset() {
     core.bus.write8_immediate(0x0000, 0x0A);
     assert_eq!(core.peek8(0xA000), 0xCA);
 }
+
+#[derive(Debug, PartialEq, Eq)]
+enum MooneyeOutcome {
+    Pass,
+    Fail([u8; 6]),
+    Timeout,
+}
+
+fn run_mooneye_rom(rom: Vec<u8>, model: GbModel, max_cycles: u64) -> MooneyeOutcome {
+    let mut core = GbCore::new(rom, None, model);
+    let mut elapsed = 0u64;
+    while elapsed < max_cycles {
+        if core.bus.peek8(core.cpu.pc) == 0x40 {
+            let regs = [
+                core.cpu.b, core.cpu.c, core.cpu.d, core.cpu.e, core.cpu.h, core.cpu.l,
+            ];
+            if regs == [3, 5, 8, 13, 21, 34] {
+                return MooneyeOutcome::Pass;
+            }
+            if regs == [0x42, 0x42, 0x42, 0x42, 0x42, 0x42] {
+                return MooneyeOutcome::Fail(regs);
+            }
+        }
+        let step_cyc = core.step_one();
+        elapsed = elapsed.saturating_add(step_cyc.max(1));
+    }
+    MooneyeOutcome::Timeout
+}
+
+fn collect_gb_roms_recursive(dir: &Path, out: &mut Vec<PathBuf>) {
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if path.is_dir() {
+            collect_gb_roms_recursive(&path, out);
+        } else if let Some(ext) = path.extension().and_then(|e| e.to_str()) {
+            let ext = ext.to_ascii_lowercase();
+            if ext == "gb" || ext == "gbc" {
+                out.push(path);
+            }
+        }
+    }
+}
+
+#[test]
+fn mooneye_ld_bb_harness_and_optional_suite() {
+    // 1. Always verify Mooneye LD B,B (0x40) magic-register PASS and FAIL detection.
+    #[rustfmt::skip]
+    let pass_prog = [
+        0x06, 3,    // LD B, 3
+        0x0E, 5,    // LD C, 5
+        0x16, 8,    // LD D, 8
+        0x1E, 13,   // LD E, 13
+        0x26, 21,   // LD H, 21
+        0x2E, 34,   // LD L, 34
+        0x40,       // LD B, B (mooneye software breakpoint)
+        0x18, 0xFE, // JR -2
+    ];
+    let pass_rom = make_test_rom(&pass_prog, "MOONOK", 0x00, 0x00, 0, 0x00);
+    assert_eq!(
+        run_mooneye_rom(pass_rom, GbModel::Dmg, 100_000),
+        MooneyeOutcome::Pass
+    );
+
+    #[rustfmt::skip]
+    let fail_prog = [
+        0x06, 0x42, 0x0E, 0x42, 0x16, 0x42, 0x1E, 0x42, 0x26, 0x42, 0x2E, 0x42,
+        0x40, 0x18, 0xFE,
+    ];
+    let fail_rom = make_test_rom(&fail_prog, "MOONFL", 0x00, 0x00, 0, 0x00);
+    assert_eq!(
+        run_mooneye_rom(fail_rom, GbModel::Dmg, 100_000),
+        MooneyeOutcome::Fail([0x42; 6])
+    );
+
+    // 2. Run external Mooneye suite ROMs if placed in `test-roms/gb/mooneye/`.
+    let mooneye_dir = workspace_root().join("test-roms").join("gb").join("mooneye");
+    if !mooneye_dir.is_dir() {
+        eprintln!(
+            "Skipping optional mooneye suite: {} not found",
+            mooneye_dir.display()
+        );
+        return;
+    }
+
+    let mut roms = Vec::new();
+    collect_gb_roms_recursive(&mooneye_dir, &mut roms);
+    roms.sort();
+    for path in roms {
+        let name = path.to_string_lossy();
+        let model = if name.contains("cgb") || name.contains("C0") {
+            GbModel::Cgb
+        } else {
+            GbModel::Dmg
+        };
+        let bytes = std::fs::read(&path).expect("read mooneye rom");
+        let outcome = run_mooneye_rom(bytes, model, 4_194_304 * 10);
+        assert_eq!(
+            outcome,
+            MooneyeOutcome::Pass,
+            "Mooneye ROM failed: {}",
+            path.display()
+        );
+    }
+}

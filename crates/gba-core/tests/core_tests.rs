@@ -1812,3 +1812,229 @@ fn test_eeprom_reads_through_fast_path_including_32mb_autodetect() {
         .read_16(0x0DFF_FF00, AccessType::NonSequential, 0x0800_0000, false);
     assert_eq!(ready_bit, 1);
 }
+
+#[test]
+fn hle_bios_edge_cases_open_bus_soundbias_timing_and_fallback() {
+    // 1. Initial boot state & HLE open-bus latch (0xE129_F000)
+    let mut rom = rom_from_arm_words(&[
+        0xE3A0_0001, // 0x00: mov r0, #1
+        0xEF19_0000, // 0x04: swi 0x19 (SoundBias(1)) -> expect SOUNDBIAS level = 0x0200
+        0xE3A0_0000, // 0x08: mov r0, #0
+        0xEF19_0000, // 0x0C: swi 0x19 (SoundBias(0)) -> expect SOUNDBIAS level = 0x0000
+        0xEF0D_0000, // 0x10: swi 0x0D (GetBiosChecksum) -> r0 = 0xBAAE_187F, bios_latch = 0xE3A0_2004
+        0xEAFF_FFFE, // 0x14: b .
+    ]);
+    rom.resize(0x200, 0);
+    // Tag ROM with Classic NES Super Mario Bros ("FSME") to test real-BIOS fallback detection
+    rom[0xAC..0xB0].copy_from_slice(b"FSME");
+
+    let mut core = GbaCore::new(None, rom.clone());
+    assert!(core.recommends_real_bios().is_some());
+    assert_eq!(
+        core.bus
+            .read_32(0x0000_0000, AccessType::NonSequential, 0x0800_0000),
+        0xE129_F000
+    );
+    assert_eq!(
+        core.bus
+            .read_16(0x0000_0002, AccessType::NonSequential, 0x0800_0000, false),
+        0xE129
+    );
+
+    // Execute SWI 0x19 SoundBias(1) while preserving resolution bits (1 << 14)
+    core.bus
+        .write_io_16(0x0400_0088, (1 << 14) | 0x0080);
+    core.cpu.step(&mut core.bus); // mov r0, #1
+    let swi_bias1_cyc = core.cpu.step(&mut core.bus); // swi 0x19 (SoundBias(1))
+    assert!(swi_bias1_cyc > 64, "SoundBias SWI should include BIOS timing");
+    assert_eq!(core.bus.apu.soundbias, (1 << 14) | 0x0200);
+
+    core.cpu.step(&mut core.bus); // mov r0, #0
+    core.cpu.step(&mut core.bus); // swi 0x19 (SoundBias(0))
+    assert_eq!(core.bus.apu.soundbias, 1 << 14);
+
+    // Execute SWI 0x0D GetBiosChecksum -> sets bios_latch = 0xE3A0_2004
+    let swi_chk_cyc = core.cpu.step(&mut core.bus);
+    assert_eq!(core.cpu.gpr[0], 0xBAAE_187F);
+    assert!(swi_chk_cyc >= 60);
+    assert_eq!(
+        core.bus
+            .read_32(0x0000_0000, AccessType::NonSequential, 0x0800_0000),
+        0xE3A0_2004
+    );
+
+    // 2. IRQ trampoline exit must update bios_latch to 0xE55E_C002 (opcode prefetched at 0x0144)
+    let irq_handler_addr = 0x0300_0000u32;
+    let irq_handler_words = [
+        0xE3A0_5042u32, // mov r5, #0x42
+        0xE12F_FF1Eu32, // bx lr (return to BIOS 0x0138)
+    ];
+    for (i, w) in irq_handler_words.iter().enumerate() {
+        core.bus
+            .write_32(irq_handler_addr + (i as u32) * 4, *w, AccessType::NonSequential);
+    }
+    core.bus
+        .write_32(0x0300_7FFC, irq_handler_addr, AccessType::NonSequential);
+    core.bus
+        .write_16(0x0400_0208, 1, AccessType::NonSequential); // IME = 1
+    core.bus
+        .write_16(0x0400_0200, 1, AccessType::NonSequential); // IE = VBlank
+    core.bus.hw.request_irq(1);
+    for _ in 0..32 {
+        core.step_one();
+        if core.cpu.gpr[5] == 0x42 && core.cpu.current_exec_pc() >= 0x0800_0000 {
+            break;
+        }
+    }
+    assert_eq!(core.cpu.gpr[5], 0x42, "user IRQ handler must execute");
+    assert_eq!(
+        core.bus
+            .read_32(0x0000_0000, AccessType::NonSequential, 0x0800_0000),
+        0xE55E_C002,
+        "after HLE IRQ exit, BIOS open-bus must latch 0xE55E_C002"
+    );
+
+    // 3. SoftReset resets bios_latch to 0xE129_F000 and branches back to 0x0800_0000
+    core.bus.hle_swi(&mut core.cpu, 0x00);
+    assert_eq!(
+        core.bus
+            .read_32(0x0000_0000, AccessType::NonSequential, 0x0800_0000),
+        0xE129_F000
+    );
+
+    // 4. SWI timing scaling across Div and CpuFastSet
+    let mut small_div = GbaCore::new(
+        None,
+        rom_from_arm_words(&[
+            0xE3A0_0008, // mov r0, #8
+            0xE3A0_1002, // mov r1, #2
+            0xEF06_0000, // swi 0x06 (Div)
+            0xEAFF_FFFE,
+        ]),
+    );
+    small_div.cpu.step(&mut small_div.bus);
+    small_div.cpu.step(&mut small_div.bus);
+    let cyc_small = small_div.cpu.step(&mut small_div.bus);
+    assert_eq!(small_div.cpu.gpr[0], 4);
+
+    let mut large_div = GbaCore::new(
+        None,
+        rom_from_arm_words(&[
+            0xE3A0_0102, // mov r0, #0x8000_0000 (Wait: 0x02 << 30 = 0x80000000)
+            0xE3A0_1003, // mov r1, #3
+            0xEF06_0000, // swi 0x06 (Div)
+            0xEAFF_FFFE,
+        ]),
+    );
+    large_div.cpu.step(&mut large_div.bus);
+    large_div.cpu.step(&mut large_div.bus);
+    let cyc_large = large_div.cpu.step(&mut large_div.bus);
+    assert!(
+        cyc_large > cyc_small,
+        "large quotient Div should take more BIOS cycles ({cyc_large} vs {cyc_small})"
+    );
+
+    // 5. Real BIOS present suppresses fallback warning; non-fallback game returns None
+    let dummy_bios = vec![0u8; 0x4000];
+    let with_bios = GbaCore::new(Some(&dummy_bios), rom.clone());
+    assert!(with_bios.recommends_real_bios().is_none());
+
+    let mut emerald_rom = rom;
+    emerald_rom[0xAC..0xB0].copy_from_slice(b"BPEE");
+    let emerald = GbaCore::new(None, emerald_rom);
+    assert!(emerald.recommends_real_bios().is_none());
+}
+
+#[test]
+fn waitcnt_prefetch_dma_boundary_and_4stage_timer_cascade() {
+    // 1. WAITCNT waitstate decoding across WS0, WS1, WS2, SRAM
+    let rom = vec![0xAAu8; 0x6_0000]; // 384 KiB ROM to span 128 KiB boundaries cleanly
+    let mut core = GbaCore::new(None, rom);
+
+    // Set WAITCNT: SRAM=8 wait (bits 0-1=3), WS0 N=3 S=1 (bits 2-4 = 1 | (1<<4)),
+    // WS1 N=2 S=1 (bits 5-7 = 2 | (1<<7)), WS2 N=8 S=1 (bits 8-10 = 3 | (1<<10)), Prefetch=OFF
+    core.bus.write_16(0x0400_0204, 0x07D7, AccessType::NonSequential);
+    assert_eq!(core.bus.rom_fetch_cycles(0x0800_0002, AccessType::NonSequential), 4); // N=3 -> 4 cyc
+    assert_eq!(core.bus.rom_fetch_cycles(0x0800_0002, AccessType::Sequential), 2);    // S=1 -> 2 cyc
+    assert_eq!(core.bus.rom_fetch_cycles(0x0A00_0002, AccessType::NonSequential), 3); // N=2 -> 3 cyc
+    assert_eq!(core.bus.rom_fetch_cycles(0x0A00_0002, AccessType::Sequential), 2);    // S=1 -> 2 cyc
+    assert_eq!(core.bus.rom_fetch_cycles(0x0C00_0002, AccessType::NonSequential), 9); // N=8 -> 9 cyc
+    assert_eq!(core.bus.rom_fetch_cycles(0x0C00_0002, AccessType::Sequential), 2);    // S=1 -> 2 cyc
+    core.bus.read_8(0x0E00_0000, AccessType::NonSequential, 0x0800_0000, false);
+    assert_eq!(core.bus.last_cycles, 9); // SRAM 8 waitstates -> 9 cycles
+
+    // 2. GamePak Prefetch Buffer (WAITCNT bit 14) reduces sequential ROM fetch cycles
+    // Use an interleaved ALU/MUL sequence that gives prefetch cycles to fill between ROM fetches:
+    let mut interleaved = Vec::new();
+    for _ in 0..16 {
+        interleaved.push(0xE3A0_0301); // mov r3, #0x04000000
+        interleaved.push(0xE002_0091); // mul r2, r1, r0 (multi-I cycle -> fills prefetch!)
+    }
+    let mut pf_off = GbaCore::new(None, rom_from_arm_words(&interleaved));
+    pf_off.bus.write_16(0x0400_0204, 0x0000, AccessType::NonSequential);
+    let mut t_off = 0u64;
+    for _ in 0..32 {
+        t_off += pf_off.cpu.step(&mut pf_off.bus);
+    }
+    let mut pf_on = GbaCore::new(None, rom_from_arm_words(&interleaved));
+    pf_on.bus.write_16(0x0400_0204, 0x4000, AccessType::NonSequential);
+    let mut t_on = 0u64;
+    for _ in 0..32 {
+        t_on += pf_on.cpu.step(&mut pf_on.bus);
+    }
+    assert!(
+        t_on < t_off,
+        "GamePak prefetch should reduce cycle count with MUL I-cycles ({t_on} < {t_off})"
+    );
+
+    // 3. DMA timing & 128 KiB ROM boundary forced N-seq penalty
+    let measure_dma3 = |src: u32| -> u64 {
+        let mut c = GbaCore::new(None, vec![0xBBu8; 0x6_0000]);
+        c.bus.write_16(0x0400_0204, 0x0000, AccessType::NonSequential); // WS0 N=5, S=3
+        c.bus.write_32(0x0400_00D4, src, AccessType::NonSequential);
+        c.bus.write_32(0x0400_00D8, 0x0300_0000, AccessType::NonSequential);
+        c.bus.write_16(0x0400_00DC, 4, AccessType::NonSequential);
+        c.bus.write_16(0x0400_00DE, 0x8400, AccessType::NonSequential); // 32-bit INC immediate
+        c.bus.scheduler.current_cycle += 2; // Flush DmaStart startup delay
+        while let Some((ev_cycle, kind)) = c.bus.scheduler.pop_due() {
+            c.bus.dispatch_event(ev_cycle, kind);
+        }
+        assert!(c.bus.hw.active_dma.is_some(), "DMA3 should become active after startup delay");
+        let mut dma_cycles = 0u64;
+        while c.bus.hw.active_dma.is_some() {
+            dma_cycles += c.bus.step_active_dma();
+        }
+        dma_cycles
+    };
+    let dma_no_cross = measure_dma3(0x0801_FFF0); // 0801FFF0..0801FFFC
+    let dma_cross = measure_dma3(0x0801_FFF8);    // crosses 0x0802_0000 on 3rd word (+2 cyc)
+    assert_eq!(
+        dma_cross - dma_no_cross,
+        2,
+        "crossing 128 KiB ROM boundary must add N-S = 2 cycles"
+    );
+
+    // 4. 4-stage Timer Cascade (TM0 -> TM1 -> TM2 -> TM3 with IRQ on TM3)
+    let mut tcore = GbaCore::new(None, vec![0u8; 0x100]);
+    tcore.bus.write_16(0x0400_0200, 1 << 6, AccessType::NonSequential); // IE: Timer3
+    tcore.bus.write_16(0x0400_010C, 0xFFFE, AccessType::NonSequential); // TM3 reload=FFFE (2 ticks)
+    tcore.bus.write_16(0x0400_0108, 0xFFFE, AccessType::NonSequential); // TM2 reload=FFFE (2 ticks)
+    tcore.bus.write_16(0x0400_0104, 0xFFFC, AccessType::NonSequential); // TM1 reload=FFFC (4 ticks)
+    tcore.bus.write_16(0x0400_0100, 0xFFFE, AccessType::NonSequential); // TM0 reload=FFFE (2 cycles)
+    tcore.bus.write_16(0x0400_010E, 0x00C4, AccessType::NonSequential); // TM3: En | IRQ | Cascade
+    tcore.bus.write_16(0x0400_010A, 0x0084, AccessType::NonSequential); // TM2: En | Cascade
+    tcore.bus.write_16(0x0400_0106, 0x0084, AccessType::NonSequential); // TM1: En | Cascade
+    tcore.bus.write_16(0x0400_0102, 0x0080, AccessType::NonSequential); // TM0: En (/1)
+
+    for _ in 0..80 {
+        tcore.step_one();
+        if (tcore.bus.hw.if_flag & (1 << 6)) != 0 {
+            break;
+        }
+    }
+    assert_ne!(
+        tcore.bus.hw.if_flag & (1 << 6),
+        0,
+        "4-stage timer cascade TM0->TM1->TM2->TM3 must raise Timer3 IRQ"
+    );
+}

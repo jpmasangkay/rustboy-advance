@@ -207,6 +207,11 @@ impl CliConfig {
         let mut args = std::env::args().skip(1);
         while let Some(arg) = args.next() {
             match arg.as_str() {
+                "--portable" => crate::config::init_portable_mode(),
+                "--version" | "-V" => {
+                    println!("Rustboy Advance v{}", env!("CARGO_PKG_VERSION"));
+                    std::process::exit(0);
+                }
                 "--headless" => cfg.headless = true,
                 "--bench" => {
                     cfg.bench = true;
@@ -389,7 +394,9 @@ impl CliConfig {
                          \t--bench                  Run 3600-frame headless benchmark (writes perf/bench-*.json & perf/REPORT.md)\n\
                          \t--bench-realtime         Run paced 59.7275 Hz headless benchmark logging drops & audio underruns\n\
                          \t--input-replay <path>    Replay deterministic button inputs and scene tags\n\
-                         \t--filter <name>          Display filter (myboy-smooth, sharp-1x, xbr-3x, lcd-matrix, soft-handheld, scale2x)\n\
+                         \t--filter <name>          Display filter (smooth-bilinear, sharp-1x, xbr-3x, lcd-matrix, soft-handheld, scale2x, crt-scanlines)\n\
+                         \t--portable               Store config, saves, states, screenshots, and covers next to executable\n\
+                         \t--version                Print version and exit\n\
                          \t--perf-dir <dir>         Output directory for benchmark artifacts (default: perf)\n\
                          \t--category <cat>         Legacy homebrew benchmark category: mode4-3d, mode5-bitmap, affine, sprites, dma-hdma, audio, or 'all'\n\
                          \t--assign <cat>=<path>    Assign a custom ROM to a legacy benchmark category\n\

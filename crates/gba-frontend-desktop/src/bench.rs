@@ -263,7 +263,7 @@ fn parse_buttons_mask(spec: &str, line_no: usize) -> Result<u16, String> {
 
 pub fn parse_display_filter(name: &str) -> Result<DisplayFilter, String> {
     match name.trim().to_ascii_lowercase().as_str() {
-        "myboy-smooth" | "myboy" | "default" => Ok(DisplayFilter::MyBoySmooth),
+        "smooth-bilinear" | "smooth_bilinear" | "default" => Ok(DisplayFilter::SmoothBilinear),
         "sharp-1x" | "sharp1x" | "sharp" | "nearest" | "raw-nearest" | "none" => {
             Ok(DisplayFilter::Sharp1x)
         }
@@ -275,14 +275,14 @@ pub fn parse_display_filter(name: &str) -> Result<DisplayFilter, String> {
         "scale2x" | "smooth-scale2x" | "epx" | "hq2x" => Ok(DisplayFilter::SmoothScale2x),
         "crt-scanlines" | "crt" | "scanlines" => Ok(DisplayFilter::CrtScanlines),
         other => Err(format!(
-            "unknown filter `{other}` (expected: none, myboy-smooth, bilinear, lcd-grid, crt-scanlines, hq2x, xbrz)"
+            "unknown filter `{other}` (expected: none, smooth-bilinear, bilinear, lcd-grid, crt-scanlines, hq2x, xbrz)"
         )),
     }
 }
 
 pub fn filter_cli_slug(filter: DisplayFilter) -> &'static str {
     match filter {
-        DisplayFilter::MyBoySmooth => "myboy-smooth",
+        DisplayFilter::SmoothBilinear => "smooth-bilinear",
         DisplayFilter::Sharp1x | DisplayFilter::RawNearest => "none",
         DisplayFilter::XbrSmooth3x => "xbrz",
         DisplayFilter::AuthenticGbaLcd => "lcd-grid",
@@ -295,7 +295,7 @@ pub fn filter_cli_slug(filter: DisplayFilter) -> &'static str {
 fn bench_shader_preset_for_filter(filter: DisplayFilter) -> ShaderPreset {
     match filter {
         DisplayFilter::Sharp1x | DisplayFilter::RawNearest => ShaderPreset::Nearest,
-        DisplayFilter::MyBoySmooth | DisplayFilter::SoftHandheld => ShaderPreset::SharpBilinear,
+        DisplayFilter::SmoothBilinear | DisplayFilter::SoftHandheld => ShaderPreset::SharpBilinear,
         DisplayFilter::AuthenticGbaLcd => ShaderPreset::LcdGrid,
         DisplayFilter::CrtScanlines => ShaderPreset::CrtScanlines,
         DisplayFilter::SmoothScale2x | DisplayFilter::XbrSmooth3x => ShaderPreset::ScaleEdge,
@@ -1913,10 +1913,10 @@ const BENCH_FILTERS: [FilterBenchDef; 8] = [
         cpu_color_correction: false,
     },
     FilterBenchDef {
-        slug: "myboy-smooth",
+        slug: "smooth-bilinear",
         shader_preset: ShaderPreset::SharpBilinear,
         color_profile_id: 0,
-        cpu_filter: DisplayFilter::MyBoySmooth,
+        cpu_filter: DisplayFilter::SmoothBilinear,
         cpu_color_correction: false,
     },
     FilterBenchDef {
@@ -2187,7 +2187,7 @@ pub fn run_bench_filters(cfg: &CliConfig) -> Result<(), String> {
     ));
 
     if let Ok(sb_timings) = bench_real_softbuffer_present(frames.min(180)) {
-        println!("\n=== Real Windowed winit+softbuffer Present (none vs myboy-smooth) ===");
+        println!("\n=== Real Windowed winit+softbuffer Present (none vs smooth-bilinear) ===");
         for (slug, avg_ms, p95_ms) in sb_timings {
             println!("  [no-gpu-softbuffer] {slug:<16} | avg={avg_ms:.4} ms | p95={p95_ms:.4} ms");
         }
@@ -2894,16 +2894,16 @@ fn recommend_selftest_filter(
     let cheapest_cost = cheapest_row.map(|r| r.avg_ms).unwrap_or(0.0);
 
     if no_gpu || !has_wgpu {
-        if let Some(myboy) = cost_for("myboy-smooth")
+        if let Some(smooth) = cost_for("smooth-bilinear")
             && let Some(none) = cost_for("none")
-            && myboy <= none + 0.15
-            && emu_avg_ms + myboy <= half_budget
+            && smooth <= none + 0.15
+            && emu_avg_ms + smooth <= half_budget
         {
             return (
-                "myboy-smooth".to_string(),
+                "smooth-bilinear".to_string(),
                 format!(
-                    "No-GPU softbuffer path: myboy-smooth ({myboy:.3} ms) is within 0.15 ms of none ({none:.3} ms) and keeps emu+filter ({:.3} ms) under 50% budget ({half_budget:.2} ms)",
-                    emu_avg_ms + myboy
+                    "No-GPU softbuffer path: smooth-bilinear ({smooth:.3} ms) is within 0.15 ms of none ({none:.3} ms) and keeps emu+filter ({:.3} ms) under 50% budget ({half_budget:.2} ms)",
+                    emu_avg_ms + smooth
                 ),
             );
         }
@@ -2916,7 +2916,7 @@ fn recommend_selftest_filter(
     }
 
     if is_cpu_adapter {
-        for cand in ["lcd-grid", "none", "myboy-smooth"] {
+        for cand in ["lcd-grid", "none", "smooth-bilinear"] {
             if cand == cheapest_slug
                 && let Some(c) = cost_for(cand)
                 && emu_avg_ms + c <= half_budget
@@ -2938,15 +2938,15 @@ fn recommend_selftest_filter(
         );
     }
 
-    if let Some(c) = cost_for("myboy-smooth")
+    if let Some(c) = cost_for("smooth-bilinear")
         && emu_avg_ms + c <= half_budget
         && c <= 2.0
     {
         let none_ms = cost_for("none").unwrap_or(0.0);
         return (
-            "myboy-smooth".to_string(),
+            "smooth-bilinear".to_string(),
             format!(
-                "Hardware GPU shader path: myboy-smooth ({c:.3} ms, +{:.3} ms over none) provides clean interpolation while keeping total work ({:.3} ms) far under 50% budget ({half_budget:.2} ms)",
+                "Hardware GPU shader path: smooth-bilinear ({c:.3} ms, +{:.3} ms over none) provides clean interpolation while keeping total work ({:.3} ms) far under 50% budget ({half_budget:.2} ms)",
                 (c - none_ms).max(0.0),
                 emu_avg_ms + c
             ),
@@ -3158,7 +3158,7 @@ pub fn run_selftest(cfg: &CliConfig) -> Result<(), String> {
         cfg.simulate_no_adapter,
         cfg.no_gpu,
         cfg.software_adapter,
-        DisplayFilter::MyBoySmooth,
+        DisplayFilter::SmoothBilinear,
         false,
         false,
         0.08,
@@ -3238,7 +3238,7 @@ pub fn run_selftest(cfg: &CliConfig) -> Result<(), String> {
     };
     filter_timings.sort_by(|a, b| a.avg_ms.total_cmp(&b.avg_ms));
 
-    // Also measure real windowed OS softbuffer present cost (`none` vs `myboy-smooth`) when running on the no-GPU path.
+    // Also measure real windowed OS softbuffer present cost (`none` vs `smooth-bilinear`) when running on the no-GPU path.
     let softbuffer_present_timings = if wgpu_probe.is_err() {
         bench_real_softbuffer_present(120)
             .unwrap_or_default()
@@ -4484,7 +4484,7 @@ pub struct SoftbufferSizeReportJson {
 }
 
 /// Phase 8d: Time real `winit + softbuffer` across `720x480`, `1280x720`, `1920x1080`, and
-/// monitor native fullscreen with `none` and `myboy-smooth` at `1x`, `--slowdown 8`, and `--slowdown 15`.
+/// monitor native fullscreen with `none` and `smooth-bilinear` at `1x`, `--slowdown 8`, and `--slowdown 15`.
 pub fn run_bench_softbuffer(cfg: &CliConfig) -> Result<(), String> {
     let frames = if cfg.frames_explicit {
         cfg.frames.max(30)

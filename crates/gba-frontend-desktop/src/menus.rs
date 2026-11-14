@@ -140,7 +140,7 @@ impl RustboyApp {
                                 });
                                 ui.menu_button("Load State", |ui| {
                                     for s in 1..=5 {
-                                        let exists = self.slot_path(s).is_some_and(|p| p.exists());
+                                        let exists = self.existing_slot_path(s).is_some();
                                         let lbl = if exists {
                                             format!("Slot {s} (Shift+F{s}) [Saved]")
                                         } else {

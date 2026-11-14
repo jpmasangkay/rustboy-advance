@@ -27,7 +27,7 @@ Run **Rustboy Advance** on any target Windows 10/11 PC to verify emulation speed
 - **System & Adapter Inventory**: CPU model, physical cores / logical threads, total RAM, Windows build, and every GPU/software adapter enumerated by `wgpu` (`Vulkan`, `DX12`, `GL`) plus the chosen backend and reason.
 - **Calibration Loop**: Single-thread integer calibration baseline compared against reference (`75.769 ms`).
 - **600 Unthrottled Headless Frames**: Emulation + filter cost using the built-in MIT/Apache `STRESS_SELF` ROM (Mode 0, 4 BGs, 128 sprites, alpha blending).
-- **Per-Filter Timing (`avg` / `p95` / `worst`)**: Every filter measured on the active adapter (plus OS `softbuffer` present cost for `none` vs `myboy-smooth` in `--no-gpu` mode).
+- **Per-Filter Timing (`avg` / `p95` / `worst`)**: Every filter measured on the active adapter (plus OS `softbuffer` present cost for `none` vs `smooth-bilinear` in `--no-gpu` mode).
 - **Paced 59.73 Hz Run (`600f` after discarding first `120f` warm-up)**: Real audio DAC DRC pacing (`DrcPacer`), frame over-budget count, spikes `>2x` (`33.485 ms`), audio underruns, and presentation interval jitter.
 - **Measured Slowdown Sweep (`N = 1, 2, 4, 6, 8, 12, 16, 24`, `300f` each)**: Real CPU-slowdown simulation (`(N-1)x` spin) stopping at the first failure, reporting both the highest `N` passing the smooth gate (`<0.5%` over-budget & `0` underruns) and highest `N` with `0` over-budget frames.
 

@@ -1146,11 +1146,14 @@ impl NoGpuApp {
             match fs::read(path) {
                 Ok(rom) => {
                     let mut c = GbaCore::new(bios_bytes.as_deref(), rom);
+                    let load_sav = sav_path
+                        .clone()
+                        .or_else(|| AppConfig::find_existing_sav_path_for_rom(path));
                     let inferred_sav = sav_path
                         .take()
-                        .unwrap_or_else(|| path.with_extension("sav"));
-                    if inferred_sav.exists()
-                        && let Ok(bytes) = fs::read(&inferred_sav)
+                        .unwrap_or_else(|| AppConfig::resolve_sav_path_for_rom(path));
+                    if let Some(src_sav) = load_sav
+                        && let Ok(bytes) = fs::read(&src_sav)
                     {
                         c.bus.cart.load_save_data(&bytes);
                     }
@@ -1238,12 +1241,12 @@ impl NoGpuApp {
             return;
         };
         let mut core = GbaCore::new(self.bios_bytes.as_deref(), rom);
-        let sav = path.with_extension("sav");
-        if sav.exists()
-            && let Ok(bytes) = fs::read(&sav)
+        if let Some(src_sav) = AppConfig::find_existing_sav_path_for_rom(path)
+            && let Ok(bytes) = fs::read(&src_sav)
         {
             core.bus.cart.load_save_data(&bytes);
         }
+        let sav = AppConfig::resolve_sav_path_for_rom(path);
         self.core = Some(core);
         self.sav_path = Some(sav);
         self.rom_name = path
@@ -1261,6 +1264,9 @@ impl NoGpuApp {
             && core.bus.cart.save_dirty
         {
             let data = core.bus.cart.export_save_data();
+            if let Some(parent) = sav.parent() {
+                let _ = fs::create_dir_all(parent);
+            }
             if fs::write(sav, &data).is_ok() {
                 core.bus.cart.save_dirty = false;
             }
@@ -1866,7 +1872,7 @@ pub fn run_no_gpu_desktop(
 }
 
 /// Benchmarks real windowed `winit + softbuffer::Surface` present latency (GDI/X11/Wayland)
-/// for `none` (`Sharp1x`) and `myboy-smooth` (`MyBoySmooth`) on the desktop OS presenter at `720x480`.
+/// for `none` (`Sharp1x`) and `smooth-bilinear` (`SmoothBilinear`) on the desktop OS presenter at `720x480`.
 pub fn bench_real_softbuffer_present(frames: usize) -> Result<Vec<(String, f64, f64)>, String> {
     let rows = bench_softbuffer_sizes(frames, false)?;
     Ok(rows
@@ -1878,7 +1884,7 @@ pub fn bench_real_softbuffer_present(frames: usize) -> Result<Vec<(String, f64, 
 
 /// Benchmarks real `winit + softbuffer::Surface` presentation + full GBA frame work across
 /// `720x480` (baseline), `1280x720` (720p), `1920x1080` (1080p), and the monitor's native
-/// fullscreen resolution with both `none` and `myboy-smooth` filters at `1x`, `8x`, and `15x`.
+/// fullscreen resolution with both `none` and `smooth-bilinear` filters at `1x`, `8x`, and `15x`.
 pub fn bench_softbuffer_sizes(
     frames: usize,
     include_scaled_slowdowns: bool,
@@ -2005,7 +2011,7 @@ pub fn bench_softbuffer_sizes(
                                results: &mut Vec<SoftbufferSizeBenchRow>| {
                 for &(slug, filter, cc) in &[
                     ("none", DisplayFilter::Sharp1x, false),
-                    ("myboy-smooth", DisplayFilter::MyBoySmooth, false),
+                    ("smooth-bilinear", DisplayFilter::SmoothBilinear, false),
                 ] {
                     postproc.prewarm(cc, false, filter, false, 0.08);
                     let linear = filter.texture_options() == egui::TextureOptions::LINEAR;
@@ -2227,14 +2233,14 @@ mod tests {
             1600,
             None,
         );
-        // Simulate a weaker CPU where 2560x1600 softbuffer MyBoySmooth exceeds budget under overload,
-        // while <=720x480 capped MyBoySmooth still fits easily.
+        // Simulate a weaker CPU where 2560x1600 softbuffer SmoothBilinear exceeds budget under overload,
+        // while <=720x480 capped SmoothBilinear still fits easily.
         let mut scaled_uncapped = uncapped_costs;
         for c in &mut scaled_uncapped {
             c.cost_ms *= 8.0;
         }
         let mut gov = QualityGovernor::with_measured_costs(
-            DisplayFilter::MyBoySmooth,
+            DisplayFilter::SmoothBilinear,
             true,
             scaled_uncapped,
         );
@@ -2254,7 +2260,7 @@ mod tests {
             .find_map(|_| gov.record_frame(1.5))
             .expect("sustained idle after lockout must lift 720x480 cap");
         assert_eq!(uncap_tr.kind, GovernorTransitionKind::UncapResolution);
-        assert_eq!(uncap_tr.to, DisplayFilter::MyBoySmooth);
+        assert_eq!(uncap_tr.to, DisplayFilter::SmoothBilinear);
         assert!(!gov.is_resolution_capped());
     }
 }

@@ -1,4 +1,4 @@
-// #![cfg_attr(all(not(debug_assertions), not(test)), windows_subsystem = "windows")]
+#![cfg_attr(all(not(debug_assertions), not(test)), windows_subsystem = "windows")]
 
 mod app;
 mod app_host;
@@ -50,6 +50,10 @@ fn is_cli_headless_invocation() -> bool {
         matches!(
             a.as_str(),
             "--headless"
+                | "--help"
+                | "-h"
+                | "--version"
+                | "-V"
                 | "--bench"
                 | "--bench-realtime"
                 | "--bench-filters"
@@ -65,6 +69,23 @@ fn is_cli_headless_invocation() -> bool {
     })
 }
 
+/// On Windows release builds compiled with `windows_subsystem = "windows"`, re-attach the parent
+/// terminal console when CLI/headless flags are passed so stdout/stderr remain visible.
+#[cfg(windows)]
+fn attach_parent_console_if_cli() {
+    const ATTACH_PARENT_PROCESS: u32 = 0xFFFF_FFFF;
+    if is_cli_headless_invocation() {
+        unsafe extern "system" {
+            fn AttachConsole(dw_process_id: u32) -> i32;
+        }
+        // Best effort: succeeds when launched from cmd/PowerShell; returns 0 if no parent console.
+        let _ = unsafe { AttachConsole(ATTACH_PARENT_PROCESS) };
+    }
+}
+
+#[cfg(not(windows))]
+fn attach_parent_console_if_cli() {}
+
 fn should_suppress_error_dialog() -> bool {
     is_cli_headless_invocation()
         || std::env::args().any(|a| a == "--perf-log" || a == "--perf-seconds")
@@ -74,7 +95,11 @@ fn install_panic_hook() {
     std::panic::set_hook(Box::new(|panic_info| {
         let msg = format!("{panic_info}");
         if !std::env::args().any(|a| a == "--gpu-probe") {
-            let _ = std::fs::write("rustboy-advance-crash.log", &msg);
+            let log_path = AppConfig::crash_log_path();
+            if let Some(parent) = log_path.parent() {
+                let _ = std::fs::create_dir_all(parent);
+            }
+            let _ = std::fs::write(log_path, &msg);
         }
         eprintln!("Rustboy Advance - Fatal Crash:\n{msg}");
         if !should_suppress_error_dialog() {
@@ -88,7 +113,11 @@ fn install_panic_hook() {
 }
 
 fn show_startup_error(title: &str, description: &str) {
-    let _ = std::fs::write("rustboy-advance-startup-error.log", description);
+    let log_path = AppConfig::startup_error_log_path();
+    if let Some(parent) = log_path.parent() {
+        let _ = std::fs::create_dir_all(parent);
+    }
+    let _ = std::fs::write(log_path, description);
     eprintln!("{title}: {description}");
     if !should_suppress_error_dialog() {
         rfd::MessageDialog::new()
@@ -100,6 +129,8 @@ fn show_startup_error(title: &str, description: &str) {
 }
 
 fn main() {
+    attach_parent_console_if_cli();
+    config::init_portable_mode();
     install_panic_hook();
 
     let builder = std::thread::Builder::new()

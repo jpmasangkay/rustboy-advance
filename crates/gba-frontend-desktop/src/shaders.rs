@@ -2535,7 +2535,7 @@ mod tests {
                 &fb,
                 false,
                 false,
-                DisplayFilter::MyBoySmooth,
+                DisplayFilter::SmoothBilinear,
                 false,
                 0.08,
             );

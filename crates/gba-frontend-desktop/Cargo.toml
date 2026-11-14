@@ -38,6 +38,12 @@ winit = { version = "0.30", default-features = false, features = ["rwh_06"] }
 
 [target.'cfg(windows)'.dependencies]
 gilrs = { version = "0.11", default-features = false, features = ["xinput"] }
+keyring = { version = "3.6", default-features = false, features = ["windows-native"] }
 
-[target.'cfg(not(windows))'.dependencies]
+[target.'cfg(target_os = "macos")'.dependencies]
 gilrs = "0.11"
+keyring = { version = "3.6", default-features = false, features = ["apple-native"] }
+
+[target.'cfg(all(not(windows), not(target_os = "macos")))'.dependencies]
+gilrs = "0.11"
+keyring = { version = "3.6", default-features = false, features = ["linux-native", "sync-secret-service", "crypto-rust"] }

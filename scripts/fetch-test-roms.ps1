@@ -116,7 +116,7 @@ foreach ($f in $NbaFiles) {
     Download-File "$NbaBase/$f" (Join-Path $OutRoot "nba-hw-test/$f")
 }
 
-Write-Host "==> Fetching Tonc prebuilt demos (tonc-bin.zip)"
+Write-Host "==> Fetching Tonc prebuilt demos (tonc-bin.zip, Copyright (c) Jasper Vijn / cearn, MIT License)"
 $ToncDir = Join-Path $OutRoot "tonc"
 $ToncMarker = Join-Path $ToncDir "win_demo.gba"
 if ((-not (Test-Path $ToncMarker)) -or $Force) {

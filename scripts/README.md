@@ -23,7 +23,19 @@ Pass `--force` (or `-Force` in PowerShell) to re-download existing files.
 | **FuzzARM** | `github.com/DenSinH/FuzzARM` | `a675329cd57da48e3e406216ba2d79dd7e09ee20` | `test-roms/fuzzarm/` |
 | **ARMWrestler (fixed)** | `github.com/destoer/armwrestler-gba-fixed` | `802e55ad61b421f4bbbc6f74f96aa4e5df4d630f` | `test-roms/armwrestler/` |
 | **NanoBoyAdvance hw-test** | `codeberg.org/nba-emu/hw-test` | `fbc99140e06f083c0a47612467cfbb02470e56dc` | `test-roms/nba-hw-test/` |
-| **Tonc demos** | `coranac.com/files/tonc-bin.zip` | 2013-03-28 archive | `test-roms/tonc/` |
+| **Tonc demos** | `coranac.com/files/tonc-bin.zip` (Jasper Vijn / cearn, MIT License) | 2013-03-28 archive | `test-roms/tonc/` |
+
+## Licensing & Redistribution Notes
+
+- All fetched GBA test ROMs live in `test-roms/` (gitignored) and are **never** checked into the repository or redistributed in release archives by default.
+- **Tonc demos (`tonc-bin.zip`):** Authored by Jasper Vijn (`cearn`, Coranac). Per upstream `libtonc` clarification, the example code and built demos are MIT-licensed; if you ever bundle `tonc/*.gba` in a distribution (e.g. a `sample-roms/` folder), retain attribution (`Copyright (c) J Vijn`) and the MIT license text.
+- **mGBA suite (`mgba-emu/suite`) & NanoBoyAdvance (`nba-emu/hw-test`):** Open-source hardware test suites (MPL-2.0 / MIT).
+- **jsmolka/gba-tests, FuzzARM, ARMWrestler:** Open-source test suites downloaded from pinned commits above.
+
+## Game Boy / Game Boy Color Suites (`gb-core`)
+
+- `gb-core` integration tests (`crates/gb-core/tests/core_tests.rs`) expect Blargg (`cpu_instrs`, `instr_timing`, `mem_timing`, `mem_timing-2`) and Matt Currie's `dmg-acid2.gb` / `cgb-acid2.gbc` under `test-roms/gb/`.
+- **Mooneye Test Suite (`Gekkio/mooneye-test-suite`):** The `mooneye_ld_bb_harness_and_optional_suite` test automatically discovers and runs any `*.gb` / `*.gbc` ROMs placed under `test-roms/gb/mooneye/` using the Mooneye `LD B, B` (`0x40`) breakpoint + Fibonacci pass (`B=3, C=5, D=8, E=13, H=21, L=34`) protocol. Build `mooneye-test-suite` from upstream releases and extract acceptance ROMs into `test-roms/gb/mooneye/`.
 
 ## Optional / User-Supplied Suites
 

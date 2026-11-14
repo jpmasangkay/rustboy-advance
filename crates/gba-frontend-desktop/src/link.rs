@@ -226,8 +226,13 @@ impl LocalLinkSession {
             return;
         }
         let data = self.p2_core.bus.cart.export_save_data();
-        if !data.is_empty() && std::fs::write(sav_path, data).is_ok() {
-            self.p2_core.bus.cart.save_dirty = false;
+        if !data.is_empty() {
+            if let Some(parent) = sav_path.parent() {
+                let _ = std::fs::create_dir_all(parent);
+            }
+            if std::fs::write(sav_path, data).is_ok() {
+                self.p2_core.bus.cart.save_dirty = false;
+            }
         }
     }
 
@@ -1307,11 +1312,14 @@ impl RustboyApp {
             return Err("Player 2 Link Cable requires a .gba ROM".into());
         }
 
-        let sav_path = p2_rom_path.with_extension("sav");
+        let existing_sav = crate::config::AppConfig::find_existing_sav_path_for_rom(p2_rom_path);
+        let sav_path = crate::config::AppConfig::resolve_sav_path_for_rom(p2_rom_path);
         let same_path_as_p1 = self.rom_path.as_ref().is_some_and(|p1p| p1p == p2_rom_path);
 
         let mut p2_core = GbaCore::new(self.bios_bytes.as_deref(), loaded.bytes);
-        if let Ok(sav) = std::fs::read(&sav_path) {
+        if let Some(src_sav) = existing_sav
+            && let Ok(sav) = std::fs::read(&src_sav)
+        {
             p2_core.bus.cart.load_save_data(&sav);
         }
         if let Some(p1_core) = &mut self.core {

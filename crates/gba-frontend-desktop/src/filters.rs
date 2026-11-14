@@ -236,7 +236,7 @@ impl VideoPostProcessor {
                 [LCD_WIDTH * 3, LCD_HEIGHT * 3],
                 egui::Color32::BLACK,
             ),
-            filter: DisplayFilter::MyBoySmooth,
+            filter: DisplayFilter::SmoothBilinear,
             lcd_grid_intensity: 0.08,
         }
     }
@@ -543,7 +543,7 @@ impl VideoPostProcessor {
             DisplayFilter::XbrSmooth3x => {
                 render_xbr_smooth_3x(&self.base_rgb, &mut self.output_image);
             }
-            DisplayFilter::MyBoySmooth | DisplayFilter::Sharp1x | DisplayFilter::RawNearest => {
+            DisplayFilter::SmoothBilinear | DisplayFilter::Sharp1x | DisplayFilter::RawNearest => {
                 if self.output_image.size != [LCD_WIDTH, LCD_HEIGHT] {
                     self.output_image =
                         egui::ColorImage::new([LCD_WIDTH, LCD_HEIGHT], egui::Color32::BLACK);
@@ -945,7 +945,7 @@ impl FrontendBridge {
                 [LCD_WIDTH * 3, LCD_HEIGHT * 3],
                 egui::Color32::BLACK,
             ),
-            filter: DisplayFilter::MyBoySmooth,
+            filter: DisplayFilter::SmoothBilinear,
             lcd_grid_intensity: 0.08,
             color_correction: true,
             lcd_ghosting: true,
@@ -998,7 +998,7 @@ impl HostFrontend for FrontendBridge {
             DisplayFilter::XbrSmooth3x => {
                 render_xbr_smooth_3x(&self.base_rgb, &mut self.output_image);
             }
-            DisplayFilter::MyBoySmooth | DisplayFilter::Sharp1x | DisplayFilter::RawNearest => {
+            DisplayFilter::SmoothBilinear | DisplayFilter::Sharp1x | DisplayFilter::RawNearest => {
                 if self.output_image.size != [LCD_WIDTH, LCD_HEIGHT] {
                     self.output_image =
                         egui::ColorImage::new([LCD_WIDTH, LCD_HEIGHT], egui::Color32::BLACK);
@@ -1470,7 +1470,7 @@ mod tests {
                 cost_ms: 0.4,
             },
             FilterCost {
-                filter: DisplayFilter::MyBoySmooth,
+                filter: DisplayFilter::SmoothBilinear,
                 cost_ms: 0.5,
             },
             FilterCost {
@@ -1559,7 +1559,7 @@ mod tests {
                 cost_ms: 5.2,
             },
             FilterCost {
-                filter: DisplayFilter::MyBoySmooth,
+                filter: DisplayFilter::SmoothBilinear,
                 cost_ms: 6.9,
             },
             FilterCost {
@@ -1610,7 +1610,7 @@ mod tests {
                 cost_ms: 0.4,
             },
             FilterCost {
-                filter: DisplayFilter::MyBoySmooth,
+                filter: DisplayFilter::SmoothBilinear,
                 cost_ms: 0.5,
             },
             FilterCost {
@@ -1753,26 +1753,26 @@ mod tests {
     fn quality_governor_caps_large_output_to_720x480_before_dropping_filter() {
         let large_costs = vec![
             FilterCost { filter: DisplayFilter::Sharp1x, cost_ms: 9.0 },
-            FilterCost { filter: DisplayFilter::MyBoySmooth, cost_ms: 12.0 },
+            FilterCost { filter: DisplayFilter::SmoothBilinear, cost_ms: 12.0 },
             FilterCost { filter: DisplayFilter::XbrSmooth3x, cost_ms: 20.0 },
         ];
         let capped_costs = vec![
             FilterCost { filter: DisplayFilter::Sharp1x, cost_ms: 0.4 },
-            FilterCost { filter: DisplayFilter::MyBoySmooth, cost_ms: 1.5 },
+            FilterCost { filter: DisplayFilter::SmoothBilinear, cost_ms: 1.5 },
             FilterCost { filter: DisplayFilter::XbrSmooth3x, cost_ms: 7.0 },
         ];
         let mut gov =
-            QualityGovernor::with_measured_costs(DisplayFilter::MyBoySmooth, true, large_costs);
+            QualityGovernor::with_measured_costs(DisplayFilter::SmoothBilinear, true, large_costs);
         gov.set_resolution_cap_support(true, Some(capped_costs));
         assert!(!gov.is_resolution_capped());
 
         // Under large window (e.g. 2560x1600 @ slowdown 8), rolling p95=15 ms triggers 720x480 cap
-        // while keeping MyBoySmooth (since 15 - 12 + 1.5 = 4.5 ms <= 8.37 ms target).
+        // while keeping SmoothBilinear (since 15 - 12 + 1.5 = 4.5 ms <= 8.37 ms target).
         let cap_tr = (0..(GOVERNOR_WINDOW_FRAMES + GOVERNOR_DOWN_SUSTAIN_FRAMES))
             .find_map(|_| gov.record_frame(15.0))
             .expect("sustained large-window overload should cap output resolution");
         assert_eq!(cap_tr.kind, GovernorTransitionKind::CapResolution);
-        assert_eq!(cap_tr.to, DisplayFilter::MyBoySmooth);
+        assert_eq!(cap_tr.to, DisplayFilter::SmoothBilinear);
         assert!(gov.is_resolution_capped());
         assert_eq!(
             gov.max_output_size(),
@@ -1789,19 +1789,19 @@ mod tests {
     fn quality_governor_lifts_720x480_cap_when_load_drops_and_backs_off_on_flap() {
         let large_costs = vec![
             FilterCost { filter: DisplayFilter::Sharp1x, cost_ms: 8.0 },
-            FilterCost { filter: DisplayFilter::MyBoySmooth, cost_ms: 12.0 },
+            FilterCost { filter: DisplayFilter::SmoothBilinear, cost_ms: 12.0 },
             FilterCost { filter: DisplayFilter::XbrSmooth3x, cost_ms: 20.0 },
         ];
         let capped_costs = vec![
             FilterCost { filter: DisplayFilter::Sharp1x, cost_ms: 0.4 },
-            FilterCost { filter: DisplayFilter::MyBoySmooth, cost_ms: 1.5 },
+            FilterCost { filter: DisplayFilter::SmoothBilinear, cost_ms: 1.5 },
             FilterCost { filter: DisplayFilter::XbrSmooth3x, cost_ms: 7.0 },
         ];
         let mut gov =
-            QualityGovernor::with_measured_costs(DisplayFilter::MyBoySmooth, true, large_costs);
+            QualityGovernor::with_measured_costs(DisplayFilter::SmoothBilinear, true, large_costs);
         gov.set_resolution_cap_support(true, Some(capped_costs));
 
-        // 1. Overload activates <= 720x480 cap while preserving MyBoySmooth.
+        // 1. Overload activates <= 720x480 cap while preserving SmoothBilinear.
         let cap_tr = (0..(GOVERNOR_WINDOW_FRAMES + GOVERNOR_DOWN_SUSTAIN_FRAMES))
             .find_map(|_| gov.record_frame(15.0))
             .expect("overload should activate 720x480 cap");
@@ -1820,18 +1820,18 @@ mod tests {
 
         // Reset lockout cycle via a clean fresh overloaded state, then drop load to idle (0.5 ms).
         let mut gov2 = QualityGovernor::with_measured_costs(
-            DisplayFilter::MyBoySmooth,
+            DisplayFilter::SmoothBilinear,
             true,
             vec![
                 FilterCost { filter: DisplayFilter::Sharp1x, cost_ms: 2.0 },
-                FilterCost { filter: DisplayFilter::MyBoySmooth, cost_ms: 3.0 },
+                FilterCost { filter: DisplayFilter::SmoothBilinear, cost_ms: 3.0 },
             ],
         );
         gov2.set_resolution_cap_support(
             true,
             Some(vec![
                 FilterCost { filter: DisplayFilter::Sharp1x, cost_ms: 0.2 },
-                FilterCost { filter: DisplayFilter::MyBoySmooth, cost_ms: 0.4 },
+                FilterCost { filter: DisplayFilter::SmoothBilinear, cost_ms: 0.4 },
             ]),
         );
         let cap2 = (0..(GOVERNOR_WINDOW_FRAMES + GOVERNOR_DOWN_SUSTAIN_FRAMES))
@@ -1850,7 +1850,7 @@ mod tests {
             .find_map(|_| gov2.record_frame(0.8))
             .expect("low sustained load after lockout should lift 720x480 cap");
         assert_eq!(uncap.kind, GovernorTransitionKind::UncapResolution);
-        assert_eq!(uncap.to, DisplayFilter::MyBoySmooth);
+        assert_eq!(uncap.to, DisplayFilter::SmoothBilinear);
         assert!(!gov2.is_resolution_capped());
         assert_eq!(gov2.max_output_size(), None);
         assert_eq!(gov2.current_lockout_frames(), GOVERNOR_BASE_LOCKOUT_FRAMES);
@@ -1987,7 +1987,7 @@ impl QualityGovernor {
                 cost_ms: 0.08,
             },
             FilterCost {
-                filter: DisplayFilter::MyBoySmooth,
+                filter: DisplayFilter::SmoothBilinear,
                 cost_ms: 0.09,
             },
             FilterCost {
@@ -2211,7 +2211,7 @@ impl QualityGovernor {
     }
 
     /// Selects the filter to run immediately upon enabling `720x480` OS-scaled cap:
-    /// preserves the current active filter if it fits under 50% of budget (e.g. `MyBoySmooth`),
+    /// preserves the current active filter if it fits under 50% of budget (e.g. `SmoothBilinear`),
     /// otherwise jumps to the best filter in `capped_costs` under 50%.
     fn select_filter_when_capping(&self, rolling_p95_ms: f64) -> DisplayFilter {
         let active_norm = canonical_governor_filter(self.active);

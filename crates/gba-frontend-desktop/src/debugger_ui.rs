@@ -7,7 +7,7 @@ use gba_core::cpu::{CPSR_C, CPSR_F, CPSR_I, CPSR_N, CPSR_T, CPSR_V, CPSR_Z, CpuM
 use gba_debugger::disassemble_range;
 
 use crate::cheats::{CheatEntry, CheatFormat, decode_cheat_lines};
-use crate::config::{GbaButton, KeyBindings, SaveOverrideChoice, format_key_name};
+use crate::config::SaveOverrideChoice;
 use crate::filters::{agb_srgb_lut, linear_lut};
 
 use crate::mem_search::{MemSearchAction, MemSearchWindow};
@@ -136,7 +136,6 @@ pub struct DebuggerWindows {
     pub show_audio: bool,
     pub show_overrides: bool,
     pub show_cheats: bool,
-    pub show_controls: bool,
     pub show_about: bool,
     pub show_io_regs: bool,
     pub show_gdb: bool,
@@ -201,9 +200,6 @@ pub struct DebuggerWindows {
     pub draft_cheat_code: String,
     pub draft_cheat_format: CheatFormat,
     pub cheat_error: Option<String>,
-
-    // Controls rebinding state
-    pub awaiting_rebind: Option<GbaButton>,
 }
 
 impl Default for DebuggerWindows {
@@ -218,7 +214,6 @@ impl Default for DebuggerWindows {
             show_audio: false,
             show_overrides: false,
             show_cheats: false,
-            show_controls: false,
             show_about: false,
             show_io_regs: false,
             show_gdb: false,
@@ -267,7 +262,6 @@ impl Default for DebuggerWindows {
             draft_cheat_code: String::new(),
             draft_cheat_format: CheatFormat::AutoRaw,
             cheat_error: None,
-            awaiting_rebind: None,
         }
     }
 }
@@ -302,7 +296,6 @@ fn checkerboard_color(x: usize, y: usize) -> Color32 {
 }
 
 impl DebuggerWindows {
-    #[allow(clippy::too_many_arguments)]
     pub fn show_all(
         &mut self,
         ctx: &egui::Context,
@@ -310,16 +303,11 @@ impl DebuggerWindows {
         paused: bool,
         color_correction: bool,
         cheats: &mut Vec<CheatEntry>,
-        keybindings: &mut KeyBindings,
-        gamepad_names: &[String],
     ) -> DebugAction {
         let mut action = DebugAction::None;
 
         if self.show_about {
             self.draw_about_window(ctx);
-        }
-        if self.show_controls && self.draw_controls_window(ctx, keybindings, gamepad_names) {
-            action = DebugAction::ConfigChanged;
         }
         if self.show_cheats && self.draw_cheats_window(ctx, cheats) {
             action = DebugAction::ConfigChanged;
@@ -1693,100 +1681,6 @@ impl DebuggerWindows {
             });
 
         self.show_cheats = open;
-        changed
-    }
-
-    fn draw_controls_window(
-        &mut self,
-        ctx: &egui::Context,
-        bindings: &mut KeyBindings,
-        gamepad_names: &[String],
-    ) -> bool {
-        let mut open = self.show_controls;
-        let mut changed = false;
-
-        // Capture next key press cleanly when rebinding
-        if let Some(btn) = self.awaiting_rebind {
-            let captured = ctx.input(|i| {
-                for ev in &i.events {
-                    if let egui::Event::Key {
-                        key, pressed: true, ..
-                    } = ev
-                    {
-                        return Some(*key);
-                    }
-                }
-                None
-            });
-            if let Some(key) = captured {
-                if key != egui::Key::Escape {
-                    bindings.set_key_name(btn, format_key_name(key));
-                    changed = true;
-                }
-                self.awaiting_rebind = None;
-            }
-        }
-
-        egui::Window::new("Controls Cheat-Sheet")
-            .open(&mut open)
-            .default_size([400.0, 420.0])
-            .resizable(false)
-            .show(ctx, |ui| {
-                ui.label(RichText::new("Keyboard Mapping").strong());
-                egui::Frame::new()
-                    .fill(SURFACE_DARK)
-                    .stroke(Stroke::new(1.0_f32, PANEL_BORDER))
-                    .inner_margin(8.0)
-                    .show(ui, |ui| {
-                        egui::Grid::new("keybind_grid")
-                            .num_columns(3)
-                            .spacing([18.0, 6.0])
-                            .show(ui, |ui| {
-                                for btn in GbaButton::ALL {
-                                    ui.label(btn.label());
-                                    let waiting = self.awaiting_rebind == Some(btn);
-                                    let btn_text = if waiting {
-                                        "Press key... (Esc cancels)".to_string()
-                                    } else {
-                                        bindings.key_name(btn).to_string()
-                                    };
-                                    if ui.button(RichText::new(btn_text).monospace()).clicked() {
-                                        self.awaiting_rebind = Some(btn);
-                                    }
-                                    ui.end_row();
-                                }
-                            });
-                    });
-
-                ui.add_space(6.0);
-                if ui.button("Reset to Defaults").clicked() {
-                    *bindings = KeyBindings::default();
-                    self.awaiting_rebind = None;
-                    changed = true;
-                }
-
-                ui.separator();
-                ui.label(RichText::new("Connected Gamepads (XInput / Gilrs)").strong());
-                if gamepad_names.is_empty() {
-                    ui.label(
-                        RichText::new("No active controllers detected — plug in an Xbox/XInput pad anytime.")
-                            .color(TEXT_MUTED),
-                    );
-                } else {
-                    for name in gamepad_names {
-                        ui.label(RichText::new(format!("• {name} (Mapped Standard)")).color(ACCENT_TEAL));
-                    }
-                }
-
-                ui.separator();
-                ui.label(
-                    RichText::new("Hotkeys: Space = Pause  |  Tab (Hold) = Fast-Forward  |  F1-F5 / Shift+F1-F5 = Save/Load  |  F11 = Fullscreen  |  F12 = Screenshot")
-                        .small()
-                        .color(TEXT_MUTED),
-                );
-            });
-
-        self.show_controls = open;
         changed
     }
 

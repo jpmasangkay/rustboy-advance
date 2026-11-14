@@ -944,10 +944,6 @@ impl RustboyApp {
 
     fn draw_menu_help(&mut self, ui: &mut egui::Ui) {
         if ui.button("Controls Cheat-Sheet...").clicked() {
-            self.debugger.show_controls = true;
-            ui.close_menu();
-        }
-        if ui.button("Controls & Keybindings...").clicked() {
             self.show_controls_dialog = true;
             ui.close_menu();
         }

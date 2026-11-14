@@ -656,7 +656,6 @@ impl RustboyApp {
                 &mut self.debugger.show_overrides,
             ),
             ("Cheat Code Manager", &mut self.debugger.show_cheats),
-            ("Controls Cheat-Sheet", &mut self.debugger.show_controls),
             ("About Rustboy Advance", &mut self.debugger.show_about),
             (
                 "I/O Register Inspector & Change Log",

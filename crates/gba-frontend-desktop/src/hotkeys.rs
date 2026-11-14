@@ -69,10 +69,7 @@ impl RustboyApp {
             });
         }
 
-        if ctx.wants_keyboard_input()
-            || self.debugger.awaiting_rebind.is_some()
-            || self.awaiting_input_bind.is_some()
-        {
+        if ctx.wants_keyboard_input() || self.awaiting_input_bind.is_some() {
             self.tab_fast_forward = false;
             self.rewinding = false;
             return;

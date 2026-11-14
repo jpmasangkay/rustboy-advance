@@ -338,9 +338,7 @@ impl RustboyApp {
         let mut raw_turbo_a = false;
         let mut raw_turbo_b = false;
 
-        let allow_kbd = !ctx.wants_keyboard_input()
-            && self.debugger.awaiting_rebind.is_none()
-            && self.awaiting_input_bind.is_none();
+        let allow_kbd = !ctx.wants_keyboard_input() && self.awaiting_input_bind.is_none();
 
         if allow_kbd {
             ctx.input(|i| {
@@ -657,6 +655,253 @@ impl RustboyApp {
         ctx.request_repaint();
     }
 
+    fn draw_gba_button_diagram(&self, ui: &mut egui::Ui, pads: &[String]) {
+        fn compact_key(raw: &str) -> String {
+            match raw.trim() {
+                "Backspace" => "Bksp".to_string(),
+                "Return" | "Enter" => "Enter".to_string(),
+                "ArrowUp" | "Up" => "↑".to_string(),
+                "ArrowDown" | "Down" => "↓".to_string(),
+                "ArrowLeft" | "Left" => "←".to_string(),
+                "ArrowRight" | "Right" => "→".to_string(),
+                s if s.is_empty() => "—".to_string(),
+                s => s.to_string(),
+            }
+        }
+
+        let width = ui.available_width().clamp(460.0, 650.0);
+        let height = 148.0_f32;
+        let (outer, _) = ui.allocate_exact_size(egui::vec2(width, height), egui::Sense::hover());
+        let p = ui.painter_at(outer);
+
+        let kb = &self.config.keybindings;
+        let hk = &kb.hotkeys;
+        let shell_rect = egui::Rect::from_min_max(
+            egui::pos2(outer.left(), outer.top() + 18.0),
+            egui::pos2(outer.right(), outer.bottom()),
+        );
+        let shell_fill = BG_CARD;
+        let pad_fill = Color32::from_rgb(0x28, 0x2C, 0x36);
+        let lcd_fill = Color32::from_rgb(0x0E, 0x12, 0x16);
+
+        let draw_pill = |center: egui::Pos2, label: &str, size: egui::Vec2, accent: bool| {
+            let r = egui::Rect::from_center_size(center, size);
+            let stroke_col = if accent { ACCENT_TEAL } else { BORDER_HAIRLINE };
+            let fill_col = if accent { ACCENT_TEAL_BG } else { lcd_fill };
+            p.rect(
+                r,
+                CornerRadius::same(4),
+                fill_col,
+                Stroke::new(1.0_f32, stroke_col),
+                egui::StrokeKind::Inside,
+            );
+            p.text(
+                center,
+                egui::Align2::CENTER_CENTER,
+                label,
+                egui::FontId::monospace(10.0),
+                if accent {
+                    ACCENT_TEAL
+                } else {
+                    Color32::from_rgb(0xE6, 0xE6, 0xE6)
+                },
+            );
+        };
+
+        // Top shoulder triggers L / R
+        let l_rect = egui::Rect::from_min_size(
+            egui::pos2(shell_rect.left() + 26.0, outer.top() + 1.0),
+            egui::vec2(96.0, 20.0),
+        );
+        let r_rect = egui::Rect::from_min_size(
+            egui::pos2(shell_rect.right() - 122.0, outer.top() + 1.0),
+            egui::vec2(96.0, 20.0),
+        );
+        for (rect, btn_name, key_str) in [(l_rect, "L", &kb.l), (r_rect, "R", &kb.r)] {
+            p.rect(
+                rect,
+                CornerRadius::same(6),
+                pad_fill,
+                Stroke::new(1.0_f32, BORDER_HAIRLINE),
+                egui::StrokeKind::Inside,
+            );
+            p.text(
+                rect.center(),
+                egui::Align2::CENTER_CENTER,
+                format!("{btn_name}: {}", compact_key(key_str)),
+                egui::FontId::monospace(10.5),
+                Color32::from_rgb(0xE6, 0xE6, 0xE6),
+            );
+        }
+
+        // Handheld body
+        p.rect(
+            shell_rect,
+            CornerRadius::same(16),
+            shell_fill,
+            Stroke::new(1.0_f32, BORDER_HAIRLINE),
+            egui::StrokeKind::Inside,
+        );
+
+        // Center GBA 3:2 LCD bezel + live status & hotkeys cheat-sheet
+        let bezel_w = (shell_rect.width() - 320.0).clamp(185.0, 250.0);
+        let bezel_rect = egui::Rect::from_center_size(
+            egui::pos2(shell_rect.center().x, shell_rect.center().y - 4.0),
+            egui::vec2(bezel_w, 98.0),
+        );
+        p.rect(
+            bezel_rect,
+            CornerRadius::same(6),
+            lcd_fill,
+            Stroke::new(1.0_f32, ACCENT_TEAL),
+            egui::StrokeKind::Inside,
+        );
+        p.text(
+            egui::pos2(bezel_rect.center().x, bezel_rect.top() + 15.0),
+            egui::Align2::CENTER_CENTER,
+            "GBA CONTROLS CHEAT-SHEET",
+            egui::FontId::proportional(10.0),
+            ACCENT_TEAL,
+        );
+        let pad_status = if let Some(first) = pads.first() {
+            if pads.len() > 1 {
+                format!("Gamepads: {first} (+{})", pads.len() - 1)
+            } else {
+                format!("Gamepad: {first}")
+            }
+        } else {
+            "Keyboard active · Plug pad anytime".to_string()
+        };
+        p.text(
+            egui::pos2(bezel_rect.center().x, bezel_rect.top() + 34.0),
+            egui::Align2::CENTER_CENTER,
+            pad_status,
+            egui::FontId::proportional(10.5),
+            if pads.is_empty() {
+                TEXT_MUTED
+            } else {
+                Color32::from_rgb(0xE6, 0xE6, 0xE6)
+            },
+        );
+        let pause_lbl = hk
+            .pause
+            .as_ref()
+            .map(HotkeyChord::display)
+            .unwrap_or_else(|| "—".to_string());
+        let ff_lbl = hk
+            .fast_forward
+            .as_ref()
+            .map(HotkeyChord::display)
+            .unwrap_or_else(|| "—".to_string());
+        let qs_lbl = hk
+            .save_state
+            .as_ref()
+            .map(HotkeyChord::display)
+            .unwrap_or_else(|| "—".to_string());
+        let ql_lbl = hk
+            .load_state
+            .as_ref()
+            .map(HotkeyChord::display)
+            .unwrap_or_else(|| "—".to_string());
+        let fs_lbl = hk
+            .fullscreen
+            .as_ref()
+            .map(HotkeyChord::display)
+            .unwrap_or_else(|| "—".to_string());
+        p.text(
+            egui::pos2(bezel_rect.center().x, bezel_rect.top() + 58.0),
+            egui::Align2::CENTER_CENTER,
+            format!("{pause_lbl} Pause · {ff_lbl} Fast-Forward"),
+            egui::FontId::monospace(9.5),
+            TEXT_MUTED,
+        );
+        p.text(
+            egui::pos2(bezel_rect.center().x, bezel_rect.top() + 76.0),
+            egui::Align2::CENTER_CENTER,
+            format!("{qs_lbl}/{ql_lbl} Save/Load · {fs_lbl} Full"),
+            egui::FontId::monospace(9.5),
+            TEXT_MUTED,
+        );
+
+        // Left side: D-Pad + directional keycaps + Select/Start
+        let dpad_c = egui::pos2(shell_rect.left() + 74.0, shell_rect.top() + 50.0);
+        let arm_len = 36.0_f32;
+        let arm_thick = 12.0_f32;
+        p.rect_filled(
+            egui::Rect::from_center_size(dpad_c, egui::vec2(arm_len, arm_thick)),
+            CornerRadius::same(2),
+            pad_fill,
+        );
+        p.rect_filled(
+            egui::Rect::from_center_size(dpad_c, egui::vec2(arm_thick, arm_len)),
+            CornerRadius::same(2),
+            pad_fill,
+        );
+        p.circle_filled(dpad_c, 3.0, lcd_fill);
+        draw_pill(
+            egui::pos2(dpad_c.x, dpad_c.y - 28.0),
+            &format!("↑{}", compact_key(&kb.up)),
+            egui::vec2(44.0, 16.0),
+            false,
+        );
+        draw_pill(
+            egui::pos2(dpad_c.x, dpad_c.y + 28.0),
+            &format!("↓{}", compact_key(&kb.down)),
+            egui::vec2(44.0, 16.0),
+            false,
+        );
+        draw_pill(
+            egui::pos2(dpad_c.x - 41.0, dpad_c.y),
+            &format!("←{}", compact_key(&kb.left)),
+            egui::vec2(42.0, 16.0),
+            false,
+        );
+        draw_pill(
+            egui::pos2(dpad_c.x + 41.0, dpad_c.y),
+            &format!("→{}", compact_key(&kb.right)),
+            egui::vec2(42.0, 16.0),
+            false,
+        );
+
+        draw_pill(
+            egui::pos2(shell_rect.left() + 52.0, shell_rect.bottom() - 16.0),
+            &format!("SEL: {}", compact_key(&kb.select)),
+            egui::vec2(72.0, 16.0),
+            false,
+        );
+        draw_pill(
+            egui::pos2(shell_rect.left() + 128.0, shell_rect.bottom() - 16.0),
+            &format!("ST: {}", compact_key(&kb.start)),
+            egui::vec2(68.0, 16.0),
+            false,
+        );
+
+        // Right side: B (lower-left) and A (upper-right) GBA face buttons
+        let b_pos = egui::pos2(shell_rect.right() - 102.0, shell_rect.top() + 58.0);
+        let a_pos = egui::pos2(shell_rect.right() - 52.0, shell_rect.top() + 42.0);
+        for (pos, name, key_str, is_a) in [(b_pos, "B", &kb.b, false), (a_pos, "A", &kb.a, true)] {
+            p.circle(
+                pos,
+                13.0,
+                if is_a { ACCENT_TEAL_BG } else { pad_fill },
+                Stroke::new(1.2_f32, if is_a { ACCENT_TEAL } else { BORDER_HAIRLINE }),
+            );
+            p.text(
+                pos,
+                egui::Align2::CENTER_CENTER,
+                name,
+                egui::FontId::proportional(11.5),
+                Color32::from_rgb(0xE6, 0xE6, 0xE6),
+            );
+            draw_pill(
+                egui::pos2(pos.x, pos.y + 23.0),
+                &compact_key(key_str),
+                egui::vec2(42.0, 16.0),
+                is_a,
+            );
+        }
+    }
+
     pub(crate) fn draw_controls_dialog(&mut self, ctx: &egui::Context) {
         if !self.show_controls_dialog {
             if self.awaiting_input_bind.is_some() {
@@ -677,9 +922,11 @@ impl RustboyApp {
             .open(&mut open)
             .collapsible(false)
             .resizable(true)
-            .default_width(660.0)
-            .default_height(520.0)
+            .default_width(680.0)
+            .default_height(650.0)
             .show(ctx, |ui| {
+                self.draw_gba_button_diagram(ui, &pads);
+                ui.add_space(6.0);
                 ui.horizontal(|ui| {
                     let tab_btn = |ui: &mut egui::Ui, current: &mut ControlsTab, tab: ControlsTab, lbl: &str| {
                         let active = *current == tab;

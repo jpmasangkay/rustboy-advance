@@ -2115,15 +2115,12 @@ impl RustboyApp {
         }
 
         // Present dockable/floating Debugger & Tool windows
-        let pads = self.connected_gamepad_names();
         let dbg_act = self.debugger.show_all(
             ctx,
             self.core.as_mut(),
             self.paused,
             self.config.color_correction,
             &mut self.active_cheats,
-            &mut self.config.keybindings,
-            &pads,
         );
         match dbg_act {
             DebugAction::TogglePause => self.toggle_pause(),

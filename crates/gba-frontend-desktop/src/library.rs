@@ -1876,9 +1876,8 @@ impl RustboyApp {
                                 bottom: 16,
                             })
                             .show(ui, |ui| {
-                                let tile_size = 160.0_f32; // Authentic GBA 1:1 square boxart
-                                let tile_w = tile_size;
-                                let tile_h = tile_size;
+                                let tile_w = 180.0_f32;
+                                let tile_h = 120.0_f32; // Native 3:2 GBA aspect ratio (240x160)
                                 let card_meta_h = 40.0_f32;
                                 let spacing_x = 16.0_f32;
                                 let spacing_y = 20.0_f32;

@@ -14,9 +14,7 @@ pub(crate) const GBA_NOMINAL_FPS: f32 = 59.7275;
 
 /// Computes rounded emulation speed percentage relative to native GBA 59.7275 FPS.
 pub(crate) fn status_bar_speed_percent(measured_fps: f32) -> u32 {
-    ((measured_fps / GBA_NOMINAL_FPS) * 100.0)
-        .round()
-        .max(0.0) as u32
+    ((measured_fps / GBA_NOMINAL_FPS) * 100.0).round().max(0.0) as u32
 }
 
 /// Formats status-bar FPS and speed percentage readout (`FPS: 59.73 (100%)`).
@@ -328,7 +326,7 @@ impl RustboyApp {
                     if ui
                         .add_sized(
                             [card_w - 40.0, 26.0],
-                            egui::Button::new("🔄 Hard Reset (Ctrl+R)"),
+                            egui::Button::new("🔄 Restart game (Ctrl+R)"),
                         )
                         .clicked()
                     {

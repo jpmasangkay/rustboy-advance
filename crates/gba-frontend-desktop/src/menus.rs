@@ -191,10 +191,7 @@ impl RustboyApp {
 
         ui.separator();
         ui.add_enabled_ui(has_rom, |ui| {
-            if ui
-                .button("Close Game / Return to Library (Ctrl+W)")
-                .clicked()
-            {
+            if ui.button("Return to Library (Ctrl+W)").clicked() {
                 ui.close_menu();
                 self.request_close_rom(ctx);
             }
@@ -370,7 +367,7 @@ impl RustboyApp {
                 ui.close_menu();
             }
 
-            if ui.button("Stop & Return to Library (Ctrl+W)").clicked() {
+            if ui.button("Return to Library (Ctrl+W)").clicked() {
                 self.request_close_rom(ctx);
                 ui.close_menu();
             }
@@ -471,9 +468,7 @@ impl RustboyApp {
                 }
                 if ui
                     .radio(self.config.dot_accurate_ppu, "High (Per-Dot Accurate)")
-                    .on_hover_text(
-                        "Cycle-Accurate Per-Dot PPU — fixes rare mid-scanline effects",
-                    )
+                    .on_hover_text("Cycle-Accurate Per-Dot PPU — fixes rare mid-scanline effects")
                     .clicked()
                 {
                     self.config.dot_accurate_ppu = true;
@@ -912,13 +907,10 @@ impl RustboyApp {
             ui.checkbox(&mut self.debugger.show_oam, "OAM Sprite Viewer");
             ui.checkbox(&mut self.debugger.show_audio, "Audio Channel Visualizer");
             ui.checkbox(&mut self.debugger.show_gdb, "GDB Remote Server...");
-            ui.horizontal(|ui| {
-                ui.add_space(20.0);
-                if ui.button("Lua Scripting Console...").clicked() {
-                    self.lua.show_console = true;
-                    ui.close_menu();
-                }
-            });
+            if ui.button("Lua Scripting Console...").clicked() {
+                self.lua.show_console = true;
+                ui.close_menu();
+            }
             let movie_lbl = if self.movie.is_recording() {
                 format!(
                     "Input Movies (TAS)... [REC {}f]",
@@ -933,26 +925,20 @@ impl RustboyApp {
             } else {
                 "Input Movies (TAS)...".to_string()
             };
-            ui.horizontal(|ui| {
-                ui.add_space(20.0);
-                if ui.button(movie_lbl).clicked() {
-                    self.show_movies = true;
-                    ui.close_menu();
-                }
-            });
-            ui.horizontal(|ui| {
-                ui.add_space(20.0);
-                if ui
-                    .add_enabled(
-                        has_rom,
-                        egui::Button::new("Hardware Overrides & Sensors..."),
-                    )
-                    .clicked()
-                {
-                    self.debugger.show_overrides = true;
-                    ui.close_menu();
-                }
-            });
+            if ui.button(movie_lbl).clicked() {
+                self.show_movies = true;
+                ui.close_menu();
+            }
+            if ui
+                .add_enabled(
+                    has_rom,
+                    egui::Button::new("Hardware Overrides & Sensors..."),
+                )
+                .clicked()
+            {
+                self.debugger.show_overrides = true;
+                ui.close_menu();
+            }
         }
     }
 
@@ -1037,7 +1023,7 @@ impl RustboyApp {
                     }
 
                     // 3. Restart game (Hard Reset)
-                    if toolbar_btn(ui, "⟲ Reset", false, has_rom)
+                    if toolbar_btn(ui, "⟲ Restart game", false, has_rom)
                         .on_hover_text(format!("Restart game / Hard Reset ({reset_key})"))
                         .clicked()
                     {
@@ -1118,9 +1104,7 @@ impl RustboyApp {
 
                     // 9. Controls
                     if toolbar_btn(ui, "🎮 Controls", self.show_controls_dialog, true)
-                        .on_hover_text(
-                            "Open Controls & Keybindings (keyboard, gamepad, hotkeys)",
-                        )
+                        .on_hover_text("Open Controls & Keybindings (keyboard, gamepad, hotkeys)")
                         .clicked()
                     {
                         self.show_controls_dialog = !self.show_controls_dialog;

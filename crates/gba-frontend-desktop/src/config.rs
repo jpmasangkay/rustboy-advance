@@ -760,6 +760,7 @@ impl ViewportScale {
 #[derive(Copy, Clone, PartialEq, Eq, Debug, Serialize, Deserialize, Default)]
 pub enum DisplayFilter {
     #[default]
+    #[serde(alias = "MyBoySmooth")]
     SmoothBilinear, // 1x (240x160) Native Linear ("Smooth Bilinear")
     Sharp1x,         // 1x (240x160) Native Nearest ("Sharp 1x")
     XbrSmooth3x,     // 3x (720x480) xBR 3x edge smoothing (Laptop HD)
@@ -1134,6 +1135,26 @@ pub struct VerifiedGpuAdapterEntry {
     pub verified_epoch_secs: u64,
 }
 
+fn deserialize_tolerant_filter_map<'de, D>(
+    deserializer: D,
+) -> Result<BTreeMap<String, DisplayFilter>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let Some(raw) = Option::<BTreeMap<String, serde_json::Value>>::deserialize(deserializer)?
+    else {
+        return Ok(BTreeMap::new());
+    };
+    Ok(raw
+        .into_iter()
+        .filter_map(|(key, value)| {
+            DisplayFilter::deserialize(value)
+                .ok()
+                .map(|filter| (key, filter))
+        })
+        .collect())
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(default)]
 pub struct AppConfig {
@@ -1154,7 +1175,7 @@ pub struct AppConfig {
     pub display_filter: DisplayFilter,
     #[serde(default = "default_auto_quality_governor")]
     pub auto_quality_governor: bool,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "deserialize_tolerant_filter_map")]
     pub governor_settled_filters: BTreeMap<String, DisplayFilter>,
     #[serde(default)]
     pub blocked_gpu_adapters: BTreeMap<String, BlockedGpuAdapterEntry>,
@@ -1440,19 +1461,15 @@ impl AppConfig {
         }
     }
 
-    pub fn from_json_str(raw: &str) -> Self {
+    fn try_from_json_str(raw: &str) -> Option<Self> {
         let mut cfg: Self = match serde_json::from_str(raw) {
             Ok(parsed) => parsed,
             Err(_) => {
-                // Upgrade configs whose `display_filter` used a removed legacy variant name.
-                if let Ok(mut map) =
-                    serde_json::from_str::<serde_json::Map<String, serde_json::Value>>(raw)
-                {
-                    map.remove("display_filter");
-                    serde_json::from_value(serde_json::Value::Object(map)).unwrap_or_default()
-                } else {
-                    Self::default()
-                }
+                // Upgrade configs whose `display_filter` used an unknown legacy variant name.
+                let mut map =
+                    serde_json::from_str::<serde_json::Map<String, serde_json::Value>>(raw).ok()?;
+                map.remove("display_filter");
+                serde_json::from_value(serde_json::Value::Object(map)).ok()?
             }
         };
         if let Ok(val) = serde_json::from_str::<serde_json::Value>(raw) {
@@ -1476,6 +1493,41 @@ impl AppConfig {
                 cfg.lcd_grid_intensity = 0.08;
             }
         }
+        Some(cfg)
+    }
+
+    #[cfg(test)]
+    pub fn from_json_str(raw: &str) -> Self {
+        Self::try_from_json_str(raw).unwrap_or_default()
+    }
+
+    fn load_from_path(path: &Path) -> Self {
+        let Ok(raw) = fs::read_to_string(path) else {
+            return Self::default();
+        };
+        let Some(mut cfg) = Self::try_from_json_str(&raw) else {
+            let bak = path.with_extension("json.bak");
+            if let Err(e) = fs::write(&bak, &raw) {
+                log::warn!(
+                    "failed to write corrupt config backup {}: {e}",
+                    bak.display()
+                );
+            } else {
+                log::warn!(
+                    "failed to parse {}, backed up to {}",
+                    path.display(),
+                    bak.display()
+                );
+            }
+            return Self::default();
+        };
+        // Migrate legacy plaintext `ra_token` from config.json into the OS credential store.
+        if !cfg.ra_token.is_empty() {
+            Self::store_ra_token(&cfg.ra_token);
+            cfg.save();
+        } else if !cfg.ra_username.is_empty() {
+            cfg.ra_token = Self::load_ra_token();
+        }
         cfg
     }
 
@@ -1488,19 +1540,7 @@ impl AppConfig {
     }
 
     pub fn load() -> Self {
-        let path = Self::config_file_path();
-        let Ok(raw) = fs::read_to_string(&path) else {
-            return Self::default();
-        };
-        let mut cfg = Self::from_json_str(&raw);
-        // Migrate legacy plaintext `ra_token` from config.json into the OS credential store.
-        if !cfg.ra_token.is_empty() {
-            Self::store_ra_token(&cfg.ra_token);
-            cfg.save();
-        } else if !cfg.ra_username.is_empty() {
-            cfg.ra_token = Self::load_ra_token();
-        }
-        cfg
+        Self::load_from_path(&Self::config_file_path())
     }
 
     pub fn save(&self) {
@@ -1889,5 +1929,63 @@ mod tests {
             "default save-state path should live in AppData/portable states/ directory"
         );
         assert_eq!(slot.file_name().unwrap(), "GoldenSun.slot2.state");
+    }
+
+    #[test]
+    fn legacy_v010_filter_names_and_corrupt_backup_preserve_settings() {
+        let v010_json = r#"{
+            "window_scale": 4,
+            "bios_path": "/roms/gba_bios.bin",
+            "integer_scaling": true,
+            "color_correction": false,
+            "display_filter": "MyBoySmooth",
+            "governor_settled_filters": {
+                "Vulkan|RTX 5070|720x480": "MyBoySmooth",
+                "Vulkan|RTX 5070|1080p": "RemovedFutureFilter",
+                "NoGpu|softbuffer|720x480": "Sharp1x"
+            }
+        }"#;
+        let parsed = AppConfig::from_json_str(v010_json);
+        assert_eq!(parsed.display_filter, DisplayFilter::SmoothBilinear);
+        assert_eq!(parsed.window_scale, 4);
+        assert_eq!(parsed.bios_path.as_deref(), Some("/roms/gba_bios.bin"));
+        assert!(parsed.integer_scaling);
+        assert!(!parsed.color_correction);
+        assert_eq!(
+            parsed.settled_filter_for("Vulkan|RTX 5070|720x480"),
+            Some(DisplayFilter::SmoothBilinear)
+        );
+        assert_eq!(parsed.settled_filter_for("Vulkan|RTX 5070|1080p"), None);
+        assert_eq!(
+            parsed.settled_filter_for("NoGpu|softbuffer|720x480"),
+            Some(DisplayFilter::Sharp1x)
+        );
+
+        assert_eq!(
+            crate::bench::parse_display_filter("myboy-smooth"),
+            Ok(DisplayFilter::SmoothBilinear)
+        );
+        assert_eq!(
+            crate::bench::parse_display_filter("myboy"),
+            Ok(DisplayFilter::SmoothBilinear)
+        );
+
+        let nonce = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_nanos();
+        let dir =
+            std::env::temp_dir().join(format!("rustboy_cfg_backup_{}_{nonce}", std::process::id()));
+        fs::create_dir_all(&dir).expect("create temp dir");
+        let cfg_path = dir.join("config.json");
+        let broken = "{ not valid json";
+        fs::write(&cfg_path, broken).expect("write broken config");
+        let fallback = AppConfig::load_from_path(&cfg_path);
+        assert_eq!(fallback.display_filter, DisplayFilter::SmoothBilinear);
+        assert_eq!(
+            fs::read_to_string(dir.join("config.json.bak")).expect("read backup"),
+            broken
+        );
+        let _ = fs::remove_dir_all(&dir);
     }
 }

@@ -264,7 +264,8 @@ fn parse_buttons_mask(spec: &str, line_no: usize) -> Result<u16, String> {
 
 pub fn parse_display_filter(name: &str) -> Result<DisplayFilter, String> {
     match name.trim().to_ascii_lowercase().as_str() {
-        "smooth-bilinear" | "smooth_bilinear" | "default" => Ok(DisplayFilter::SmoothBilinear),
+        "smooth-bilinear" | "smooth_bilinear" | "myboy-smooth" | "myboy_smooth" | "myboy"
+        | "default" => Ok(DisplayFilter::SmoothBilinear),
         "sharp-1x" | "sharp1x" | "sharp" | "nearest" | "raw-nearest" | "none" => {
             Ok(DisplayFilter::Sharp1x)
         }

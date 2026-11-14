@@ -430,7 +430,8 @@ impl RustboyApp {
             RomPlatform::Gba => parse_gba_cart_metadata(&header[..bytes_read]),
         };
 
-        let has_battery_sav = crate::config::AppConfig::find_existing_sav_path_for_rom(path).is_some();
+        let has_battery_sav =
+            crate::config::AppConfig::find_existing_sav_path_for_rom(path).is_some();
 
         Some(RomLibraryEntry {
             path: path.to_path_buf(),
@@ -558,9 +559,7 @@ impl RustboyApp {
                     .display_name
                     .to_lowercase()
                     .cmp(&b.display_name.to_lowercase()),
-                TableSortColumn::Region => {
-                    library_region_label(a).cmp(library_region_label(b))
-                }
+                TableSortColumn::Region => library_region_label(a).cmp(library_region_label(b)),
                 TableSortColumn::Size => a
                     .size_mb
                     .partial_cmp(&b.size_mb)
@@ -1991,13 +1990,21 @@ mod tests {
 
         let scan1 = RustboyApp::scan_folders_collect(std::slice::from_ref(&temp_dir));
         assert!(scan1.error.is_none());
-        let names1: Vec<&str> = scan1.entries.iter().map(|e| e.display_name.as_str()).collect();
+        let names1: Vec<&str> = scan1
+            .entries
+            .iter()
+            .map(|e| e.display_name.as_str())
+            .collect();
         assert_eq!(names1, vec!["my_homebrew", "Summon Night"]);
 
         // Delete one ROM from disk -> Refresh scan must remove the deleted ghost entry.
         fs::remove_file(&homebrew_gba).unwrap();
         let scan2 = RustboyApp::scan_folders_collect(std::slice::from_ref(&temp_dir));
-        let names2: Vec<&str> = scan2.entries.iter().map(|e| e.display_name.as_str()).collect();
+        let names2: Vec<&str> = scan2
+            .entries
+            .iter()
+            .map(|e| e.display_name.as_str())
+            .collect();
         assert_eq!(names2, vec!["Summon Night"]);
 
         let _ = fs::remove_dir_all(&temp_dir);
@@ -2038,13 +2045,19 @@ mod tests {
         app.table_sort_descending = false;
         app.sort_library_entries(&mut entries);
         assert_eq!(
-            entries.iter().map(|e| e.display_name.as_str()).collect::<Vec<_>>(),
+            entries
+                .iter()
+                .map(|e| e.display_name.as_str())
+                .collect::<Vec<_>>(),
             vec!["Beta", "Gamma", "Alpha"]
         );
         app.table_sort_descending = true;
         app.sort_library_entries(&mut entries);
         assert_eq!(
-            entries.iter().map(|e| e.display_name.as_str()).collect::<Vec<_>>(),
+            entries
+                .iter()
+                .map(|e| e.display_name.as_str())
+                .collect::<Vec<_>>(),
             vec!["Alpha", "Gamma", "Beta"]
         );
 

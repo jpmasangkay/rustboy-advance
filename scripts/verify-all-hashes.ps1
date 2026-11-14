@@ -49,22 +49,29 @@ $checks = @(
 
 $verified = 0
 $skipped = 0
+$tmpOut = Join-Path ([System.IO.Path]::GetTempPath()) "rba_verify_hashes_$PID.out.log"
+$tmpErr = Join-Path ([System.IO.Path]::GetTempPath()) "rba_verify_hashes_$PID.err.log"
 
-foreach ($c in $checks) {
-    if (-not (Test-Path $c.Rom)) {
-        Write-Warning "Skipping $($c.Name): ROM not found at $($c.Rom)"
-        $skipped++
-        continue
+try {
+    foreach ($c in $checks) {
+        if (-not (Test-Path $c.Rom)) {
+            Write-Warning "Skipping $($c.Name): ROM not found at $($c.Rom)"
+            $skipped++
+            continue
+        }
+        $procArgs = @("--headless", "--verify-hashes", $c.Ref, "`"$($c.Rom)`"", "--frames", "$($c.Frames)")
+        if ($c.Replay) { $procArgs += @("--input-replay", $c.Replay) }
+        if ($c.Sav) { $procArgs += @("--sav", $c.Sav) }
+        $proc = Start-Process -FilePath $exe -ArgumentList $procArgs -WindowStyle Hidden -PassThru -Wait -RedirectStandardOutput $tmpOut -RedirectStandardError $tmpErr
+        $out = ((Get-Content $tmpOut -ErrorAction SilentlyContinue) + (Get-Content $tmpErr -ErrorAction SilentlyContinue)) -join "`n"
+        if ($proc.ExitCode -ne 0) {
+            throw "Hash verification FAILED for $($c.Name) (exit $($proc.ExitCode)): $out"
+        }
+        Write-Host $out
+        $verified++
     }
-    $args = @("--headless", "--verify-hashes", $c.Ref, $c.Rom, "--frames", $c.Frames)
-    if ($c.Replay) { $args += @("--input-replay", $c.Replay) }
-    if ($c.Sav) { $args += @("--sav", $c.Sav) }
-    $out = & $exe @args
-    if ($LASTEXITCODE -ne 0) {
-        throw "Hash verification FAILED for $($c.Name): $out"
-    }
-    Write-Host $out
-    $verified++
+} finally {
+    Remove-Item $tmpOut, $tmpErr -ErrorAction SilentlyContinue
 }
 
 $total = $checks.Count

@@ -33,7 +33,7 @@ mimalloc = "0.1.52"
 pollster = "0.4"
 eframe = { version = "0.31", default-features = false, features = ["wgpu", "default_fonts", "wayland", "x11"] }
 wgpu = { version = "24.0", default-features = false, features = ["dx12", "wgsl"] }
-softbuffer = "0.4"
+softbuffer = { version = "0.4", default-features = false, features = ["x11", "x11-dlopen", "wayland", "wayland-dlopen"] }
 winit = { version = "0.30", default-features = false, features = ["rwh_06"] }
 
 [target.'cfg(windows)'.dependencies]

@@ -129,6 +129,7 @@ pub fn run_desktop(
     let options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
             .with_title(title)
+            .with_icon(crate::icon::app_window_icon())
             .with_inner_size([init_width, init_height])
             .with_min_inner_size([520.0, 380.0])
             .with_fullscreen(fullscreen)

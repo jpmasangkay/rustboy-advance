@@ -1233,6 +1233,12 @@ pub struct AppConfig {
     pub ra_token: String,
     #[serde(default)]
     pub auto_download_covers: bool,
+    #[serde(default = "default_welcome_completed")]
+    pub welcome_completed: bool,
+}
+
+fn default_welcome_completed() -> bool {
+    true
 }
 
 impl Default for AppConfig {
@@ -1289,6 +1295,7 @@ impl Default for AppConfig {
             ra_username: String::new(),
             ra_token: String::new(),
             auto_download_covers: false,
+            welcome_completed: true,
         }
     }
 }
@@ -1513,8 +1520,15 @@ impl AppConfig {
     }
 
     fn load_from_path(path: &Path) -> Self {
-        let Ok(raw) = fs::read_to_string(path) else {
-            return Self::default();
+        let raw = match fs::read_to_string(path) {
+            Ok(raw) => raw,
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
+                return Self {
+                    welcome_completed: false,
+                    ..Self::default()
+                };
+            }
+            Err(_) => return Self::default(),
         };
         let Some(mut cfg) = Self::try_from_json_str(&raw) else {
             let bak = path.with_extension("json.bak");
@@ -1999,6 +2013,16 @@ mod tests {
             fs::read_to_string(dir.join("config.json.bak")).expect("read backup"),
             broken
         );
+
+        // First-run (missing config file) defaults to showing Welcome Card without touching existing files
+        let missing_cfg = dir.join("fresh_config.json");
+        let fresh = AppConfig::load_from_path(&missing_cfg);
+        assert!(!fresh.welcome_completed);
+
+        // Existing legacy config without `welcome_completed` field preserves false=completed default (true)
+        let legacy = AppConfig::from_json_str(v010_json);
+        assert!(legacy.welcome_completed);
+
         let _ = fs::remove_dir_all(&dir);
     }
 }

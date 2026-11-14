@@ -128,7 +128,126 @@ fn format_playtime(seconds: u64) -> String {
     }
 }
 
+pub(crate) fn first_frame_cover_path(rom_path: &Path) -> Option<PathBuf> {
+    let stem = rom_path.file_stem()?.to_string_lossy();
+    let trimmed = stem.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+    Some(crate::config::AppConfig::covers_dir().join(format!("{trimmed}.firstframe.png")))
+}
+
+pub(crate) fn has_user_cover_for_path(rom_path: &Path, rom_code: &str) -> bool {
+    let stem = rom_path
+        .file_stem()
+        .map(|s| s.to_string_lossy().to_string())
+        .unwrap_or_default();
+    let dummy = RomLibraryEntry {
+        path: rom_path.to_path_buf(),
+        display_name: stem,
+        internal_title: String::new(),
+        game_code: rom_code.to_string(),
+        region: "",
+        size_mb: 0.0,
+        has_battery_sav: false,
+        source_kind: RomSourceKind::Raw,
+        platform: RomPlatform::Gba,
+        cart_type_label: String::new(),
+    };
+    find_user_cover_image(&dummy).is_some()
+}
+
+pub(crate) fn capture_first_frame_cover_fallback(
+    rom_path: &Path,
+    rom_code: &str,
+    fb_bgr555: &[u16; gba_core::LCD_WIDTH * gba_core::LCD_HEIGHT],
+    is_gb: bool,
+    force_fallback: bool,
+) -> Result<Option<PathBuf>, String> {
+    if has_user_cover_for_path(rom_path, rom_code) {
+        return Ok(None);
+    }
+    let Some(dest) = first_frame_cover_path(rom_path) else {
+        return Ok(None);
+    };
+    if dest.exists() {
+        return Ok(None);
+    }
+
+    let mut rgba_full = vec![0u8; gba_core::LCD_WIDTH * gba_core::LCD_HEIGHT * 4];
+    crate::capture::bgr555_to_rgba(
+        fb_bgr555,
+        true,
+        crate::config::ColorProfileChoice::Agb001,
+        &mut rgba_full,
+    );
+    let (rgba, width, height) = if is_gb {
+        (
+            crate::gb_bridge::crop_gb_rgba_from_240x160(&rgba_full),
+            gb_core::LCD_WIDTH as u32,
+            gb_core::LCD_HEIGHT as u32,
+        )
+    } else {
+        (
+            rgba_full,
+            gba_core::LCD_WIDTH as u32,
+            gba_core::LCD_HEIGHT as u32,
+        )
+    };
+
+    if !force_fallback && is_uniform_rgba_frame(&rgba) {
+        return Ok(None);
+    }
+
+    if let Some(parent) = dest.parent() {
+        fs::create_dir_all(parent).map_err(|e| format!("Failed creating covers dir: {e}"))?;
+    }
+    // Atomically create the fallback file so existing artwork is never clobbered.
+    let file = match fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(&dest)
+    {
+        Ok(f) => f,
+        Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => return Ok(None),
+        Err(e) => return Err(format!("Failed creating first-frame cover file: {e}")),
+    };
+    let mut writer = std::io::BufWriter::new(file);
+    let encoder = image::codecs::png::PngEncoder::new(&mut writer);
+    use image::ImageEncoder;
+    if let Err(e) = encoder.write_image(&rgba, width, height, image::ExtendedColorType::Rgba8) {
+        let _ = fs::remove_file(&dest);
+        return Err(format!("Failed encoding first-frame cover PNG: {e}"));
+    }
+    Ok(Some(dest))
+}
+
+fn is_uniform_rgba_frame(rgba: &[u8]) -> bool {
+    let chunks = rgba.as_chunks::<4>().0;
+    let Some(first) = chunks.first() else {
+        return true;
+    };
+    let (r0, g0, b0) = (first[0], first[1], first[2]);
+    let mut distinct_pixels = 0usize;
+    for px in chunks {
+        if px[0].abs_diff(r0) > 6 || px[1].abs_diff(g0) > 6 || px[2].abs_diff(b0) > 6 {
+            distinct_pixels += 1;
+            if distinct_pixels >= 48 {
+                return false;
+            }
+        }
+    }
+    true
+}
+
 pub(crate) fn find_cover_image(entry: &RomLibraryEntry) -> Option<PathBuf> {
+    if let Some(user_cover) = find_user_cover_image(entry) {
+        return Some(user_cover);
+    }
+    first_frame_cover_path(&entry.path).filter(|p| p.is_file())
+}
+
+fn find_user_cover_image(entry: &RomLibraryEntry) -> Option<PathBuf> {
     let stem = entry.path.file_stem()?.to_string_lossy();
     let display = &entry.display_name;
 
@@ -393,6 +512,217 @@ pub(crate) fn format_empty_state_controls_hint(kb: &KeyBindings) -> String {
 }
 
 impl RustboyApp {
+    fn draw_welcome_card(&mut self, ui: &mut egui::Ui, centered: bool) {
+        let max_w = if centered {
+            540.0
+        } else {
+            ui.available_width().min(920.0)
+        };
+        let draw_inner = |ui: &mut egui::Ui, app: &mut Self| {
+            egui::Frame::new()
+                .fill(COLOR_SURFACE)
+                .stroke(STROKE_BORDER)
+                .corner_radius(RADIUS_DEFAULT)
+                .inner_margin(if centered { 22.0 } else { 14.0 })
+                .show(ui, |ui| {
+                    ui.set_width((max_w - if centered { 44.0 } else { 28.0 }).max(240.0));
+                    ui.label(
+                        RichText::new("Welcome to Rustboy Advance")
+                            .size(if centered { 20.0 } else { 16.0 })
+                            .strong()
+                            .color(COLOR_TEXT),
+                    );
+                    ui.add_space(4.0);
+                    ui.label(
+                        RichText::new(
+                            "Set up your game folder and review controls before jumping in.",
+                        )
+                        .size(12.5)
+                        .color(COLOR_TEXT_SECONDARY),
+                    );
+                    ui.add_space(12.0);
+
+                    // Step 1: Game folder
+                    egui::Frame::new()
+                        .fill(COLOR_TILE)
+                        .stroke(STROKE_BORDER)
+                        .corner_radius(RADIUS_DEFAULT)
+                        .inner_margin(10.0)
+                        .show(ui, |ui| {
+                            ui.horizontal(|ui| {
+                                ui.vertical(|ui| {
+                                    ui.label(
+                                        RichText::new("1. Choose Game Folder")
+                                            .size(13.0)
+                                            .strong()
+                                            .color(COLOR_TEXT),
+                                    );
+                                    let folder_status = if app.rom_folders.is_empty() {
+                                        "Add a folder containing .gba, .gb, .gbc, or .zip games."
+                                            .to_string()
+                                    } else {
+                                        let count = app.rom_folders.len();
+                                        let noun = if count == 1 { "folder" } else { "folders" };
+                                        format!(
+                                            "{count} {noun} configured ({} games found)",
+                                            app.library_entries.len()
+                                        )
+                                    };
+                                    ui.label(
+                                        RichText::new(folder_status).size(11.5).color(
+                                            if app.rom_folders.is_empty() {
+                                                COLOR_TEXT_SECONDARY
+                                            } else {
+                                                ACCENT_TEAL
+                                            },
+                                        ),
+                                    );
+                                });
+                                ui.with_layout(
+                                    Layout::right_to_left(Align::Center),
+                                    |ui| {
+                                        let btn_label = if app.rom_folders.is_empty() {
+                                            "📁 Choose Game Folder..."
+                                        } else {
+                                            "📁 Add Another Folder..."
+                                        };
+                                        if ui
+                                            .add(
+                                                egui::Button::new(
+                                                    RichText::new(btn_label).color(COLOR_TEXT),
+                                                )
+                                                .fill(COLOR_BG)
+                                                .stroke(STROKE_BORDER),
+                                            )
+                                            .clicked()
+                                        {
+                                            app.add_rom_folder_dialog();
+                                        }
+                                    },
+                                );
+                            });
+                        });
+
+                    ui.add_space(8.0);
+
+                    // Step 2: Controls & Gamepad
+                    egui::Frame::new()
+                        .fill(COLOR_TILE)
+                        .stroke(STROKE_BORDER)
+                        .corner_radius(RADIUS_DEFAULT)
+                        .inner_margin(10.0)
+                        .show(ui, |ui| {
+                            ui.horizontal(|ui| {
+                                ui.vertical(|ui| {
+                                    ui.set_max_width((ui.available_width() - 165.0).max(160.0));
+                                    ui.label(
+                                        RichText::new("2. Check Controls")
+                                            .size(13.0)
+                                            .strong()
+                                            .color(COLOR_TEXT),
+                                    );
+                                    ui.label(
+                                        RichText::new(format_empty_state_controls_hint(
+                                            &app.config.keybindings,
+                                        ))
+                                        .size(11.5)
+                                        .color(COLOR_TEXT_SECONDARY),
+                                    );
+                                    let pads = app.connected_gamepad_names();
+                                    let pad_text = if pads.is_empty() {
+                                        "Controller: None connected (auto-detected when plugged in)"
+                                            .to_string()
+                                    } else {
+                                        format!("Controller connected: {}", pads.join(", "))
+                                    };
+                                    ui.label(
+                                        RichText::new(pad_text).size(11.0).color(
+                                            if pads.is_empty() {
+                                                COLOR_TEXT_SECONDARY
+                                            } else {
+                                                ACCENT_TEAL
+                                            },
+                                        ),
+                                    );
+                                });
+                                ui.with_layout(
+                                    Layout::right_to_left(Align::Center),
+                                    |ui| {
+                                        if ui
+                                            .add(
+                                                egui::Button::new(
+                                                    RichText::new("🎮 Check Controls...")
+                                                        .color(COLOR_TEXT),
+                                                )
+                                                .fill(COLOR_BG)
+                                                .stroke(STROKE_BORDER),
+                                            )
+                                            .clicked()
+                                        {
+                                            app.show_controls_dialog = true;
+                                        }
+                                    },
+                                );
+                            });
+                        });
+
+                    ui.add_space(12.0);
+                    ui.horizontal(|ui| {
+                        let primary_fill = if app.rom_folders.is_empty() {
+                            COLOR_TILE
+                        } else {
+                            ACCENT_TEAL
+                        };
+                        let primary_text = if app.rom_folders.is_empty() {
+                            COLOR_TEXT
+                        } else {
+                            Color32::from_rgb(14, 18, 20)
+                        };
+                        if ui
+                            .add(
+                                egui::Button::new(
+                                    RichText::new("Continue to Library")
+                                        .strong()
+                                        .color(primary_text),
+                                )
+                                .fill(primary_fill)
+                                .stroke(STROKE_BORDER),
+                            )
+                            .clicked()
+                        {
+                            app.config.welcome_completed = true;
+                            app.config.save();
+                        }
+                        if ui
+                            .add(
+                                egui::Button::new(
+                                    RichText::new("Skip").color(COLOR_TEXT_SECONDARY),
+                                )
+                                .fill(Color32::TRANSPARENT)
+                                .stroke(STROKE_BORDER),
+                            )
+                            .clicked()
+                        {
+                            app.config.welcome_completed = true;
+                            app.config.save();
+                        }
+                    });
+                });
+        };
+
+        if centered {
+            ui.vertical_centered(|ui| {
+                ui.add_space(28.0);
+                draw_inner(ui, self);
+            });
+        } else {
+            ui.vertical_centered(|ui| {
+                draw_inner(ui, self);
+            });
+            ui.add_space(10.0);
+        }
+    }
+
     pub(crate) fn scan_folder_recursive(dir: &Path, depth: usize, out: &mut Vec<PathBuf>) {
         if depth > 3 {
             return;
@@ -965,6 +1295,14 @@ impl RustboyApp {
         }
 
         // 2. Empty & Loading States
+        if !self.config.welcome_completed {
+            let welcome_centered = self.rom_folders.is_empty() && filtered.is_empty();
+            self.draw_welcome_card(ui, welcome_centered);
+            if welcome_centered && !self.config.welcome_completed {
+                return;
+            }
+        }
+
         if self.rom_folders.is_empty() && filtered.is_empty() {
             ui.vertical_centered(|ui| {
                 ui.add_space((ui.available_height() * 0.16).max(32.0));
@@ -2200,5 +2538,112 @@ mod tests {
         assert!(custom_hint.contains("W/S/A/D = D-Pad"));
         assert!(custom_hint.contains("K / J = B / A"));
         assert!(custom_hint.contains("Space = Start"));
+    }
+
+    #[test]
+    fn test_first_frame_cover_fallback_writes_and_never_overwrites_user_cover() {
+        let nonce = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let covers_dir = crate::config::AppConfig::covers_dir();
+        let _ = fs::create_dir_all(&covers_dir);
+
+        // 1. Uniform solid frame is skipped when force_fallback = false, then saved when forced or patterned.
+        let rom_auto = PathBuf::from(format!("b1_auto_{nonce}.gba"));
+        let solid_fb = [0x001Fu16; gba_core::LCD_WIDTH * gba_core::LCD_HEIGHT];
+        let skipped =
+            capture_first_frame_cover_fallback(&rom_auto, "B1AT", &solid_fb, false, false).unwrap();
+        assert!(skipped.is_none(), "uniform boot frame should be skipped before fallback");
+
+        let mut patterned_fb = solid_fb;
+        for (idx, px) in patterned_fb.iter_mut().enumerate().take(400) {
+            *px = ((idx as u16) * 17) & 0x7FFF;
+        }
+        let saved = capture_first_frame_cover_fallback(&rom_auto, "B1AT", &patterned_fb, false, false)
+            .unwrap()
+            .expect("non-uniform frame should write firstframe png");
+        assert!(saved.is_file());
+        assert!(saved.to_string_lossy().ends_with(".firstframe.png"));
+
+        // Verify find_cover_image picks up firstframe fallback when no user cover exists.
+        let entry_auto = RomLibraryEntry {
+            path: rom_auto.clone(),
+            display_name: format!("b1_auto_{nonce}"),
+            internal_title: String::new(),
+            game_code: "B1AT".into(),
+            region: "Homebrew",
+            size_mb: 0.1,
+            has_battery_sav: false,
+            source_kind: RomSourceKind::Raw,
+            platform: RomPlatform::Gba,
+            cart_type_label: String::new(),
+        };
+        assert_eq!(find_cover_image(&entry_auto), Some(saved.clone()));
+
+        // Placing a real user cover in covers_dir immediately takes priority without overwriting anything.
+        let user_cover = covers_dir.join(format!("b1_auto_{nonce}.png"));
+        let sentinel = b"user-cover-sentinel";
+        fs::write(&user_cover, sentinel).unwrap();
+        assert_eq!(find_cover_image(&entry_auto), Some(user_cover.clone()));
+        // Calling capture again never overwrites user_cover or firstframe.
+        assert!(
+            capture_first_frame_cover_fallback(&rom_auto, "B1AT", &patterned_fb, false, true)
+                .unwrap()
+                .is_none()
+        );
+        assert_eq!(fs::read(&user_cover).unwrap(), sentinel);
+        let _ = fs::remove_file(&user_cover);
+        let _ = fs::remove_file(&saved);
+
+        // 2. Game with existing adjacent user cover never creates a first-frame fallback file.
+        let rom_with_cover_stem = format!("b1_existing_{nonce}");
+        let existing_user_cover = covers_dir.join(format!("{rom_with_cover_stem}.png"));
+        fs::write(&existing_user_cover, b"existing-user-art").unwrap();
+        let rom_with_cover = PathBuf::from(format!("{rom_with_cover_stem}.gba"));
+        let created = capture_first_frame_cover_fallback(
+            &rom_with_cover,
+            "B1EX",
+            &patterned_fb,
+            false,
+            true,
+        )
+        .unwrap();
+        assert!(created.is_none(), "must never create fallback when user cover exists");
+        assert!(!first_frame_cover_path(&rom_with_cover).unwrap().exists());
+        assert_eq!(fs::read(&existing_user_cover).unwrap(), b"existing-user-art");
+        let _ = fs::remove_file(&existing_user_cover);
+    }
+
+    #[test]
+    fn test_welcome_card_renders_and_stays_idle_without_timer_repaints() {
+        let mut app =
+            std::mem::ManuallyDrop::new(RustboyApp::new(crate::headless::CliConfig::default()));
+        app.rom_folders.clear();
+        app.library_entries.clear();
+        app.config.welcome_completed = false;
+        let ctx = egui::Context::default();
+        let raw_input = egui::RawInput {
+            screen_rect: Some(egui::Rect::from_min_size(
+                egui::Pos2::ZERO,
+                egui::vec2(1120.0, 720.0),
+            )),
+            ..Default::default()
+        };
+        let mut last_delay = std::time::Duration::ZERO;
+        for _ in 0..3 {
+            let out = ctx.run(raw_input.clone(), |ctx| {
+                app.update(ctx);
+            });
+            last_delay = out
+                .viewport_output
+                .get(&egui::ViewportId::ROOT)
+                .map(|v| v.repaint_delay)
+                .unwrap_or(std::time::Duration::MAX);
+        }
+        assert!(
+            last_delay > std::time::Duration::from_secs(60),
+            "welcome card must stay idle (repaint on input only), got {last_delay:?}"
+        );
     }
 }

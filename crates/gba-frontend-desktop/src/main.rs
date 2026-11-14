@@ -17,6 +17,7 @@ mod gpu_probe;
 mod headless;
 mod hotkeys;
 mod hud;
+mod icon;
 mod input;
 mod library;
 mod link;

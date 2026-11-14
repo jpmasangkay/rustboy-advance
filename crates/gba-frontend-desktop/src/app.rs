@@ -169,6 +169,7 @@ pub(crate) struct RustboyApp {
     pub(crate) attempted_cover_downloads: HashSet<PathBuf>,
     pub(crate) cover_download_tx: std::sync::mpsc::Sender<(PathBuf, bool)>,
     pub(crate) cover_download_rx: std::sync::mpsc::Receiver<(PathBuf, bool)>,
+    pub(crate) first_frame_cover_saved: bool,
 
     // Real-Time Rewind Buffer
     pub(crate) rewind_buffer: RewindBuffer,
@@ -351,6 +352,7 @@ impl RustboyApp {
             attempted_cover_downloads: HashSet::new(),
             cover_download_tx,
             cover_download_rx,
+            first_frame_cover_saved: false,
             rewind_buffer: RewindBuffer::new(rewind_budget_mb),
             frame_counter: 0,
             unsaved_frames_since_save: 0,
@@ -625,6 +627,9 @@ impl RustboyApp {
 
         self.rom_folders = loaded_folders;
         self.favorites = loaded_favs;
+        if !self.rom_folders.is_empty() {
+            self.config.welcome_completed = true;
+        }
     }
 
     pub(crate) fn open_rom(
@@ -760,6 +765,8 @@ impl RustboyApp {
         self.frame_counter = 0;
         self.unsaved_frames_since_save = 0;
         self.pending_confirm_action = None;
+        self.first_frame_cover_saved =
+            crate::library::has_user_cover_for_path(rom_path, &code);
         self.rewinding = false;
         self.autofire_state.clear_latches();
         self.base_pressed_mask = 0;
@@ -826,6 +833,7 @@ impl RustboyApp {
         self.frame_counter = 0;
         self.unsaved_frames_since_save = 0;
         self.pending_confirm_action = None;
+        self.first_frame_cover_saved = false;
         self.rewinding = false;
         self.autofire_state.clear_latches();
         self.base_pressed_mask = 0;
@@ -2395,6 +2403,38 @@ impl RustboyApp {
         {
             let _ = self.capture.stop_gif();
             self.notify(&format!("GIF recording error: {err}"));
+        }
+        if video_ready && !self.first_frame_cover_saved && self.frame_counter >= 30 {
+            self.try_capture_first_frame_cover();
+        }
+    }
+
+    fn try_capture_first_frame_cover(&mut self) {
+        let Some(rom_path) = self.rom_path.as_ref().cloned() else {
+            self.first_frame_cover_saved = true;
+            return;
+        };
+        let is_gb = self.gb.is_some();
+        let force_fallback = self.frame_counter >= 180;
+        match crate::library::capture_first_frame_cover_fallback(
+            &rom_path,
+            &self.rom_code,
+            &self.sink.framebuffer,
+            is_gb,
+            force_fallback,
+        ) {
+            Ok(Some(_saved_path)) => {
+                self.first_frame_cover_saved = true;
+                self.cover_textures.remove(&rom_path);
+            }
+            Ok(None) => {
+                if force_fallback || crate::library::has_user_cover_for_path(&rom_path, &self.rom_code) {
+                    self.first_frame_cover_saved = true;
+                }
+            }
+            Err(_) => {
+                self.first_frame_cover_saved = true;
+            }
         }
     }
 

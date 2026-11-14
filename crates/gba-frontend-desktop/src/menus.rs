@@ -961,8 +961,16 @@ impl RustboyApp {
             self.debugger.show_controls = true;
             ui.close_menu();
         }
-        if ui.button("Customize Controls...").clicked() {
+        if ui.button("Controls & Keybindings...").clicked() {
             self.show_controls_dialog = true;
+            ui.close_menu();
+        }
+        if ui.button("Welcome Guide...").clicked() {
+            self.config.welcome_completed = false;
+            self.config.save();
+            if self.has_active_game() {
+                self.notify("Welcome Guide enabled — return to Library to view it");
+            }
             ui.close_menu();
         }
         if ui
@@ -1108,7 +1116,17 @@ impl RustboyApp {
                         self.config.master_volume
                     ));
 
-                    // 9. Settings
+                    // 9. Controls
+                    if toolbar_btn(ui, "🎮 Controls", self.show_controls_dialog, true)
+                        .on_hover_text(
+                            "Open Controls & Keybindings (keyboard, gamepad, hotkeys)",
+                        )
+                        .clicked()
+                    {
+                        self.show_controls_dialog = !self.show_controls_dialog;
+                    }
+
+                    // 10. Settings
                     if toolbar_btn(ui, "☰ Settings", self.show_settings, true)
                         .on_hover_text(
                             "Open Settings (interface, audio, controls, developer tools)",

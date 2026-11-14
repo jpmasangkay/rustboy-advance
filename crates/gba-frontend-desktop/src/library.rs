@@ -568,38 +568,33 @@ impl RustboyApp {
                                             app.library_entries.len()
                                         )
                                     };
-                                    ui.label(
-                                        RichText::new(folder_status).size(11.5).color(
-                                            if app.rom_folders.is_empty() {
-                                                COLOR_TEXT_SECONDARY
-                                            } else {
-                                                ACCENT_TEAL
-                                            },
-                                        ),
-                                    );
-                                });
-                                ui.with_layout(
-                                    Layout::right_to_left(Align::Center),
-                                    |ui| {
-                                        let btn_label = if app.rom_folders.is_empty() {
-                                            "📁 Choose Game Folder..."
+                                    ui.label(RichText::new(folder_status).size(11.5).color(
+                                        if app.rom_folders.is_empty() {
+                                            COLOR_TEXT_SECONDARY
                                         } else {
-                                            "📁 Add Another Folder..."
-                                        };
-                                        if ui
-                                            .add(
-                                                egui::Button::new(
-                                                    RichText::new(btn_label).color(COLOR_TEXT),
-                                                )
-                                                .fill(COLOR_BG)
-                                                .stroke(STROKE_BORDER),
+                                            ACCENT_TEAL
+                                        },
+                                    ));
+                                });
+                                ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                                    let btn_label = if app.rom_folders.is_empty() {
+                                        "📁 Choose Game Folder..."
+                                    } else {
+                                        "📁 Add Another Folder..."
+                                    };
+                                    if ui
+                                        .add(
+                                            egui::Button::new(
+                                                RichText::new(btn_label).color(COLOR_TEXT),
                                             )
-                                            .clicked()
-                                        {
-                                            app.add_rom_folder_dialog();
-                                        }
-                                    },
-                                );
+                                            .fill(COLOR_BG)
+                                            .stroke(STROKE_BORDER),
+                                        )
+                                        .clicked()
+                                    {
+                                        app.add_rom_folder_dialog();
+                                    }
+                                });
                             });
                         });
 
@@ -621,9 +616,8 @@ impl RustboyApp {
                                             .strong()
                                             .color(COLOR_TEXT),
                                     );
-                                    let controls_summary = format_empty_state_controls_hint(
-                                        &app.config.keybindings,
-                                    );
+                                    let controls_summary =
+                                        format_empty_state_controls_hint(&app.config.keybindings);
                                     let controls_summary = controls_summary
                                         .strip_prefix("3. Controls: ")
                                         .unwrap_or(&controls_summary);
@@ -639,34 +633,29 @@ impl RustboyApp {
                                     } else {
                                         format!("Controller connected: {}", pads.join(", "))
                                     };
-                                    ui.label(
-                                        RichText::new(pad_text).size(11.0).color(
-                                            if pads.is_empty() {
-                                                COLOR_TEXT_SECONDARY
-                                            } else {
-                                                ACCENT_TEAL
-                                            },
-                                        ),
-                                    );
+                                    ui.label(RichText::new(pad_text).size(11.0).color(
+                                        if pads.is_empty() {
+                                            COLOR_TEXT_SECONDARY
+                                        } else {
+                                            ACCENT_TEAL
+                                        },
+                                    ));
                                 });
-                                ui.with_layout(
-                                    Layout::right_to_left(Align::Center),
-                                    |ui| {
-                                        if ui
-                                            .add(
-                                                egui::Button::new(
-                                                    RichText::new("🎮 Check Controls...")
-                                                        .color(COLOR_TEXT),
-                                                )
-                                                .fill(COLOR_BG)
-                                                .stroke(STROKE_BORDER),
+                                ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                                    if ui
+                                        .add(
+                                            egui::Button::new(
+                                                RichText::new("🎮 Check Controls...")
+                                                    .color(COLOR_TEXT),
                                             )
-                                            .clicked()
-                                        {
-                                            app.show_controls_dialog = true;
-                                        }
-                                    },
-                                );
+                                            .fill(COLOR_BG)
+                                            .stroke(STROKE_BORDER),
+                                        )
+                                        .clicked()
+                                    {
+                                        app.show_controls_dialog = true;
+                                    }
+                                });
                             });
                         });
 
@@ -690,7 +679,8 @@ impl RustboyApp {
                                         .color(primary_text),
                                 )
                                 .fill(primary_fill)
-                                .stroke(STROKE_BORDER),
+                                .stroke(STROKE_BORDER)
+                                .min_size(egui::vec2(144.0, 28.0)),
                             )
                             .clicked()
                         {
@@ -699,11 +689,13 @@ impl RustboyApp {
                         }
                         if ui
                             .add(
-                                egui::Button::new(
-                                    RichText::new("Skip").color(COLOR_TEXT_SECONDARY),
-                                )
-                                .fill(Color32::TRANSPARENT)
-                                .stroke(STROKE_BORDER),
+                                egui::Button::new(RichText::new("Skip").color(COLOR_TEXT))
+                                    .fill(COLOR_TILE)
+                                    .stroke(Stroke::new(
+                                        1.0_f32,
+                                        Color32::from_rgb(0x46, 0x46, 0x46),
+                                    ))
+                                    .min_size(egui::vec2(72.0, 28.0)),
                             )
                             .clicked()
                         {
@@ -2558,15 +2550,19 @@ mod tests {
         let solid_fb = [0x001Fu16; gba_core::LCD_WIDTH * gba_core::LCD_HEIGHT];
         let skipped =
             capture_first_frame_cover_fallback(&rom_auto, "B1AT", &solid_fb, false, false).unwrap();
-        assert!(skipped.is_none(), "uniform boot frame should be skipped before fallback");
+        assert!(
+            skipped.is_none(),
+            "uniform boot frame should be skipped before fallback"
+        );
 
         let mut patterned_fb = solid_fb;
         for (idx, px) in patterned_fb.iter_mut().enumerate().take(400) {
             *px = ((idx as u16) * 17) & 0x7FFF;
         }
-        let saved = capture_first_frame_cover_fallback(&rom_auto, "B1AT", &patterned_fb, false, false)
-            .unwrap()
-            .expect("non-uniform frame should write firstframe png");
+        let saved =
+            capture_first_frame_cover_fallback(&rom_auto, "B1AT", &patterned_fb, false, false)
+                .unwrap()
+                .expect("non-uniform frame should write firstframe png");
         assert!(saved.is_file());
         assert!(saved.to_string_lossy().ends_with(".firstframe.png"));
 
@@ -2605,17 +2601,18 @@ mod tests {
         let existing_user_cover = covers_dir.join(format!("{rom_with_cover_stem}.png"));
         fs::write(&existing_user_cover, b"existing-user-art").unwrap();
         let rom_with_cover = PathBuf::from(format!("{rom_with_cover_stem}.gba"));
-        let created = capture_first_frame_cover_fallback(
-            &rom_with_cover,
-            "B1EX",
-            &patterned_fb,
-            false,
-            true,
-        )
-        .unwrap();
-        assert!(created.is_none(), "must never create fallback when user cover exists");
+        let created =
+            capture_first_frame_cover_fallback(&rom_with_cover, "B1EX", &patterned_fb, false, true)
+                .unwrap();
+        assert!(
+            created.is_none(),
+            "must never create fallback when user cover exists"
+        );
         assert!(!first_frame_cover_path(&rom_with_cover).unwrap().exists());
-        assert_eq!(fs::read(&existing_user_cover).unwrap(), b"existing-user-art");
+        assert_eq!(
+            fs::read(&existing_user_cover).unwrap(),
+            b"existing-user-art"
+        );
         let _ = fs::remove_file(&existing_user_cover);
     }
 

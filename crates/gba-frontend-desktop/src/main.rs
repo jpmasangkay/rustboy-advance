@@ -68,6 +68,7 @@ fn is_cli_headless_invocation() -> bool {
                 | "--selftest"
                 | "--scan-library"
                 | "--verify-save-flush"
+                | "--verify-perf-check"
                 | "--gpu-probe"
                 | "--dump-hashes"
                 | "--verify-hashes"

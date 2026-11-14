@@ -426,7 +426,7 @@ fn capture_a1_ui_screenshots_if_requested() {
 
 #[test]
 fn capture_a2_ui_screenshots_if_requested() {
-    use crate::settings_ui::{PerfCheckState, parse_selftest_report_with_json};
+    use crate::settings_ui::PerfCheckState;
 
     let Some(dir) = std::env::var_os("RBA_SCREENSHOT_DIR").map(PathBuf::from) else {
         // Lightweight non-GPU smoke check for Settings & Performance Check dialogs
@@ -503,52 +503,37 @@ fn capture_a2_ui_screenshots_if_requested() {
             .expect("render A2 Settings dialog");
     }
 
-    // 4. Performance Check (--selftest) modal with summary + Copy/Save
+    // 4. Performance Check (--selftest) modal run via real binary, Details expanded
     {
         let ctx = egui::Context::default();
         configure_obsidian_style(&ctx);
         let mut app = make_isolated_app();
         load_synthetic_active_game(&mut app);
-        let sample = "\
-=== RUSTBOY ADVANCE PORTABLE --SELFTEST (PASS) ===\n\
-  Build:             commit=072e4078c7b3 | built=2026-11-14T09:22:04Z | exe_sha256=9a11a338ca98028e\n\
-  Host:              AMD Ryzen 9 8945HX with Radeon Graphics (16c/32t) | RAM=32560 MB | OS=Windows 11\n\
-  Enumerated GPUs:   2 adapter(s) visible to wgpu\n\
-    [1] NVIDIA GeForce RTX 5070 Laptop GPU (Vulkan / DiscreteGpu)\n\
-    [2] Microsoft Basic Render Driver (Dx12 / Cpu)\n\
-  Chosen Adapter:    NVIDIA GeForce RTX 5070 Laptop GPU (Vulkan / DiscreteGpu) [gpu-shader]\n\
-  Calibration:       75.527 ms (ref 75.769 ms, ratio vs ref = 1.00x)\n\
-  Headless (600f):   998.1 FPS | headroom = 16.71x | emu_avg=0.836 ms | total avg=1.002 ms\n\
-  Paced (600f +120w): work avg=1.042 p95=1.368 p99.5=1.494 ms | over_budget=0 (0.000%)\n\
-  Slowdown Sweep:    [1x(p99.5=1.91ms,PASS), 8x(p99.5=12.05ms,PASS), 12x(p99.5=18.28ms,FAIL)]\n\
-  Measured Ceiling:  smooth (<0.5% over, 0 underruns) = 8x | zero-over-budget = 8x\n\
-  Recommended Filter: smooth-bilinear — Hardware GPU shader path provides clean interpolation\n";
-        let full_json = serde_json::json!({
-            "schema_version": 3,
-            "exe_sha256": "9a11a338ca98028ee0dfd44d542f71e326ea49890979ad658938b201fbb98fb4",
-            "git_commit": "072e4078c7b3",
-            "build_time_utc": "2026-11-14T09:22:04Z",
-            "calibration_ratio_vs_ref": 1.0032,
-            "available_adapters": [
-                { "name": "NVIDIA GeForce RTX 5070 Laptop GPU", "backend": "Vulkan" }
-            ],
-            "slowdown_sweep": [
-                { "slowdown_x": 8, "smooth_passed": true }
-            ],
-            "measured_smooth_ceiling_x": 8,
-            "measured_zero_over_budget_x": 8,
-            "recommended_filter": "smooth-bilinear",
-            "passed": true
-        })
-        .to_string();
+
+        let mut candidates: Vec<PathBuf> = vec![
+            PathBuf::from("target/release/rustboy-advance.exe"),
+            PathBuf::from("../../target/release/rustboy-advance.exe"),
+            PathBuf::from("target/debug/rustboy-advance.exe"),
+            PathBuf::from("../../target/debug/rustboy-advance.exe"),
+        ];
+        if let Ok(cur) = std::env::current_exe()
+            && let Some(target_dir) = cur
+                .ancestors()
+                .find(|p| p.file_name().is_some_and(|n| n == "target"))
+        {
+            candidates.insert(0, target_dir.join("release/rustboy-advance.exe"));
+            candidates.push(target_dir.join("debug/rustboy-advance.exe"));
+        }
+        let exe_path = candidates.into_iter().find(|p| p.is_file()).expect(
+            "Real rustboy-advance binary (target/release or target/debug) required to capture real Performance Check screenshot",
+        );
+        let (_cancel, rx) = crate::settings_ui::spawn_selftest_child(exe_path);
+        let report = rx
+            .recv_timeout(std::time::Duration::from_secs(55))
+            .expect("real Performance Check (--selftest) child timed out");
         app.show_perf_check = true;
-        app.perf_check = PerfCheckState::Finished(Box::new(parse_selftest_report_with_json(
-            sample,
-            "",
-            Some(full_json),
-            true,
-            11340,
-        )));
+        app.perf_details_open = true;
+        app.perf_check = PerfCheckState::Finished(Box::new(report));
         renderer
             .render_app_to_png(&ctx, &mut app, None, &dir.join("a2_perf_check.png"))
             .expect("render A2 Performance Check modal");

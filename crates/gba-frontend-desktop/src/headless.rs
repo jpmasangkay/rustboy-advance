@@ -146,6 +146,7 @@ pub struct CliConfig {
     pub capture_png: Option<PathBuf>,
     pub capture_frame: Option<u64>,
     pub verify_save_flush: Option<String>,
+    pub verify_perf_check: Option<PathBuf>,
 }
 
 impl Default for CliConfig {
@@ -200,6 +201,7 @@ impl Default for CliConfig {
             capture_png: None,
             capture_frame: None,
             verify_save_flush: None,
+            verify_perf_check: None,
         }
     }
 }
@@ -385,6 +387,11 @@ impl CliConfig {
                 "--verify-save-flush" => {
                     let v = args.next().ok_or("missing value for --verify-save-flush")?;
                     cfg.verify_save_flush = Some(v);
+                    cfg.headless = true;
+                }
+                "--verify-perf-check" => {
+                    let v = args.next().ok_or("missing value for --verify-perf-check")?;
+                    cfg.verify_perf_check = Some(PathBuf::from(v));
                     cfg.headless = true;
                 }
                 "--dump-regs" => cfg.dump_regs = true,
@@ -886,7 +893,44 @@ fn run_scan_library_headless() -> Result<(), String> {
     Ok(())
 }
 
+fn run_perf_check_export_headless(out_json: &std::path::Path) -> Result<(), String> {
+    let mut app = std::mem::ManuallyDrop::new(crate::RustboyApp::new(CliConfig::default()));
+    app.start_performance_check();
+    let ctx = egui::Context::default();
+    let start = std::time::Instant::now();
+    loop {
+        app.poll_perf_check(&ctx);
+        if let crate::settings_ui::PerfCheckState::Finished(ref report) = app.perf_check {
+            let json = report.export_json();
+            if let Some(parent) = out_json.parent()
+                && !parent.as_os_str().is_empty()
+            {
+                fs::create_dir_all(parent)
+                    .map_err(|e| format!("Failed creating output folder: {e}"))?;
+            }
+            fs::write(out_json, &json)
+                .map_err(|e| format!("Failed writing perf check JSON: {e}"))?;
+            println!(
+                "PERF_CHECK_DONE passed={} elapsed_ms={} verdict={:?} json_path={}",
+                report.passed,
+                report.elapsed_ms,
+                report.verdict_headline(),
+                out_json.display()
+            );
+            return Ok(());
+        }
+        if start.elapsed() > std::time::Duration::from_secs(55) {
+            return Err("Timed out waiting for Performance Check (--selftest) child".into());
+        }
+        std::thread::sleep(std::time::Duration::from_millis(25));
+    }
+}
+
 pub fn run_headless(cfg: &CliConfig) -> Result<(), String> {
+    if let Some(ref out_json) = cfg.verify_perf_check {
+        return run_perf_check_export_headless(out_json);
+    }
+
     if cfg.calibrate {
         return bench::run_calibrate();
     }

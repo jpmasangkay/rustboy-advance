@@ -303,7 +303,9 @@ fn measured_filter_assign(slot: &mut Option<String>, val: &str) {
     }
 }
 
-fn spawn_selftest_child(exe_path: PathBuf) -> (Arc<AtomicBool>, Receiver<PerfCheckReport>) {
+pub(crate) fn spawn_selftest_child(
+    exe_path: PathBuf,
+) -> (Arc<AtomicBool>, Receiver<PerfCheckReport>) {
     let cancel = Arc::new(AtomicBool::new(false));
     let cancel_worker = Arc::clone(&cancel);
     let (tx, rx) = mpsc::channel();
@@ -926,7 +928,8 @@ impl RustboyApp {
 
         egui::Window::new("Performance Check")
             .open(&mut open)
-            .default_size([540.0, 420.0])
+            .default_size([700.0, 560.0])
+            .max_size([760.0, 620.0])
             .resizable(true)
             .collapsible(false)
             .show(ctx, |ui| match &self.perf_check {
@@ -961,120 +964,161 @@ impl RustboyApp {
                     } else {
                         egui::Color32::from_rgb(230, 175, 85)
                     };
-                    egui::Frame::new()
-                        .fill(COLOR_TILE)
-                        .stroke(STROKE_BORDER)
-                        .corner_radius(2)
-                        .inner_margin(egui::Margin::same(10))
-                        .show(ui, |ui| {
-                            ui.set_width(ui.available_width());
-                            ui.horizontal(|ui| {
-                                ui.label(
-                                    egui::RichText::new(verdict)
-                                        .size(15.0)
-                                        .strong()
-                                        .color(badge_color),
-                                );
-                                ui.with_layout(
-                                    egui::Layout::right_to_left(egui::Align::Center),
-                                    |ui| {
-                                        ui.label(
-                                            egui::RichText::new(format!(
-                                                "{} · {:.2}s",
-                                                report.status_label,
-                                                report.elapsed_ms as f32 / 1000.0
-                                            ))
-                                            .small()
-                                            .color(COLOR_TEXT_SECONDARY),
-                                        );
-                                    },
-                                );
-                            });
-                            ui.add_space(4.0);
-                            ui.label(
-                                egui::RichText::new(report.plain_summary_line()).color(COLOR_TEXT),
-                            );
-
-                            if let Some(ref err) = report.error_message {
-                                ui.add_space(4.0);
-                                ui.label(
-                                    egui::RichText::new(err)
-                                        .color(egui::Color32::from_rgb(220, 95, 95)),
-                                );
-                            }
-                        });
-
-                    ui.add_space(8.0);
-                    egui::CollapsingHeader::new("Details")
-                        .default_open(false)
+                    egui::ScrollArea::vertical()
+                        .id_salt("perf_check_outer_scroll")
+                        .max_height(480.0)
                         .show(ui, |ui| {
                             egui::Frame::new()
                                 .fill(COLOR_TILE)
                                 .stroke(STROKE_BORDER)
                                 .corner_radius(2)
-                                .inner_margin(egui::Margin::same(8))
+                                .inner_margin(egui::Margin::same(10))
                                 .show(ui, |ui| {
                                     ui.set_width(ui.available_width());
-                                    let adapters_joined = if report.enumerated_adapters.is_empty() {
-                                        None
-                                    } else {
-                                        Some(report.enumerated_adapters.join("\n"))
-                                    };
-                                    egui::Grid::new("perf_check_summary_grid")
-                                        .num_columns(2)
-                                        .spacing([12.0, 4.0])
-                                        .show(ui, |ui| {
-                                            let rows: [(&str, Option<&str>); 11] = [
-                                                ("Build", report.build_info.as_deref()),
-                                                ("Adapter", report.chosen_adapter.as_deref()),
-                                                ("Enumerated GPUs", adapters_joined.as_deref()),
-                                                ("Calibration", report.calibration.as_deref()),
-                                                ("Headless", report.headless.as_deref()),
-                                                ("Paced", report.paced.as_deref()),
-                                                ("Fixed GPU Wait", report.fixed_gpu_wait.as_deref()),
-                                                ("Slowdown Sweep", report.slowdown_sweep.as_deref()),
-                                                ("Measured Ceiling", report.measured_ceiling.as_deref()),
-                                                ("Recommended Filter", report.recommended_filter.as_deref()),
-                                                ("Issues", report.fail_reasons.as_deref()),
-                                            ];
-                                            for (label, value) in rows {
-                                                if let Some(val) = value {
-                                                    ui.label(
-                                                        egui::RichText::new(label)
-                                                            .color(COLOR_TEXT_SECONDARY),
-                                                    );
-                                                    ui.label(
-                                                        egui::RichText::new(val).color(COLOR_TEXT),
-                                                    );
-                                                    ui.end_row();
-                                                }
-                                            }
-                                        });
+                                    ui.horizontal(|ui| {
+                                        ui.label(
+                                            egui::RichText::new(verdict)
+                                                .size(15.0)
+                                                .strong()
+                                                .color(badge_color),
+                                        );
+                                        ui.with_layout(
+                                            egui::Layout::right_to_left(egui::Align::Center),
+                                            |ui| {
+                                                ui.label(
+                                                    egui::RichText::new(format!(
+                                                        "{} · {:.2}s",
+                                                        report.status_label,
+                                                        report.elapsed_ms as f32 / 1000.0
+                                                    ))
+                                                    .small()
+                                                    .color(COLOR_TEXT_SECONDARY),
+                                                );
+                                            },
+                                        );
+                                    });
+                                    ui.add_space(4.0);
+                                    ui.add(
+                                        egui::Label::new(
+                                            egui::RichText::new(report.plain_summary_line())
+                                                .color(COLOR_TEXT),
+                                        )
+                                        .wrap(),
+                                    );
+
+                                    if let Some(ref err) = report.error_message {
+                                        ui.add_space(4.0);
+                                        ui.add(
+                                            egui::Label::new(
+                                                egui::RichText::new(err)
+                                                    .color(egui::Color32::from_rgb(220, 95, 95)),
+                                            )
+                                            .wrap(),
+                                        );
+                                    }
                                 });
 
-                            ui.add_space(6.0);
-                            ui.label(
-                                egui::RichText::new("Full --selftest Output")
-                                    .small()
-                                    .color(COLOR_TEXT_SECONDARY),
-                            );
-                            egui::Frame::new()
-                                .fill(COLOR_TILE)
-                                .stroke(STROKE_BORDER)
-                                .corner_radius(2)
-                                .inner_margin(egui::Margin::same(8))
+                            ui.add_space(8.0);
+                            egui::CollapsingHeader::new("Details")
+                                .default_open(self.perf_details_open)
                                 .show(ui, |ui| {
-                                    egui::ScrollArea::vertical()
-                                        .max_height(150.0)
+                                    egui::Frame::new()
+                                        .fill(COLOR_TILE)
+                                        .stroke(STROKE_BORDER)
+                                        .corner_radius(2)
+                                        .inner_margin(egui::Margin::same(8))
                                         .show(ui, |ui| {
-                                            ui.add(
-                                                egui::TextEdit::multiline(
-                                                    &mut report.raw_output.as_str(),
-                                                )
-                                                .font(egui::TextStyle::Monospace)
-                                                .desired_width(f32::INFINITY)
-                                                .frame(false),
-                                            );
+                                            ui.set_width(ui.available_width());
+                                            let adapters_joined =
+                                                if report.enumerated_adapters.is_empty() {
+                                                    None
+                                                } else {
+                                                    Some(report.enumerated_adapters.join("\n"))
+                                                };
+                                            egui::Grid::new("perf_check_summary_grid")
+                                                .num_columns(2)
+                                                .spacing([12.0, 4.0])
+                                                .max_col_width(540.0)
+                                                .show(ui, |ui| {
+                                                    let rows: [(&str, Option<&str>); 11] = [
+                                                        ("Build", report.build_info.as_deref()),
+                                                        (
+                                                            "Adapter",
+                                                            report.chosen_adapter.as_deref(),
+                                                        ),
+                                                        (
+                                                            "Enumerated GPUs",
+                                                            adapters_joined.as_deref(),
+                                                        ),
+                                                        (
+                                                            "Calibration",
+                                                            report.calibration.as_deref(),
+                                                        ),
+                                                        ("Headless", report.headless.as_deref()),
+                                                        ("Paced", report.paced.as_deref()),
+                                                        (
+                                                            "Fixed GPU Wait",
+                                                            report.fixed_gpu_wait.as_deref(),
+                                                        ),
+                                                        (
+                                                            "Slowdown Sweep",
+                                                            report.slowdown_sweep.as_deref(),
+                                                        ),
+                                                        (
+                                                            "Measured Ceiling",
+                                                            report.measured_ceiling.as_deref(),
+                                                        ),
+                                                        (
+                                                            "Recommended Filter",
+                                                            report.recommended_filter.as_deref(),
+                                                        ),
+                                                        ("Issues", report.fail_reasons.as_deref()),
+                                                    ];
+                                                    for (label, value) in rows {
+                                                        if let Some(val) = value {
+                                                            ui.label(
+                                                                egui::RichText::new(label)
+                                                                    .color(COLOR_TEXT_SECONDARY),
+                                                            );
+                                                            ui.add(
+                                                                egui::Label::new(
+                                                                    egui::RichText::new(val)
+                                                                        .color(COLOR_TEXT),
+                                                                )
+                                                                .wrap(),
+                                                            );
+                                                            ui.end_row();
+                                                        }
+                                                    }
+                                                });
+                                        });
+
+                                    ui.add_space(6.0);
+                                    ui.label(
+                                        egui::RichText::new("Full --selftest Output")
+                                            .small()
+                                            .color(COLOR_TEXT_SECONDARY),
+                                    );
+                                    egui::Frame::new()
+                                        .fill(COLOR_TILE)
+                                        .stroke(STROKE_BORDER)
+                                        .corner_radius(2)
+                                        .inner_margin(egui::Margin::same(8))
+                                        .show(ui, |ui| {
+                                            ui.set_width(ui.available_width());
+                                            egui::ScrollArea::vertical()
+                                                .id_salt("perf_check_raw_scroll")
+                                                .max_height(130.0)
+                                                .show(ui, |ui| {
+                                                    ui.add(
+                                                        egui::TextEdit::multiline(
+                                                            &mut report.raw_output.as_str(),
+                                                        )
+                                                        .font(egui::TextStyle::Monospace)
+                                                        .desired_width(f32::INFINITY)
+                                                        .frame(false),
+                                                    );
+                                                });
                                         });
                                 });
                         });

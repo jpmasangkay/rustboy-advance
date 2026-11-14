@@ -10,5 +10,4 @@ crate-type = ["rlib", "cdylib"]
 [dependencies]
 gb-core = { path = "../gb-core" }
 gba-core = { path = "../gba-core" }
-log.workspace = true
 

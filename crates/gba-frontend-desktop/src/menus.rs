@@ -103,7 +103,7 @@ impl RustboyApp {
                         ui.separator();
                         ui.add_enabled_ui(has_rom, |ui| {
                             if ui
-                                .button("⏹ Close Game / Return to Library (Esc / Ctrl+W)")
+                                .button("⏹ Close Game / Return to Library (Ctrl+W)")
                                 .clicked()
                             {
                                 ui.close_menu();
@@ -225,7 +225,7 @@ impl RustboyApp {
                                 self.hard_reset();
                                 ui.close_menu();
                             }
-                            if ui.button("⏹ Stop & Return to Library (Esc)").clicked() {
+                            if ui.button("⏹ Stop & Return to Library (Ctrl+W)").clicked() {
                                 self.close_rom(ctx);
                                 ui.close_menu();
                             }
@@ -578,10 +578,16 @@ impl RustboyApp {
                                 self.config.save();
                             }
                             if ui
-                                .checkbox(&mut self.config.show_menu_bar, "Show Menu Bar in Window")
+                                .checkbox(
+                                    &mut self.config.show_menu_bar,
+                                    "Show Menu Bar in Window (Ctrl+Shift+M)",
+                                )
                                 .changed()
                             {
                                 self.config.save();
+                                if !self.config.show_menu_bar {
+                                    self.notify("Menu bar hidden — press Ctrl+Shift+M to restore");
+                                }
                             }
                         });
                         ui.menu_button("Video Layers", |ui| {
@@ -868,22 +874,34 @@ impl RustboyApp {
                     ui.separator();
 
                     // Group 2: Pause, Stop, Step, Rewind, Reset, FF
+                    let hotkeys = &self.config.keybindings.hotkeys;
+                    let pause_key = hotkeys.display(HotkeyAction::Pause);
+                    let adv_key = hotkeys.display(HotkeyAction::FrameAdvance);
+                    let rewind_key = hotkeys.display(HotkeyAction::Rewind);
+                    let reset_key = hotkeys.display(HotkeyAction::HardReset);
+                    let ff_key = hotkeys.display(HotkeyAction::FastForward);
+                    let save_key = hotkeys.display(HotkeyAction::SaveState);
+                    let load_key = hotkeys.display(HotkeyAction::LoadState);
+                    let state_mgr_key = hotkeys.display(HotkeyAction::StateManager);
+                    let snap_key = hotkeys.display(HotkeyAction::Screenshot);
+                    let mute_key = hotkeys.display(HotkeyAction::Mute);
+
                     let play_lbl = if self.paused { "▶ Resume" } else { "⏸ Pause" };
                     if toolbar_btn(ui, play_lbl, self.paused, has_rom)
-                        .on_hover_text("Pause / Resume emulation (P / Space)")
+                        .on_hover_text(format!("Pause / Resume emulation ({pause_key})"))
                         .clicked()
                     {
                         self.toggle_pause();
                     }
                     if toolbar_btn(ui, "⏹ Stop", false, has_rom)
-                        .on_hover_text("Stop game and return to ROM Library (Esc / Ctrl+W)")
+                        .on_hover_text("Stop game and return to ROM Library (Ctrl+W)")
                         .clicked()
                     {
                         self.close_rom(ctx);
                     }
                     let hardcore = self.is_ra_hardcore_active();
                     if toolbar_btn(ui, "⏭ Step", false, has_rom && !hardcore)
-                        .on_hover_text("Advance 1 Frame (Ctrl+N)")
+                        .on_hover_text(format!("Advance 1 Frame ({adv_key})"))
                         .clicked()
                     {
                         self.step_single_frame(ctx);
@@ -891,13 +909,13 @@ impl RustboyApp {
                     let rewind_enabled =
                         has_rom && !hardcore && self.config.rewind_enabled && !self.rewind_buffer.is_empty();
                     if toolbar_btn(ui, "⏪ Rewind", false, rewind_enabled)
-                        .on_hover_text("Rewind ~0.5s (or hold R key in-game)")
+                        .on_hover_text(format!("Rewind ~0.5s (or hold {rewind_key} in-game)"))
                         .clicked()
                     {
                         self.rewind_manual_with_movie_sync();
                     }
                     if toolbar_btn(ui, "⟲ Reset", false, has_rom)
-                        .on_hover_text("Hard Reset (Ctrl+R)")
+                        .on_hover_text(format!("Hard Reset ({reset_key})"))
                         .clicked()
                     {
                         self.hard_reset();
@@ -905,7 +923,7 @@ impl RustboyApp {
                     let eff_speed = self.effective_speed_multiplier();
                     let turbo_on = self.tab_fast_forward || eff_speed > 1.05 || eff_speed <= 0.0;
                     if toolbar_btn(ui, "⏩ FF", turbo_on, has_rom)
-                        .on_hover_text("Toggle Fast-Forward (Tab / hotkey)")
+                        .on_hover_text(format!("Toggle Fast-Forward ({ff_key})"))
                         .clicked()
                     {
                         let target_speed = if eff_speed > 1.05 || eff_speed <= 0.0 {
@@ -926,25 +944,25 @@ impl RustboyApp {
 
                     // Group 3: S1, L1, States, Snap
                     if toolbar_btn(ui, "💾 S1", false, has_rom)
-                        .on_hover_text("Quick Save Slot 1 (F5)")
+                        .on_hover_text(format!("Quick Save Slot 1 ({save_key})"))
                         .clicked()
                     {
                         self.quick_save(1);
                     }
                     if toolbar_btn(ui, "📂 L1", false, has_rom)
-                        .on_hover_text("Quick Load Slot 1 (F7)")
+                        .on_hover_text(format!("Quick Load Slot 1 ({load_key})"))
                         .clicked()
                     {
                         self.quick_load(1);
                     }
                     if toolbar_btn(ui, "◈ States", self.show_state_manager, true)
-                        .on_hover_text("Open Visual Save State Manager (F6)")
+                        .on_hover_text(format!("Open Visual Save State Manager ({state_mgr_key})"))
                         .clicked()
                     {
                         self.show_state_manager = !self.show_state_manager;
                     }
                     if toolbar_btn(ui, "📷 Snap", false, has_rom)
-                        .on_hover_text("Save Screenshot alongside ROM (F12)")
+                        .on_hover_text(format!("Save Screenshot ({snap_key})"))
                         .clicked()
                     {
                         self.capture_screenshot();
@@ -955,7 +973,7 @@ impl RustboyApp {
                     // Group 4: Audio, sRGB, Filter: LCD Matrix
                     let audio_active = !self.config.muted;
                     if toolbar_btn(ui, "🔊 Audio", audio_active, true)
-                        .on_hover_text("Toggle Audio Output (M)")
+                        .on_hover_text(format!("Toggle Audio Output ({mute_key})"))
                         .clicked()
                     {
                         self.config.muted = !self.config.muted;
@@ -1021,16 +1039,28 @@ impl RustboyApp {
                     ui.separator();
 
                     // Group 5: CPU, Hex, VRAM, Audio, Link
-                    if toolbar_btn(ui, "CPU", self.debugger.show_cpu, true).clicked() {
+                    if toolbar_btn(ui, "CPU", self.debugger.show_cpu, true)
+                        .on_hover_text("Open CPU & Disassembler Window")
+                        .clicked()
+                    {
                         self.debugger.show_cpu = !self.debugger.show_cpu;
                     }
-                    if toolbar_btn(ui, "Hex", self.debugger.show_hex, true).clicked() {
+                    if toolbar_btn(ui, "Hex", self.debugger.show_hex, true)
+                        .on_hover_text("Open Hex Memory Viewer")
+                        .clicked()
+                    {
                         self.debugger.show_hex = !self.debugger.show_hex;
                     }
-                    if toolbar_btn(ui, "VRAM", self.debugger.show_vram, true).clicked() {
+                    if toolbar_btn(ui, "VRAM", self.debugger.show_vram, true)
+                        .on_hover_text("Open VRAM / Tile / Palette Viewer")
+                        .clicked()
+                    {
                         self.debugger.show_vram = !self.debugger.show_vram;
                     }
-                    if toolbar_btn(ui, "Audio", self.debugger.show_audio, true).clicked() {
+                    if toolbar_btn(ui, "Audio", self.debugger.show_audio, true)
+                        .on_hover_text("Open Audio Channel Visualizer")
+                        .clicked()
+                    {
                         self.debugger.show_audio = !self.debugger.show_audio;
                     }
                     let link_on = self.link.local_is_active()

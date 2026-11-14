@@ -1,0 +1,354 @@
+use std::mem::ManuallyDrop;
+use std::path::{Path, PathBuf};
+
+use eframe::egui_wgpu::{self, wgpu};
+
+use crate::app::{RustboyApp, configure_obsidian_style};
+use crate::config::{AppConfig, DisplayFilter, HotkeyAction};
+use crate::headless::CliConfig;
+use crate::library::{LibraryViewMode, RomLibraryEntry};
+use crate::rom_loader::{RomPlatform, RomSourceKind};
+use gba_core::{LCD_HEIGHT, LCD_WIDTH};
+
+struct OffscreenUiRenderer {
+    device: wgpu::Device,
+    queue: wgpu::Queue,
+    egui_renderer: egui_wgpu::Renderer,
+    tex: wgpu::Texture,
+    view: wgpu::TextureView,
+    width: u32,
+    height: u32,
+}
+
+impl OffscreenUiRenderer {
+    fn new(width: u32, height: u32) -> Result<Self, String> {
+        let backends = wgpu::Backends::VULKAN | wgpu::Backends::DX12;
+        let instance = wgpu::Instance::new(&wgpu::InstanceDescriptor {
+            backends,
+            ..Default::default()
+        });
+        let adapters = instance.enumerate_adapters(backends);
+        let adapter = crate::shaders::select_preferred_adapter(adapters.iter())
+            .or_else(|| crate::shaders::discover_software_cpu_adapter().ok())
+            .ok_or_else(|| "No offscreen wgpu adapter available".to_string())?;
+        let (device, queue) =
+            pollster::block_on(adapter.request_device(&wgpu::DeviceDescriptor::default(), None))
+                .map_err(|e| format!("request_device failed: {e}"))?;
+
+        let format = wgpu::TextureFormat::Rgba8Unorm;
+        let egui_renderer = egui_wgpu::Renderer::new(&device, format, None, 1, false);
+        let tex = device.create_texture(&wgpu::TextureDescriptor {
+            label: Some("ui_snapshot_target"),
+            size: wgpu::Extent3d {
+                width,
+                height,
+                depth_or_array_layers: 1,
+            },
+            mip_level_count: 1,
+            sample_count: 1,
+            dimension: wgpu::TextureDimension::D2,
+            format,
+            usage: wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::COPY_SRC,
+            view_formats: &[],
+        });
+        let view = tex.create_view(&wgpu::TextureViewDescriptor::default());
+        Ok(Self {
+            device,
+            queue,
+            egui_renderer,
+            tex,
+            view,
+            width,
+            height,
+        })
+    }
+
+    fn render_app_to_png(
+        &mut self,
+        ctx: &egui::Context,
+        app: &mut RustboyApp,
+        hover_pos: Option<egui::Pos2>,
+        out_path: &Path,
+    ) -> Result<(), String> {
+        let screen_rect = egui::Rect::from_min_size(
+            egui::Pos2::ZERO,
+            egui::vec2(self.width as f32, self.height as f32),
+        );
+
+        let mut last_output = None;
+        let mut to_free = Vec::new();
+        for step in 0..3 {
+            let mut raw = egui::RawInput {
+                screen_rect: Some(screen_rect),
+                time: Some(10.0 + step as f64 * 0.25),
+                ..Default::default()
+            };
+            if let Some(pos) = hover_pos {
+                raw.events.push(egui::Event::PointerMoved(pos));
+            }
+            let out = ctx.run(raw, |c| {
+                app.update(c);
+            });
+            for (id, delta) in &out.textures_delta.set {
+                self.egui_renderer
+                    .update_texture(&self.device, &self.queue, *id, delta);
+            }
+            to_free.extend(out.textures_delta.free.iter().copied());
+            last_output = Some(out);
+        }
+        let full_output = last_output.expect("at least one frame rendered");
+
+        let clipped_primitives = ctx.tessellate(full_output.shapes, full_output.pixels_per_point);
+        let screen_descriptor = egui_wgpu::ScreenDescriptor {
+            size_in_pixels: [self.width, self.height],
+            pixels_per_point: full_output.pixels_per_point,
+        };
+
+        let mut encoder = self
+            .device
+            .create_command_encoder(&wgpu::CommandEncoderDescriptor {
+                label: Some("ui_snapshot_encoder"),
+            });
+        let user_cmds = self.egui_renderer.update_buffers(
+            &self.device,
+            &self.queue,
+            &mut encoder,
+            &clipped_primitives,
+            &screen_descriptor,
+        );
+
+        {
+            let rpass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+                label: Some("ui_snapshot_pass"),
+                color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                    view: &self.view,
+                    resolve_target: None,
+                    ops: wgpu::Operations {
+                        load: wgpu::LoadOp::Clear(wgpu::Color {
+                            r: 0.05,
+                            g: 0.06,
+                            b: 0.08,
+                            a: 1.0,
+                        }),
+                        store: wgpu::StoreOp::Store,
+                    },
+                })],
+                depth_stencil_attachment: None,
+                timestamp_writes: None,
+                occlusion_query_set: None,
+            });
+            let mut rpass = rpass.forget_lifetime();
+            self.egui_renderer
+                .render(&mut rpass, &clipped_primitives, &screen_descriptor);
+        }
+
+        let unpadded_bpr = self.width * 4;
+        let aligned_bpr = (unpadded_bpr + 255) & !255;
+        let buf_size = u64::from(aligned_bpr) * u64::from(self.height);
+        let staging = self.device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("ui_snapshot_readback"),
+            size: buf_size,
+            usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ,
+            mapped_at_creation: false,
+        });
+        encoder.copy_texture_to_buffer(
+            self.tex.as_image_copy(),
+            wgpu::TexelCopyBufferInfo {
+                buffer: &staging,
+                layout: wgpu::TexelCopyBufferLayout {
+                    offset: 0,
+                    bytes_per_row: Some(aligned_bpr),
+                    rows_per_image: Some(self.height),
+                },
+            },
+            wgpu::Extent3d {
+                width: self.width,
+                height: self.height,
+                depth_or_array_layers: 1,
+            },
+        );
+
+        let mut cmds = user_cmds;
+        cmds.push(encoder.finish());
+        self.queue.submit(cmds);
+        self.device.poll(wgpu::Maintain::Wait);
+
+        let slice = staging.slice(..);
+        let (tx, rx) = std::sync::mpsc::channel();
+        slice.map_async(wgpu::MapMode::Read, move |res| {
+            let _ = tx.send(res);
+        });
+        self.device.poll(wgpu::Maintain::Wait);
+        rx.recv()
+            .map_err(|e| format!("map recv failed: {e}"))?
+            .map_err(|e| format!("map failed: {e:?}"))?;
+
+        let mapped = slice.get_mapped_range();
+        let mut rgba = vec![0u8; (unpadded_bpr * self.height) as usize];
+        for row in 0..self.height as usize {
+            let src_off = row * aligned_bpr as usize;
+            let dst_off = row * unpadded_bpr as usize;
+            rgba[dst_off..dst_off + unpadded_bpr as usize]
+                .copy_from_slice(&mapped[src_off..src_off + unpadded_bpr as usize]);
+        }
+        drop(mapped);
+        staging.unmap();
+
+        for id in &to_free {
+            self.egui_renderer.free_texture(id);
+        }
+
+        if let Some(parent) = out_path.parent() {
+            let _ = std::fs::create_dir_all(parent);
+        }
+        image::save_buffer(
+            out_path,
+            &rgba,
+            self.width,
+            self.height,
+            image::ColorType::Rgba8,
+        )
+        .map_err(|e| format!("save PNG failed: {e}"))
+    }
+}
+
+fn make_isolated_app() -> ManuallyDrop<RustboyApp> {
+    let mut app = RustboyApp::new(CliConfig::default());
+    app.library_scanning = false;
+    app.library_scan_rx = None;
+    app.library_scan_error = None;
+    app.rom_folders = vec![PathBuf::from(r"C:\Games\GBA"), PathBuf::from(r"C:\Games\GBC")];
+    app.config = AppConfig::default();
+    app.config.display_filter = DisplayFilter::SoftHandheld;
+    app.favorites.clear();
+    let p1 = PathBuf::from(r"C:\Games\GBA\Summon Night - Swordcraft Story (USA).gba");
+    let p2 = PathBuf::from(r"C:\Games\GBA\Homebrew Micro Demo.gba");
+    let p3 = PathBuf::from(r"C:\Games\GBC\Links Awakening DX.gbc");
+    app.favorites.insert(p1.clone());
+    app.library_entries = vec![
+        RomLibraryEntry {
+            path: p1,
+            display_name: "Summon Night - Swordcraft Story (USA)".to_string(),
+            internal_title: "SUMMON NIGHT".to_string(),
+            game_code: "BSNE".to_string(),
+            region: "USA",
+            size_mb: 16.0,
+            has_battery_sav: true,
+            source_kind: RomSourceKind::Raw,
+            platform: RomPlatform::Gba,
+            cart_type_label: String::new(),
+        },
+        RomLibraryEntry {
+            path: p2,
+            display_name: "Homebrew Micro Demo (Long Verifiable Title Showcase Edition)".to_string(),
+            internal_title: "MICRODEMO".to_string(),
+            game_code: "HOMZ".to_string(),
+            region: "",
+            size_mb: 0.125,
+            has_battery_sav: false,
+            source_kind: RomSourceKind::Raw,
+            platform: RomPlatform::Gba,
+            cart_type_label: String::new(),
+        },
+        RomLibraryEntry {
+            path: p3,
+            display_name: "Links Awakening DX".to_string(),
+            internal_title: "ZELDA".to_string(),
+            game_code: "C123".to_string(),
+            region: "World",
+            size_mb: 1.0,
+            has_battery_sav: true,
+            source_kind: RomSourceKind::Zip,
+            platform: RomPlatform::Gbc,
+            cart_type_label: "MBC5+RAM+BATT".to_string(),
+        },
+    ];
+    ManuallyDrop::new(app)
+}
+
+fn load_synthetic_active_game(app: &mut RustboyApp) {
+    let rom = crate::stress_rom::build_stress_mode0_4bg_128spr_rom();
+    let core = gba_core::GbaCore::new(None, rom);
+    app.core = Some(core);
+    app.rom_title = "Summon Night".to_string();
+    app.rom_code = "BSNE".to_string();
+    app.paused = false;
+    app.show_pause_overlay = false;
+    app.measured_fps = 59.73;
+
+    // Populate recognizable test pattern in core framebuffer
+    let mut fb = [0u16; LCD_WIDTH * LCD_HEIGHT];
+    for y in 0..LCD_HEIGHT {
+        for x in 0..LCD_WIDTH {
+            let r = ((x * 31) / LCD_WIDTH) as u16;
+            let g = ((y * 31) / LCD_HEIGHT) as u16;
+            let b = if (x / 16 + y / 16) % 2 == 0 { 22 } else { 8 };
+            fb[y * LCD_WIDTH + x] = (b << 10) | (g << 5) | r;
+        }
+    }
+    app.sink.push_frame(&fb);
+}
+
+#[test]
+fn capture_a1_ui_screenshots_if_requested() {
+    let Some(dir) = std::env::var_os("RBA_SCREENSHOT_DIR").map(PathBuf::from) else {
+        // Lightweight non-GPU UI logic smoke check
+        let ctx = egui::Context::default();
+        configure_obsidian_style(&ctx);
+        let mut app = make_isolated_app();
+        let _ = ctx.run(Default::default(), |c| app.update(c));
+        return;
+    };
+
+    let mut renderer =
+        OffscreenUiRenderer::new(1120, 720).expect("offscreen wgpu renderer for screenshots");
+
+    // 1. Library Table view (2 Folders, no "Unk", MB/KB formatting, Favorites stars, clean status bar)
+    {
+        let ctx = egui::Context::default();
+        configure_obsidian_style(&ctx);
+        let mut app = make_isolated_app();
+        app.library_view_mode = LibraryViewMode::Table;
+        let _ = HotkeyAction::Pause;
+        renderer
+            .render_app_to_png(&ctx, &mut app, Some(egui::pos2(120.0, 165.0)), &dir.join("a1_library_table.png"))
+            .expect("render table");
+    }
+
+    // 2. Library Grid view (1 Folder singular grammar, consistent sizes, top-right ★)
+    {
+        let ctx = egui::Context::default();
+        configure_obsidian_style(&ctx);
+        let mut app = make_isolated_app();
+        app.rom_folders.truncate(1);
+        app.library_view_mode = LibraryViewMode::Grid;
+        renderer
+            .render_app_to_png(&ctx, &mut app, Some(egui::pos2(95.0, 210.0)), &dir.join("a1_library_grid.png"))
+            .expect("render grid");
+    }
+
+    // 3. In-game HUD/Toolbar (developer_tools = false -> hides kHz/DRC/BIOS, shows FPS %)
+    {
+        let ctx = egui::Context::default();
+        configure_obsidian_style(&ctx);
+        let mut app = make_isolated_app();
+        load_synthetic_active_game(&mut app);
+        app.config.developer_tools = false;
+        // Hover over Pause toolbar button area
+        renderer
+            .render_app_to_png(&ctx, &mut app, Some(egui::pos2(230.0, 38.0)), &dir.join("a1_gameplay_hud.png"))
+            .expect("render gameplay hud");
+    }
+
+    // 4. In-game HUD with developer_tools = true (restores BIOS/DRC/kHz)
+    {
+        let ctx = egui::Context::default();
+        configure_obsidian_style(&ctx);
+        let mut app = make_isolated_app();
+        load_synthetic_active_game(&mut app);
+        app.config.developer_tools = true;
+        renderer
+            .render_app_to_png(&ctx, &mut app, None, &dir.join("a1_gameplay_devtools.png"))
+            .expect("render devtools status bar");
+    }
+}

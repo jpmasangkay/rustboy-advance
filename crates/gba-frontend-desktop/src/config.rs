@@ -1188,6 +1188,8 @@ pub struct AppConfig {
     pub show_toolbar: bool,
     pub show_status_bar: bool,
     pub show_menu_bar: bool,
+    #[serde(default)]
+    pub developer_tools: bool,
     pub rumble_enabled: bool,
     pub pause_overlay_enabled: bool,
     pub playtimes: BTreeMap<String, RomPlaytime>,
@@ -1251,6 +1253,7 @@ impl Default for AppConfig {
             show_toolbar: true,
             show_status_bar: true,
             show_menu_bar: true,
+            developer_tools: false,
             rumble_enabled: true,
             pause_overlay_enabled: true,
             playtimes: BTreeMap::new(),

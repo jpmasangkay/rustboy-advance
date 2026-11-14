@@ -57,6 +57,18 @@ impl RustboyApp {
             return;
         }
 
+        if ctx.input(|i| {
+            i.modifiers.ctrl && i.modifiers.shift && !i.modifiers.alt && i.key_pressed(Key::M)
+        }) {
+            self.config.show_menu_bar = !self.config.show_menu_bar;
+            self.config.save();
+            self.notify(if self.config.show_menu_bar {
+                "Menu Bar Shown (Ctrl+Shift+M)"
+            } else {
+                "Menu Bar Hidden — press Ctrl+Shift+M to restore"
+            });
+        }
+
         if ctx.wants_keyboard_input()
             || self.debugger.awaiting_rebind.is_some()
             || self.awaiting_input_bind.is_some()

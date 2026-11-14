@@ -32,6 +32,8 @@ mod savestates;
 mod shaders;
 mod stress_rom;
 mod theme;
+#[cfg(test)]
+mod ui_snapshots;
 
 use gba_core::{LCD_HEIGHT, LCD_WIDTH};
 

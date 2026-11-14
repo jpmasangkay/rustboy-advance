@@ -313,7 +313,7 @@ impl RustboyApp {
                 let reg = match slice.get(0x014A).copied().unwrap_or(0xFF) {
                     0x00 => "JPN",
                     0x01 => "World",
-                    _ => "Unk",
+                    _ => "",
                 };
                 let cart = gb_cart_type_label(gb_hdr.cart_type).to_string();
                 (title, code, reg, cart)
@@ -348,7 +348,7 @@ impl RustboyApp {
                         b'P' | b'D' | b'F' | b'I' | b'S' => "EUR",
                         b'J' => "JPN",
                         b'A' => "World",
-                        _ => "Unk",
+                        _ => "",
                     };
                     (
                         title_clean.trim().to_string(),
@@ -360,7 +360,7 @@ impl RustboyApp {
                     (
                         String::from("Homebrew"),
                         String::from("HOME"),
-                        "Unk",
+                        "",
                         String::from("GBA ROM"),
                     )
                 }
@@ -565,7 +565,11 @@ impl RustboyApp {
                             .corner_radius(RADIUS_DEFAULT)
                             .stroke(grid_stroke)
                             .min_size(egui::vec2(26.0, 26.0));
-                        if ui.add(grid_btn).on_hover_text("Grid View").clicked() {
+                        if ui
+                            .add(grid_btn)
+                            .on_hover_text("Switch to Grid View (box art tiles)")
+                            .clicked()
+                        {
                             self.library_view_mode = LibraryViewMode::Grid;
                             self.save_persistent_config();
                         }
@@ -580,7 +584,11 @@ impl RustboyApp {
                             .corner_radius(RADIUS_DEFAULT)
                             .stroke(table_stroke)
                             .min_size(egui::vec2(26.0, 26.0));
-                        if ui.add(table_btn).on_hover_text("Table View").clicked() {
+                        if ui
+                            .add(table_btn)
+                            .on_hover_text("Switch to List / Table View")
+                            .clicked()
+                        {
                             self.library_view_mode = LibraryViewMode::Table;
                             self.save_persistent_config();
                         }
@@ -603,7 +611,12 @@ impl RustboyApp {
                         .corner_radius(RADIUS_DEFAULT)
                         .stroke(star_stroke)
                         .min_size(egui::vec2(26.0, 26.0));
-                        if ui.add(fav_btn).on_hover_text("Filter Favorites").clicked() {
+                        let fav_tooltip = if fav_active {
+                            "Showing Favorites only (click to show all games)"
+                        } else {
+                            "Show only Favorite games"
+                        };
+                        if ui.add(fav_btn).on_hover_text(fav_tooltip).clicked() {
                             self.filter_favorites_only = !self.filter_favorites_only;
                         }
 
@@ -797,16 +810,19 @@ impl RustboyApp {
         let mut launch_target: Option<PathBuf> = None;
         let mut game_settings_entry: Option<RomLibraryEntry> = None;
         let mut rescan_needed = false;
+        let mut toggle_favorite: Option<PathBuf> = None;
 
         match self.library_view_mode {
             LibraryViewMode::Table => {
                 let avail_w = ui.available_width();
+                let fav_col_w = 24.0_f32;
                 let region_w = 80.0_f32;
                 let size_w = 90.0_f32;
                 let last_played_w = 130.0_f32;
                 let play_time_w = 100.0_f32;
                 let title_w =
-                    (avail_w - region_w - size_w - last_played_w - play_time_w - 40.0).max(180.0);
+                    (avail_w - fav_col_w - region_w - size_w - last_played_w - play_time_w - 40.0)
+                        .max(180.0);
 
                 let mut sorted_entries = filtered;
                 sorted_entries.sort_by(|a, b| {
@@ -914,7 +930,7 @@ impl RustboyApp {
                 ui.scope_builder(egui::UiBuilder::new().max_rect(header_rect), |ui| {
                     ui.spacing_mut().item_spacing = egui::vec2(0.0, 0.0);
                     ui.horizontal(|ui| {
-                        ui.add_space(16.0);
+                        ui.add_space(16.0 + fav_col_w);
                         if draw_header_btn(
                             ui,
                             "TITLE",
@@ -1077,34 +1093,68 @@ impl RustboyApp {
                             let last_played_ts = pt.map(|p| p.last_played_timestamp).unwrap_or(0);
                             let total_seconds = pt.map(|p| p.total_seconds).unwrap_or(0);
 
+                            let is_fav = self.favorites.contains(&entry.path);
                             let lp_str = format_last_played_ts(last_played_ts);
                             let pt_str = format_playtime(total_seconds);
-                            let size_str = format!("{:.1} MB", entry.size_mb);
+                            let size_str = format_rom_size_mb(entry.size_mb);
 
                             ui.scope_builder(egui::UiBuilder::new().max_rect(row_rect), |ui| {
                                 ui.spacing_mut().item_spacing = egui::vec2(0.0, 0.0);
                                 ui.horizontal(|ui| {
-                                    ui.add_space(16.0);
+                                    ui.add_space(12.0);
+                                    let star_btn = egui::Button::new(
+                                        RichText::new(if is_fav { "★" } else { "☆" })
+                                            .size(12.0)
+                                            .color(if is_fav {
+                                                ACCENT_TEAL
+                                            } else {
+                                                COLOR_TEXT_SECONDARY
+                                            }),
+                                    )
+                                    .frame(false)
+                                    .min_size(egui::vec2(20.0, 26.0));
+                                    let star_tip = if is_fav {
+                                        "Remove from Favorites"
+                                    } else {
+                                        "Add to Favorites"
+                                    };
+                                    if ui
+                                        .add_sized([20.0, 28.0], star_btn)
+                                        .on_hover_text(star_tip)
+                                        .clicked()
+                                    {
+                                        toggle_favorite = Some(entry.path.clone());
+                                    }
+                                    ui.add_space(8.0);
 
                                     // Title
-                                    ui.add_sized(
+                                    let title_resp = ui.add_sized(
                                         [title_w, 28.0],
                                         egui::Label::new(
                                             RichText::new(&entry.display_name)
                                                 .color(COLOR_TEXT)
                                                 .size(12.0),
                                         )
+                                        .selectable(false)
                                         .truncate(),
                                     );
+                                    if title_resp.clicked() {
+                                        self.selected_rom_path = Some(entry.path.clone());
+                                    }
+                                    if title_resp.double_clicked() {
+                                        launch_target = Some(entry.path.clone());
+                                    }
+                                    title_resp.on_hover_text(&entry.display_name);
 
-                                    // Region: plain text
+                                    // Region: plain text (blank when unknown)
                                     ui.add_sized(
                                         [region_w, 28.0],
                                         egui::Label::new(
                                             RichText::new(entry.region)
                                                 .color(COLOR_TEXT_SECONDARY)
                                                 .size(12.0),
-                                        ),
+                                        )
+                                        .selectable(false),
                                     );
 
                                     // Size: right-aligned
@@ -1317,15 +1367,56 @@ impl RustboyApp {
                                                     egui::StrokeKind::Inside,
                                                 );
 
+                                                // Subtle top-right Favorite star badge & hover full-title tooltip
+                                                let is_fav = self.favorites.contains(&entry.path);
+                                                let show_star = is_fav || tile_resp.hovered();
+                                                tile_resp.on_hover_text(&entry.display_name);
+                                                if show_star {
+                                                    let star_rect = egui::Rect::from_min_size(
+                                                        egui::pos2(
+                                                            tile_rect.right() - 26.0,
+                                                            tile_rect.top() + 4.0,
+                                                        ),
+                                                        egui::vec2(22.0, 22.0),
+                                                    );
+                                                    let star_btn = egui::Button::new(
+                                                        RichText::new(if is_fav { "★" } else { "☆" })
+                                                            .size(13.0)
+                                                            .color(if is_fav {
+                                                                ACCENT_TEAL
+                                                            } else {
+                                                                COLOR_TEXT_SECONDARY
+                                                            }),
+                                                    )
+                                                    .fill(Color32::from_rgba_unmultiplied(
+                                                        0x12, 0x12, 0x12, 200,
+                                                    ))
+                                                    .stroke(STROKE_BORDER)
+                                                    .corner_radius(RADIUS_DEFAULT);
+                                                    let star_tip = if is_fav {
+                                                        "Remove from Favorites"
+                                                    } else {
+                                                        "Add to Favorites"
+                                                    };
+                                                    if ui
+                                                        .put(star_rect, star_btn)
+                                                        .on_hover_text(star_tip)
+                                                        .clicked()
+                                                    {
+                                                        toggle_favorite = Some(entry.path.clone());
+                                                    }
+                                                }
+
                                                 // 2. Metadata Directly Below Tile
                                                 ui.add_space(4.0);
 
-                                                // Title 12px white, single-line ellipsis
+                                                // Title 12px white, single-line ellipsis + full title tooltip
                                                 let title_lbl = egui::Label::new(
                                                     RichText::new(&entry.display_name)
                                                         .color(COLOR_TEXT)
                                                         .size(12.0),
                                                 )
+                                                .selectable(false)
                                                 .truncate();
                                                 let title_resp = ui.add_sized([tile_w, 16.0], title_lbl);
                                                 if title_resp.clicked() {
@@ -1334,14 +1425,15 @@ impl RustboyApp {
                                                 if title_resp.double_clicked() {
                                                     launch_target = Some(entry.path.clone());
                                                 }
+                                                title_resp.on_hover_text(&entry.display_name);
 
-                                                // "REGION · SIZE" in secondary text
-                                                let size_mb_int = entry.size_mb.round() as u32;
-                                                let meta_str = format!(
-                                                    "{} · {} MB",
-                                                    entry.region,
-                                                    size_mb_int.max(1)
-                                                );
+                                                // "REGION · SIZE" (or just "SIZE" if region unknown)
+                                                let size_str = format_rom_size_mb(entry.size_mb);
+                                                let meta_str = if entry.region.is_empty() {
+                                                    size_str
+                                                } else {
+                                                    format!("{} · {}", entry.region, size_str)
+                                                };
                                                 ui.label(
                                                     RichText::new(meta_str)
                                                         .color(COLOR_TEXT_SECONDARY)
@@ -1354,6 +1446,13 @@ impl RustboyApp {
                             });
                     });
             }
+        }
+
+        if let Some(fav_path) = toggle_favorite {
+            if !self.favorites.remove(&fav_path) {
+                self.favorites.insert(fav_path);
+            }
+            self.save_persistent_config();
         }
 
         if rescan_needed {
@@ -1369,6 +1468,15 @@ impl RustboyApp {
         {
             self.notify_error(&e);
         }
+    }
+}
+
+pub(crate) fn format_rom_size_mb(size_mb: f32) -> String {
+    if size_mb < 0.99 {
+        let kb = (size_mb * 1024.0).round().max(1.0) as u32;
+        format!("{kb} KB")
+    } else {
+        format!("{size_mb:.1} MB")
     }
 }
 
@@ -1443,6 +1551,27 @@ mod tests {
         assert_eq!(cgb_entry.cart_type_label, "MBC3+RTC+RAM+BATT");
         assert_eq!(cgb_entry.region, "JPN");
         assert!(cgb_entry.game_code.starts_with('C'));
+
+        let _ = fs::remove_dir_all(&temp_dir);
+    }
+
+    #[test]
+    fn test_rom_size_formatting_and_hidden_unknown_region() {
+        assert_eq!(format_rom_size_mb(0.03125), "32 KB");
+        assert_eq!(format_rom_size_mb(0.5), "512 KB");
+        assert_eq!(format_rom_size_mb(16.0), "16.0 MB");
+
+        let temp_dir = std::env::temp_dir().join("rba_test_unk_region");
+        let _ = fs::remove_dir_all(&temp_dir);
+        fs::create_dir_all(&temp_dir).unwrap();
+        let mut rom = vec![0u8; 512];
+        rom[0xA0..0xA6].copy_from_slice(b"HOMEBR");
+        rom[0xAC..0xB0].copy_from_slice(b"HOMZ");
+        let rom_path = temp_dir.join("homebrew_demo.gba");
+        fs::write(&rom_path, &rom).unwrap();
+
+        let parsed = RustboyApp::parse_gba_header(&rom_path).expect("parse ok");
+        assert_eq!(parsed.region, "");
 
         let _ = fs::remove_dir_all(&temp_dir);
     }

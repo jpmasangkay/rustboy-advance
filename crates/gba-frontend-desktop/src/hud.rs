@@ -28,60 +28,72 @@ impl RustboyApp {
             .show(ctx, |ui| {
                 ui.horizontal(|ui| {
                     ui.set_height(20.0);
-                    // Left: "N Games | N Folders" + core name
-                    let n_games = self.library_entries.len();
                     let n_folders = self.rom_folders.len();
                     let left_text = if let Some(t) = &self.toast {
                         t.text.clone()
-                    } else if (n_games == 0 && n_folders == 0) || self.has_active_game() {
-                        format!("{n_games} Games | {n_folders} Folders | Core: GBA-ARM7TDMI (Strict JIT)")
+                    } else if self.has_active_game() {
+                        if self.paused {
+                            format!("Paused — {}", self.rom_title)
+                        } else {
+                            format!("Playing — {}", self.rom_title)
+                        }
+                    } else if n_folders == 0 {
+                        "Ready — Add a ROM folder or open a file".to_string()
                     } else {
-                        format!("{n_games} Games | {n_folders} Folders")
+                        format!(
+                            "{n_folders} Folder{}",
+                            if n_folders == 1 { "" } else { "s" }
+                        )
                     };
                     ui.label(RichText::new(left_text).color(crate::theme::COLOR_TEXT_SECONDARY));
 
-                    // Right: FPS (mono) + BIOS status
                     ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                        let (bios_lbl, bios_color) = if self.bios_bytes.is_some() {
-                            ("BIOS: Official GBA (normatt)", crate::theme::ACCENT_TEAL)
-                        } else {
-                            ("BIOS: HLE", crate::theme::COLOR_TEXT_SECONDARY)
-                        };
-                        ui.label(RichText::new(bios_lbl).color(bios_color));
+                        if self.config.developer_tools {
+                            let (bios_lbl, bios_color) = if self.bios_bytes.is_some() {
+                                ("BIOS: Custom GBA", crate::theme::ACCENT_TEAL)
+                            } else {
+                                ("BIOS: HLE", crate::theme::COLOR_TEXT_SECONDARY)
+                            };
+                            ui.label(RichText::new(bios_lbl).color(bios_color));
+                            ui.add_space(16.0);
+                        }
 
-                        ui.add_space(16.0);
+                        if self.has_active_game() && !self.paused {
+                            let pct = ((self.measured_fps / 59.7275) * 100.0).round().max(0.0) as u32;
+                            let fps_text = format!("FPS: {:.2} ({pct}%)", self.measured_fps);
+                            ui.monospace(
+                                RichText::new(fps_text).color(crate::theme::COLOR_TEXT_SECONDARY),
+                            );
+                            ui.add_space(8.0);
+                        }
 
-                        let fps_text = if self.has_active_game() || self.measured_fps > 1.0 {
-                            format!("FPS: {:.2} (100%)", self.measured_fps)
-                        } else {
-                            "FPS: 0.00".to_string()
-                        };
-                        ui.monospace(
-                            RichText::new(fps_text).color(crate::theme::COLOR_TEXT_SECONDARY),
-                        );
-                        ui.add_space(8.0);
-                        let underruns = self.sink.audio.underruns();
-                        let occ = self.sink.audio.occupancy_percent();
-                        let drc_text = if underruns > 0 {
-                            format!("DRC: {occ:.1}% ({underruns} underruns)")
-                        } else {
-                            format!("DRC: {occ:.1}%")
-                        };
-                        ui.monospace(
-                            RichText::new(drc_text)
-                                .small()
-                                .color(if underruns > 0 {
-                                    Color32::from_rgb(239, 68, 68)
-                                } else {
-                                    crate::theme::COLOR_TEXT_SECONDARY
-                                }),
-                        );
-                        ui.add_space(8.0);
-                        ui.label(
-                            RichText::new(format!("{:.1} kHz", self.host_audio_rate as f32 / 1000.0))
+                        if self.config.developer_tools {
+                            let underruns = self.sink.audio.underruns();
+                            let occ = self.sink.audio.occupancy_percent();
+                            let drc_text = if underruns > 0 {
+                                format!("DRC: {occ:.1}% ({underruns} underruns)")
+                            } else {
+                                format!("DRC: {occ:.1}%")
+                            };
+                            ui.monospace(
+                                RichText::new(drc_text)
+                                    .small()
+                                    .color(if underruns > 0 {
+                                        Color32::from_rgb(239, 68, 68)
+                                    } else {
+                                        crate::theme::COLOR_TEXT_SECONDARY
+                                    }),
+                            );
+                            ui.add_space(8.0);
+                            ui.label(
+                                RichText::new(format!(
+                                    "{:.1} kHz",
+                                    self.host_audio_rate as f32 / 1000.0
+                                ))
                                 .small()
                                 .color(crate::theme::COLOR_TEXT_SECONDARY),
-                        );
+                            );
+                        }
 
                         if let Some(core) = &mut self.core {
                             if core.bus.cart.solar_enabled {

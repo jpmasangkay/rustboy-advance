@@ -357,7 +357,7 @@ mod win32_gdi {
         if lines <= 0 {
             return Err("GetDIBits returned 0 scanlines".to_string());
         }
-        for px in rgba.chunks_exact_mut(4) {
+        for px in rgba.as_chunks_mut::<4>().0 {
             px.swap(0, 2);
             px[3] = 255;
         }
@@ -442,6 +442,7 @@ impl NoGpuCpuPresenter {
         &self.scratch_xrgb
     }
 
+    #[allow(clippy::too_many_arguments)] // Low-level software RGB/XRGB blit primitive
     pub fn blit_rgba_to_slice(
         &mut self,
         src: &[egui::Color32],
@@ -748,6 +749,7 @@ impl NoGpuCpuPresenter {
 
     /// Presents `img` capped at most `720x480` via Win32 `StretchDIBits` (`None` on non-Windows).
     #[allow(unused_variables)]
+    #[allow(clippy::too_many_arguments)] // Win32 GDI capped presenter takes explicit surface geometry
     pub fn present_capped_os_stretch(
         &mut self,
         window: &Window,
@@ -763,7 +765,7 @@ impl NoGpuCpuPresenter {
         self.present_rgba_to_xrgb(src, src_w, src_h, cap_w, cap_h, halftone);
         #[cfg(target_os = "windows")]
         {
-            return win32_gdi::present_stretch_dibits(
+            win32_gdi::present_stretch_dibits(
                 window,
                 &self.scratch_xrgb[..xrgb_len],
                 cap_w,
@@ -771,7 +773,7 @@ impl NoGpuCpuPresenter {
                 dst_w,
                 dst_h,
                 halftone,
-            );
+            )
         }
         #[cfg(not(target_os = "windows"))]
         {
@@ -779,6 +781,7 @@ impl NoGpuCpuPresenter {
         }
     }
 
+    #[allow(clippy::too_many_arguments)] // Benchmark helper accepts explicit filter & display parameters
     pub fn measure_capped_filter_costs(
         &mut self,
         postproc: &mut VideoPostProcessor,

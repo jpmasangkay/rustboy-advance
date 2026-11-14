@@ -93,11 +93,16 @@ pub(crate) mod win_mmcss {
                 if module.is_null() {
                     return None;
                 }
-                let p_set_char =
-                    GetProcAddress(module, b"AvSetMmThreadCharacteristicsW\0".as_ptr());
-                let p_set_prio = GetProcAddress(module, b"AvSetMmThreadPriority\0".as_ptr());
-                let p_revert =
-                    GetProcAddress(module, b"AvRevertMmThreadCharacteristics\0".as_ptr());
+                let p_set_char = GetProcAddress(
+                    module,
+                    c"AvSetMmThreadCharacteristicsW".as_ptr().cast::<u8>(),
+                );
+                let p_set_prio =
+                    GetProcAddress(module, c"AvSetMmThreadPriority".as_ptr().cast::<u8>());
+                let p_revert = GetProcAddress(
+                    module,
+                    c"AvRevertMmThreadCharacteristics".as_ptr().cast::<u8>(),
+                );
                 if p_set_char.is_null() || p_set_prio.is_null() || p_revert.is_null() {
                     return None;
                 }

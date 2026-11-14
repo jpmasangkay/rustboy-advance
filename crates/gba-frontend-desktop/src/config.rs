@@ -1431,11 +1431,11 @@ impl AppConfig {
     pub fn load_ra_token() -> String {
         #[cfg(test)]
         {
-            return TEST_KEYRING_TOKEN
+            TEST_KEYRING_TOKEN
                 .lock()
                 .ok()
                 .and_then(|g| g.clone())
-                .unwrap_or_default();
+                .unwrap_or_default()
         }
         #[cfg(not(test))]
         {
@@ -1894,9 +1894,11 @@ mod tests {
     #[test]
     fn ra_token_is_excluded_from_json_and_paths_target_data_dirs() {
         AppConfig::clear_ra_token();
-        let mut cfg = AppConfig::default();
-        cfg.ra_username = "player1".to_string();
-        cfg.ra_token = "super_secret_token".to_string();
+        let cfg = AppConfig {
+            ra_username: "player1".to_string(),
+            ra_token: "super_secret_token".to_string(),
+            ..Default::default()
+        };
         let json = serde_json::to_string(&cfg).expect("serialize");
         assert!(
             !json.contains("super_secret_token"),

@@ -1301,8 +1301,10 @@ mod tests {
             assert!(matches!(outcome3, GpuGuardOutcome::UseNoGpu { .. }));
 
             // Launch 4 with --retry-gpu clears blocklist, probes again, and caches success.
-            let mut retry_cli = CliConfig::default();
-            retry_cli.retry_gpu = true;
+            let retry_cli = CliConfig {
+                retry_gpu: true,
+                ..Default::default()
+            };
             let mut probed_after_retry = false;
             let outcome4 = evaluate_guard_with_runner_at(
                 &retry_cli,

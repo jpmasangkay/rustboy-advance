@@ -863,6 +863,8 @@ impl RustboyApp {
     }
 
     fn flush_battery_save_mode(&mut self, sync: bool) {
+        #[allow(clippy::if_same_then_else)]
+        // Keep periodic vs shutdown/reset save-flush conditions explicit.
         if sync {
             self.join_pending_save_flush();
         } else if self
@@ -2635,9 +2637,11 @@ mod tests {
         rom[0x140..0x14C].copy_from_slice(b"SRAM_V110\0\0\0");
         fs::write(&rom_path, &rom).unwrap();
 
-        let mut cli = crate::headless::CliConfig::default();
-        cli.rom_path = Some(rom_path.clone());
-        cli.sav_path = Some(sav_path.clone());
+        let cli = crate::headless::CliConfig {
+            rom_path: Some(rom_path.clone()),
+            sav_path: Some(sav_path.clone()),
+            ..Default::default()
+        };
         let mut app = RustboyApp::new(cli);
         assert!(app.has_active_game());
 

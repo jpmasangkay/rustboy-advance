@@ -39,8 +39,8 @@ jobs:
             libgl1-mesa-dev \
             libegl-dev
 
-      - name: Install Rust stable toolchain
-        uses: dtolnay/rust-toolchain@stable
+      - name: Install pinned Rust toolchain
+        uses: dtolnay/rust-toolchain@1.99.1
         with:
           components: clippy, rustfmt
 
@@ -51,9 +51,7 @@ jobs:
         run: cargo fmt --all -- --check
 
       - name: Run Clippy
-        run: |
-          cargo clippy --workspace --all-targets
-          cargo clippy -p gba-testrunner --lib --bins --tests --no-deps -- -D warnings
+        run: cargo clippy --workspace --all-targets -- -D warnings
 
       - name: Run workspace unit & harness tests (dev profile)
         run: cargo test --workspace

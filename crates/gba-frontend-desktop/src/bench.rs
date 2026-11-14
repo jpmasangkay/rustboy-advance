@@ -2125,7 +2125,7 @@ pub fn run_bench_filters(cfg: &CliConfig) -> Result<(), String> {
         rom_name,
     } = load_rom_and_bios(cfg)?;
     let replay = load_replay(cfg)?;
-    let frames = cfg.frames.min(600).max(120);
+    let frames = cfg.frames.clamp(120, 600);
     let ts = format_utc_timestamp();
 
     fs::create_dir_all(&cfg.perf_dir)
@@ -2300,6 +2300,7 @@ fn bench_filter_rows_wgpu(
             postproc.prewarm(def.cpu_color_correction, false, def.cpu_filter, false, 0.08);
             let linear = def.cpu_filter.texture_options() == egui::TextureOptions::LINEAR;
 
+            #[allow(clippy::needless_range_loop)] // Bounded 5-frame warmup indexing
             for i in 0..5.min(captured_frames.len()) {
                 let img = postproc.process_display_filter(
                     &captured_frames[i],
@@ -2370,6 +2371,7 @@ fn bench_filter_rows_wgpu(
         }
     } else {
         for def in &BENCH_FILTERS {
+            #[allow(clippy::needless_range_loop)] // Bounded 5-frame warmup indexing
             for i in 0..5.min(captured_frames.len()) {
                 let fb = &captured_frames[i];
                 ctx.pipeline.stage_frames(fb, fb, false);
@@ -2463,6 +2465,7 @@ fn bench_filter_rows_cpu(
 
     for def in &BENCH_FILTERS {
         postproc.prewarm(def.cpu_color_correction, false, def.cpu_filter, false, 0.08);
+        #[allow(clippy::needless_range_loop)] // Bounded 5-frame warmup indexing
         for i in 0..5.min(captured_frames.len()) {
             let img = postproc.process_display_filter(
                 &captured_frames[i],
@@ -2849,6 +2852,7 @@ fn bench_filter_rows_no_gpu(
     for def in &BENCH_FILTERS {
         postproc.prewarm(def.cpu_color_correction, false, def.cpu_filter, false, 0.08);
         let linear = def.cpu_filter.texture_options() == egui::TextureOptions::LINEAR;
+        #[allow(clippy::needless_range_loop)] // Bounded 5-frame warmup indexing
         for i in 0..5.min(captured_frames.len()) {
             let img = postproc.process_display_filter(
                 &captured_frames[i],
@@ -3034,6 +3038,7 @@ struct SelftestPacedMetrics {
     cadence_jitter_frames: usize,
 }
 
+#[allow(clippy::too_many_arguments)] // Selftest paced-window helper takes explicit instrumentation handles
 fn run_selftest_paced_window<'a>(
     core: &mut GbaCore,
     frontend: &mut RealtimeFrontend<'a>,
@@ -3941,11 +3946,11 @@ pub fn run_hash_pass(cfg: &CliConfig) -> Result<(), String> {
     };
 
     if let Some(out_path) = &cfg.dump_hashes {
-        if let Some(parent) = out_path.parent() {
-            if !parent.as_os_str().is_empty() {
-                fs::create_dir_all(parent)
-                    .map_err(|e| format!("failed to create dir {}: {e}", parent.display()))?;
-            }
+        if let Some(parent) = out_path.parent()
+            && !parent.as_os_str().is_empty()
+        {
+            fs::create_dir_all(parent)
+                .map_err(|e| format!("failed to create dir {}: {e}", parent.display()))?;
         }
         let body = serde_json::to_string(&archive)
             .map_err(|e| format!("failed to serialize hash archive: {e}"))?;
@@ -4045,9 +4050,9 @@ pub fn sha256_bytes(data: &[u8]) -> [u8; 32] {
     msg.extend_from_slice(&bit_len.to_be_bytes());
 
     let mut w = [0u32; 64];
-    for chunk in msg.chunks_exact(64) {
-        for (i, word) in chunk.chunks_exact(4).enumerate() {
-            w[i] = u32::from_be_bytes([word[0], word[1], word[2], word[3]]);
+    for chunk in msg.as_chunks::<64>().0 {
+        for (i, word) in chunk.as_chunks::<4>().0.iter().enumerate() {
+            w[i] = u32::from_be_bytes(*word);
         }
         for i in 16..64 {
             let s0 = w[i - 15].rotate_right(7) ^ w[i - 15].rotate_right(18) ^ (w[i - 15] >> 3);

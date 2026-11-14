@@ -214,11 +214,11 @@ mod win32 {
     fn resolve_dwm_fn() -> Option<DwmGetTimingFn> {
         static FN_CACHE: OnceLock<Option<DwmGetTimingFn>> = OnceLock::new();
         *FN_CACHE.get_or_init(|| unsafe {
-            let hmod = LoadLibraryA(b"dwmapi.dll\0".as_ptr());
+            let hmod = LoadLibraryA(c"dwmapi.dll".as_ptr().cast::<u8>());
             if hmod.is_null() {
                 return None;
             }
-            let proc = GetProcAddress(hmod, b"DwmGetCompositionTimingInfo\0".as_ptr());
+            let proc = GetProcAddress(hmod, c"DwmGetCompositionTimingInfo".as_ptr().cast::<u8>());
             if proc.is_null() {
                 None
             } else {

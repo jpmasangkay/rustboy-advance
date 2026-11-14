@@ -296,6 +296,8 @@ impl RustboyApp {
     }
 
     pub(crate) fn flush_gb_battery_save_mode(&mut self, force_rtc_update: bool, sync: bool) {
+        #[allow(clippy::if_same_then_else)]
+        // Keep periodic vs shutdown/reset save-flush conditions explicit.
         if sync {
             self.join_pending_save_flush();
         } else if self

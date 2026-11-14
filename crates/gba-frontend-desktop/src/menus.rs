@@ -432,56 +432,60 @@ impl RustboyApp {
             ui.close_menu();
         }
 
-        ui.menu_button("Reduce Input Lag", |ui| {
-            if ui
-                .radio(self.config.run_ahead_frames == 0, "Off (Default)")
-                .on_hover_text("Run-Ahead Latency: 0 frames")
-                .clicked()
-            {
-                self.config.run_ahead_frames = 0;
-                self.config.save();
-            }
-            if ui
-                .radio(
-                    self.config.run_ahead_frames == 1,
-                    "1 Frame Lower Latency (-16.7ms)",
-                )
-                .on_hover_text("Run-Ahead Latency: 1 frame (uses more CPU)")
-                .clicked()
-            {
-                self.config.run_ahead_frames = 1;
-                self.config.save();
-            }
-        })
-        .response
-        .on_hover_text("Run-Ahead Latency: predict frames to trim internal game input delay");
+        if dev_tools {
+            ui.menu_button("Reduce Input Lag", |ui| {
+                if ui
+                    .radio(self.config.run_ahead_frames == 0, "Off (Default)")
+                    .on_hover_text("Run-Ahead Latency: 0 frames")
+                    .clicked()
+                {
+                    self.config.run_ahead_frames = 0;
+                    self.config.save();
+                }
+                if ui
+                    .radio(
+                        self.config.run_ahead_frames == 1,
+                        "1 Frame Lower Latency (-16.7ms)",
+                    )
+                    .on_hover_text("Run-Ahead Latency: 1 frame (uses more CPU)")
+                    .clicked()
+                {
+                    self.config.run_ahead_frames = 1;
+                    self.config.save();
+                }
+            })
+            .response
+            .on_hover_text("Run-Ahead Latency: predict frames to trim internal game input delay");
 
-        ui.menu_button("Graphics Accuracy", |ui| {
-            if ui
-                .radio(!self.config.dot_accurate_ppu, "Fast (Scanline)")
-                .on_hover_text("Fast Scanline Renderer — best speed for most games")
-                .clicked()
-            {
-                self.config.dot_accurate_ppu = false;
-                if let Some(core) = &mut self.core {
-                    core.bus.ppu.dot_accurate_mode = false;
+            ui.menu_button("Graphics Accuracy", |ui| {
+                if ui
+                    .radio(!self.config.dot_accurate_ppu, "Fast (Scanline)")
+                    .on_hover_text("Fast Scanline Renderer — best speed for most games")
+                    .clicked()
+                {
+                    self.config.dot_accurate_ppu = false;
+                    if let Some(core) = &mut self.core {
+                        core.bus.ppu.dot_accurate_mode = false;
+                    }
+                    self.config.save();
                 }
-                self.config.save();
-            }
-            if ui
-                .radio(self.config.dot_accurate_ppu, "High (Per-Dot Accurate)")
-                .on_hover_text("Cycle-Accurate Per-Dot PPU — fixes rare mid-scanline effects")
-                .clicked()
-            {
-                self.config.dot_accurate_ppu = true;
-                if let Some(core) = &mut self.core {
-                    core.bus.ppu.dot_accurate_mode = true;
+                if ui
+                    .radio(self.config.dot_accurate_ppu, "High (Per-Dot Accurate)")
+                    .on_hover_text(
+                        "Cycle-Accurate Per-Dot PPU — fixes rare mid-scanline effects",
+                    )
+                    .clicked()
+                {
+                    self.config.dot_accurate_ppu = true;
+                    if let Some(core) = &mut self.core {
+                        core.bus.ppu.dot_accurate_mode = true;
+                    }
+                    self.config.save();
                 }
-                self.config.save();
-            }
-        })
-        .response
-        .on_hover_text("PPU Accuracy mode");
+            })
+            .response
+            .on_hover_text("PPU Accuracy mode");
+        }
 
         if ui
             .checkbox(&mut self.config.auto_frameskip, "Skip Frames If Slow")

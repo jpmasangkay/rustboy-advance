@@ -144,7 +144,8 @@ pub(crate) fn add_slider(
         let visuals = &mut ui.style_mut().visuals;
         visuals.slider_trailing_fill = true;
         visuals.widgets.inactive.bg_fill = Color32::from_rgb(0x36, 0x36, 0x3C);
-        visuals.widgets.inactive.bg_stroke = Stroke::new(1.0_f32, Color32::from_rgb(0x4A, 0x4A, 0x52));
+        visuals.widgets.inactive.bg_stroke =
+            Stroke::new(1.0_f32, Color32::from_rgb(0x4A, 0x4A, 0x52));
         visuals.widgets.hovered.bg_fill = Color32::from_rgb(0x44, 0x44, 0x4C);
         visuals.widgets.active.bg_fill = Color32::from_rgb(0x4E, 0x4E, 0x56);
         visuals.selection.bg_fill = Color32::from_rgb(0x22, 0x8E, 0x84);

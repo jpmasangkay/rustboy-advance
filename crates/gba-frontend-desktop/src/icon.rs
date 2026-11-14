@@ -14,36 +14,31 @@ pub(crate) fn build_app_icon_rgba() -> Vec<u8> {
         }
     };
 
-    let fill_rounded_rect = |buf: &mut [u8],
-                             x0: i32,
-                             y0: i32,
-                             x1: i32,
-                             y1: i32,
-                             radius: i32,
-                             color: [u8; 4]| {
-        let r2 = radius * radius;
-        for y in y0..=y1 {
-            for x in x0..=x1 {
-                let dx = if x < x0 + radius {
-                    x0 + radius - x
-                } else if x > x1 - radius {
-                    x - (x1 - radius)
-                } else {
-                    0
-                };
-                let dy = if y < y0 + radius {
-                    y0 + radius - y
-                } else if y > y1 - radius {
-                    y - (y1 - radius)
-                } else {
-                    0
-                };
-                if dx * dx + dy * dy <= r2 && x >= 0 && y >= 0 {
-                    set_px(buf, x as usize, y as usize, color);
+    let fill_rounded_rect =
+        |buf: &mut [u8], x0: i32, y0: i32, x1: i32, y1: i32, radius: i32, color: [u8; 4]| {
+            let r2 = radius * radius;
+            for y in y0..=y1 {
+                for x in x0..=x1 {
+                    let dx = if x < x0 + radius {
+                        x0 + radius - x
+                    } else if x > x1 - radius {
+                        x - (x1 - radius)
+                    } else {
+                        0
+                    };
+                    let dy = if y < y0 + radius {
+                        y0 + radius - y
+                    } else if y > y1 - radius {
+                        y - (y1 - radius)
+                    } else {
+                        0
+                    };
+                    if dx * dx + dy * dy <= r2 && x >= 0 && y >= 0 {
+                        set_px(buf, x as usize, y as usize, color);
+                    }
                 }
             }
-        }
-    };
+        };
 
     // Outer Obsidian chassis + subtle border
     fill_rounded_rect(&mut rgba, 3, 12, 60, 51, 8, [0x2E, 0x2E, 0x32, 0xFF]);
@@ -102,7 +97,10 @@ mod tests {
             .iter()
             .filter(|px| px[3] == 0xFF)
             .count();
-        assert!(opaque_pixels > 1500, "icon should have solid console silhouette");
+        assert!(
+            opaque_pixels > 1500,
+            "icon should have solid console silhouette"
+        );
         assert!(
             rgba.as_chunks::<4>().0.contains(&[0x2E, 0xC4, 0xB6, 0xFF]),
             "icon should include Obsidian teal accent"

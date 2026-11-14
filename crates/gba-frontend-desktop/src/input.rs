@@ -664,7 +664,7 @@ impl RustboyApp {
                 "ArrowDown" | "Down" => "↓".to_string(),
                 "ArrowLeft" | "Left" => "←".to_string(),
                 "ArrowRight" | "Right" => "→".to_string(),
-                s if s.is_empty() => "—".to_string(),
+                "" => "—".to_string(),
                 s => s.to_string(),
             }
         }

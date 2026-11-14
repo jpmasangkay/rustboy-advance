@@ -144,6 +144,7 @@ pub struct CliConfig {
     pub gpu_probe_timeout_ms: Option<u64>,
     pub capture_png: Option<PathBuf>,
     pub capture_frame: Option<u64>,
+    pub verify_save_flush: Option<String>,
 }
 
 impl Default for CliConfig {
@@ -196,6 +197,7 @@ impl Default for CliConfig {
             gpu_probe_timeout_ms: None,
             capture_png: None,
             capture_frame: None,
+            verify_save_flush: None,
         }
     }
 }
@@ -364,6 +366,13 @@ impl CliConfig {
                 }
                 "--selftest" => {
                     cfg.selftest = true;
+                    cfg.headless = true;
+                }
+                "--verify-save-flush" => {
+                    let v = args
+                        .next()
+                        .ok_or("missing value for --verify-save-flush")?;
+                    cfg.verify_save_flush = Some(v);
                     cfg.headless = true;
                 }
                 "--dump-regs" => cfg.dump_regs = true,

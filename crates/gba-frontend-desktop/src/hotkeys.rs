@@ -49,6 +49,14 @@ fn is_hotkey_just_pressed(i: &egui::InputState, chord: Option<&HotkeyChord>) -> 
 
 impl RustboyApp {
     pub(crate) fn handle_global_shortcuts(&mut self, ctx: &egui::Context) {
+        if ctx.input(|i| {
+            i.modifiers.alt && !i.modifiers.ctrl && !i.modifiers.shift && i.key_pressed(Key::F4)
+        }) {
+            self.handle_alt_f4_quit();
+            ctx.send_viewport_cmd(egui::ViewportCommand::Close);
+            return;
+        }
+
         if ctx.wants_keyboard_input()
             || self.debugger.awaiting_rebind.is_some()
             || self.awaiting_input_bind.is_some()
@@ -60,16 +68,14 @@ impl RustboyApp {
 
         // Smart Escape key handling:
         // In Fullscreen: Escape always exits Fullscreen back to Windowed mode.
-        // In Windowed mode: Escape toggles the in-game Pause Overlay Menu!
+        // In Windowed mode: Escape toggles the in-game Pause Overlay Menu (flushing .sav synchronously)!
         if ctx.input(|i| !i.modifiers.any() && i.key_pressed(Key::Escape)) {
             if self.is_fullscreen {
                 self.is_fullscreen = false;
                 ctx.send_viewport_cmd(egui::ViewportCommand::Fullscreen(false));
                 self.notify("Exited Fullscreen");
                 return;
-            } else if self.has_active_game() {
-                self.show_pause_overlay = !self.show_pause_overlay;
-                self.paused = self.show_pause_overlay;
+            } else if self.pause_and_flush_on_escape() {
                 return;
             }
         }

@@ -197,6 +197,7 @@ pub(crate) struct RustboyApp {
     pub(crate) toast: Option<ToastMessage>,
     pub(crate) title_dirty: bool,
     pub(crate) quit_requested: bool,
+    pub(crate) pending_save_flush: Option<std::thread::JoinHandle<()>>,
 
     // Immersive Controls, Overlays & States
     pub(crate) last_mouse_activity: Instant,
@@ -363,6 +364,7 @@ impl RustboyApp {
             toast: None,
             title_dirty: true,
             quit_requested: false,
+            pending_save_flush: None,
             last_mouse_activity: Instant::now(),
             show_pause_overlay: false,
             show_state_manager: false,
@@ -609,7 +611,8 @@ impl RustboyApp {
         explicit_patch: Option<&Path>,
         ctx: Option<&egui::Context>,
     ) -> Result<(), String> {
-        self.flush_battery_save();
+        self.flush_gb_battery_save_sync(true);
+        self.flush_battery_save_sync();
         self.save_rom_specific_settings();
         self.stop_all_captures(true);
         self.movie.reset_for_rom_change();
@@ -757,8 +760,8 @@ impl RustboyApp {
     }
 
     pub(crate) fn close_rom(&mut self, ctx: &egui::Context) {
-        self.flush_gb_battery_save(true);
-        self.flush_battery_save();
+        self.flush_gb_battery_save_sync(true);
+        self.flush_battery_save_sync();
         self.save_rom_specific_settings();
         self.stop_all_captures(true);
         self.movie.reset_for_rom_change();
@@ -824,12 +827,36 @@ impl RustboyApp {
         save_game_settings_entry(&mut self.config, &self.rom_code, self.rom_crc32, ov);
     }
 
+    pub(crate) fn join_pending_save_flush(&mut self) {
+        if let Some(handle) = self.pending_save_flush.take() {
+            let _ = handle.join();
+        }
+    }
+
     pub(crate) fn flush_battery_save(&mut self) {
+        self.flush_battery_save_mode(false);
+    }
+
+    pub(crate) fn flush_battery_save_sync(&mut self) {
+        self.flush_battery_save_mode(true);
+    }
+
+    fn flush_battery_save_mode(&mut self, sync: bool) {
+        if sync {
+            self.join_pending_save_flush();
+        } else if self
+            .pending_save_flush
+            .as_ref()
+            .is_some_and(|h| h.is_finished())
+        {
+            self.join_pending_save_flush();
+        }
+
         if let Some(local) = &mut self.link.local {
             local.flush_p2_battery_save();
         }
         if self.gb.is_some() {
-            self.flush_gb_battery_save(false);
+            self.flush_gb_battery_save_mode(false, sync);
             return;
         }
         let (Some(core), Some(sav_path)) = (&mut self.core, &self.sav_path) else {
@@ -839,16 +866,42 @@ impl RustboyApp {
             return;
         }
         let data = core.bus.cart.export_save_data().to_vec();
-        if !data.is_empty() {
+        if data.is_empty() {
+            return;
+        }
+        if sync {
+            if write_save_bytes_sync(sav_path, &data).is_ok() {
+                core.bus.cart.save_dirty = false;
+            }
+        } else if self.pending_save_flush.is_none() {
             core.bus.cart.save_dirty = false;
             let path = sav_path.clone();
-            std::thread::spawn(move || {
+            self.pending_save_flush = Some(std::thread::spawn(move || {
                 if let Some(parent) = path.parent() {
                     let _ = fs::create_dir_all(parent);
                 }
                 let _ = fs::write(path, data);
-            });
+            }));
         }
+    }
+
+    pub(crate) fn pause_and_flush_on_escape(&mut self) -> bool {
+        if !self.has_active_game() {
+            return false;
+        }
+        self.show_pause_overlay = !self.show_pause_overlay;
+        self.paused = self.show_pause_overlay;
+        if self.paused {
+            self.flush_gb_battery_save_sync(true);
+            self.flush_battery_save_sync();
+        }
+        true
+    }
+
+    pub(crate) fn handle_alt_f4_quit(&mut self) {
+        self.flush_gb_battery_save_sync(true);
+        self.flush_battery_save_sync();
+        self.quit_requested = true;
     }
 
     pub(crate) fn load_custom_bios_dialog(&mut self) {
@@ -898,7 +951,7 @@ impl RustboyApp {
                 Ok(bytes) => {
                     core.bus.cart.load_save_data(&bytes);
                     core.bus.cart.save_dirty = true;
-                    self.flush_battery_save();
+                    self.flush_battery_save_sync();
                     self.notify("Imported Battery Save");
                 }
                 Err(e) => self.notify(&format!("Import failed: {e}")),
@@ -1420,10 +1473,11 @@ impl RustboyApp {
                     if let Some(core) = &mut self.core {
                         core.bus.cart.load_save_data(&bytes);
                         core.bus.cart.save_dirty = true;
+                        self.flush_battery_save_sync();
                         self.notify("Loaded dropped .sav file");
                     } else if let Some(gb) = &mut self.gb {
                         gb.load_sav_with_rtc(&bytes);
-                        self.flush_gb_battery_save(true);
+                        self.flush_gb_battery_save_sync(true);
                         self.notify("Loaded dropped GB/GBC .sav file");
                     }
                 }
@@ -2106,8 +2160,9 @@ impl RustboyApp {
         self.stop_all_captures(false);
         self.ra.on_rom_closed();
         self.lua.on_rom_changed("", "");
-        self.flush_gb_battery_save(true);
-        self.flush_battery_save();
+        self.flush_gb_battery_save_sync(true);
+        self.flush_battery_save_sync();
+        self.join_pending_save_flush();
         self.save_rom_specific_settings();
         self.link.disconnect_all();
         self.save_persistent_config();
@@ -2372,6 +2427,81 @@ fn step_gba_frame_with_optional_run_ahead(
     }
 }
 
+pub(crate) fn write_save_bytes_sync(path: &Path, data: &[u8]) -> std::io::Result<()> {
+    use std::io::Write;
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent)?;
+    }
+    let mut file = fs::OpenOptions::new()
+        .write(true)
+        .create(true)
+        .truncate(true)
+        .open(path)?;
+    file.write_all(data)?;
+    file.sync_all()?;
+    Ok(())
+}
+
+impl Drop for RustboyApp {
+    fn drop(&mut self) {
+        self.flush_gb_battery_save_sync(true);
+        self.flush_battery_save_sync();
+        self.join_pending_save_flush();
+    }
+}
+
+pub(crate) fn verify_eframe_save_flush_cli(
+    cli: crate::headless::CliConfig,
+    mode: &str,
+) -> Result<(), String> {
+    let mut app = RustboyApp::new(cli);
+    if !app.has_active_game() {
+        return Err("Positional ROM did not open an active game in RustboyApp".into());
+    }
+    {
+        let core = app
+            .core
+            .as_mut()
+            .ok_or("Expected active GBA core after opening ROM")?;
+        let _ = core.run_frame_debug(&mut app.sink, &gba_core::DebugControl::default());
+        for (i, &b) in b"SVOK".iter().enumerate() {
+            core.bus.cart.write_sram(0x0E00_0000 + i as u32, b);
+        }
+        if !core.bus.cart.save_dirty {
+            return Err("Failed to mark cartridge battery save dirty".into());
+        }
+    }
+    match mode {
+        "eframe-esc" => {
+            if !app.pause_and_flush_on_escape() {
+                return Err("Escape handler refused to pause active game".into());
+            }
+            if app.core.as_ref().is_some_and(|c| c.bus.cart.save_dirty) {
+                return Err("Escape pause did not flush battery save synchronously".into());
+            }
+            app.on_exit();
+        }
+        "eframe-alt-f4" => {
+            app.handle_alt_f4_quit();
+            if !app.quit_requested {
+                return Err("Alt+F4 handler did not set quit_requested".into());
+            }
+            if app.core.as_ref().is_some_and(|c| c.bus.cart.save_dirty) {
+                return Err("Alt+F4 handler did not flush battery save synchronously".into());
+            }
+            app.on_exit();
+        }
+        "eframe-close" => {
+            app.on_exit();
+            if app.core.as_ref().is_some_and(|c| c.bus.cart.save_dirty) {
+                return Err("on_exit close path left battery save dirty".into());
+            }
+        }
+        other => return Err(format!("unknown eframe save-flush verify mode: {other}")),
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2452,5 +2582,63 @@ mod tests {
             core_on.bus.scheduler.current_cycle,
             core_off.bus.scheduler.current_cycle
         );
+    }
+
+    #[test]
+    fn test_sync_flush_on_exit_and_drop_persists_save_with_no_race() {
+        let nonce = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_nanos();
+        let dir = std::env::temp_dir().join(format!(
+            "rustboy_sync_flush_{}_{nonce}",
+            std::process::id()
+        ));
+        fs::create_dir_all(&dir).unwrap();
+        let rom_path = dir.join("test_sram.gba");
+        let sav_path = dir.join("nested/save.sav");
+
+        let mut rom = vec![0xFFu8; 4096];
+        rom[0..4].copy_from_slice(&0xEAFF_FFFEu32.to_le_bytes());
+        rom[0xA0..0xAC].copy_from_slice(b"SYNCUNIT\0\0\0\0");
+        rom[0xAC..0xB0].copy_from_slice(b"BSYU");
+        rom[0xB0..0xB2].copy_from_slice(b"01");
+        rom[0xB2] = 0x96;
+        rom[0x140..0x14C].copy_from_slice(b"SRAM_V110\0\0\0");
+        fs::write(&rom_path, &rom).unwrap();
+
+        let mut cli = crate::headless::CliConfig::default();
+        cli.rom_path = Some(rom_path.clone());
+        cli.sav_path = Some(sav_path.clone());
+        let mut app = RustboyApp::new(cli);
+        assert!(app.has_active_game());
+
+        // Trigger periodic async flush first, then mutate again and immediately close via on_exit().
+        {
+            let core = app.core.as_mut().unwrap();
+            for (i, &b) in b"OLD1".iter().enumerate() {
+                core.bus.cart.write_sram(0x0E00_0000 + i as u32, b);
+            }
+        }
+        app.flush_battery_save();
+        {
+            let core = app.core.as_mut().unwrap();
+            for (i, &b) in b"NEW2".iter().enumerate() {
+                core.bus.cart.write_sram(0x0E00_0000 + i as u32, b);
+            }
+        }
+        app.on_exit();
+
+        let bytes = fs::read(&sav_path).unwrap();
+        assert_eq!(&bytes[..4], b"NEW2");
+        assert!(!app.core.as_ref().unwrap().bus.cart.save_dirty);
+
+        // Mutate again and drop without calling on_exit() directly.
+        app.core.as_mut().unwrap().bus.cart.write_sram(0x0E00_0000, b'X');
+        drop(app);
+        let bytes_after_drop = fs::read(&sav_path).unwrap();
+        assert_eq!(&bytes_after_drop[..4], b"XEW2");
+
+        let _ = fs::remove_dir_all(&dir);
     }
 }

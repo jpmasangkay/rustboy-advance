@@ -5,6 +5,10 @@ use std::sync::Arc;
 impl eframe::App for RustboyApp {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         self.update(ctx);
+        if self.quit_requested || ctx.input(|i| i.viewport().close_requested()) {
+            self.flush_gb_battery_save_sync(true);
+            self.flush_battery_save_sync();
+        }
         if self.quit_requested {
             ctx.send_viewport_cmd(egui::ViewportCommand::Close);
         }

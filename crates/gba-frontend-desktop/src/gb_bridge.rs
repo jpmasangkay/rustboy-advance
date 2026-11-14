@@ -290,8 +290,22 @@ impl RustboyApp {
         self.sink.suppress_audio = false;
     }
 
-    /// Flushes GB battery SRAM (and MBC3 RTC timestamp if `force_rtc_update`) to `.sav`.
-    pub(crate) fn flush_gb_battery_save(&mut self, force_rtc_update: bool) {
+    /// Synchronously flushes GB battery SRAM and RTC trailer to disk, joining any pending flush first.
+    pub(crate) fn flush_gb_battery_save_sync(&mut self, force_rtc_update: bool) {
+        self.flush_gb_battery_save_mode(force_rtc_update, true);
+    }
+
+    pub(crate) fn flush_gb_battery_save_mode(&mut self, force_rtc_update: bool, sync: bool) {
+        if sync {
+            self.join_pending_save_flush();
+        } else if self
+            .pending_save_flush
+            .as_ref()
+            .is_some_and(|h| h.is_finished())
+        {
+            self.join_pending_save_flush();
+        }
+
         let (Some(gb), Some(sav_path)) = (&mut self.gb, &self.sav_path) else {
             return;
         };
@@ -303,15 +317,22 @@ impl RustboyApp {
             return;
         }
         let data = gb.export_sav_with_rtc();
-        if !data.is_empty() {
+        if data.is_empty() {
+            return;
+        }
+        if sync {
+            if crate::app::write_save_bytes_sync(sav_path, &data).is_ok() {
+                gb.core.clear_battery_dirty();
+            }
+        } else if self.pending_save_flush.is_none() {
             gb.core.clear_battery_dirty();
             let path = sav_path.clone();
-            std::thread::spawn(move || {
+            self.pending_save_flush = Some(std::thread::spawn(move || {
                 if let Some(parent) = path.parent() {
                     let _ = fs::create_dir_all(parent);
                 }
                 let _ = fs::write(path, data);
-            });
+            }));
         }
     }
 
@@ -330,7 +351,7 @@ impl RustboyApp {
                     if let Some(gb) = &mut self.gb {
                         gb.load_sav_with_rtc(&bytes);
                     }
-                    self.flush_gb_battery_save(true);
+                    self.flush_gb_battery_save_sync(true);
                     self.notify("Imported GB/GBC Battery Save");
                 }
                 Err(e) => self.notify_error(&format!("Import failed: {e}")),

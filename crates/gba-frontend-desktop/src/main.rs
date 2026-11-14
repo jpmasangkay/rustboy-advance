@@ -62,6 +62,7 @@ fn is_cli_headless_invocation() -> bool {
                 | "--calibrate"
                 | "--profile-sw"
                 | "--selftest"
+                | "--verify-save-flush"
                 | "--gpu-probe"
                 | "--dump-hashes"
                 | "--verify-hashes"
@@ -157,6 +158,20 @@ fn real_main() {
             std::process::exit(2);
         }
     };
+
+    if let Some(mode) = cli.verify_save_flush.clone() {
+        let res = if mode.starts_with("nogpu-") {
+            no_gpu::verify_nogpu_save_flush_cli(cli, &mode)
+        } else {
+            app::verify_eframe_save_flush_cli(cli, &mode)
+        };
+        if let Err(e) = res {
+            eprintln!("Save-flush verification failed ({mode}): {e}");
+            std::process::exit(1);
+        }
+        println!("Save-flush verification passed ({mode})");
+        return;
+    }
 
     if cli.headless {
         if let Err(e) = headless::run_headless(&cli) {

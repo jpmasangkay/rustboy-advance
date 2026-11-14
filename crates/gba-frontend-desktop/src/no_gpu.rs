@@ -1264,12 +1264,64 @@ impl NoGpuApp {
             && core.bus.cart.save_dirty
         {
             let data = core.bus.cart.export_save_data();
-            if let Some(parent) = sav.parent() {
-                let _ = fs::create_dir_all(parent);
-            }
-            if fs::write(sav, &data).is_ok() {
+            if crate::app::write_save_bytes_sync(sav, data).is_ok() {
                 core.bus.cart.save_dirty = false;
             }
+        }
+    }
+
+    fn quit_with_save_flush(&mut self) {
+        self.flush_save();
+        if let Some(ref mut logger) = self.perf_logger {
+            logger.finish_and_print();
+        }
+        self.config
+            .set_settled_filter(self.profile_key.clone(), self.governor.active_filter());
+        self.config.save();
+    }
+
+    fn handle_key_down(&mut self, code: KeyCode) -> bool {
+        let alt_down = self.pressed_keys.contains(&KeyCode::AltLeft)
+            || self.pressed_keys.contains(&KeyCode::AltRight);
+        match code {
+            KeyCode::KeyP => {
+                self.paused = !self.paused;
+                if self.paused {
+                    self.flush_save();
+                }
+                false
+            }
+            KeyCode::KeyF => {
+                let next = self.config.display_filter.next();
+                self.config.display_filter = next;
+                self.config.shader_preset = next.default_shader_preset();
+                self.governor.set_user_target(next);
+                self.config.save();
+                self.sink.frame_dirty = true;
+                false
+            }
+            KeyCode::KeyO
+                if self.pressed_keys.contains(&KeyCode::ControlLeft)
+                    || self.pressed_keys.contains(&KeyCode::ControlRight) =>
+            {
+                if let Some(path) = rfd::FileDialog::new()
+                    .set_title("Open GBA ROM")
+                    .add_filter("GBA ROMs", &["gba", "agb", "bin"])
+                    .pick_file()
+                {
+                    self.load_rom(&path);
+                }
+                false
+            }
+            KeyCode::F4 if alt_down => {
+                self.quit_with_save_flush();
+                true
+            }
+            KeyCode::Escape => {
+                self.quit_with_save_flush();
+                true
+            }
+            _ => false,
         }
     }
 
@@ -1534,14 +1586,11 @@ impl ApplicationHandler for NoGpuApp {
     ) {
         match event {
             WindowEvent::CloseRequested => {
-                self.flush_save();
-                if let Some(ref mut logger) = self.perf_logger {
-                    logger.finish_and_print();
-                }
-                self.config
-                    .set_settled_filter(self.profile_key.clone(), self.governor.active_filter());
-                self.config.save();
+                self.quit_with_save_flush();
                 event_loop.exit();
+            }
+            WindowEvent::Destroyed => {
+                self.flush_save();
             }
             WindowEvent::Resized(new_size) => {
                 self.size = (new_size.width.max(1), new_size.height.max(1));
@@ -1595,43 +1644,8 @@ impl ApplicationHandler for NoGpuApp {
                 if let PhysicalKey::Code(code) = event.physical_key {
                     if event.state == ElementState::Pressed {
                         self.pressed_keys.insert(code);
-                        if !event.repeat {
-                            match code {
-                                KeyCode::KeyP => self.paused = !self.paused,
-                                KeyCode::KeyF => {
-                                    let next = self.config.display_filter.next();
-                                    self.config.display_filter = next;
-                                    self.config.shader_preset = next.default_shader_preset();
-                                    self.governor.set_user_target(next);
-                                    self.config.save();
-                                    self.sink.frame_dirty = true;
-                                }
-                                KeyCode::KeyO
-                                    if self.pressed_keys.contains(&KeyCode::ControlLeft)
-                                        || self.pressed_keys.contains(&KeyCode::ControlRight) =>
-                                {
-                                    if let Some(path) = rfd::FileDialog::new()
-                                        .set_title("Open GBA ROM")
-                                        .add_filter("GBA ROMs", &["gba", "agb", "bin"])
-                                        .pick_file()
-                                    {
-                                        self.load_rom(&path);
-                                    }
-                                }
-                                KeyCode::Escape => {
-                                    self.flush_save();
-                                    if let Some(ref mut logger) = self.perf_logger {
-                                        logger.finish_and_print();
-                                    }
-                                    self.config.set_settled_filter(
-                                        self.profile_key.clone(),
-                                        self.governor.active_filter(),
-                                    );
-                                    self.config.save();
-                                    event_loop.exit();
-                                }
-                                _ => {}
-                            }
+                        if !event.repeat && self.handle_key_down(code) {
+                            event_loop.exit();
                         }
                     } else {
                         self.pressed_keys.remove(&code);
@@ -1835,6 +1849,60 @@ impl ApplicationHandler for NoGpuApp {
         };
         event_loop.set_control_flow(ControlFlow::WaitUntil(wait_until));
     }
+
+    fn exiting(&mut self, _event_loop: &ActiveEventLoop) {
+        self.flush_save();
+    }
+}
+
+impl Drop for NoGpuApp {
+    fn drop(&mut self) {
+        self.flush_save();
+    }
+}
+
+pub(crate) fn verify_nogpu_save_flush_cli(cli: CliConfig, mode: &str) -> Result<(), String> {
+    let mut app = NoGpuApp::new(
+        "Rustboy Advance".to_string(),
+        720,
+        480,
+        cli,
+        "verify-save-flush",
+    );
+    {
+        let core = app
+            .core
+            .as_mut()
+            .ok_or("Positional ROM did not open an active game in NoGpuApp")?;
+        let _ = core.run_frame_debug(&mut app.sink, &gba_core::DebugControl::default());
+        for (i, &b) in b"SVOK".iter().enumerate() {
+            core.bus.cart.write_sram(0x0E00_0000 + i as u32, b);
+        }
+        if !core.bus.cart.save_dirty {
+            return Err("Failed to mark cartridge battery save dirty".into());
+        }
+    }
+    match mode {
+        "nogpu-esc" => {
+            if !app.handle_key_down(KeyCode::Escape) {
+                return Err("No-GPU Escape key did not trigger quit path".into());
+            }
+        }
+        "nogpu-alt-f4" => {
+            app.pressed_keys.insert(KeyCode::AltLeft);
+            if !app.handle_key_down(KeyCode::F4) {
+                return Err("No-GPU Alt+F4 key did not trigger quit path".into());
+            }
+        }
+        "nogpu-close" => {
+            app.quit_with_save_flush();
+        }
+        other => return Err(format!("unknown no-gpu save-flush verify mode: {other}")),
+    }
+    if app.core.as_ref().is_some_and(|c| c.bus.cart.save_dirty) {
+        return Err(format!("No-GPU quit mode `{mode}` left battery save dirty"));
+    }
+    Ok(())
 }
 
 /// Runs the desktop emulator purely via `winit + softbuffer` (zero `wgpu`/Vulkan/DX12/GL usage).
@@ -1865,7 +1933,7 @@ pub fn run_no_gpu_desktop(
     event_loop
         .run_app(&mut app)
         .map_err(|e| format!("winit No-GPU event loop failed: {e}"))?;
-    if let Some(err) = app.startup_err {
+    if let Some(err) = app.startup_err.take() {
         return Err(err);
     }
     Ok(())

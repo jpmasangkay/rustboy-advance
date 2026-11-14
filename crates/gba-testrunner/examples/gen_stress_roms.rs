@@ -31,9 +31,22 @@ fn encode_arm_imm(val: u32) -> Option<u32> {
 }
 
 enum Patch {
-    Branch { word_idx: usize, cond: u32, link: bool, label: String },
-    LdrLitLabel { word_idx: usize, rd: u32, label: String },
-    LdrLitConst { word_idx: usize, rd: u32, value: u32 },
+    Branch {
+        word_idx: usize,
+        cond: u32,
+        link: bool,
+        label: String,
+    },
+    LdrLitLabel {
+        word_idx: usize,
+        rd: u32,
+        label: String,
+    },
+    LdrLitConst {
+        word_idx: usize,
+        rd: u32,
+        value: u32,
+    },
 }
 
 struct ArmBuilder {
@@ -69,12 +82,8 @@ impl ArmBuilder {
         }
         hdr[0xBD] = chk.wrapping_sub(0x19) as u8;
         for i in 0..48 {
-            words[i] = u32::from_le_bytes([
-                hdr[i * 4],
-                hdr[i * 4 + 1],
-                hdr[i * 4 + 2],
-                hdr[i * 4 + 3],
-            ]);
+            words[i] =
+                u32::from_le_bytes([hdr[i * 4], hdr[i * 4 + 1], hdr[i * 4 + 2], hdr[i * 4 + 3]]);
         }
         // Entry branch at word 0 -> ROM 0x0800_00C0 (word 48), skip offset = 48 - 2 = 46 words
         words[0] = 0xEA00_0000 | 46;
@@ -342,7 +351,8 @@ impl ArmBuilder {
             let start_word = self.words.len();
             self.labels.insert(name, start_word);
             for chunk in bytes.chunks_exact(4) {
-                self.words.push(u32::from_le_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]));
+                self.words
+                    .push(u32::from_le_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]));
             }
         }
 
@@ -371,18 +381,33 @@ impl ArmBuilder {
                     let rel = (target_word as isize) - (word_idx as isize + 2);
                     assert!(rel >= -(1 << 23) && rel < (1 << 23));
                     let link_bit = if link { 1 << 24 } else { 0 };
-                    self.words[word_idx] = (cond << 28) | (0x5 << 25) | link_bit | ((rel as u32) & 0x00FF_FFFF);
+                    self.words[word_idx] =
+                        (cond << 28) | (0x5 << 25) | link_bit | ((rel as u32) & 0x00FF_FFFF);
                 }
-                Patch::LdrLitConst { word_idx, rd, value } => {
+                Patch::LdrLitConst {
+                    word_idx,
+                    rd,
+                    value,
+                } => {
                     let pool_word = const_pool_idx[&value];
                     let byte_off = ((pool_word as isize) - (word_idx as isize + 2)) * 4;
-                    assert!((0..4096).contains(&byte_off), "const literal offset out of range: {byte_off}");
+                    assert!(
+                        (0..4096).contains(&byte_off),
+                        "const literal offset out of range: {byte_off}"
+                    );
                     self.words[word_idx] = 0xE59F_0000 | ((rd & 0xF) << 12) | (byte_off as u32);
                 }
-                Patch::LdrLitLabel { word_idx, rd, label } => {
+                Patch::LdrLitLabel {
+                    word_idx,
+                    rd,
+                    label,
+                } => {
                     let pool_word = label_pool_idx[&label];
                     let byte_off = ((pool_word as isize) - (word_idx as isize + 2)) * 4;
-                    assert!((0..4096).contains(&byte_off), "label literal offset out of range: {byte_off}");
+                    assert!(
+                        (0..4096).contains(&byte_off),
+                        "label literal offset out of range: {byte_off}"
+                    );
                     self.words[word_idx] = 0xE59F_0000 | ((rd & 0xF) << 12) | (byte_off as u32);
                 }
             }
@@ -556,10 +581,10 @@ fn gen_stress_aff_objwin() -> Vec<u8> {
     // WIN0 + WIN1 + OBJWIN active across all scanlines 0..160
     b.write_io16(0x0400_0040, (24 << 8) | 216); // WIN0H
     b.write_io16(0x0400_0042, (48 << 8) | 192); // WIN1H
-    b.write_io16(0x0400_0044, (0 << 8) | 160);  // WIN0V
-    b.write_io16(0x0400_0046, (0 << 8) | 160);  // WIN1V
-    b.write_io16(0x0400_0048, 0x3F3F);          // WININ
-    b.write_io16(0x0400_004A, 0x3F3F);          // WINOUT
+    b.write_io16(0x0400_0044, (0 << 8) | 160); // WIN0V
+    b.write_io16(0x0400_0046, (0 << 8) | 160); // WIN1V
+    b.write_io16(0x0400_0048, 0x3F3F); // WININ
+    b.write_io16(0x0400_004A, 0x3F3F); // WINOUT
 
     // Mosaic 3x3 on BG & OBJ
     b.write_io16(0x0400_004C, 0x2222);
@@ -578,7 +603,7 @@ fn gen_stress_aff_objwin() -> Vec<u8> {
     // Shift BG2X / BG3X smoothly (1 pixel/frame = 0x100 in 24.8 fixed point)
     b.mov_u32(0, 0x0400_0028);
     b.mov_lsl(2, 8, 8);
-    b.str32(2, 0, 0);    // BG2X
+    b.str32(2, 0, 0); // BG2X
     b.str32(2, 0, 0x10); // BG3X
     b.b("main_loop");
 

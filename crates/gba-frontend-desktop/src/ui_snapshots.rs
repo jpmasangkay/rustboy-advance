@@ -249,7 +249,10 @@ fn make_isolated_app() -> ManuallyDrop<RustboyApp> {
     app.library_scanning = false;
     app.library_scan_rx = None;
     app.library_scan_error = None;
-    app.rom_folders = vec![PathBuf::from(r"C:\Games\GBA"), PathBuf::from(r"C:\Games\GBC")];
+    app.rom_folders = vec![
+        PathBuf::from(r"C:\Games\GBA"),
+        PathBuf::from(r"C:\Games\GBC"),
+    ];
     app.config = AppConfig::default();
     app.config.display_filter = DisplayFilter::SoftHandheld;
     app.favorites.clear();
@@ -272,7 +275,8 @@ fn make_isolated_app() -> ManuallyDrop<RustboyApp> {
         },
         RomLibraryEntry {
             path: p2,
-            display_name: "Homebrew Micro Demo (Long Verifiable Title Showcase Edition)".to_string(),
+            display_name: "Homebrew Micro Demo (Long Verifiable Title Showcase Edition)"
+                .to_string(),
             internal_title: "MICRODEMO".to_string(),
             game_code: "HOMZ".to_string(),
             region: "",
@@ -343,7 +347,12 @@ fn capture_a1_ui_screenshots_if_requested() {
         app.library_view_mode = LibraryViewMode::Table;
         let _ = HotkeyAction::Pause;
         renderer
-            .render_app_to_png(&ctx, &mut app, Some(egui::pos2(120.0, 165.0)), &dir.join("a1_library_table.png"))
+            .render_app_to_png(
+                &ctx,
+                &mut app,
+                Some(egui::pos2(120.0, 165.0)),
+                &dir.join("a1_library_table.png"),
+            )
             .expect("render table");
     }
 
@@ -355,7 +364,12 @@ fn capture_a1_ui_screenshots_if_requested() {
         app.rom_folders.truncate(1);
         app.library_view_mode = LibraryViewMode::Grid;
         renderer
-            .render_app_to_png(&ctx, &mut app, Some(egui::pos2(95.0, 210.0)), &dir.join("a1_library_grid.png"))
+            .render_app_to_png(
+                &ctx,
+                &mut app,
+                Some(egui::pos2(95.0, 210.0)),
+                &dir.join("a1_library_grid.png"),
+            )
             .expect("render grid");
     }
 
@@ -368,7 +382,12 @@ fn capture_a1_ui_screenshots_if_requested() {
         app.config.developer_tools = false;
         // Hover over Pause toolbar button area
         renderer
-            .render_app_to_png(&ctx, &mut app, Some(egui::pos2(230.0, 38.0)), &dir.join("a1_gameplay_hud.png"))
+            .render_app_to_png(
+                &ctx,
+                &mut app,
+                Some(egui::pos2(230.0, 38.0)),
+                &dir.join("a1_gameplay_hud.png"),
+            )
             .expect("render gameplay hud");
     }
 
@@ -480,7 +499,8 @@ fn capture_a2_ui_screenshots_if_requested() {
   Recommended Filter: LCD Matrix\n\
   JSON:              {\"passed\":true,\"adapter\":\"NVIDIA GeForce RTX\",\"missed_frames\":0}\n";
         app.show_perf_check = true;
-        app.perf_check = PerfCheckState::Finished(Box::new(parse_selftest_report(sample, "", true, 11340)));
+        app.perf_check =
+            PerfCheckState::Finished(Box::new(parse_selftest_report(sample, "", true, 11340)));
         renderer
             .render_app_to_png(&ctx, &mut app, None, &dir.join("a2_perf_check.png"))
             .expect("render A2 Performance Check modal");
@@ -628,7 +648,12 @@ fn capture_a3_ui_screenshots_if_requested() {
             .insert(PathBuf::from(r"C:\Games\GBA\Metroid Fusion (USA).gba"));
         app.selected_rom_path = Some(PathBuf::from(r"C:\Games\GBA\Metroid Fusion (USA).gba"));
         renderer
-            .render_app_to_png(&ctx, &mut app, None, &dir.join("a3_library_grid_sorted.png"))
+            .render_app_to_png(
+                &ctx,
+                &mut app,
+                None,
+                &dir.join("a3_library_grid_sorted.png"),
+            )
             .expect("render A3 sorted grid");
     }
 

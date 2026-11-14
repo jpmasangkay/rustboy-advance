@@ -47,11 +47,7 @@ fn read_git_commit() -> String {
         .output()
         .map(|s| s.status.success() && !String::from_utf8_lossy(&s.stdout).trim().is_empty())
         .unwrap_or(false);
-    if dirty {
-        format!("{hash}-dirty")
-    } else {
-        hash
-    }
+    if dirty { format!("{hash}-dirty") } else { hash }
 }
 
 fn main() {
@@ -65,4 +61,3 @@ fn main() {
     println!("cargo:rustc-env=RBA_GIT_COMMIT={}", read_git_commit());
     println!("cargo:rustc-env=RBA_BUILD_TIME_UTC={}", format_utc_now());
 }
-

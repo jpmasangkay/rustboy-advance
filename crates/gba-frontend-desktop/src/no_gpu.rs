@@ -308,19 +308,8 @@ mod win32_gdi {
             return Err("CreateCompatibleBitmap failed".to_string());
         }
         let old = unsafe { SelectObject(mem_dc, hbmp) };
-        let blt_ok = unsafe {
-            BitBlt(
-                mem_dc,
-                0,
-                0,
-                dst_w as i32,
-                dst_h as i32,
-                hdc,
-                0,
-                0,
-                SRCCOPY,
-            )
-        };
+        let blt_ok =
+            unsafe { BitBlt(mem_dc, 0, 0, dst_w as i32, dst_h as i32, hdc, 0, 0, SRCCOPY) };
         if blt_ok == 0 {
             unsafe {
                 SelectObject(mem_dc, old);
@@ -698,7 +687,13 @@ impl NoGpuCpuPresenter {
         let pattern = crate::filters::test_filter_pattern_fb();
         let mut costs = Vec::with_capacity(DisplayFilter::ALL.len());
         for &filter in &DisplayFilter::ALL {
-            postproc.prewarm(color_correction, lcd_ghosting, filter, false, grid_intensity);
+            postproc.prewarm(
+                color_correction,
+                lcd_ghosting,
+                filter,
+                false,
+                grid_intensity,
+            );
             let linear = filter.texture_options() == egui::TextureOptions::LINEAR;
             for _ in 0..2 {
                 let img = postproc.process_display_filter(
@@ -709,7 +704,14 @@ impl NoGpuCpuPresenter {
                     false,
                     grid_intensity,
                 );
-                self.present_rgba_to_xrgb(&img.pixels, img.size[0], img.size[1], dst_w, dst_h, linear);
+                self.present_rgba_to_xrgb(
+                    &img.pixels,
+                    img.size[0],
+                    img.size[1],
+                    dst_w,
+                    dst_h,
+                    linear,
+                );
             }
             let mut samples = [0.0f64; 3];
             for slot in &mut samples {
@@ -790,7 +792,13 @@ impl NoGpuCpuPresenter {
         let pattern = crate::filters::test_filter_pattern_fb();
         let mut costs = Vec::with_capacity(DisplayFilter::ALL.len());
         for &filter in &DisplayFilter::ALL {
-            postproc.prewarm(color_correction, lcd_ghosting, filter, false, grid_intensity);
+            postproc.prewarm(
+                color_correction,
+                lcd_ghosting,
+                filter,
+                false,
+                grid_intensity,
+            );
             let linear = filter.texture_options() == egui::TextureOptions::LINEAR;
             for _ in 0..2 {
                 let img = postproc.process_display_filter(
@@ -1029,13 +1037,7 @@ struct NoGpuApp {
 }
 
 impl NoGpuApp {
-    fn new(
-        title: String,
-        init_w: u32,
-        init_h: u32,
-        cli: CliConfig,
-        reason: &str,
-    ) -> Self {
+    fn new(title: String, init_w: u32, init_h: u32, cli: CliConfig, reason: &str) -> Self {
         let mut config = AppConfig::load();
         if let Some(f) = cli.filter {
             config.display_filter = f;
@@ -1061,8 +1063,7 @@ impl NoGpuApp {
         if sync_60hz {
             drc_pacer.set_base_fps(60.0);
         }
-        let phase_lock =
-            crate::display_timing::VblankPhaseLock::new(sync_60hz, display_refresh_hz);
+        let phase_lock = crate::display_timing::VblankPhaseLock::new(sync_60hz, display_refresh_hz);
         if phase_lock.is_enabled() {
             audio.set_rate_offset_ppm(phase_lock.audio_rate_offset_ppm());
         }
@@ -1460,7 +1461,11 @@ impl NoGpuApp {
                         self.total_emu_frames,
                         self.config.display_filter.label(),
                         self.governor.is_resolution_capped(),
-                        if use_capped_os_stretch { "StretchDIBits" } else { "softbuffer" }
+                        if use_capped_os_stretch {
+                            "StretchDIBits"
+                        } else {
+                            "softbuffer"
+                        }
                     ),
                     Err(e) => eprintln!("[capture] Screenshot capture failed: {e}"),
                 }
@@ -1506,7 +1511,10 @@ impl ApplicationHandler for NoGpuApp {
             return;
         }
         let mut attrs = Window::default_attributes()
-            .with_title(format!("{} [No-GPU: softbuffer] — {}", self.title, self.rom_name))
+            .with_title(format!(
+                "{} [No-GPU: softbuffer] — {}",
+                self.title, self.rom_name
+            ))
             .with_inner_size(LogicalSize::new(self.size.0, self.size.1));
         if self.fullscreen_on_start {
             attrs = attrs.with_fullscreen(Some(winit::window::Fullscreen::Borderless(None)));
@@ -1650,7 +1658,8 @@ impl ApplicationHandler for NoGpuApp {
                     } else {
                         self.pressed_keys.remove(&code);
                     }
-                    self.sink.keypad = compute_gba_keypad(&self.pressed_keys, &self.config.keybindings);
+                    self.sink.keypad =
+                        compute_gba_keypad(&self.pressed_keys, &self.config.keybindings);
                 }
             }
             WindowEvent::RedrawRequested => {
@@ -2025,9 +2034,7 @@ pub fn bench_softbuffer_sizes(
                 core.run_frame(&mut core_sink);
             }
 
-            let mut sizes = vec![
-                ("720x480 (3x GBA baseline)".to_string(), 720u32, 480u32),
-            ];
+            let mut sizes = vec![("720x480 (3x GBA baseline)".to_string(), 720u32, 480u32)];
             if self.include_scaled_slowdowns {
                 sizes.push(("1280x720 (720p)".to_string(), 1280, 720));
                 sizes.push(("1920x1080 (1080p)".to_string(), 1920, 1080));
@@ -2067,126 +2074,126 @@ pub fn bench_softbuffer_sizes(
                 }
             }
 
-            let run_variant = |variant: SizePresentVariant,
-                               res_label: &str,
-                               w: u32,
-                               h: u32,
-                               surf: &mut softbuffer::Surface<Arc<Window>, Arc<Window>>,
-                               core: &mut GbaCore,
-                               core_sink: &mut NullSink,
-                               postproc: &mut VideoPostProcessor,
-                               blitter: &mut NoGpuCpuPresenter,
-                               results: &mut Vec<SoftbufferSizeBenchRow>| {
-                for &(slug, filter, cc) in &[
-                    ("none", DisplayFilter::Sharp1x, false),
-                    ("smooth-bilinear", DisplayFilter::SmoothBilinear, false),
-                ] {
-                    postproc.prewarm(cc, false, filter, false, 0.08);
-                    let linear = filter.texture_options() == egui::TextureOptions::LINEAR;
-                    let mut present_once = |core_fb: &[u16; LCD_WIDTH * LCD_HEIGHT]| {
-                        let img = postproc.process_display_filter(
-                            core_fb, cc, false, filter, false, 0.08,
-                        );
-                        match variant {
-                            SizePresentVariant::SoftbufferUncapped => {
-                                if let Ok(mut buf) = surf.buffer_mut() {
-                                    blitter.blit_rgba_to_slice(
+            let run_variant =
+                |variant: SizePresentVariant,
+                 res_label: &str,
+                 w: u32,
+                 h: u32,
+                 surf: &mut softbuffer::Surface<Arc<Window>, Arc<Window>>,
+                 core: &mut GbaCore,
+                 core_sink: &mut NullSink,
+                 postproc: &mut VideoPostProcessor,
+                 blitter: &mut NoGpuCpuPresenter,
+                 results: &mut Vec<SoftbufferSizeBenchRow>| {
+                    for &(slug, filter, cc) in &[
+                        ("none", DisplayFilter::Sharp1x, false),
+                        ("smooth-bilinear", DisplayFilter::SmoothBilinear, false),
+                    ] {
+                        postproc.prewarm(cc, false, filter, false, 0.08);
+                        let linear = filter.texture_options() == egui::TextureOptions::LINEAR;
+                        let mut present_once = |core_fb: &[u16; LCD_WIDTH * LCD_HEIGHT]| {
+                            let img = postproc
+                                .process_display_filter(core_fb, cc, false, filter, false, 0.08);
+                            match variant {
+                                SizePresentVariant::SoftbufferUncapped => {
+                                    if let Ok(mut buf) = surf.buffer_mut() {
+                                        blitter.blit_rgba_to_slice(
+                                            &img.pixels,
+                                            img.size[0],
+                                            img.size[1],
+                                            &mut buf,
+                                            w as usize,
+                                            h as usize,
+                                            linear,
+                                        );
+                                        let _ = buf.present();
+                                    }
+                                }
+                                #[cfg(target_os = "windows")]
+                                SizePresentVariant::StretchDibitsColorOnColor => {
+                                    let _ = blitter.present_capped_os_stretch(
+                                        &win,
                                         &img.pixels,
                                         img.size[0],
                                         img.size[1],
-                                        &mut buf,
                                         w as usize,
                                         h as usize,
-                                        linear,
+                                        false,
                                     );
-                                    let _ = buf.present();
+                                }
+                                #[cfg(target_os = "windows")]
+                                SizePresentVariant::StretchDibitsHalftone => {
+                                    let _ = blitter.present_capped_os_stretch(
+                                        &win,
+                                        &img.pixels,
+                                        img.size[0],
+                                        img.size[1],
+                                        w as usize,
+                                        h as usize,
+                                        true,
+                                    );
                                 }
                             }
-                            #[cfg(target_os = "windows")]
-                            SizePresentVariant::StretchDibitsColorOnColor => {
-                                let _ = blitter.present_capped_os_stretch(
-                                    &win,
-                                    &img.pixels,
-                                    img.size[0],
-                                    img.size[1],
-                                    w as usize,
-                                    h as usize,
-                                    false,
-                                );
-                            }
-                            #[cfg(target_os = "windows")]
-                            SizePresentVariant::StretchDibitsHalftone => {
-                                let _ = blitter.present_capped_os_stretch(
-                                    &win,
-                                    &img.pixels,
-                                    img.size[0],
-                                    img.size[1],
-                                    w as usize,
-                                    h as usize,
-                                    true,
-                                );
-                            }
-                        }
-                    };
-                    for _ in 0..8 {
-                        core.run_frame(core_sink);
-                        present_once(&core_sink.0);
-                    }
-
-                    for &slowdown in slowdowns {
-                        let mut present_samples = Vec::with_capacity(self.frames);
-                        let mut total_samples = Vec::with_capacity(self.frames);
-                        let mut over_budget = 0usize;
-                        for _ in 0..self.frames {
-                            let t_frame = Instant::now();
+                        };
+                        for _ in 0..8 {
                             core.run_frame(core_sink);
-                            let t_pres = Instant::now();
                             present_once(&core_sink.0);
-                            let pres_ms = t_pres.elapsed().as_secs_f64() * 1000.0;
-                            let raw_dur = t_frame.elapsed();
-                            if slowdown > 1 {
-                                let target = raw_dur.mul_f64(slowdown as f64);
-                                while t_frame.elapsed() < target {
-                                    std::hint::spin_loop();
-                                }
-                            }
-                            let total_ms = t_frame.elapsed().as_secs_f64() * 1000.0;
-                            if total_ms > 1000.0 / (16_777_216.0 / 280_896.0) {
-                                over_budget += 1;
-                            }
-                            present_samples.push(pres_ms * slowdown as f64);
-                            total_samples.push(total_ms);
                         }
-                        present_samples.sort_by(f64::total_cmp);
-                        total_samples.sort_by(f64::total_cmp);
-                        let n = self.frames.max(1);
-                        let pres_avg = present_samples.iter().sum::<f64>() / n as f64;
-                        let pres_p95 = present_samples[((n - 1) * 95) / 100];
-                        let tot_avg = total_samples.iter().sum::<f64>() / n as f64;
-                        let tot_p95 = total_samples[((n - 1) * 95) / 100];
-                        let tot_p99 = total_samples[((n - 1) * 99) / 100];
-                        let tot_worst = *total_samples.last().unwrap_or(&0.0);
-                        let over_pct = (over_budget as f64 / n as f64) * 100.0;
-                        results.push(SoftbufferSizeBenchRow {
-                            present_mode: variant.label().to_string(),
-                            resolution_label: res_label.to_string(),
-                            width: w,
-                            height: h,
-                            filter: slug.to_string(),
-                            slowdown_x: slowdown,
-                            frames: self.frames,
-                            present_only_avg_ms: pres_avg,
-                            present_only_p95_ms: pres_p95,
-                            total_work_avg_ms: tot_avg,
-                            total_work_p95_ms: tot_p95,
-                            total_work_p99_ms: tot_p99,
-                            total_work_worst_ms: tot_worst,
-                            over_budget_pct: over_pct,
-                            fits_budget: over_pct < 0.50,
-                        });
+
+                        for &slowdown in slowdowns {
+                            let mut present_samples = Vec::with_capacity(self.frames);
+                            let mut total_samples = Vec::with_capacity(self.frames);
+                            let mut over_budget = 0usize;
+                            for _ in 0..self.frames {
+                                let t_frame = Instant::now();
+                                core.run_frame(core_sink);
+                                let t_pres = Instant::now();
+                                present_once(&core_sink.0);
+                                let pres_ms = t_pres.elapsed().as_secs_f64() * 1000.0;
+                                let raw_dur = t_frame.elapsed();
+                                if slowdown > 1 {
+                                    let target = raw_dur.mul_f64(slowdown as f64);
+                                    while t_frame.elapsed() < target {
+                                        std::hint::spin_loop();
+                                    }
+                                }
+                                let total_ms = t_frame.elapsed().as_secs_f64() * 1000.0;
+                                if total_ms > 1000.0 / (16_777_216.0 / 280_896.0) {
+                                    over_budget += 1;
+                                }
+                                present_samples.push(pres_ms * slowdown as f64);
+                                total_samples.push(total_ms);
+                            }
+                            present_samples.sort_by(f64::total_cmp);
+                            total_samples.sort_by(f64::total_cmp);
+                            let n = self.frames.max(1);
+                            let pres_avg = present_samples.iter().sum::<f64>() / n as f64;
+                            let pres_p95 = present_samples[((n - 1) * 95) / 100];
+                            let tot_avg = total_samples.iter().sum::<f64>() / n as f64;
+                            let tot_p95 = total_samples[((n - 1) * 95) / 100];
+                            let tot_p99 = total_samples[((n - 1) * 99) / 100];
+                            let tot_worst = *total_samples.last().unwrap_or(&0.0);
+                            let over_pct = (over_budget as f64 / n as f64) * 100.0;
+                            results.push(SoftbufferSizeBenchRow {
+                                present_mode: variant.label().to_string(),
+                                resolution_label: res_label.to_string(),
+                                width: w,
+                                height: h,
+                                filter: slug.to_string(),
+                                slowdown_x: slowdown,
+                                frames: self.frames,
+                                present_only_avg_ms: pres_avg,
+                                present_only_p95_ms: pres_p95,
+                                total_work_avg_ms: tot_avg,
+                                total_work_p95_ms: tot_p95,
+                                total_work_p99_ms: tot_p99,
+                                total_work_worst_ms: tot_worst,
+                                over_budget_pct: over_pct,
+                                fits_budget: over_pct < 0.50,
+                            });
+                        }
                     }
-                }
-            };
+                };
 
             for (res_label, w, h) in sizes {
                 let _ = surf.resize(

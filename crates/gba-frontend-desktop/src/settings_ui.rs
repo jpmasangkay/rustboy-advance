@@ -487,10 +487,7 @@ impl RustboyApp {
                             );
                         });
                         ui.separator();
-                        if ui
-                            .checkbox(&mut self.config.muted, "Mute audio")
-                            .changed()
-                        {
+                        if ui.checkbox(&mut self.config.muted, "Mute audio").changed() {
                             self.sync_audio_volume();
                             self.config.save();
                         }
@@ -518,9 +515,12 @@ impl RustboyApp {
                 ctx.input(|i| i.pointer.interact_pos())
                     .unwrap_or(egui::Pos2::ZERO),
             )
-            && !self
-                .volume_button_rect
-                .is_some_and(|r| r.contains(ctx.input(|i| i.pointer.interact_pos()).unwrap_or(egui::Pos2::ZERO)))
+            && !self.volume_button_rect.is_some_and(|r| {
+                r.contains(
+                    ctx.input(|i| i.pointer.interact_pos())
+                        .unwrap_or(egui::Pos2::ZERO),
+                )
+            })
         {
             self.show_volume_popup = false;
         }

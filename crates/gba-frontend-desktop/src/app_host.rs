@@ -68,7 +68,10 @@ pub fn run_desktop(
     );
     println!(
         "[backend] Selected: {} ({} / {}) — reason: {}",
-        decision.adapter_name, decision.adapter_backend, decision.adapter_device_type, decision.reason
+        decision.adapter_name,
+        decision.adapter_backend,
+        decision.adapter_device_type,
+        decision.reason
     );
     log::info!(
         "[backend] Selected: {} ({} / {}) — reason: {}",

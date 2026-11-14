@@ -1437,7 +1437,10 @@ fn test_timer_overhead_and_subsystem_breakdown() {
     println!("Average cost per measurement: {ns_per_call:.2} ns");
     let calls_per_frame = 160 + 228 + 50; // PPU (160) + APU (228) + DMA (~50)
     let frame_overhead_us = (calls_per_frame as f64 * ns_per_call) / 1000.0;
-    println!("Estimated timer overhead per frame ({calls_per_frame} calls): {frame_overhead_us:.3} us ({:.4} ms)", frame_overhead_us / 1000.0);
+    println!(
+        "Estimated timer overhead per frame ({calls_per_frame} calls): {frame_overhead_us:.3} us ({:.4} ms)",
+        frame_overhead_us / 1000.0
+    );
 
     let env_rom = std::env::var("GBA_BENCHMARK_ROM").ok();
     let rom_path = env_rom.as_deref().unwrap_or("roms/benchmark.gba");
@@ -1447,7 +1450,9 @@ fn test_timer_overhead_and_subsystem_breakdown() {
         impl gba_core::HostFrontend for DummyFe {
             fn present_frame(&mut self, _fb: &[u16; 240 * 160]) {}
             fn push_audio_samples(&mut self, _samples: &[i16]) {}
-            fn poll_keypad(&mut self) -> u16 { 0x03FF }
+            fn poll_keypad(&mut self) -> u16 {
+                0x03FF
+            }
         }
         let mut fe = DummyFe;
         // Warmup 60 frames
@@ -1486,13 +1491,34 @@ fn test_timer_overhead_and_subsystem_breakdown() {
         let other_ms = uninst_per_frame_ms - (ppu_ms + apu_ms + dma_ms);
 
         println!("\n=== EMPIRICAL COMPARISON (120 frames of benchmark ROM) ===");
-        println!("Pass 1 (Uninstrumented run_frame):     {uninst_per_frame_ms:.4} ms/frame ({:.1} FPS)", 1000.0 / uninst_per_frame_ms);
-        println!("Pass 2 (Instrumented run_frame_bench): {bench_per_frame_ms:.4} ms/frame ({:.1} FPS)", 1000.0 / bench_per_frame_ms);
-        println!("Empirical Instrumentation Overhead:    {empirical_timer_overhead_ms:.4} ms/frame ({:.2}%)", (empirical_timer_overhead_ms / uninst_per_frame_ms) * 100.0);
-        println!("  PPU Time:                            {ppu_ms:.4} ms ({:.1}%)", (ppu_ms / uninst_per_frame_ms) * 100.0);
-        println!("  APU Time:                            {apu_ms:.4} ms ({:.1}%)", (apu_ms / uninst_per_frame_ms) * 100.0);
-        println!("  DMA Time:                            {dma_ms:.4} ms ({:.1}%)", (dma_ms / uninst_per_frame_ms) * 100.0);
-        println!("  CPU + Bus Remaining:                 {other_ms:.4} ms ({:.1}%)", (other_ms / uninst_per_frame_ms) * 100.0);
+        println!(
+            "Pass 1 (Uninstrumented run_frame):     {uninst_per_frame_ms:.4} ms/frame ({:.1} FPS)",
+            1000.0 / uninst_per_frame_ms
+        );
+        println!(
+            "Pass 2 (Instrumented run_frame_bench): {bench_per_frame_ms:.4} ms/frame ({:.1} FPS)",
+            1000.0 / bench_per_frame_ms
+        );
+        println!(
+            "Empirical Instrumentation Overhead:    {empirical_timer_overhead_ms:.4} ms/frame ({:.2}%)",
+            (empirical_timer_overhead_ms / uninst_per_frame_ms) * 100.0
+        );
+        println!(
+            "  PPU Time:                            {ppu_ms:.4} ms ({:.1}%)",
+            (ppu_ms / uninst_per_frame_ms) * 100.0
+        );
+        println!(
+            "  APU Time:                            {apu_ms:.4} ms ({:.1}%)",
+            (apu_ms / uninst_per_frame_ms) * 100.0
+        );
+        println!(
+            "  DMA Time:                            {dma_ms:.4} ms ({:.1}%)",
+            (dma_ms / uninst_per_frame_ms) * 100.0
+        );
+        println!(
+            "  CPU + Bus Remaining:                 {other_ms:.4} ms ({:.1}%)",
+            (other_ms / uninst_per_frame_ms) * 100.0
+        );
 
         // Measure instruction profile
         let mut total_insts = 0u64;
@@ -1506,8 +1532,13 @@ fn test_timer_overhead_and_subsystem_breakdown() {
             total_stores += prof.mem_write_cycles;
             total_branches += prof.branch_flush_cycles;
         }
-        println!("  Profile counts / frame: insts={}, loads={}, stores={}, branches={}",
-            total_insts / 120, total_loads / 120, total_stores / 120, total_branches / 120);
+        println!(
+            "  Profile counts / frame: insts={}, loads={}, stores={}, branches={}",
+            total_insts / 120,
+            total_loads / 120,
+            total_stores / 120,
+            total_branches / 120
+        );
     }
 }
 
@@ -1705,8 +1736,7 @@ fn test_dma_writing_into_cached_code_page() {
         .write_32(0x0400_00D4, 0x0200_1000, AccessType::NonSequential); // DMA3SAD
     core.bus
         .write_32(0x0400_00D8, 0x0300_8010, AccessType::NonSequential); // DMA3DAD (alias!)
-    core.bus
-        .write_16(0x0400_00DC, 1, AccessType::NonSequential); // DMA3CNT_L = 1 word
+    core.bus.write_16(0x0400_00DC, 1, AccessType::NonSequential); // DMA3CNT_L = 1 word
     core.bus
         .write_16(0x0400_00DE, 0x8400, AccessType::NonSequential); // Enable | 32-bit | Immediate
     flush_immediate_dma(&mut core);
@@ -1788,14 +1818,20 @@ fn test_eeprom_reads_through_fast_path_including_32mb_autodetect() {
         let dummy = core
             .bus
             .read_16(0x0DFF_FF00, AccessType::NonSequential, 0x0800_0000, false);
-        assert_eq!(dummy, 0, "EEPROM dummy bit {d} should be 0 (got {dummy:#x})");
+        assert_eq!(
+            dummy, 0,
+            "EEPROM dummy bit {d} should be 0 (got {dummy:#x})"
+        );
     }
     let mut read_back = 0u64;
     for i in 0..64 {
         let bit = core
             .bus
             .read_16(0x0DFF_FF00, AccessType::NonSequential, 0x0800_0000, false);
-        assert!(bit <= 1, "EEPROM read bypassed into ROM bytes ({bit:#x}) at bit {i}");
+        assert!(
+            bit <= 1,
+            "EEPROM read bypassed into ROM bytes ({bit:#x}) at bit {i}"
+        );
         read_back = (read_back << 1) | ((bit & 1) as u64);
     }
     assert_eq!(read_back, payload);
@@ -1842,11 +1878,13 @@ fn hle_bios_edge_cases_open_bus_soundbias_timing_and_fallback() {
     );
 
     // Execute SWI 0x19 SoundBias(1) while preserving resolution bits (1 << 14)
-    core.bus
-        .write_io_16(0x0400_0088, (1 << 14) | 0x0080);
+    core.bus.write_io_16(0x0400_0088, (1 << 14) | 0x0080);
     core.cpu.step(&mut core.bus); // mov r0, #1
     let swi_bias1_cyc = core.cpu.step(&mut core.bus); // swi 0x19 (SoundBias(1))
-    assert!(swi_bias1_cyc > 64, "SoundBias SWI should include BIOS timing");
+    assert!(
+        swi_bias1_cyc > 64,
+        "SoundBias SWI should include BIOS timing"
+    );
     assert_eq!(core.bus.apu.soundbias, (1 << 14) | 0x0200);
 
     core.cpu.step(&mut core.bus); // mov r0, #0
@@ -1870,15 +1908,16 @@ fn hle_bios_edge_cases_open_bus_soundbias_timing_and_fallback() {
         0xE12F_FF1Eu32, // bx lr (return to BIOS 0x0138)
     ];
     for (i, w) in irq_handler_words.iter().enumerate() {
-        core.bus
-            .write_32(irq_handler_addr + (i as u32) * 4, *w, AccessType::NonSequential);
+        core.bus.write_32(
+            irq_handler_addr + (i as u32) * 4,
+            *w,
+            AccessType::NonSequential,
+        );
     }
     core.bus
         .write_32(0x0300_7FFC, irq_handler_addr, AccessType::NonSequential);
-    core.bus
-        .write_16(0x0400_0208, 1, AccessType::NonSequential); // IME = 1
-    core.bus
-        .write_16(0x0400_0200, 1, AccessType::NonSequential); // IE = VBlank
+    core.bus.write_16(0x0400_0208, 1, AccessType::NonSequential); // IME = 1
+    core.bus.write_16(0x0400_0200, 1, AccessType::NonSequential); // IE = VBlank
     core.bus.hw.request_irq(1);
     for _ in 0..32 {
         core.step_one();
@@ -1953,14 +1992,40 @@ fn waitcnt_prefetch_dma_boundary_and_4stage_timer_cascade() {
 
     // Set WAITCNT: SRAM=8 wait (bits 0-1=3), WS0 N=3 S=1 (bits 2-4 = 1 | (1<<4)),
     // WS1 N=2 S=1 (bits 5-7 = 2 | (1<<7)), WS2 N=8 S=1 (bits 8-10 = 3 | (1<<10)), Prefetch=OFF
-    core.bus.write_16(0x0400_0204, 0x07D7, AccessType::NonSequential);
-    assert_eq!(core.bus.rom_fetch_cycles(0x0800_0002, AccessType::NonSequential), 4); // N=3 -> 4 cyc
-    assert_eq!(core.bus.rom_fetch_cycles(0x0800_0002, AccessType::Sequential), 2);    // S=1 -> 2 cyc
-    assert_eq!(core.bus.rom_fetch_cycles(0x0A00_0002, AccessType::NonSequential), 3); // N=2 -> 3 cyc
-    assert_eq!(core.bus.rom_fetch_cycles(0x0A00_0002, AccessType::Sequential), 2);    // S=1 -> 2 cyc
-    assert_eq!(core.bus.rom_fetch_cycles(0x0C00_0002, AccessType::NonSequential), 9); // N=8 -> 9 cyc
-    assert_eq!(core.bus.rom_fetch_cycles(0x0C00_0002, AccessType::Sequential), 2);    // S=1 -> 2 cyc
-    core.bus.read_8(0x0E00_0000, AccessType::NonSequential, 0x0800_0000, false);
+    core.bus
+        .write_16(0x0400_0204, 0x07D7, AccessType::NonSequential);
+    assert_eq!(
+        core.bus
+            .rom_fetch_cycles(0x0800_0002, AccessType::NonSequential),
+        4
+    ); // N=3 -> 4 cyc
+    assert_eq!(
+        core.bus
+            .rom_fetch_cycles(0x0800_0002, AccessType::Sequential),
+        2
+    ); // S=1 -> 2 cyc
+    assert_eq!(
+        core.bus
+            .rom_fetch_cycles(0x0A00_0002, AccessType::NonSequential),
+        3
+    ); // N=2 -> 3 cyc
+    assert_eq!(
+        core.bus
+            .rom_fetch_cycles(0x0A00_0002, AccessType::Sequential),
+        2
+    ); // S=1 -> 2 cyc
+    assert_eq!(
+        core.bus
+            .rom_fetch_cycles(0x0C00_0002, AccessType::NonSequential),
+        9
+    ); // N=8 -> 9 cyc
+    assert_eq!(
+        core.bus
+            .rom_fetch_cycles(0x0C00_0002, AccessType::Sequential),
+        2
+    ); // S=1 -> 2 cyc
+    core.bus
+        .read_8(0x0E00_0000, AccessType::NonSequential, 0x0800_0000, false);
     assert_eq!(core.bus.last_cycles, 9); // SRAM 8 waitstates -> 9 cycles
 
     // 2. GamePak Prefetch Buffer (WAITCNT bit 14) reduces sequential ROM fetch cycles
@@ -1971,13 +2036,17 @@ fn waitcnt_prefetch_dma_boundary_and_4stage_timer_cascade() {
         interleaved.push(0xE002_0091); // mul r2, r1, r0 (multi-I cycle -> fills prefetch!)
     }
     let mut pf_off = GbaCore::new(None, rom_from_arm_words(&interleaved));
-    pf_off.bus.write_16(0x0400_0204, 0x0000, AccessType::NonSequential);
+    pf_off
+        .bus
+        .write_16(0x0400_0204, 0x0000, AccessType::NonSequential);
     let mut t_off = 0u64;
     for _ in 0..32 {
         t_off += pf_off.cpu.step(&mut pf_off.bus);
     }
     let mut pf_on = GbaCore::new(None, rom_from_arm_words(&interleaved));
-    pf_on.bus.write_16(0x0400_0204, 0x4000, AccessType::NonSequential);
+    pf_on
+        .bus
+        .write_16(0x0400_0204, 0x4000, AccessType::NonSequential);
     let mut t_on = 0u64;
     for _ in 0..32 {
         t_on += pf_on.cpu.step(&mut pf_on.bus);
@@ -1990,16 +2059,22 @@ fn waitcnt_prefetch_dma_boundary_and_4stage_timer_cascade() {
     // 3. DMA timing & 128 KiB ROM boundary forced N-seq penalty
     let measure_dma3 = |src: u32| -> u64 {
         let mut c = GbaCore::new(None, vec![0xBBu8; 0x6_0000]);
-        c.bus.write_16(0x0400_0204, 0x0000, AccessType::NonSequential); // WS0 N=5, S=3
+        c.bus
+            .write_16(0x0400_0204, 0x0000, AccessType::NonSequential); // WS0 N=5, S=3
         c.bus.write_32(0x0400_00D4, src, AccessType::NonSequential);
-        c.bus.write_32(0x0400_00D8, 0x0300_0000, AccessType::NonSequential);
+        c.bus
+            .write_32(0x0400_00D8, 0x0300_0000, AccessType::NonSequential);
         c.bus.write_16(0x0400_00DC, 4, AccessType::NonSequential);
-        c.bus.write_16(0x0400_00DE, 0x8400, AccessType::NonSequential); // 32-bit INC immediate
+        c.bus
+            .write_16(0x0400_00DE, 0x8400, AccessType::NonSequential); // 32-bit INC immediate
         c.bus.scheduler.current_cycle += 2; // Flush DmaStart startup delay
         while let Some((ev_cycle, kind)) = c.bus.scheduler.pop_due() {
             c.bus.dispatch_event(ev_cycle, kind);
         }
-        assert!(c.bus.hw.active_dma.is_some(), "DMA3 should become active after startup delay");
+        assert!(
+            c.bus.hw.active_dma.is_some(),
+            "DMA3 should become active after startup delay"
+        );
         let mut dma_cycles = 0u64;
         while c.bus.hw.active_dma.is_some() {
             dma_cycles += c.bus.step_active_dma();
@@ -2007,7 +2082,7 @@ fn waitcnt_prefetch_dma_boundary_and_4stage_timer_cascade() {
         dma_cycles
     };
     let dma_no_cross = measure_dma3(0x0801_FFF0); // 0801FFF0..0801FFFC
-    let dma_cross = measure_dma3(0x0801_FFF8);    // crosses 0x0802_0000 on 3rd word (+2 cyc)
+    let dma_cross = measure_dma3(0x0801_FFF8); // crosses 0x0802_0000 on 3rd word (+2 cyc)
     assert_eq!(
         dma_cross - dma_no_cross,
         2,
@@ -2016,15 +2091,33 @@ fn waitcnt_prefetch_dma_boundary_and_4stage_timer_cascade() {
 
     // 4. 4-stage Timer Cascade (TM0 -> TM1 -> TM2 -> TM3 with IRQ on TM3)
     let mut tcore = GbaCore::new(None, vec![0u8; 0x100]);
-    tcore.bus.write_16(0x0400_0200, 1 << 6, AccessType::NonSequential); // IE: Timer3
-    tcore.bus.write_16(0x0400_010C, 0xFFFE, AccessType::NonSequential); // TM3 reload=FFFE (2 ticks)
-    tcore.bus.write_16(0x0400_0108, 0xFFFE, AccessType::NonSequential); // TM2 reload=FFFE (2 ticks)
-    tcore.bus.write_16(0x0400_0104, 0xFFFC, AccessType::NonSequential); // TM1 reload=FFFC (4 ticks)
-    tcore.bus.write_16(0x0400_0100, 0xFFFE, AccessType::NonSequential); // TM0 reload=FFFE (2 cycles)
-    tcore.bus.write_16(0x0400_010E, 0x00C4, AccessType::NonSequential); // TM3: En | IRQ | Cascade
-    tcore.bus.write_16(0x0400_010A, 0x0084, AccessType::NonSequential); // TM2: En | Cascade
-    tcore.bus.write_16(0x0400_0106, 0x0084, AccessType::NonSequential); // TM1: En | Cascade
-    tcore.bus.write_16(0x0400_0102, 0x0080, AccessType::NonSequential); // TM0: En (/1)
+    tcore
+        .bus
+        .write_16(0x0400_0200, 1 << 6, AccessType::NonSequential); // IE: Timer3
+    tcore
+        .bus
+        .write_16(0x0400_010C, 0xFFFE, AccessType::NonSequential); // TM3 reload=FFFE (2 ticks)
+    tcore
+        .bus
+        .write_16(0x0400_0108, 0xFFFE, AccessType::NonSequential); // TM2 reload=FFFE (2 ticks)
+    tcore
+        .bus
+        .write_16(0x0400_0104, 0xFFFC, AccessType::NonSequential); // TM1 reload=FFFC (4 ticks)
+    tcore
+        .bus
+        .write_16(0x0400_0100, 0xFFFE, AccessType::NonSequential); // TM0 reload=FFFE (2 cycles)
+    tcore
+        .bus
+        .write_16(0x0400_010E, 0x00C4, AccessType::NonSequential); // TM3: En | IRQ | Cascade
+    tcore
+        .bus
+        .write_16(0x0400_010A, 0x0084, AccessType::NonSequential); // TM2: En | Cascade
+    tcore
+        .bus
+        .write_16(0x0400_0106, 0x0084, AccessType::NonSequential); // TM1: En | Cascade
+    tcore
+        .bus
+        .write_16(0x0400_0102, 0x0080, AccessType::NonSequential); // TM0: En (/1)
 
     for _ in 0..80 {
         tcore.step_one();

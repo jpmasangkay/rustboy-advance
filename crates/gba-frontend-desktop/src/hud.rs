@@ -59,7 +59,8 @@ impl RustboyApp {
                         }
 
                         if self.has_active_game() && !self.paused {
-                            let pct = ((self.measured_fps / 59.7275) * 100.0).round().max(0.0) as u32;
+                            let pct =
+                                ((self.measured_fps / 59.7275) * 100.0).round().max(0.0) as u32;
                             let fps_text = format!("FPS: {:.2} ({pct}%)", self.measured_fps);
                             ui.monospace(
                                 RichText::new(fps_text).color(crate::theme::COLOR_TEXT_SECONDARY),
@@ -75,15 +76,11 @@ impl RustboyApp {
                             } else {
                                 format!("DRC: {occ:.1}%")
                             };
-                            ui.monospace(
-                                RichText::new(drc_text)
-                                    .small()
-                                    .color(if underruns > 0 {
-                                        Color32::from_rgb(239, 68, 68)
-                                    } else {
-                                        crate::theme::COLOR_TEXT_SECONDARY
-                                    }),
-                            );
+                            ui.monospace(RichText::new(drc_text).small().color(if underruns > 0 {
+                                Color32::from_rgb(239, 68, 68)
+                            } else {
+                                crate::theme::COLOR_TEXT_SECONDARY
+                            }));
                             ui.add_space(8.0);
                             ui.label(
                                 RichText::new(format!(
@@ -99,12 +96,15 @@ impl RustboyApp {
                             if core.bus.cart.solar_enabled {
                                 ui.add_space(12.0);
                                 if ui.small_button("+").clicked() {
-                                    core.bus.cart.solar_lux = core.bus.cart.solar_lux.saturating_add(25);
+                                    core.bus.cart.solar_lux =
+                                        core.bus.cart.solar_lux.saturating_add(25);
                                 }
                                 if ui.small_button("−").clicked() {
-                                    core.bus.cart.solar_lux = core.bus.cart.solar_lux.saturating_sub(25);
+                                    core.bus.cart.solar_lux =
+                                        core.bus.cart.solar_lux.saturating_sub(25);
                                 }
-                                let lvl = ((core.bus.cart.solar_lux as f32 / 255.0) * 10.0).round() as u8;
+                                let lvl =
+                                    ((core.bus.cart.solar_lux as f32 / 255.0) * 10.0).round() as u8;
                                 ui.label(
                                     RichText::new(format!("Solar: {lvl}/10"))
                                         .color(crate::theme::ACCENT_TEAL),
@@ -112,23 +112,18 @@ impl RustboyApp {
                             }
                             if self.rumble_in_progress {
                                 ui.add_space(8.0);
-                                ui.label(
-                                    RichText::new("Rumble")
-                                        .color(crate::theme::ACCENT_TEAL),
-                                );
+                                ui.label(RichText::new("Rumble").color(crate::theme::ACCENT_TEAL));
                             }
                             if core.bus.cart.tilt_enabled {
                                 ui.add_space(8.0);
                                 ui.label(
-                                    RichText::new("Tilt")
-                                        .color(crate::theme::COLOR_TEXT_SECONDARY),
+                                    RichText::new("Tilt").color(crate::theme::COLOR_TEXT_SECONDARY),
                                 );
                             }
                             if core.bus.cart.gyro_enabled {
                                 ui.add_space(8.0);
                                 ui.label(
-                                    RichText::new("Gyro")
-                                        .color(crate::theme::COLOR_TEXT_SECONDARY),
+                                    RichText::new("Gyro").color(crate::theme::COLOR_TEXT_SECONDARY),
                                 );
                             }
                         }

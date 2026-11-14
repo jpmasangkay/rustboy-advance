@@ -182,7 +182,8 @@ impl RomEmitter {
             let rom_addr = 0x0800_0000u32 + (self.words.len() as u32) * 4;
             self.words[blob_ptr_words[b_idx]] = rom_addr;
             for chunk in bytes.chunks_exact(4) {
-                self.words.push(u32::from_le_bytes(chunk.try_into().unwrap()));
+                self.words
+                    .push(u32::from_le_bytes(chunk.try_into().unwrap()));
             }
         }
         let mut out = Vec::with_capacity(self.words.len() * 4);
@@ -232,11 +233,8 @@ fn build_mode0_64x64_map(seed: u16) -> Vec<u8> {
     for screen in 0..4u16 {
         for ty in 0..32u16 {
             for tx in 0..32u16 {
-                let tile = (tx.wrapping_mul(3)
-                    ^ ty.wrapping_mul(5)
-                    ^ screen.wrapping_mul(7)
-                    ^ seed)
-                    & 63;
+                let tile =
+                    (tx.wrapping_mul(3) ^ ty.wrapping_mul(5) ^ screen.wrapping_mul(7) ^ seed) & 63;
                 let pal = ((tx + ty + seed) & 15) << 12;
                 let entry = pal | tile;
                 out.extend_from_slice(&entry.to_le_bytes());
@@ -410,6 +408,9 @@ mod tests {
             "expected rich multi-color Mode 0 scene, found {} colors",
             distinct_colors.len()
         );
-        assert_ne!(f10, f30, "expected scrolling animation between frame 10 and 30");
+        assert_ne!(
+            f10, f30,
+            "expected scrolling animation between frame 10 and 30"
+        );
     }
 }

@@ -29,9 +29,9 @@ mod retroachievements;
 mod rewind;
 mod rom_loader;
 mod savestates;
+mod settings_ui;
 mod shaders;
 mod stress_rom;
-mod settings_ui;
 mod theme;
 #[cfg(test)]
 mod ui_snapshots;
@@ -235,7 +235,9 @@ fn real_main() {
 
     let cli_fallback = cli.clone();
     if let Err(err) = app_host::run_desktop("Rustboy Advance", init_w, init_h, cli) {
-        log::warn!("wgpu desktop initialization unavailable ({err}); falling back to no-GPU presenter");
+        log::warn!(
+            "wgpu desktop initialization unavailable ({err}); falling back to no-GPU presenter"
+        );
         println!(
             "[backend] Selected: {} — reason: wgpu fallback ({err})",
             crate::shaders::ADAPTER_FALLBACK_ORDER[3]

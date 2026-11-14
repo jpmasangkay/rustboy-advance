@@ -453,7 +453,10 @@ impl RustboyApp {
     }
 
     pub(crate) fn quick_load(&mut self, slot: usize) {
-        let Some(path) = self.existing_slot_path(slot).or_else(|| self.slot_path(slot)) else {
+        let Some(path) = self
+            .existing_slot_path(slot)
+            .or_else(|| self.slot_path(slot))
+        else {
             return;
         };
         // Backup current core state before loading for instant undo

@@ -258,16 +258,16 @@ impl RustboyApp {
             config.shader_preset = f.default_shader_preset();
             config.scanline_grid = f == DisplayFilter::AuthenticGbaLcd;
         }
-        let cli_replay = cli
-            .input_replay
-            .as_deref()
-            .and_then(|p| match crate::bench::InputReplay::load(p) {
-                Ok(r) => Some(r),
-                Err(e) => {
-                    log::error!("Failed to load CLI --input-replay: {e}");
-                    None
-                }
-            });
+        let cli_replay =
+            cli.input_replay
+                .as_deref()
+                .and_then(|p| match crate::bench::InputReplay::load(p) {
+                    Ok(r) => Some(r),
+                    Err(e) => {
+                        log::error!("Failed to load CLI --input-replay: {e}");
+                        None
+                    }
+                });
         let cli_perf_log_path = cli.perf_log;
         let cli_perf_seconds = cli.perf_seconds;
         let cli_loop_replay = cli.loop_replay;
@@ -495,7 +495,9 @@ impl RustboyApp {
                 crate::filters::GovernorTransitionKind::StepDown => "switched",
                 crate::filters::GovernorTransitionKind::StepUp => "recovered",
                 crate::filters::GovernorTransitionKind::CapResolution => "capped output to 720x480",
-                crate::filters::GovernorTransitionKind::UncapResolution => "uncapped output resolution",
+                crate::filters::GovernorTransitionKind::UncapResolution => {
+                    "uncapped output resolution"
+                }
             };
             self.notify_warn(&format!(
                 "Quality Governor: {verb} {} -> {} (p95 {:.1} ms)",
@@ -1849,9 +1851,7 @@ impl RustboyApp {
         }
 
         if !self.paused {
-            match paced_wake_at
-                .map(|wake_at| wake_at.saturating_duration_since(Instant::now()))
-            {
+            match paced_wake_at.map(|wake_at| wake_at.saturating_duration_since(Instant::now())) {
                 Some(delay) if delay >= Duration::from_micros(500) => {
                     // egui::Context::request_repaint_after subtracts predicted_dt (default 1/60s),
                     // which clamps delays <= 16.67ms to ZERO; compensate so the requested timer holds.
@@ -2153,7 +2153,9 @@ impl RustboyApp {
                 rs.target_format,
             ) {
                 Ok(pipeline) => {
-                    log::info!("WGPU/WGSL post-processing shader pipeline initialized successfully");
+                    log::info!(
+                        "WGPU/WGSL post-processing shader pipeline initialized successfully"
+                    );
                     self.wgpu_shaders = Some(Arc::new(Mutex::new(pipeline)));
                 }
                 Err(err) => {
@@ -2618,10 +2620,8 @@ mod tests {
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap_or_default()
             .as_nanos();
-        let dir = std::env::temp_dir().join(format!(
-            "rustboy_sync_flush_{}_{nonce}",
-            std::process::id()
-        ));
+        let dir =
+            std::env::temp_dir().join(format!("rustboy_sync_flush_{}_{nonce}", std::process::id()));
         fs::create_dir_all(&dir).unwrap();
         let rom_path = dir.join("test_sram.gba");
         let sav_path = dir.join("nested/save.sav");
@@ -2662,7 +2662,12 @@ mod tests {
         assert!(!app.core.as_ref().unwrap().bus.cart.save_dirty);
 
         // Mutate again and drop without calling on_exit() directly.
-        app.core.as_mut().unwrap().bus.cart.write_sram(0x0E00_0000, b'X');
+        app.core
+            .as_mut()
+            .unwrap()
+            .bus
+            .cart
+            .write_sram(0x0E00_0000, b'X');
         drop(app);
         let bytes_after_drop = fs::read(&sav_path).unwrap();
         assert_eq!(&bytes_after_drop[..4], b"XEW2");

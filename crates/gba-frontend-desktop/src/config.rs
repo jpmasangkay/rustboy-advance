@@ -1445,7 +1445,9 @@ impl AppConfig {
             Ok(parsed) => parsed,
             Err(_) => {
                 // Upgrade configs whose `display_filter` used a removed legacy variant name.
-                if let Ok(mut map) = serde_json::from_str::<serde_json::Map<String, serde_json::Value>>(raw) {
+                if let Ok(mut map) =
+                    serde_json::from_str::<serde_json::Map<String, serde_json::Value>>(raw)
+                {
                     map.remove("display_filter");
                     serde_json::from_value(serde_json::Value::Object(map)).unwrap_or_default()
                 } else {
@@ -1793,7 +1795,10 @@ mod tests {
         cfg.set_settled_filter(k2.clone(), DisplayFilter::Sharp1x);
         let raw = serde_json::to_string(&cfg).expect("serialize config");
         let back = AppConfig::from_json_str(&raw);
-        assert_eq!(back.settled_filter_for(&k1), Some(DisplayFilter::SmoothBilinear));
+        assert_eq!(
+            back.settled_filter_for(&k1),
+            Some(DisplayFilter::SmoothBilinear)
+        );
         assert_eq!(back.settled_filter_for(&k2), Some(DisplayFilter::Sharp1x));
         assert_eq!(back.settled_filter_for(&k3), None);
     }

@@ -113,7 +113,11 @@ impl RustboyApp {
         has_rom: bool,
         dev_tools: bool,
     ) {
-        let snap_key = self.config.keybindings.hotkeys.display(HotkeyAction::Screenshot);
+        let snap_key = self
+            .config
+            .keybindings
+            .hotkeys
+            .display(HotkeyAction::Screenshot);
         let state_mgr_key = self
             .config
             .keybindings
@@ -187,7 +191,10 @@ impl RustboyApp {
 
         ui.separator();
         ui.add_enabled_ui(has_rom, |ui| {
-            if ui.button("Close Game / Return to Library (Ctrl+W)").clicked() {
+            if ui
+                .button("Close Game / Return to Library (Ctrl+W)")
+                .clicked()
+            {
                 ui.close_menu();
                 self.close_rom(ctx);
             }
@@ -354,7 +361,9 @@ impl RustboyApp {
             if dev_tools
                 && ui
                     .button("Soft Reset (SWI 00h)")
-                    .on_hover_text("Software Reset via BIOS SWI 00h (may skip cartridge header init)")
+                    .on_hover_text(
+                        "Software Reset via BIOS SWI 00h (may skip cartridge header init)",
+                    )
                     .clicked()
             {
                 self.soft_reset();
@@ -476,7 +485,9 @@ impl RustboyApp {
 
         if ui
             .checkbox(&mut self.config.auto_frameskip, "Skip Frames If Slow")
-            .on_hover_text("Auto Frame-Skip: drop rendered video frames on slow hardware to keep sound smooth")
+            .on_hover_text(
+                "Auto Frame-Skip: drop rendered video frames on slow hardware to keep sound smooth",
+            )
             .clicked()
         {
             self.config.save();
@@ -501,7 +512,11 @@ impl RustboyApp {
                 if ui
                     .selectable_label(
                         self.config.window_scale == s,
-                        format!("{s}x ({}x{})", LCD_WIDTH * usize::from(s), LCD_HEIGHT * usize::from(s)),
+                        format!(
+                            "{s}x ({}x{})",
+                            LCD_WIDTH * usize::from(s),
+                            LCD_HEIGHT * usize::from(s)
+                        ),
                     )
                     .clicked()
                 {
@@ -786,10 +801,7 @@ impl RustboyApp {
             ui.close_menu();
         }
         if ui
-            .add_enabled(
-                !hardcore,
-                egui::Button::new("Cheat Code Manager..."),
-            )
+            .add_enabled(!hardcore, egui::Button::new("Cheat Code Manager..."))
             .clicked()
         {
             self.debugger.show_cheats = true;
@@ -896,7 +908,10 @@ impl RustboyApp {
                 ui.close_menu();
             }
             let movie_lbl = if self.movie.is_recording() {
-                format!("Input Movies (TAS)... [REC {}f]", self.movie.current_frame())
+                format!(
+                    "Input Movies (TAS)... [REC {}f]",
+                    self.movie.current_frame()
+                )
             } else if self.movie.is_playing() {
                 format!(
                     "Input Movies (TAS)... [PLAY {}/{}]",
@@ -911,7 +926,10 @@ impl RustboyApp {
                 ui.close_menu();
             }
             if ui
-                .add_enabled(has_rom, egui::Button::new("Hardware Overrides & Sensors..."))
+                .add_enabled(
+                    has_rom,
+                    egui::Button::new("Hardware Overrides & Sensors..."),
+                )
                 .clicked()
             {
                 self.debugger.show_overrides = true;
@@ -980,7 +998,11 @@ impl RustboyApp {
                     ui.separator();
 
                     // 2. Pause / Resume
-                    let play_lbl = if self.paused { "▶ Resume" } else { "⏸ Pause" };
+                    let play_lbl = if self.paused {
+                        "▶ Resume"
+                    } else {
+                        "⏸ Pause"
+                    };
                     if toolbar_btn(ui, play_lbl, self.paused, has_rom)
                         .on_hover_text(format!("Pause / Resume ({pause_key})"))
                         .clicked()
@@ -1051,12 +1073,7 @@ impl RustboyApp {
                     } else {
                         format!("🔊 {}%", self.config.master_volume)
                     };
-                    let vol_resp = toolbar_btn(
-                        ui,
-                        &vol_label,
-                        self.show_volume_popup,
-                        true,
-                    );
+                    let vol_resp = toolbar_btn(ui, &vol_label, self.show_volume_popup, true);
                     self.volume_button_rect = Some(vol_resp.rect);
                     if vol_resp.clicked() {
                         self.show_volume_popup = !self.show_volume_popup;
@@ -1075,7 +1092,9 @@ impl RustboyApp {
 
                     // 9. Settings
                     if toolbar_btn(ui, "☰ Settings", self.show_settings, true)
-                        .on_hover_text("Open Settings (interface, audio, controls, developer tools)")
+                        .on_hover_text(
+                            "Open Settings (interface, audio, controls, developer tools)",
+                        )
                         .clicked()
                     {
                         self.show_settings = !self.show_settings;

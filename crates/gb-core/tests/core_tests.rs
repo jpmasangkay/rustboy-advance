@@ -684,7 +684,10 @@ fn mooneye_ld_bb_harness_and_optional_suite() {
     );
 
     // 2. Run external Mooneye suite ROMs if placed in `test-roms/gb/mooneye/`.
-    let mooneye_dir = workspace_root().join("test-roms").join("gb").join("mooneye");
+    let mooneye_dir = workspace_root()
+        .join("test-roms")
+        .join("gb")
+        .join("mooneye");
     if !mooneye_dir.is_dir() {
         eprintln!(
             "Skipping optional mooneye suite: {} not found",

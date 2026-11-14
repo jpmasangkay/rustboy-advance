@@ -1525,7 +1525,8 @@ mod tests {
         assert_eq!(gov.active_filter(), DisplayFilter::AuthenticGbaLcd);
 
         // Also check cold-start settle time (<180 frames = ~3.0s) from an empty window.
-        let mut cold_gov = QualityGovernor::with_measured_costs(DisplayFilter::XbrSmooth3x, true, costs);
+        let mut cold_gov =
+            QualityGovernor::with_measured_costs(DisplayFilter::XbrSmooth3x, true, costs);
         let cold_ev = (0..185)
             .find_map(|f| cold_gov.record_frame(13.5).map(|ev| (f, ev)))
             .expect("expected cold-start settle within 180 frames");
@@ -1693,10 +1694,7 @@ mod tests {
             gov.current_lockout_frames(),
             GOVERNOR_BASE_LOCKOUT_FRAMES * 2
         );
-        assert_eq!(
-            gov.up_lockout_remaining(),
-            GOVERNOR_BASE_LOCKOUT_FRAMES * 2
-        );
+        assert_eq!(gov.up_lockout_remaining(), GOVERNOR_BASE_LOCKOUT_FRAMES * 2);
 
         // Well past old 5min + 60s window (24,000 frames), must STILL be locked out because lockout doubled to 10min!
         for _ in 0..24_000 {
@@ -1721,17 +1719,17 @@ mod tests {
         assert_eq!(gov.active_filter(), DisplayFilter::SmoothScale2x);
 
         // Also test persisted starting filter below user_target: starts settled at AuthenticGbaLcd while targeting XbrSmooth3x.
-        let mut persisted_gov = QualityGovernor::with_measured_costs(
-            DisplayFilter::XbrSmooth3x,
-            true,
-            costs,
-        );
+        let mut persisted_gov =
+            QualityGovernor::with_measured_costs(DisplayFilter::XbrSmooth3x, true, costs);
         persisted_gov.set_active_from_persisted(DisplayFilter::AuthenticGbaLcd);
-        assert_eq!(persisted_gov.active_filter(), DisplayFilter::AuthenticGbaLcd);
-        let recovered_from_persisted =
-            (0..(GOVERNOR_WINDOW_FRAMES + GOVERNOR_RECOVERY_SUSTAIN_FRAMES))
-                .find_map(|_| persisted_gov.record_frame(2.0))
-                .expect("persisted filter with zero initial lockout can recover after 60s <35%");
+        assert_eq!(
+            persisted_gov.active_filter(),
+            DisplayFilter::AuthenticGbaLcd
+        );
+        let recovered_from_persisted = (0..(GOVERNOR_WINDOW_FRAMES
+            + GOVERNOR_RECOVERY_SUSTAIN_FRAMES))
+            .find_map(|_| persisted_gov.record_frame(2.0))
+            .expect("persisted filter with zero initial lockout can recover after 60s <35%");
         assert_eq!(recovered_from_persisted.to, DisplayFilter::SmoothScale2x);
     }
 
@@ -1752,14 +1750,32 @@ mod tests {
     #[test]
     fn quality_governor_caps_large_output_to_720x480_before_dropping_filter() {
         let large_costs = vec![
-            FilterCost { filter: DisplayFilter::Sharp1x, cost_ms: 9.0 },
-            FilterCost { filter: DisplayFilter::SmoothBilinear, cost_ms: 12.0 },
-            FilterCost { filter: DisplayFilter::XbrSmooth3x, cost_ms: 20.0 },
+            FilterCost {
+                filter: DisplayFilter::Sharp1x,
+                cost_ms: 9.0,
+            },
+            FilterCost {
+                filter: DisplayFilter::SmoothBilinear,
+                cost_ms: 12.0,
+            },
+            FilterCost {
+                filter: DisplayFilter::XbrSmooth3x,
+                cost_ms: 20.0,
+            },
         ];
         let capped_costs = vec![
-            FilterCost { filter: DisplayFilter::Sharp1x, cost_ms: 0.4 },
-            FilterCost { filter: DisplayFilter::SmoothBilinear, cost_ms: 1.5 },
-            FilterCost { filter: DisplayFilter::XbrSmooth3x, cost_ms: 7.0 },
+            FilterCost {
+                filter: DisplayFilter::Sharp1x,
+                cost_ms: 0.4,
+            },
+            FilterCost {
+                filter: DisplayFilter::SmoothBilinear,
+                cost_ms: 1.5,
+            },
+            FilterCost {
+                filter: DisplayFilter::XbrSmooth3x,
+                cost_ms: 7.0,
+            },
         ];
         let mut gov =
             QualityGovernor::with_measured_costs(DisplayFilter::SmoothBilinear, true, large_costs);
@@ -1788,14 +1804,32 @@ mod tests {
     #[test]
     fn quality_governor_lifts_720x480_cap_when_load_drops_and_backs_off_on_flap() {
         let large_costs = vec![
-            FilterCost { filter: DisplayFilter::Sharp1x, cost_ms: 8.0 },
-            FilterCost { filter: DisplayFilter::SmoothBilinear, cost_ms: 12.0 },
-            FilterCost { filter: DisplayFilter::XbrSmooth3x, cost_ms: 20.0 },
+            FilterCost {
+                filter: DisplayFilter::Sharp1x,
+                cost_ms: 8.0,
+            },
+            FilterCost {
+                filter: DisplayFilter::SmoothBilinear,
+                cost_ms: 12.0,
+            },
+            FilterCost {
+                filter: DisplayFilter::XbrSmooth3x,
+                cost_ms: 20.0,
+            },
         ];
         let capped_costs = vec![
-            FilterCost { filter: DisplayFilter::Sharp1x, cost_ms: 0.4 },
-            FilterCost { filter: DisplayFilter::SmoothBilinear, cost_ms: 1.5 },
-            FilterCost { filter: DisplayFilter::XbrSmooth3x, cost_ms: 7.0 },
+            FilterCost {
+                filter: DisplayFilter::Sharp1x,
+                cost_ms: 0.4,
+            },
+            FilterCost {
+                filter: DisplayFilter::SmoothBilinear,
+                cost_ms: 1.5,
+            },
+            FilterCost {
+                filter: DisplayFilter::XbrSmooth3x,
+                cost_ms: 7.0,
+            },
         ];
         let mut gov =
             QualityGovernor::with_measured_costs(DisplayFilter::SmoothBilinear, true, large_costs);
@@ -1810,8 +1844,9 @@ mod tests {
 
         // 2. Intermediate load (p95 = 5.0 ms < 35%, est_emu = 3.5 ms) stays capped if uncapping
         // would push predicted total (3.5 + 12.0 = 15.5 ms) over 50% budget (8.37 ms).
-        let premature = (0..(GOVERNOR_BASE_LOCKOUT_FRAMES + GOVERNOR_RECOVERY_SUSTAIN_FRAMES + 200))
-            .find_map(|_| gov.record_frame(5.0));
+        let premature =
+            (0..(GOVERNOR_BASE_LOCKOUT_FRAMES + GOVERNOR_RECOVERY_SUSTAIN_FRAMES + 200))
+                .find_map(|_| gov.record_frame(5.0));
         assert!(
             premature.is_none(),
             "must not uncap when uncapped work exceeds 50% target"
@@ -1823,15 +1858,27 @@ mod tests {
             DisplayFilter::SmoothBilinear,
             true,
             vec![
-                FilterCost { filter: DisplayFilter::Sharp1x, cost_ms: 2.0 },
-                FilterCost { filter: DisplayFilter::SmoothBilinear, cost_ms: 3.0 },
+                FilterCost {
+                    filter: DisplayFilter::Sharp1x,
+                    cost_ms: 2.0,
+                },
+                FilterCost {
+                    filter: DisplayFilter::SmoothBilinear,
+                    cost_ms: 3.0,
+                },
             ],
         );
         gov2.set_resolution_cap_support(
             true,
             Some(vec![
-                FilterCost { filter: DisplayFilter::Sharp1x, cost_ms: 0.2 },
-                FilterCost { filter: DisplayFilter::SmoothBilinear, cost_ms: 0.4 },
+                FilterCost {
+                    filter: DisplayFilter::Sharp1x,
+                    cost_ms: 0.2,
+                },
+                FilterCost {
+                    filter: DisplayFilter::SmoothBilinear,
+                    cost_ms: 0.4,
+                },
             ]),
         );
         let cap2 = (0..(GOVERNOR_WINDOW_FRAMES + GOVERNOR_DOWN_SUSTAIN_FRAMES))
@@ -1861,7 +1908,10 @@ mod tests {
             .expect("re-overload inside flap window should immediately re-cap");
         assert_eq!(flap.kind, GovernorTransitionKind::CapResolution);
         assert!(gov2.is_resolution_capped());
-        assert_eq!(gov2.current_lockout_frames(), GOVERNOR_BASE_LOCKOUT_FRAMES * 2);
+        assert_eq!(
+            gov2.current_lockout_frames(),
+            GOVERNOR_BASE_LOCKOUT_FRAMES * 2
+        );
     }
 }
 
@@ -1915,8 +1965,16 @@ pub fn test_filter_pattern_fb() -> Box<[u16; LCD_WIDTH * LCD_HEIGHT]> {
         for x in 0..LCD_WIDTH {
             let edge = ((x / 4) ^ (y / 4)) & 1;
             let diag = if (x + y) % 9 < 3 { 31 } else { 4 };
-            let r = if edge == 0 { (x & 31) as u16 } else { diag as u16 };
-            let g = if edge == 0 { diag as u16 } else { (y & 31) as u16 };
+            let r = if edge == 0 {
+                (x & 31) as u16
+            } else {
+                diag as u16
+            };
+            let g = if edge == 0 {
+                diag as u16
+            } else {
+                (y & 31) as u16
+            };
             let b = (((x ^ y) >> 1) & 31) as u16;
             fb[y * LCD_WIDTH + x] = (b << 10) | (g << 5) | r;
         }

@@ -93,9 +93,11 @@ pub(crate) mod win_mmcss {
                 if module.is_null() {
                     return None;
                 }
-                let p_set_char = GetProcAddress(module, b"AvSetMmThreadCharacteristicsW\0".as_ptr());
+                let p_set_char =
+                    GetProcAddress(module, b"AvSetMmThreadCharacteristicsW\0".as_ptr());
                 let p_set_prio = GetProcAddress(module, b"AvSetMmThreadPriority\0".as_ptr());
-                let p_revert = GetProcAddress(module, b"AvRevertMmThreadCharacteristics\0".as_ptr());
+                let p_revert =
+                    GetProcAddress(module, b"AvRevertMmThreadCharacteristics\0".as_ptr());
                 if p_set_char.is_null() || p_set_prio.is_null() || p_revert.is_null() {
                     return None;
                 }
@@ -135,11 +137,12 @@ pub(crate) mod win_mmcss {
                     }
                 }
                 let prev_prio = GetThreadPriority(GetCurrentThread());
-                let prev_thread_priority = if SetThreadPriority(GetCurrentThread(), fallback_prio) != 0 {
-                    Some(prev_prio)
-                } else {
-                    None
-                };
+                let prev_thread_priority =
+                    if SetThreadPriority(GetCurrentThread(), fallback_prio) != 0 {
+                        Some(prev_prio)
+                    } else {
+                        None
+                    };
                 Self {
                     handle,
                     prev_thread_priority,
@@ -355,15 +358,13 @@ impl AudioConsumer {
             if !self.was_underrunning {
                 self.underruns.fetch_add(1, Ordering::Relaxed);
                 self.was_underrunning = true;
-                let _ = self.target_fill.try_update(
-                    Ordering::Relaxed,
-                    Ordering::Relaxed,
-                    |cur| {
+                let _ = self
+                    .target_fill
+                    .try_update(Ordering::Relaxed, Ordering::Relaxed, |cur| {
                         let next =
                             (cur + ADAPTIVE_TARGET_STEP_SAMPLES).min(MAX_TARGET_FILL_SAMPLES);
                         (next > cur).then_some(next)
-                    },
-                );
+                    });
             }
             // Smooth exponential decay on underrun (0.985 factor) prevents speaker pops.
             let newest_idx = (self.hist_idx + SINC_TAPS - 1) & (SINC_TAPS - 1);
@@ -744,7 +745,8 @@ impl AudioOutput {
     #[inline]
     pub fn occupancy_percent(&self) -> f32 {
         let occ = self.occupancy.load(Ordering::Relaxed);
-        let scale = (self.target_fill.load(Ordering::Relaxed).max(1) * 2).min(RING_CAPACITY_SAMPLES);
+        let scale =
+            (self.target_fill.load(Ordering::Relaxed).max(1) * 2).min(RING_CAPACITY_SAMPLES);
         (occ as f32 / scale as f32) * 100.0
     }
 

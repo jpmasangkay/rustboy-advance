@@ -507,39 +507,41 @@ impl WgpuShaderPipeline {
             pipelines[4].clone().unwrap(),
         ];
 
-        let plain_pipeline = Arc::new(device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
-            label: Some("fs_plain"),
-            layout: Some(&pipeline_layout),
-            vertex: wgpu::VertexState {
-                module: &shader,
-                entry_point: Some("vs_main"),
-                buffers: &[],
-                compilation_options: Default::default(),
+        let plain_pipeline = Arc::new(device.create_render_pipeline(
+            &wgpu::RenderPipelineDescriptor {
+                label: Some("fs_plain"),
+                layout: Some(&pipeline_layout),
+                vertex: wgpu::VertexState {
+                    module: &shader,
+                    entry_point: Some("vs_main"),
+                    buffers: &[],
+                    compilation_options: Default::default(),
+                },
+                fragment: Some(wgpu::FragmentState {
+                    module: &shader,
+                    entry_point: Some("fs_plain"),
+                    targets: &[Some(wgpu::ColorTargetState {
+                        format: target_format,
+                        blend: None,
+                        write_mask: wgpu::ColorWrites::ALL,
+                    })],
+                    compilation_options: Default::default(),
+                }),
+                primitive: wgpu::PrimitiveState {
+                    topology: wgpu::PrimitiveTopology::TriangleList,
+                    strip_index_format: None,
+                    front_face: wgpu::FrontFace::Ccw,
+                    cull_mode: None,
+                    unclipped_depth: false,
+                    polygon_mode: wgpu::PolygonMode::Fill,
+                    conservative: false,
+                },
+                depth_stencil: None,
+                multisample: wgpu::MultisampleState::default(),
+                multiview: None,
+                cache: None,
             },
-            fragment: Some(wgpu::FragmentState {
-                module: &shader,
-                entry_point: Some("fs_plain"),
-                targets: &[Some(wgpu::ColorTargetState {
-                    format: target_format,
-                    blend: None,
-                    write_mask: wgpu::ColorWrites::ALL,
-                })],
-                compilation_options: Default::default(),
-            }),
-            primitive: wgpu::PrimitiveState {
-                topology: wgpu::PrimitiveTopology::TriangleList,
-                strip_index_format: None,
-                front_face: wgpu::FrontFace::Ccw,
-                cull_mode: None,
-                unclipped_depth: false,
-                polygon_mode: wgpu::PolygonMode::Fill,
-                conservative: false,
-            },
-            depth_stencil: None,
-            multisample: wgpu::MultisampleState::default(),
-            multiview: None,
-            cache: None,
-        }));
+        ));
 
         let blank = vec![0u8; LCD_WIDTH * LCD_HEIGHT * 4];
 
@@ -657,7 +659,8 @@ impl WgpuShaderPipeline {
             lcd_ghosting: 0.0,
             _pad: 0.0,
         };
-        self.queue.write_buffer(&self.uniform_buf, 0, bytemuck::bytes_of(&uniforms));
+        self.queue
+            .write_buffer(&self.uniform_buf, 0, bytemuck::bytes_of(&uniforms));
 
         let mut rpass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
             label: Some("bench_filter_pass"),
@@ -1548,7 +1551,9 @@ pub fn choose_desktop_backend(
             adapter_backend: "NoGpu".to_string(),
             adapter_device_type: "CpuFallback".to_string(),
             is_cpu_adapter: true,
-            reason: format!("{msg}; fell back automatically to No-GPU presenter (winit + softbuffer)"),
+            reason: format!(
+                "{msg}; fell back automatically to No-GPU presenter (winit + softbuffer)"
+            ),
             fallback_reason: Some(msg),
             cpu_adapter_ms: None,
             no_gpu_ms: None,
@@ -1591,7 +1596,13 @@ pub fn choose_desktop_backend(
 
     let mut no_gpu_post = VideoPostProcessor::new();
     let mut no_gpu_blit = crate::no_gpu::NoGpuCpuPresenter::new(w as usize, h as usize);
-    no_gpu_post.prewarm(color_correction, lcd_ghosting, filter, false, grid_intensity);
+    no_gpu_post.prewarm(
+        color_correction,
+        lcd_ghosting,
+        filter,
+        false,
+        grid_intensity,
+    );
     for _ in 0..8 {
         let img = no_gpu_post.process_display_filter(
             &pattern,
@@ -1653,7 +1664,13 @@ pub fn choose_desktop_backend(
     };
 
     let mut cpu_post = VideoPostProcessor::new();
-    cpu_post.prewarm(color_correction, lcd_ghosting, filter, false, grid_intensity);
+    cpu_post.prewarm(
+        color_correction,
+        lcd_ghosting,
+        filter,
+        false,
+        grid_intensity,
+    );
     for _ in 0..8 {
         let img = cpu_post.process_display_filter(
             &pattern,
@@ -1820,7 +1837,8 @@ impl BenchWgpuContext {
             view_formats: &[],
         });
         let output_view = out_tex.create_view(&wgpu::TextureViewDescriptor::default());
-        let pipeline = WgpuShaderPipeline::new(Arc::clone(&device), Arc::clone(&queue), tex_format)?;
+        let pipeline =
+            WgpuShaderPipeline::new(Arc::clone(&device), Arc::clone(&queue), tex_format)?;
         let plain_presenter = PlainTexturePresenter::new(&device, tex_format);
 
         Ok(Self {
@@ -1988,8 +2006,7 @@ impl BenchWgpuContext {
         }
 
         // A: breakdown of full baseline present_frame_sync
-        let (mut s_stage, mut s_curr, mut s_prev, mut s_enc, mut s_sub) =
-            (0.0, 0.0, 0.0, 0.0, 0.0);
+        let (mut s_stage, mut s_curr, mut s_prev, mut s_enc, mut s_sub) = (0.0, 0.0, 0.0, 0.0, 0.0);
         for _ in 0..frames {
             let t0 = Instant::now();
             self.pipeline.stage_frames(curr_arr, curr_arr, true);
@@ -2065,8 +2082,11 @@ impl BenchWgpuContext {
                     lcd_ghosting: 0.0,
                     _pad: 0.0,
                 };
-                self.queue
-                    .write_buffer(&self.pipeline.uniform_buf, 0, bytemuck::bytes_of(&uniforms));
+                self.queue.write_buffer(
+                    &self.pipeline.uniform_buf,
+                    0,
+                    bytemuck::bytes_of(&uniforms),
+                );
                 let mut enc = self
                     .device
                     .create_command_encoder(&wgpu::CommandEncoderDescriptor { label: None });
@@ -2096,14 +2116,17 @@ impl BenchWgpuContext {
             sum / n
         };
 
-        let b_bench_filters_none_ms =
-            bench_render(wgpu::LoadOp::Clear(wgpu::Color::BLACK), &self.pipeline.pipelines[0]);
-        let c_loadop_load_ms =
-            bench_render(wgpu::LoadOp::Load, &self.pipeline.pipelines[0]);
+        let b_bench_filters_none_ms = bench_render(
+            wgpu::LoadOp::Clear(wgpu::Color::BLACK),
+            &self.pipeline.pipelines[0],
+        );
+        let c_loadop_load_ms = bench_render(wgpu::LoadOp::Load, &self.pipeline.pipelines[0]);
         let e_plain_shader_720p_ms =
             bench_render(wgpu::LoadOp::Load, &self.pipeline.plain_pipeline);
-        let l_plain_clear_720p_ms =
-            bench_render(wgpu::LoadOp::Clear(wgpu::Color::BLACK), &self.pipeline.plain_pipeline);
+        let l_plain_clear_720p_ms = bench_render(
+            wgpu::LoadOp::Clear(wgpu::Color::BLACK),
+            &self.pipeline.plain_pipeline,
+        );
 
         let mut d_sum = 0.0;
         for _ in 0..frames {
@@ -2234,11 +2257,7 @@ impl BenchWgpuContext {
             let mut enc = self
                 .device
                 .create_command_encoder(&wgpu::CommandEncoderDescriptor { label: None });
-            enc.copy_texture_to_texture(
-                src_240.as_image_copy(),
-                dst_240.as_image_copy(),
-                ext_240,
-            );
+            enc.copy_texture_to_texture(src_240.as_image_copy(), dst_240.as_image_copy(), ext_240);
             self.queue.submit(Some(enc.finish()));
             self.device.poll(wgpu::Maintain::Wait);
             i_sum += t0.elapsed().as_secs_f64() * 1000.0;
@@ -2485,11 +2504,16 @@ mod tests {
             "Software CPU:     {:?}",
             sw_cpu.as_ref().map(|a| {
                 let info = a.get_info();
-                (info.name, format!("{:?}", info.backend), format!("{:?}", info.device_type))
+                (
+                    info.name,
+                    format!("{:?}", info.backend),
+                    format!("{:?}", info.device_type),
+                )
             })
         );
         if find_software_vulkan_icd().is_some() {
-            let sw_adapter = sw_cpu.expect("CPU Vulkan software ICD exists so Cpu adapter should load");
+            let sw_adapter =
+                sw_cpu.expect("CPU Vulkan software ICD exists so Cpu adapter should load");
             assert_eq!(sw_adapter.get_info().device_type, wgpu::DeviceType::Cpu);
         }
     }
@@ -2497,12 +2521,24 @@ mod tests {
     #[test]
     fn test_adapter_fallback_order_and_missing_adapter_returns_clear_error() {
         assert_eq!(ADAPTER_FALLBACK_ORDER.len(), 4);
-        assert!(backend_fallback_rank(wgpu::Backend::Vulkan) < backend_fallback_rank(wgpu::Backend::Dx12));
-        assert!(backend_fallback_rank(wgpu::Backend::Dx12) < backend_fallback_rank(wgpu::Backend::Gl));
-        assert!(device_type_rank(wgpu::DeviceType::DiscreteGpu) < device_type_rank(wgpu::DeviceType::IntegratedGpu));
-        assert!(device_type_rank(wgpu::DeviceType::IntegratedGpu) < device_type_rank(wgpu::DeviceType::Cpu));
+        assert!(
+            backend_fallback_rank(wgpu::Backend::Vulkan)
+                < backend_fallback_rank(wgpu::Backend::Dx12)
+        );
+        assert!(
+            backend_fallback_rank(wgpu::Backend::Dx12) < backend_fallback_rank(wgpu::Backend::Gl)
+        );
+        assert!(
+            device_type_rank(wgpu::DeviceType::DiscreteGpu)
+                < device_type_rank(wgpu::DeviceType::IntegratedGpu)
+        );
+        assert!(
+            device_type_rank(wgpu::DeviceType::IntegratedGpu)
+                < device_type_rank(wgpu::DeviceType::Cpu)
+        );
 
-        let empty_hw = BenchWgpuContext::init_with_backends(wgpu::Backends::empty(), false, 720, 480);
+        let empty_hw =
+            BenchWgpuContext::init_with_backends(wgpu::Backends::empty(), false, 720, 480);
         let empty_hw_err = match empty_hw {
             Ok(_) => panic!("empty backends must not initialize an adapter"),
             Err(e) => e,
@@ -2512,7 +2548,8 @@ mod tests {
             "unexpected error message: {empty_hw_err}"
         );
 
-        let empty_sw = BenchWgpuContext::init_with_backends(wgpu::Backends::empty(), true, 720, 480);
+        let empty_sw =
+            BenchWgpuContext::init_with_backends(wgpu::Backends::empty(), true, 720, 480);
         let empty_sw_err = match empty_sw {
             Ok(_) => panic!("empty software backends must return clear Err"),
             Err(e) => e,

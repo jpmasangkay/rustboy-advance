@@ -1169,7 +1169,11 @@ mod tests {
         fs::write(&raw_gba_homebrew, &junk).unwrap();
         fs::write(&raw_agb_homebrew, &junk).unwrap();
         fs::write(&junk_bin, &junk).unwrap();
-        fs::write(&valid_gba_bin, make_valid_gba_rom(b"BINGBAGAME\0\0", b"BGBE", 256)).unwrap();
+        fs::write(
+            &valid_gba_bin,
+            make_valid_gba_rom(b"BINGBAGAME\0\0", b"BGBE", 256),
+        )
+        .unwrap();
         fs::write(&valid_gbc_bin, make_valid_gbc_rom(b"BINGBCGAME\0")).unwrap();
 
         // Raw .gba/.agb homebrew without headers are NEVER rejected.

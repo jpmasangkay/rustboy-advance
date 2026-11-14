@@ -230,6 +230,12 @@ pub(crate) struct RustboyApp {
     pub(crate) cli_replay: Option<crate::bench::InputReplay>,
     pub(crate) cli_loop_replay: bool,
     pub(crate) cli_replay_frame: usize,
+    pub(crate) show_settings: bool,
+    pub(crate) show_perf_check: bool,
+    pub(crate) perf_check: crate::settings_ui::PerfCheckState,
+    pub(crate) show_volume_popup: bool,
+    pub(crate) volume_popup_anchor: Option<egui::Pos2>,
+    pub(crate) volume_button_rect: Option<egui::Rect>,
     pub(crate) sync_60hz: bool,
     pub(crate) display_refresh_hz: Option<f64>,
     pub(crate) pacing_deadline: Option<Instant>,
@@ -389,6 +395,12 @@ impl RustboyApp {
             cli_replay,
             cli_loop_replay,
             cli_replay_frame: 0,
+            show_settings: false,
+            show_perf_check: false,
+            perf_check: crate::settings_ui::PerfCheckState::Idle,
+            show_volume_popup: false,
+            volume_popup_anchor: None,
+            volume_button_rect: None,
             sync_60hz: cli_sync_60hz,
             display_refresh_hz: cli_display_refresh_hz,
             pacing_deadline: None,
@@ -1898,6 +1910,7 @@ impl RustboyApp {
             self.title_dirty = false;
         }
         self.handle_dropped_files(ctx);
+        self.poll_perf_check(ctx);
         self.handle_global_shortcuts(ctx);
         self.advance_emulation(ctx);
 
@@ -1914,6 +1927,9 @@ impl RustboyApp {
             && !self.paused
             && !self.show_pause_overlay
             && !self.show_state_manager
+            && !self.show_settings
+            && !self.show_perf_check
+            && !self.show_volume_popup
             && !self.link.show_window
             && now.duration_since(self.last_mouse_activity) > Duration::from_millis(2200);
 
@@ -1968,6 +1984,9 @@ impl RustboyApp {
         self.draw_game_settings_dialog(ctx);
         self.draw_movies_panel(ctx);
         self.draw_link_window(ctx);
+        self.draw_volume_popup(ctx);
+        self.draw_settings_dialog(ctx);
+        self.draw_perf_check_dialog(ctx);
         let hardcore = self.is_ra_hardcore_active();
         self.lua
             .show_lua_console(ctx, self.core.is_some(), hardcore);
@@ -2154,6 +2173,7 @@ impl RustboyApp {
     }
 
     pub fn on_exit(&mut self) {
+        self.cancel_perf_check();
         if let Some(ref mut logger) = self.perf_logger {
             logger.finish_and_print();
         }

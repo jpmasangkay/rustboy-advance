@@ -70,6 +70,17 @@ impl OffscreenUiRenderer {
         hover_pos: Option<egui::Pos2>,
         out_path: &Path,
     ) -> Result<(), String> {
+        self.render_app_with_click_to_png(ctx, app, None, hover_pos, out_path)
+    }
+
+    fn render_app_with_click_to_png(
+        &mut self,
+        ctx: &egui::Context,
+        app: &mut RustboyApp,
+        click_pos: Option<egui::Pos2>,
+        hover_pos: Option<egui::Pos2>,
+        out_path: &Path,
+    ) -> Result<(), String> {
         let screen_rect = egui::Rect::from_min_size(
             egui::Pos2::ZERO,
             egui::vec2(self.width as f32, self.height as f32),
@@ -77,13 +88,34 @@ impl OffscreenUiRenderer {
 
         let mut last_output = None;
         let mut to_free = Vec::new();
-        for step in 0..3 {
+        for step in 0..4 {
             let mut raw = egui::RawInput {
                 screen_rect: Some(screen_rect),
                 time: Some(10.0 + step as f64 * 0.25),
                 ..Default::default()
             };
-            if let Some(pos) = hover_pos {
+            if let Some(cpos) = click_pos {
+                if step == 1 {
+                    raw.events.push(egui::Event::PointerMoved(cpos));
+                    raw.events.push(egui::Event::PointerButton {
+                        pos: cpos,
+                        button: egui::PointerButton::Primary,
+                        pressed: true,
+                        modifiers: egui::Modifiers::NONE,
+                    });
+                } else if step == 2 {
+                    raw.events.push(egui::Event::PointerMoved(cpos));
+                    raw.events.push(egui::Event::PointerButton {
+                        pos: cpos,
+                        button: egui::PointerButton::Primary,
+                        pressed: false,
+                        modifiers: egui::Modifiers::NONE,
+                    });
+                }
+            }
+            if step == 3
+                && let Some(pos) = hover_pos
+            {
                 raw.events.push(egui::Event::PointerMoved(pos));
             }
             let out = ctx.run(raw, |c| {
@@ -350,5 +382,125 @@ fn capture_a1_ui_screenshots_if_requested() {
         renderer
             .render_app_to_png(&ctx, &mut app, None, &dir.join("a1_gameplay_devtools.png"))
             .expect("render devtools status bar");
+    }
+}
+
+#[test]
+fn capture_a2_ui_screenshots_if_requested() {
+    use crate::settings_ui::{PerfCheckState, parse_selftest_report};
+
+    let Some(dir) = std::env::var_os("RBA_SCREENSHOT_DIR").map(PathBuf::from) else {
+        // Lightweight non-GPU smoke check for Settings & Performance Check dialogs
+        let ctx = egui::Context::default();
+        configure_obsidian_style(&ctx);
+        let mut app = make_isolated_app();
+        app.show_settings = true;
+        app.show_perf_check = true;
+        let _ = ctx.run(Default::default(), |c| app.update(c));
+        return;
+    };
+    let _ = std::fs::create_dir_all(&dir);
+
+    let mut renderer =
+        OffscreenUiRenderer::new(1120, 720).expect("offscreen wgpu renderer for A2 screenshots");
+
+    // 1. 5-menu bar + 9-button toolbar + Play menu dropdown (normal player mode)
+    {
+        let ctx = egui::Context::default();
+        configure_obsidian_style(&ctx);
+        let mut app = make_isolated_app();
+        load_synthetic_active_game(&mut app);
+        app.config.developer_tools = false;
+        renderer
+            .render_app_with_click_to_png(
+                &ctx,
+                &mut app,
+                Some(egui::pos2(46.0, 12.0)),
+                Some(egui::pos2(60.0, 95.0)),
+                &dir.join("a2_menus_and_toolbar.png"),
+            )
+            .expect("render A2 menus and toolbar");
+    }
+
+    // 2. Volume popup anchored under toolbar
+    {
+        let ctx = egui::Context::default();
+        configure_obsidian_style(&ctx);
+        let mut app = make_isolated_app();
+        load_synthetic_active_game(&mut app);
+        app.show_volume_popup = true;
+        app.volume_popup_anchor = Some(egui::pos2(540.0, 56.0));
+        renderer
+            .render_app_to_png(&ctx, &mut app, None, &dir.join("a2_volume_popup.png"))
+            .expect("render A2 volume popup");
+    }
+
+    // 2b. Help menu expanded
+    {
+        let ctx = egui::Context::default();
+        configure_obsidian_style(&ctx);
+        let mut app = make_isolated_app();
+        load_synthetic_active_game(&mut app);
+        renderer
+            .render_app_with_click_to_png(
+                &ctx,
+                &mut app,
+                Some(egui::pos2(212.0, 12.0)),
+                Some(egui::pos2(230.0, 70.0)),
+                &dir.join("a2_help_menu.png"),
+            )
+            .expect("render A2 Help menu");
+    }
+
+    // 3. Settings dialog with Developer tools switch
+    {
+        let ctx = egui::Context::default();
+        configure_obsidian_style(&ctx);
+        let mut app = make_isolated_app();
+        load_synthetic_active_game(&mut app);
+        app.show_settings = true;
+        renderer
+            .render_app_to_png(&ctx, &mut app, None, &dir.join("a2_settings.png"))
+            .expect("render A2 Settings dialog");
+    }
+
+    // 4. Performance Check (--selftest) modal with summary + Copy/Save
+    {
+        let ctx = egui::Context::default();
+        configure_obsidian_style(&ctx);
+        let mut app = make_isolated_app();
+        load_synthetic_active_game(&mut app);
+        let sample = "\
+=== RUSTBOY ADVANCE PORTABLE --SELFTEST (PASS) ===\n\
+  Chosen Adapter:    NVIDIA GeForce RTX (Vulkan)\n\
+  Calibration:       Present=0.42ms Blit=0.18ms Filter=0.95ms (xbr_fast=1.60ms)\n\
+  Headless (600f):   1.12s -> 535.7 fps | Jitter p99=0.06ms | Underruns=0\n\
+  Paced (600f +120w): 10.01s -> 59.94 fps | Missed=0\n\
+  Measured Ceiling:  filter=LCD Matrix\n\
+  Recommended Filter: LCD Matrix\n\
+  JSON:              {\"passed\":true,\"adapter\":\"NVIDIA GeForce RTX\",\"missed_frames\":0}\n";
+        app.show_perf_check = true;
+        app.perf_check = PerfCheckState::Finished(Box::new(parse_selftest_report(sample, "", true, 11340)));
+        renderer
+            .render_app_to_png(&ctx, &mut app, None, &dir.join("a2_perf_check.png"))
+            .expect("render A2 Performance Check modal");
+    }
+
+    // 5. Tools menu with developer_tools = true
+    {
+        let ctx = egui::Context::default();
+        configure_obsidian_style(&ctx);
+        let mut app = make_isolated_app();
+        load_synthetic_active_game(&mut app);
+        app.config.developer_tools = true;
+        renderer
+            .render_app_with_click_to_png(
+                &ctx,
+                &mut app,
+                Some(egui::pos2(190.0, 12.0)),
+                Some(egui::pos2(210.0, 290.0)),
+                &dir.join("a2_devtools_menu.png"),
+            )
+            .expect("render A2 Tools developer menu");
     }
 }

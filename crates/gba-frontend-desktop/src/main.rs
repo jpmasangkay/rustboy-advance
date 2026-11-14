@@ -31,6 +31,7 @@ mod rom_loader;
 mod savestates;
 mod shaders;
 mod stress_rom;
+mod settings_ui;
 mod theme;
 #[cfg(test)]
 mod ui_snapshots;

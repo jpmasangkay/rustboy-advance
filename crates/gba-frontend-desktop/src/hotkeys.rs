@@ -79,17 +79,13 @@ impl RustboyApp {
         }
 
         // Smart Escape key handling:
-        // In Fullscreen: Escape always exits Fullscreen back to Windowed mode.
-        // In Windowed mode: Escape toggles the in-game Pause Overlay Menu (flushing .sav synchronously)!
-        if ctx.input(|i| !i.modifiers.any() && i.key_pressed(Key::Escape)) {
-            if self.is_fullscreen {
-                self.is_fullscreen = false;
-                ctx.send_viewport_cmd(egui::ViewportCommand::Fullscreen(false));
-                self.notify("Exited Fullscreen");
-                return;
-            } else if self.pause_and_flush_on_escape() {
-                return;
-            }
+        // 1. Close the top-most open dialog / popup (never loses focus silently)
+        // 2. Exit Fullscreen back to Windowed mode
+        // 3. Toggle the in-game Pause Overlay Menu (flushing .sav synchronously)
+        if ctx.input(|i| !i.modifiers.any() && i.key_pressed(Key::Escape))
+            && self.handle_escape_key(ctx)
+        {
+            return;
         }
 
         // Ctrl+W returns to library when a game is running
@@ -275,11 +271,27 @@ impl RustboyApp {
             }
         }
     }
+
+    /// Processes Escape precedence: top dialog -> fullscreen -> pause overlay.
+    pub(crate) fn handle_escape_key(&mut self, ctx: &egui::Context) -> bool {
+        if self.close_top_dialog_on_escape(ctx) {
+            return true;
+        }
+        if self.is_fullscreen {
+            self.is_fullscreen = false;
+            ctx.send_viewport_cmd(egui::ViewportCommand::Fullscreen(false));
+            self.notify("Exited Fullscreen");
+            return true;
+        }
+        self.pause_and_flush_on_escape()
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::headless::CliConfig;
+    use std::mem::ManuallyDrop;
 
     #[test]
     fn test_hotkey_chord_requires_exact_modifiers() {
@@ -317,5 +329,60 @@ mod tests {
             Key::F1,
             egui::Modifiers::NONE
         ));
+    }
+
+    #[test]
+    fn test_escape_precedence_dialog_then_fullscreen_then_pause() {
+        let mut app = ManuallyDrop::new(RustboyApp::new(CliConfig::default()));
+        app.core = Some(gba_core::GbaCore::new(None, vec![0u8; 256]));
+        app.sav_path = None;
+        app.config.pause_overlay_enabled = true;
+        app.is_fullscreen = true;
+        app.show_settings = true;
+        app.paused = false;
+        app.show_pause_overlay = false;
+
+        let ctx = egui::Context::default();
+        let esc_input = egui::RawInput {
+            events: vec![egui::Event::Key {
+                key: Key::Escape,
+                physical_key: None,
+                pressed: true,
+                repeat: false,
+                modifiers: egui::Modifiers::NONE,
+            }],
+            ..Default::default()
+        };
+
+        // 1st Esc: closes dialog first, keeps fullscreen and running state
+        let _ = ctx.run(esc_input.clone(), |ctx| {
+            app.handle_global_shortcuts(ctx);
+        });
+        assert!(!app.show_settings);
+        assert!(app.is_fullscreen);
+        assert!(!app.show_pause_overlay);
+        assert!(!app.paused);
+
+        // 2nd Esc: exits fullscreen, keeps running state
+        let _ = ctx.run(esc_input.clone(), |ctx| {
+            app.handle_global_shortcuts(ctx);
+        });
+        assert!(!app.is_fullscreen);
+        assert!(!app.show_pause_overlay);
+        assert!(!app.paused);
+
+        // 3rd Esc: toggles pause overlay on
+        let _ = ctx.run(esc_input.clone(), |ctx| {
+            app.handle_global_shortcuts(ctx);
+        });
+        assert!(app.show_pause_overlay);
+        assert!(app.paused);
+
+        // 4th Esc: resumes gameplay
+        let _ = ctx.run(esc_input, |ctx| {
+            app.handle_global_shortcuts(ctx);
+        });
+        assert!(!app.show_pause_overlay);
+        assert!(!app.paused);
     }
 }

@@ -1727,7 +1727,7 @@ impl DebuggerWindows {
             }
         }
 
-        egui::Window::new("Controls & Keybindings")
+        egui::Window::new("Controls Cheat-Sheet")
             .open(&mut open)
             .default_size([400.0, 420.0])
             .resizable(false)

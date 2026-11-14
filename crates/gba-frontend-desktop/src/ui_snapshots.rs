@@ -8,7 +8,6 @@ use crate::config::{AppConfig, DisplayFilter, HotkeyAction};
 use crate::headless::CliConfig;
 use crate::library::{LibraryViewMode, RomLibraryEntry};
 use crate::rom_loader::{RomPlatform, RomSourceKind};
-use gba_core::{LCD_HEIGHT, LCD_WIDTH};
 
 struct OffscreenUiRenderer {
     device: wgpu::Device,
@@ -303,26 +302,47 @@ fn make_isolated_app() -> ManuallyDrop<RustboyApp> {
 }
 
 fn load_synthetic_active_game(app: &mut RustboyApp) {
-    let rom = crate::stress_rom::build_stress_mode0_4bg_128spr_rom();
-    let core = gba_core::GbaCore::new(None, rom);
+    let manifest_dir = Path::new(env!("CARGO_MANIFEST_DIR"));
+    let summon_night =
+        PathBuf::from(r"C:\Users\My Laptop\Downloads\Summon Night - Swordcraft Story (USA).gba");
+    let tonc_m7 = manifest_dir.join("../../test-roms/tonc/m7_ex.gba");
+    let (rom, title, code) = if let Ok(bytes) = std::fs::read(&summon_night) {
+        (
+            bytes,
+            "Summon Night - Swordcraft Story".to_string(),
+            "BSNE".to_string(),
+        )
+    } else if let Ok(bytes) = std::fs::read(&tonc_m7) {
+        (bytes, "m7_ex".to_string(), "TONC".to_string())
+    } else {
+        (
+            crate::stress_rom::build_stress_mode0_4bg_128spr_rom(),
+            "Stress Mode0 Demo".to_string(),
+            "HOME".to_string(),
+        )
+    };
+
+    let mut core = gba_core::GbaCore::new(None, rom);
+    app.sink.capture_audio = false;
+    app.sink.suppress_audio = true;
+    for frame in 0..1200 {
+        let mask = match frame {
+            480..=484 | 820..=824 => gba_core::KEY_START,
+            _ => 0,
+        };
+        app.sink.keypad = gba_core::encode_keyinput(mask);
+        let _ = core.run_frame_with_breakpoints(&mut app.sink, &[]);
+    }
+    app.sink.keypad = gba_core::encode_keyinput(0);
+    app.sink.push_frame(&core.bus.ppu.framebuffer);
     app.core = Some(core);
-    app.rom_title = "Summon Night".to_string();
-    app.rom_code = "BSNE".to_string();
+    app.rom_title = title;
+    app.rom_code = code;
+    app.first_frame_cover_saved = true;
+    app.frame_counter = 1200;
     app.paused = false;
     app.show_pause_overlay = false;
     app.measured_fps = 59.73;
-
-    // Populate recognizable test pattern in core framebuffer
-    let mut fb = [0u16; LCD_WIDTH * LCD_HEIGHT];
-    for y in 0..LCD_HEIGHT {
-        for x in 0..LCD_WIDTH {
-            let r = ((x * 31) / LCD_WIDTH) as u16;
-            let g = ((y * 31) / LCD_HEIGHT) as u16;
-            let b = if (x / 16 + y / 16) % 2 == 0 { 22 } else { 8 };
-            fb[y * LCD_WIDTH + x] = (b << 10) | (g << 5) | r;
-        }
-    }
-    app.sink.push_frame(&fb);
 }
 
 #[test]
@@ -551,6 +571,71 @@ fn capture_a2_ui_screenshots_if_requested() {
             )
             .expect("render A2 Tools developer menu");
     }
+
+    // 6. File menu open on real active game
+    {
+        let ctx = egui::Context::default();
+        configure_obsidian_style(&ctx);
+        let mut app = make_isolated_app();
+        load_synthetic_active_game(&mut app);
+        renderer
+            .render_app_with_click_to_png(
+                &ctx,
+                &mut app,
+                Some(egui::pos2(20.0, 12.0)),
+                None,
+                &dir.join("fix9_file_menu.png"),
+            )
+            .expect("render Fix9 File menu");
+    }
+
+    // 7. Screen & Sound menu open on real active game
+    {
+        let ctx = egui::Context::default();
+        configure_obsidian_style(&ctx);
+        let mut app = make_isolated_app();
+        load_synthetic_active_game(&mut app);
+        renderer
+            .render_app_with_click_to_png(
+                &ctx,
+                &mut app,
+                Some(egui::pos2(120.0, 12.0)),
+                None,
+                &dir.join("fix9_screen_and_sound_menu.png"),
+            )
+            .expect("render Fix9 Screen & Sound menu");
+    }
+
+    // 8. Play menu open with developer_tools = true
+    {
+        let ctx = egui::Context::default();
+        configure_obsidian_style(&ctx);
+        let mut app = make_isolated_app();
+        load_synthetic_active_game(&mut app);
+        app.config.developer_tools = true;
+        renderer
+            .render_app_with_click_to_png(
+                &ctx,
+                &mut app,
+                Some(egui::pos2(55.0, 12.0)),
+                None,
+                &dir.join("fix9_play_devtools_menu.png"),
+            )
+            .expect("render Fix9 Play DevTools menu");
+    }
+
+    // 9. Confirm Unsaved Progress dialog before Restart game / Stop
+    {
+        let ctx = egui::Context::default();
+        configure_obsidian_style(&ctx);
+        let mut app = make_isolated_app();
+        load_synthetic_active_game(&mut app);
+        app.unsaved_frames_since_save = 240;
+        app.request_hard_reset();
+        renderer
+            .render_app_to_png(&ctx, &mut app, None, &dir.join("fix9_confirm_unsaved.png"))
+            .expect("render Fix9 Unsaved Progress confirm dialog");
+    }
 }
 
 #[test]
@@ -722,5 +807,115 @@ fn capture_a3_ui_screenshots_if_requested() {
         renderer
             .render_app_to_png(&ctx, &mut app, None, &dir.join("a3_missing_file_error.png"))
             .expect("render A3 missing file error");
+    }
+}
+
+#[test]
+fn capture_b1_ui_screenshots_if_requested() {
+    let Some(dir) = std::env::var_os("RBA_SCREENSHOT_DIR").map(PathBuf::from) else {
+        let ctx = egui::Context::default();
+        configure_obsidian_style(&ctx);
+        let mut app = make_isolated_app();
+        app.rom_folders.clear();
+        app.library_entries.clear();
+        app.config.welcome_completed = false;
+        let _ = ctx.run(Default::default(), |c| app.update(c));
+        app.show_controls_dialog = true;
+        let _ = ctx.run(Default::default(), |c| app.update(c));
+        return;
+    };
+    let _ = std::fs::create_dir_all(&dir);
+
+    let mut renderer =
+        OffscreenUiRenderer::new(1120, 720).expect("offscreen wgpu renderer for B1 screenshots");
+
+    // 1. Centered Welcome Card on first run
+    {
+        let ctx = egui::Context::default();
+        configure_obsidian_style(&ctx);
+        let mut app = make_isolated_app();
+        app.rom_folders.clear();
+        app.library_entries.clear();
+        app.config.welcome_completed = false;
+        renderer
+            .render_app_to_png(&ctx, &mut app, None, &dir.join("b1_welcome_card.png"))
+            .expect("render B1 welcome card");
+    }
+
+    // 2. Controls & Keybindings screen opened from toolbar / menu
+    {
+        let ctx = egui::Context::default();
+        configure_obsidian_style(&ctx);
+        let mut app = make_isolated_app();
+        app.show_controls_dialog = true;
+        renderer
+            .render_app_to_png(&ctx, &mut app, None, &dir.join("b1_controls_screen.png"))
+            .expect("render B1 controls dialog");
+    }
+
+    // 3. First-frame cover art fallback displayed in Library Grid
+    {
+        let ctx = egui::Context::default();
+        configure_obsidian_style(&ctx);
+        let mut app = make_isolated_app();
+        load_synthetic_active_game(&mut app);
+        let nonce = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let snap_stem = format!("b1_snap_firstframe_{nonce}");
+        let snap_path = PathBuf::from(format!(r"C:\Games\GBA\{snap_stem}.gba"));
+        let created = crate::library::capture_first_frame_cover_fallback(
+            &snap_path,
+            "BSNE",
+            &app.sink.framebuffer,
+            false,
+            true,
+        )
+        .expect("capture first-frame cover for snapshot");
+        app.close_rom(&ctx);
+        app.library_scanning = false;
+        app.library_scan_rx = None;
+        app.library_scan_error = None;
+        app.toast = None;
+        app.library_view_mode = LibraryViewMode::Grid;
+        app.config.auto_download_covers = false;
+        app.library_entries = vec![
+            RomLibraryEntry {
+                path: snap_path.clone(),
+                display_name: "Summon Night (First-Frame Cover)".to_string(),
+                internal_title: "SUMMON NIGHT".to_string(),
+                game_code: "BSNE".to_string(),
+                region: "USA",
+                size_mb: 16.0,
+                has_battery_sav: true,
+                source_kind: RomSourceKind::Raw,
+                platform: RomPlatform::Gba,
+                cart_type_label: "GBA Cart".to_string(),
+            },
+            RomLibraryEntry {
+                path: PathBuf::from(r"C:\Games\GBA\Homebrew Micro Demo.gba"),
+                display_name: "Homebrew Micro Demo (No Cover)".to_string(),
+                internal_title: "Homebrew".to_string(),
+                game_code: "HOME".to_string(),
+                region: "",
+                size_mb: 0.125,
+                has_battery_sav: false,
+                source_kind: RomSourceKind::Raw,
+                platform: RomPlatform::Gba,
+                cart_type_label: "GBA ROM".to_string(),
+            },
+        ];
+        renderer
+            .render_app_to_png(
+                &ctx,
+                &mut app,
+                None,
+                &dir.join("b1_first_frame_cover_grid.png"),
+            )
+            .expect("render B1 first-frame cover grid");
+        if let Some(p) = created {
+            let _ = std::fs::remove_file(p);
+        }
     }
 }

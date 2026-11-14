@@ -48,8 +48,7 @@ jobs:
         uses: Swatinem/rust-cache@v2
 
       - name: Check formatting
-        run: |
-          rustfmt --edition 2024 --check crates/gba-testrunner/src/main.rs crates/gba-testrunner/src/lib.rs crates/gba-testrunner/tests/rom_suite.rs
+        run: cargo fmt --all -- --check
 
       - name: Run Clippy
         run: |

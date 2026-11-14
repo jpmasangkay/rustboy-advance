@@ -10,6 +10,8 @@ use gba_core::{
 use image::{ImageBuffer, Rgb, RgbImage};
 use serde::{Deserialize, Serialize};
 
+pub mod stress_roms;
+
 /// Embedded default test manifest compiled into the crate as a fallback.
 pub const DEFAULT_MANIFEST_TOML: &str = include_str!("../manifest.toml");
 

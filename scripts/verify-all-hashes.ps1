@@ -11,14 +11,37 @@ Set-Location $RepoRoot
 
 $exe = (Resolve-Path "target\release\rustboy-advance.exe").Path
 
+$syntheticPaths = @(
+    "roms\homebrew\stress_aff_objwin.gba",
+    "roms\homebrew\stress_mode0_4bg_128spr.gba",
+    "roms\homebrew\stress_bitmap_345.gba"
+)
+if ($syntheticPaths | Where-Object { -not (Test-Path $_) }) {
+    Write-Host "Synthetic stress ROMs missing in roms\homebrew; regenerating via gen_stress_roms..."
+    & (Join-Path $PSScriptRoot "generate-stress-roms.ps1")
+}
+
+function Resolve-RomPath {
+    param([string[]]$Candidates)
+    foreach ($p in $Candidates) {
+        if ($p -and (Test-Path $p)) { return $p }
+    }
+    return $Candidates[0]
+}
+
+$summonCandidates = @(
+    $env:GBA_SUMMON_NIGHT_ROM,
+    "roms\summon_night.gba",
+    (Join-Path $env:USERPROFILE "Downloads\Summon Night - Swordcraft Story (USA).gba")
+)
 $checks = @(
-    @{ Name="Summon Night (3600f)"; Ref="perf\baselines\summon_night_3600.hashes.json"; Rom=$(if ($env:GBA_SUMMON_NIGHT_ROM) { $env:GBA_SUMMON_NIGHT_ROM } else { "roms\summon_night.gba" }); Replay="perf\replays\summon_night.txt"; Sav="perf\replays\summon_night.sav"; Frames=3600 },
-    @{ Name="m7_ex.gba"; Ref="perf\baselines\m7_ex_600.hashes.json"; Rom="roms\homebrew\m7_ex.gba"; Replay="perf\replays\tonc_m7_ex.txt"; Sav=$null; Frames=600 },
-    @{ Name="win_demo.gba"; Ref="perf\baselines\win_demo_600.hashes.json"; Rom="roms\homebrew\win_demo.gba"; Replay="perf\replays\tonc_win_demo.txt"; Sav=$null; Frames=600 },
-    @{ Name="bld_demo.gba"; Ref="perf\baselines\bld_demo_600.hashes.json"; Rom="roms\homebrew\bld_demo.gba"; Replay="perf\replays\tonc_bld_demo.txt"; Sav=$null; Frames=600 },
-    @{ Name="mos_demo.gba"; Ref="perf\baselines\mos_demo_600.hashes.json"; Rom="roms\homebrew\mos_demo.gba"; Replay="perf\replays\tonc_mos_demo.txt"; Sav=$null; Frames=600 },
-    @{ Name="oacombo.gba"; Ref="perf\baselines\oacombo_600.hashes.json"; Rom="roms\homebrew\oacombo.gba"; Replay="perf\replays\tonc_oacombo.txt"; Sav=$null; Frames=600 },
-    @{ Name="bm_modes.gba"; Ref="perf\baselines\bm_modes_600.hashes.json"; Rom="roms\homebrew\bm_modes.gba"; Replay="perf\replays\tonc_bm_modes.txt"; Sav=$null; Frames=600 },
+    @{ Name="Summon Night (3600f)"; Ref="perf\baselines\summon_night_3600.hashes.json"; Rom=(Resolve-RomPath $summonCandidates); Replay="perf\replays\summon_night.txt"; Sav="perf\replays\summon_night.sav"; Frames=3600 },
+    @{ Name="m7_ex.gba"; Ref="perf\baselines\m7_ex_600.hashes.json"; Rom=(Resolve-RomPath @("roms\homebrew\m7_ex.gba", "test-roms\tonc\m7_ex.gba")); Replay="perf\replays\tonc_m7_ex.txt"; Sav=$null; Frames=600 },
+    @{ Name="win_demo.gba"; Ref="perf\baselines\win_demo_600.hashes.json"; Rom=(Resolve-RomPath @("roms\homebrew\win_demo.gba", "test-roms\tonc\win_demo.gba")); Replay="perf\replays\tonc_win_demo.txt"; Sav=$null; Frames=600 },
+    @{ Name="bld_demo.gba"; Ref="perf\baselines\bld_demo_600.hashes.json"; Rom=(Resolve-RomPath @("roms\homebrew\bld_demo.gba", "test-roms\tonc\bld_demo.gba")); Replay="perf\replays\tonc_bld_demo.txt"; Sav=$null; Frames=600 },
+    @{ Name="mos_demo.gba"; Ref="perf\baselines\mos_demo_600.hashes.json"; Rom=(Resolve-RomPath @("roms\homebrew\mos_demo.gba", "test-roms\tonc\mos_demo.gba")); Replay="perf\replays\tonc_mos_demo.txt"; Sav=$null; Frames=600 },
+    @{ Name="oacombo.gba"; Ref="perf\baselines\oacombo_600.hashes.json"; Rom=(Resolve-RomPath @("roms\homebrew\oacombo.gba", "test-roms\tonc\oacombo.gba")); Replay="perf\replays\tonc_oacombo.txt"; Sav=$null; Frames=600 },
+    @{ Name="bm_modes.gba"; Ref="perf\baselines\bm_modes_600.hashes.json"; Rom=(Resolve-RomPath @("roms\homebrew\bm_modes.gba", "test-roms\tonc\bm_modes.gba")); Replay="perf\replays\tonc_bm_modes.txt"; Sav=$null; Frames=600 },
     @{ Name="stress_aff_objwin.gba"; Ref="perf\baselines\stress_aff_objwin_600.hashes.json"; Rom="roms\homebrew\stress_aff_objwin.gba"; Replay=$null; Sav=$null; Frames=600 },
     @{ Name="stress_mode0_4bg_128spr.gba"; Ref="perf\baselines\stress_mode0_4bg_128spr_600.hashes.json"; Rom="roms\homebrew\stress_mode0_4bg_128spr.gba"; Replay=$null; Sav=$null; Frames=600 },
     @{ Name="stress_bitmap_345.gba"; Ref="perf\baselines\stress_bitmap_345_600.hashes.json"; Rom="roms\homebrew\stress_bitmap_345.gba"; Replay="perf\replays\stress_bitmap_345.txt"; Sav=$null; Frames=600 }

@@ -24,7 +24,7 @@ image = { version = "0.25", default-features = false, features = ["png", "jpeg"]
 gif = "0.13"
 lz4_flex.workspace = true
 crc32fast = "1.5"
-zip = { version = "2", default-features = false, features = ["deflate"] }
+zip = { version = "2", default-features = false, features = ["deflate-flate2", "flate2"] }
 sevenz-rust2 = { version = "0.25", default-features = false, features = ["util"] }
 piccolo = "0.3"
 md-5 = "0.10"

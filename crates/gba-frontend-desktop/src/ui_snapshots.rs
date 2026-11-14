@@ -504,3 +504,170 @@ fn capture_a2_ui_screenshots_if_requested() {
             .expect("render A2 Tools developer menu");
     }
 }
+
+#[test]
+fn capture_a3_ui_screenshots_if_requested() {
+    use crate::library::TableSortColumn;
+
+    let Some(dir) = std::env::var_os("RBA_SCREENSHOT_DIR").map(PathBuf::from) else {
+        // Lightweight non-GPU smoke check for Grid sort & Empty state
+        let ctx = egui::Context::default();
+        configure_obsidian_style(&ctx);
+        let mut app = make_isolated_app();
+        app.config.auto_download_covers = false;
+        app.library_view_mode = LibraryViewMode::Grid;
+        app.table_sort_column = TableSortColumn::Size;
+        app.table_sort_descending = true;
+        let _ = ctx.run(Default::default(), |c| app.update(c));
+        app.rom_folders.clear();
+        app.library_entries.clear();
+        let _ = ctx.run(Default::default(), |c| app.update(c));
+        return;
+    };
+    let _ = std::fs::create_dir_all(&dir);
+
+    let mut renderer =
+        OffscreenUiRenderer::new(1120, 720).expect("offscreen wgpu renderer for A3 screenshots");
+
+    // 1. Multi-row Grid view sorted by Size descending with even tile alignment & Homebrew badge
+    {
+        let ctx = egui::Context::default();
+        configure_obsidian_style(&ctx);
+        let mut app = make_isolated_app();
+        app.config.auto_download_covers = false;
+        app.library_view_mode = LibraryViewMode::Grid;
+        app.table_sort_column = TableSortColumn::Size;
+        app.table_sort_descending = true;
+        app.library_entries = vec![
+            RomLibraryEntry {
+                path: PathBuf::from(r"C:\Games\GBA\Summon Night - Swordcraft Story (USA).gba"),
+                display_name: "Summon Night - Swordcraft Story (USA)".to_string(),
+                internal_title: "SUMMON NIGHT".to_string(),
+                game_code: "BSNE".to_string(),
+                region: "USA",
+                size_mb: 16.0,
+                has_battery_sav: true,
+                source_kind: RomSourceKind::Raw,
+                platform: RomPlatform::Gba,
+                cart_type_label: "GBA Cart".to_string(),
+            },
+            RomLibraryEntry {
+                path: PathBuf::from(r"C:\Games\GBA\Golden Sun - The Lost Age (USA).gba"),
+                display_name: "Golden Sun - The Lost Age (USA)".to_string(),
+                internal_title: "GOLDEN SUN 2".to_string(),
+                game_code: "AGFE".to_string(),
+                region: "USA",
+                size_mb: 16.0,
+                has_battery_sav: true,
+                source_kind: RomSourceKind::Raw,
+                platform: RomPlatform::Gba,
+                cart_type_label: "GBA Cart".to_string(),
+            },
+            RomLibraryEntry {
+                path: PathBuf::from(r"C:\Games\GBA\Metroid Fusion (USA).gba"),
+                display_name: "Metroid Fusion (USA)".to_string(),
+                internal_title: "METROID4".to_string(),
+                game_code: "AMTE".to_string(),
+                region: "USA",
+                size_mb: 8.0,
+                has_battery_sav: true,
+                source_kind: RomSourceKind::Raw,
+                platform: RomPlatform::Gba,
+                cart_type_label: "GBA Cart".to_string(),
+            },
+            RomLibraryEntry {
+                path: PathBuf::from(r"C:\Games\GBA\Advance Wars (EUR).gba"),
+                display_name: "Advance Wars (EUR)".to_string(),
+                internal_title: "ADVANCEWARS".to_string(),
+                game_code: "AWRP".to_string(),
+                region: "EUR",
+                size_mb: 4.0,
+                has_battery_sav: true,
+                source_kind: RomSourceKind::Raw,
+                platform: RomPlatform::Gba,
+                cart_type_label: "GBA Cart".to_string(),
+            },
+            RomLibraryEntry {
+                path: PathBuf::from(r"C:\Games\GBC\Links Awakening DX.gbc"),
+                display_name: "Links Awakening DX".to_string(),
+                internal_title: "ZELDA".to_string(),
+                game_code: "C123".to_string(),
+                region: "World",
+                size_mb: 1.0,
+                has_battery_sav: true,
+                source_kind: RomSourceKind::Zip,
+                platform: RomPlatform::Gbc,
+                cart_type_label: "MBC5+RAM+BATT".to_string(),
+            },
+            RomLibraryEntry {
+                path: PathBuf::from(r"C:\Games\GBA\Castlevania - Circle of the Moon (JPN).gba"),
+                display_name: "Castlevania - Circle of the Moon (JPN)".to_string(),
+                internal_title: "DRACULA".to_string(),
+                game_code: "AAMJ".to_string(),
+                region: "JPN",
+                size_mb: 8.0,
+                has_battery_sav: true,
+                source_kind: RomSourceKind::Raw,
+                platform: RomPlatform::Gba,
+                cart_type_label: "GBA Cart".to_string(),
+            },
+            RomLibraryEntry {
+                path: PathBuf::from(r"C:\Games\GBA\Homebrew Micro Demo.gba"),
+                display_name: "Homebrew Micro Demo (Unheadered ROM)".to_string(),
+                internal_title: "Homebrew".to_string(),
+                game_code: "HOME".to_string(),
+                region: "",
+                size_mb: 0.125,
+                has_battery_sav: false,
+                source_kind: RomSourceKind::Raw,
+                platform: RomPlatform::Gba,
+                cart_type_label: "GBA ROM".to_string(),
+            },
+        ];
+        app.favorites
+            .insert(PathBuf::from(r"C:\Games\GBA\Metroid Fusion (USA).gba"));
+        app.selected_rom_path = Some(PathBuf::from(r"C:\Games\GBA\Metroid Fusion (USA).gba"));
+        renderer
+            .render_app_to_png(&ctx, &mut app, None, &dir.join("a3_library_grid_sorted.png"))
+            .expect("render A3 sorted grid");
+    }
+
+    // 2. Empty-state card with "How to play" hint
+    {
+        let ctx = egui::Context::default();
+        configure_obsidian_style(&ctx);
+        let mut app = make_isolated_app();
+        app.config.auto_download_covers = false;
+        app.rom_folders.clear();
+        app.library_entries.clear();
+        renderer
+            .render_app_to_png(&ctx, &mut app, None, &dir.join("a3_empty_state.png"))
+            .expect("render A3 empty state");
+    }
+
+    // 3. Persistent error message after attempting to launch a deleted/missing ROM file
+    {
+        let ctx = egui::Context::default();
+        configure_obsidian_style(&ctx);
+        let mut app = make_isolated_app();
+        app.config.auto_download_covers = false;
+        app.library_view_mode = LibraryViewMode::Table;
+        let ghost = PathBuf::from(r"C:\Games\GBA\Deleted Ghost Game.gba");
+        app.library_entries.push(RomLibraryEntry {
+            path: ghost.clone(),
+            display_name: "Deleted Ghost Game".to_string(),
+            internal_title: "GHOST".to_string(),
+            game_code: "GHST".to_string(),
+            region: "USA",
+            size_mb: 8.0,
+            has_battery_sav: false,
+            source_kind: RomSourceKind::Raw,
+            platform: RomPlatform::Gba,
+            cart_type_label: "GBA Cart".to_string(),
+        });
+        app.launch_library_rom(&ghost, &ctx);
+        renderer
+            .render_app_to_png(&ctx, &mut app, None, &dir.join("a3_missing_file_error.png"))
+            .expect("render A3 missing file error");
+    }
+}

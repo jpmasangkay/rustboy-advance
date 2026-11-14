@@ -159,6 +159,9 @@ pub(crate) struct RustboyApp {
     pub(crate) table_sort_descending: bool,
     pub(crate) cover_textures: HashMap<PathBuf, TextureHandle>,
     pub(crate) pending_cover_downloads: HashSet<PathBuf>,
+    pub(crate) attempted_cover_downloads: HashSet<PathBuf>,
+    pub(crate) cover_download_tx: std::sync::mpsc::Sender<(PathBuf, bool)>,
+    pub(crate) cover_download_rx: std::sync::mpsc::Receiver<(PathBuf, bool)>,
 
     // Real-Time Rewind Buffer
     pub(crate) rewind_buffer: RewindBuffer,
@@ -296,6 +299,7 @@ impl RustboyApp {
         let governor_user_target = config.display_filter;
         let quality_governor =
             QualityGovernor::new(config.display_filter, config.auto_quality_governor);
+        let (cover_download_tx, cover_download_rx) = std::sync::mpsc::channel();
         let mut app = Self {
             config,
             core: None,
@@ -335,6 +339,9 @@ impl RustboyApp {
             table_sort_descending: false,
             cover_textures: HashMap::new(),
             pending_cover_downloads: HashSet::new(),
+            attempted_cover_downloads: HashSet::new(),
+            cover_download_tx,
+            cover_download_rx,
             rewind_buffer: RewindBuffer::new(rewind_budget_mb),
             frame_counter: 0,
             rewinding: false,
@@ -1899,6 +1906,7 @@ impl RustboyApp {
             self.notify_error(&err);
         }
         self.poll_library_scan(ctx);
+        self.poll_cover_downloads(ctx);
         self.pump_gamepad_events(ctx);
         self.poll_gdb_server();
         if self.ra.poll_events(&mut self.config) {

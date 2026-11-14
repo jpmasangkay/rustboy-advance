@@ -48,6 +48,26 @@ pub enum TableSortColumn {
     PlayTime,
 }
 
+impl TableSortColumn {
+    pub(crate) const ALL: [TableSortColumn; 5] = [
+        TableSortColumn::Title,
+        TableSortColumn::Region,
+        TableSortColumn::Size,
+        TableSortColumn::LastPlayed,
+        TableSortColumn::PlayTime,
+    ];
+
+    pub(crate) const fn label(self) -> &'static str {
+        match self {
+            Self::Title => "Title",
+            Self::Region => "Region",
+            Self::Size => "Size",
+            Self::LastPlayed => "Last Played",
+            Self::PlayTime => "Play Time",
+        }
+    }
+}
+
 fn civil_from_days(days: i64) -> (i32, u32, u32) {
     let z = days + 719468;
     let era = if z >= 0 { z } else { z - 146096 } / 146097;
@@ -163,7 +183,11 @@ pub(crate) fn find_cover_image(entry: &RomLibraryEntry) -> Option<PathBuf> {
     None
 }
 
-pub(crate) fn trigger_cover_download(entry: &RomLibraryEntry) {
+pub(crate) fn trigger_cover_download(
+    entry: &RomLibraryEntry,
+    done_tx: Option<mpsc::Sender<(PathBuf, bool)>>,
+) {
+    let entry_path = entry.path.clone();
     let display_name = entry.display_name.clone();
     let stem = entry
         .path
@@ -209,6 +233,7 @@ pub(crate) fn trigger_cover_download(entry: &RomLibraryEntry) {
             }
         }
 
+        let succeeded = downloaded_bytes.is_some();
         if let Some(bytes) = downloaded_bytes {
             let appdata_covers = crate::config::AppConfig::covers_dir();
             let _ = std::fs::create_dir_all(&appdata_covers);
@@ -232,6 +257,9 @@ pub(crate) fn trigger_cover_download(entry: &RomLibraryEntry) {
                     );
                 }
             }
+        }
+        if let Some(tx) = done_tx {
+            let _ = tx.send((entry_path, succeeded));
         }
     });
 }
@@ -262,6 +290,87 @@ fn url_encode_name(s: &str) -> String {
         }
     }
     out
+}
+
+/// Parses internal title, game code, region, and cartridge label from a GBA header slice,
+/// falling back to `"Homebrew"` when no cartridge header is present.
+fn parse_gba_cart_metadata(header: &[u8]) -> (String, String, &'static str, String) {
+    if header.len() < 0xB0 {
+        return (
+            String::from("Homebrew"),
+            String::from("HOME"),
+            "",
+            String::from("GBA ROM"),
+        );
+    }
+
+    let title_raw = &header[0xA0..0xAC];
+    let has_printable_title = title_raw
+        .iter()
+        .take_while(|&&c| c != 0)
+        .all(|&c| c.is_ascii_graphic() || c == b' ');
+    let title_clean: String = title_raw
+        .iter()
+        .take_while(|&&c| c != 0)
+        .map(|&c| {
+            if c.is_ascii_graphic() || c == b' ' {
+                c as char
+            } else {
+                ' '
+            }
+        })
+        .collect();
+    let code_raw = &header[0xAC..0xB0];
+    let has_valid_code = code_raw.iter().all(|&c| c.is_ascii_alphanumeric());
+    let title_trimmed = title_clean.trim();
+    let has_cart_header = crate::rom_loader::is_valid_gba_rom_header(header)
+        || (has_printable_title
+            && has_valid_code
+            && title_trimmed.chars().any(|c| c.is_ascii_alphanumeric()));
+
+    if !has_cart_header {
+        return (
+            String::from("Homebrew"),
+            String::from("HOME"),
+            "",
+            String::from("GBA ROM"),
+        );
+    }
+
+    let code_clean: String = code_raw
+        .iter()
+        .map(|&c| {
+            if c.is_ascii_alphanumeric() {
+                c as char
+            } else {
+                '-'
+            }
+        })
+        .collect();
+    let reg = match code_raw.get(3).copied().unwrap_or(b' ') {
+        b'E' | b'U' => "USA",
+        b'P' | b'D' | b'F' | b'I' | b'S' => "EUR",
+        b'J' => "JPN",
+        b'A' => "World",
+        _ => "",
+    };
+    (
+        title_trimmed.to_string(),
+        code_clean,
+        reg,
+        String::from("GBA Cart"),
+    )
+}
+
+/// Formats the region label shown in the library UI, labeling unheadered ROMs as `"Homebrew"`.
+pub(crate) fn library_region_label(entry: &RomLibraryEntry) -> &str {
+    if !entry.region.is_empty() {
+        entry.region
+    } else if entry.game_code == "HOME" {
+        "Homebrew"
+    } else {
+        ""
+    }
 }
 
 impl RustboyApp {
@@ -318,53 +427,7 @@ impl RustboyApp {
                 let cart = gb_cart_type_label(gb_hdr.cart_type).to_string();
                 (title, code, reg, cart)
             }
-            RomPlatform::Gba => {
-                if bytes_read >= 0xB0 {
-                    let title_raw = &header[0xA0..0xAC];
-                    let title_clean: String = title_raw
-                        .iter()
-                        .take_while(|&&c| c != 0)
-                        .map(|&c| {
-                            if c.is_ascii_graphic() || c == b' ' {
-                                c as char
-                            } else {
-                                ' '
-                            }
-                        })
-                        .collect();
-                    let code_raw = &header[0xAC..0xB0];
-                    let code_clean: String = code_raw
-                        .iter()
-                        .map(|&c| {
-                            if c.is_ascii_alphanumeric() {
-                                c as char
-                            } else {
-                                '-'
-                            }
-                        })
-                        .collect();
-                    let reg = match code_raw.get(3).copied().unwrap_or(b' ') {
-                        b'E' | b'U' => "USA",
-                        b'P' | b'D' | b'F' | b'I' | b'S' => "EUR",
-                        b'J' => "JPN",
-                        b'A' => "World",
-                        _ => "",
-                    };
-                    (
-                        title_clean.trim().to_string(),
-                        code_clean,
-                        reg,
-                        String::from("GBA Cart"),
-                    )
-                } else {
-                    (
-                        String::from("Homebrew"),
-                        String::from("HOME"),
-                        "",
-                        String::from("GBA ROM"),
-                    )
-                }
-            }
+            RomPlatform::Gba => parse_gba_cart_metadata(&header[..bytes_read]),
         };
 
         let has_battery_sav = crate::config::AppConfig::find_existing_sav_path_for_rom(path).is_some();
@@ -426,6 +489,7 @@ impl RustboyApp {
     }
 
     pub(crate) fn rescan_rom_folders(&mut self) {
+        self.attempted_cover_downloads.clear();
         if self.rom_folders.is_empty() {
             self.library_entries.clear();
             self.library_scanning = false;
@@ -452,6 +516,11 @@ impl RustboyApp {
         match rx.try_recv() {
             Ok(result) => {
                 self.library_entries = result.entries;
+                if let Some(sel) = &self.selected_rom_path
+                    && !self.library_entries.iter().any(|e| &e.path == sel)
+                {
+                    self.selected_rom_path = None;
+                }
                 self.library_scan_error = result.error;
                 self.library_scanning = false;
                 self.library_scan_rx = None;
@@ -463,6 +532,152 @@ impl RustboyApp {
                 self.library_scanning = false;
                 self.library_scan_rx = None;
             }
+        }
+    }
+
+    /// Drains completed cover art download notifications so idle repaints stop once finished.
+    pub(crate) fn poll_cover_downloads(&mut self, ctx: &egui::Context) {
+        let mut any_finished = false;
+        while let Ok((path, succeeded)) = self.cover_download_rx.try_recv() {
+            self.pending_cover_downloads.remove(&path);
+            if succeeded {
+                self.cover_textures.remove(&path);
+            }
+            any_finished = true;
+        }
+        if any_finished {
+            ctx.request_repaint();
+        }
+    }
+
+    /// Sorts library entries according to the active `table_sort_column` and direction.
+    pub(crate) fn sort_library_entries(&self, entries: &mut [RomLibraryEntry]) {
+        entries.sort_by(|a, b| {
+            let ord = match self.table_sort_column {
+                TableSortColumn::Title => a
+                    .display_name
+                    .to_lowercase()
+                    .cmp(&b.display_name.to_lowercase()),
+                TableSortColumn::Region => {
+                    library_region_label(a).cmp(library_region_label(b))
+                }
+                TableSortColumn::Size => a
+                    .size_mb
+                    .partial_cmp(&b.size_mb)
+                    .unwrap_or(std::cmp::Ordering::Equal),
+                TableSortColumn::LastPlayed => {
+                    let ts_a = self
+                        .config
+                        .playtimes
+                        .get(&a.game_code)
+                        .map(|p| p.last_played_timestamp)
+                        .unwrap_or(0);
+                    let ts_b = self
+                        .config
+                        .playtimes
+                        .get(&b.game_code)
+                        .map(|p| p.last_played_timestamp)
+                        .unwrap_or(0);
+                    ts_a.cmp(&ts_b)
+                }
+                TableSortColumn::PlayTime => {
+                    let sec_a = self
+                        .config
+                        .playtimes
+                        .get(&a.game_code)
+                        .map(|p| p.total_seconds)
+                        .unwrap_or(0);
+                    let sec_b = self
+                        .config
+                        .playtimes
+                        .get(&b.game_code)
+                        .map(|p| p.total_seconds)
+                        .unwrap_or(0);
+                    sec_a.cmp(&sec_b)
+                }
+            };
+            let ordered = if self.table_sort_descending {
+                ord.reverse()
+            } else {
+                ord
+            };
+            ordered.then_with(|| {
+                a.display_name
+                    .to_lowercase()
+                    .cmp(&b.display_name.to_lowercase())
+            })
+        });
+    }
+
+    /// Launches a ROM from the library or recent menu, pruning ghost entries cleanly if deleted.
+    pub(crate) fn launch_library_rom(&mut self, path: &Path, ctx: &egui::Context) {
+        if !path.is_file() {
+            let file_label = path
+                .file_name()
+                .and_then(|s| s.to_str())
+                .unwrap_or("Selected ROM");
+            let prev_len = self.library_entries.len();
+            self.library_entries.retain(|e| e.path != path);
+            if self.selected_rom_path.as_deref() == Some(path) {
+                self.selected_rom_path = None;
+            }
+            self.cover_textures.remove(path);
+            self.pending_cover_downloads.remove(path);
+            self.attempted_cover_downloads.remove(path);
+
+            let path_str = path.to_string_lossy();
+            let before_recent = self.config.recent_roms.len();
+            self.config.recent_roms.retain(|r| r.path != path_str);
+            if self.config.recent_roms.len() != before_recent {
+                self.config.save();
+            }
+
+            let ghost_note = if self.library_entries.len() != prev_len {
+                " The missing entry was removed from the library list."
+            } else {
+                ""
+            };
+            let msg = format!(
+                "Could not launch '{file_label}': file was not found at '{}'.{ghost_note}",
+                path.display()
+            );
+            if self.has_active_game() {
+                self.notify_error(&msg);
+            }
+            self.library_scan_error = Some(msg);
+            return;
+        }
+
+        if let Err(e) = self.open_rom(path, None, Some(ctx)) {
+            let file_label = path
+                .file_name()
+                .and_then(|s| s.to_str())
+                .unwrap_or("Selected ROM");
+            let msg = format!("Could not launch '{file_label}': {e}");
+            if self.has_active_game() {
+                self.notify_error(&e);
+            }
+            self.library_scan_error = Some(msg);
+        }
+    }
+
+    pub(crate) fn remove_rom_folder_from_vec(
+        rom_folders: &mut Vec<PathBuf>,
+        entry_path: &Path,
+    ) -> bool {
+        let before = rom_folders.len();
+        rom_folders.retain(|f| !entry_path.starts_with(f));
+        if rom_folders.len() == before
+            && let Some(parent) = entry_path.parent()
+        {
+            rom_folders.retain(|f| f != parent);
+        }
+        rom_folders.len() != before
+    }
+
+    fn remove_rom_folder_for_entry(&mut self, entry_path: &Path) {
+        if Self::remove_rom_folder_from_vec(&mut self.rom_folders, entry_path) {
+            self.save_persistent_config();
         }
     }
 
@@ -626,6 +841,60 @@ impl RustboyApp {
                             .desired_width(180.0)
                             .min_size(egui::vec2(180.0, 26.0));
                         ui.add(search_edit);
+
+                        if is_grid {
+                            let dir_arrow = if self.table_sort_descending {
+                                "↓"
+                            } else {
+                                "↑"
+                            };
+                            let dir_tip = if self.table_sort_descending {
+                                "Sort Descending (click for Ascending)"
+                            } else {
+                                "Sort Ascending (click for Descending)"
+                            };
+                            let dir_btn = egui::Button::new(
+                                RichText::new(dir_arrow).color(COLOR_TEXT),
+                            )
+                            .corner_radius(RADIUS_DEFAULT)
+                            .stroke(STROKE_BORDER)
+                            .min_size(egui::vec2(26.0, 26.0));
+                            if ui.add(dir_btn).on_hover_text(dir_tip).clicked() {
+                                self.table_sort_descending = !self.table_sort_descending;
+                            }
+
+                            egui::ComboBox::from_id_salt("library_grid_sort")
+                                .width(104.0)
+                                .selected_text(
+                                    RichText::new(format!(
+                                        "Sort: {}",
+                                        self.table_sort_column.label()
+                                    ))
+                                    .size(12.0)
+                                    .color(COLOR_TEXT),
+                                )
+                                .show_ui(ui, |ui| {
+                                    for col in TableSortColumn::ALL {
+                                        if ui
+                                            .selectable_label(
+                                                self.table_sort_column == col,
+                                                col.label(),
+                                            )
+                                            .clicked()
+                                        {
+                                            if self.table_sort_column == col {
+                                                self.table_sort_descending =
+                                                    !self.table_sort_descending;
+                                            } else {
+                                                self.table_sort_column = col;
+                                                self.table_sort_descending = false;
+                                            }
+                                        }
+                                    }
+                                })
+                                .response
+                                .on_hover_text("Sort games in Grid View");
+                        }
                     });
                 });
             });
@@ -680,49 +949,89 @@ impl RustboyApp {
         // 2. Empty & Loading States
         if self.rom_folders.is_empty() && filtered.is_empty() {
             ui.vertical_centered(|ui| {
-                ui.add_space((ui.available_height() * 0.35).max(40.0));
-                ui.label(
-                    RichText::new("No Game Directories Configured")
-                        .size(16.0)
-                        .strong()
-                        .color(COLOR_TEXT),
-                );
-                ui.add_space(8.0);
-                ui.label(
-                    RichText::new(
-                        "Add a folder containing your .gba, .gb, .gbc, .zip, or .7z ROMs to populate the game list, or open a single file.",
-                    )
-                    .color(COLOR_TEXT_SECONDARY)
-                    .size(12.0),
-                );
-                ui.add_space(16.0);
-                ui.horizontal(|ui| {
-                    let total_btn_w = 140.0 * 2.0 + 8.0;
-                    let pad = (ui.available_width() - total_btn_w).max(0.0) * 0.5;
-                    ui.add_space(pad);
-
-                    let add_btn = egui::Button::new(
-                        RichText::new("📁 Add Game Folder...").color(COLOR_TEXT),
-                    )
-                    .corner_radius(RADIUS_DEFAULT)
+                ui.add_space((ui.available_height() * 0.16).max(32.0));
+                let card_w = (ui.available_width() - 48.0).clamp(320.0, 540.0);
+                egui::Frame::new()
+                    .fill(COLOR_SURFACE)
                     .stroke(STROKE_BORDER)
-                    .min_size(egui::vec2(140.0, 28.0));
-                    if ui.add(add_btn).clicked() {
-                        self.add_rom_folder_dialog();
-                    }
-
-                    ui.add_space(8.0);
-
-                    let open_btn = egui::Button::new(
-                        RichText::new("📄 Open ROM File...").color(COLOR_TEXT),
-                    )
                     .corner_radius(RADIUS_DEFAULT)
-                    .stroke(STROKE_BORDER)
-                    .min_size(egui::vec2(140.0, 28.0));
-                    if ui.add(open_btn).clicked() {
-                        self.trigger_open_rom_dialog(ctx);
-                    }
-                });
+                    .inner_margin(egui::Margin::symmetric(24, 22))
+                    .show(ui, |ui| {
+                        ui.set_width(card_w);
+                        ui.vertical_centered(|ui| {
+                            ui.label(
+                                RichText::new("No Game Directories Configured")
+                                    .size(16.0)
+                                    .strong()
+                                    .color(COLOR_TEXT),
+                            );
+                            ui.add_space(6.0);
+                            ui.label(
+                                RichText::new(
+                                    "Add a folder with your .gba, .agb, .bin, .gb, .gbc, .zip, or .7z ROMs to populate the library, or open a single file.",
+                                )
+                                .color(COLOR_TEXT_SECONDARY)
+                                .size(12.0),
+                            );
+                            ui.add_space(16.0);
+                            ui.horizontal(|ui| {
+                                let total_btn_w = 150.0 * 2.0 + 10.0;
+                                let pad = (ui.available_width() - total_btn_w).max(0.0) * 0.5;
+                                ui.add_space(pad);
+
+                                let add_btn = egui::Button::new(
+                                    RichText::new("📁 Add Game Folder...").color(COLOR_TEXT),
+                                )
+                                .fill(ACCENT_TEAL_BG)
+                                .corner_radius(RADIUS_DEFAULT)
+                                .stroke(STROKE_TEAL)
+                                .min_size(egui::vec2(150.0, 30.0));
+                                if ui.add(add_btn).clicked() {
+                                    self.add_rom_folder_dialog();
+                                }
+
+                                ui.add_space(10.0);
+
+                                let open_btn = egui::Button::new(
+                                    RichText::new("📄 Open ROM File...").color(COLOR_TEXT),
+                                )
+                                .corner_radius(RADIUS_DEFAULT)
+                                .stroke(STROKE_BORDER)
+                                .min_size(egui::vec2(150.0, 30.0));
+                                if ui.add(open_btn).clicked() {
+                                    self.trigger_open_rom_dialog(ctx);
+                                }
+                            });
+                        });
+
+                        ui.add_space(16.0);
+                        egui::Frame::new()
+                            .fill(COLOR_TILE)
+                            .stroke(STROKE_BORDER)
+                            .corner_radius(RADIUS_DEFAULT)
+                            .inner_margin(egui::Margin::symmetric(14, 12))
+                            .show(ui, |ui| {
+                                ui.set_width((card_w - 28.0).max(200.0));
+                                ui.label(
+                                    RichText::new("How to play")
+                                        .size(12.0)
+                                        .strong()
+                                        .color(ACCENT_TEAL),
+                                );
+                                ui.add_space(6.0);
+                                for tip in [
+                                    "1. Click Add Game Folder above (or + Open in the toolbar) to pick your games.",
+                                    "2. Double-click any title to start playing; progress saves automatically to .sav.",
+                                    "3. Controls: Arrow Keys = D-Pad, Z / X = B / A, A / S = L / R, Enter = Start, Esc = Pause.",
+                                ] {
+                                    ui.label(
+                                        RichText::new(tip)
+                                            .size(11.5)
+                                            .color(COLOR_TEXT_SECONDARY),
+                                    );
+                                }
+                            });
+                    });
             });
             return;
         }
@@ -809,6 +1118,7 @@ impl RustboyApp {
         // 3. Render Table or Grid View
         let mut launch_target: Option<PathBuf> = None;
         let mut game_settings_entry: Option<RomLibraryEntry> = None;
+        let mut remove_folder_path: Option<PathBuf> = None;
         let mut rescan_needed = false;
         let mut toggle_favorite: Option<PathBuf> = None;
 
@@ -825,54 +1135,7 @@ impl RustboyApp {
                         .max(180.0);
 
                 let mut sorted_entries = filtered;
-                sorted_entries.sort_by(|a, b| {
-                    let ord = match self.table_sort_column {
-                        TableSortColumn::Title => a
-                            .display_name
-                            .to_lowercase()
-                            .cmp(&b.display_name.to_lowercase()),
-                        TableSortColumn::Region => a.region.cmp(b.region),
-                        TableSortColumn::Size => a
-                            .size_mb
-                            .partial_cmp(&b.size_mb)
-                            .unwrap_or(std::cmp::Ordering::Equal),
-                        TableSortColumn::LastPlayed => {
-                            let ts_a = self
-                                .config
-                                .playtimes
-                                .get(&a.game_code)
-                                .map(|p| p.last_played_timestamp)
-                                .unwrap_or(0);
-                            let ts_b = self
-                                .config
-                                .playtimes
-                                .get(&b.game_code)
-                                .map(|p| p.last_played_timestamp)
-                                .unwrap_or(0);
-                            ts_a.cmp(&ts_b)
-                        }
-                        TableSortColumn::PlayTime => {
-                            let sec_a = self
-                                .config
-                                .playtimes
-                                .get(&a.game_code)
-                                .map(|p| p.total_seconds)
-                                .unwrap_or(0);
-                            let sec_b = self
-                                .config
-                                .playtimes
-                                .get(&b.game_code)
-                                .map(|p| p.total_seconds)
-                                .unwrap_or(0);
-                            sec_a.cmp(&sec_b)
-                        }
-                    };
-                    if self.table_sort_descending {
-                        ord.reverse()
-                    } else {
-                        ord
-                    }
-                });
+                self.sort_library_entries(&mut sorted_entries);
 
                 // Table Header (28px height, 1px bottom border)
                 let (header_rect, _) =
@@ -1061,11 +1324,7 @@ impl RustboyApp {
                                 }
                                 ui.separator();
                                 if ui.button("🗑 Remove Folder from Library").clicked() {
-                                    if let Some(parent) = entry.path.parent() {
-                                        self.rom_folders.retain(|f| f != parent);
-                                        self.save_persistent_config();
-                                        rescan_needed = true;
-                                    }
+                                    remove_folder_path = Some(entry.path.clone());
                                     ui.close_menu();
                                 }
                             });
@@ -1146,11 +1405,11 @@ impl RustboyApp {
                                     }
                                     title_resp.on_hover_text(&entry.display_name);
 
-                                    // Region: plain text (blank when unknown)
+                                    // Region: plain text ("Homebrew" for unheadered GBA ROMs, blank when unknown)
                                     ui.add_sized(
                                         [region_w, 28.0],
                                         egui::Label::new(
-                                            RichText::new(entry.region)
+                                            RichText::new(library_region_label(entry))
                                                 .color(COLOR_TEXT_SECONDARY)
                                                 .size(12.0),
                                         )
@@ -1201,8 +1460,11 @@ impl RustboyApp {
                     });
             }
             LibraryViewMode::Grid => {
-                // Ensure covers are loaded or scheduled for download
-                for entry in &filtered {
+                let mut sorted_entries = filtered;
+                self.sort_library_entries(&mut sorted_entries);
+
+                // Ensure covers are loaded or scheduled once for download
+                for entry in &sorted_entries {
                     if !self.cover_textures.contains_key(&entry.path) {
                         if let Some(cover_path) = find_cover_image(entry) {
                             if let Ok(img) = image::open(&cover_path) {
@@ -1220,9 +1482,11 @@ impl RustboyApp {
                             }
                         } else if self.config.auto_download_covers
                             && !self.pending_cover_downloads.contains(&entry.path)
+                            && !self.attempted_cover_downloads.contains(&entry.path)
                         {
                             self.pending_cover_downloads.insert(entry.path.clone());
-                            trigger_cover_download(entry);
+                            self.attempted_cover_downloads.insert(entry.path.clone());
+                            trigger_cover_download(entry, Some(self.cover_download_tx.clone()));
                         }
                     }
                 }
@@ -1242,207 +1506,289 @@ impl RustboyApp {
                                 bottom: 16,
                             })
                             .show(ui, |ui| {
-                                ui.spacing_mut().item_spacing = egui::vec2(16.0, 20.0);
-                                ui.horizontal_wrapped(|ui| {
-                                    let tile_size = 160.0_f32; // Authentic GBA 1:1 square boxart
-                                    let tile_w = tile_size;
-                                    let tile_h = tile_size;
+                                let tile_size = 160.0_f32; // Authentic GBA 1:1 square boxart
+                                let tile_w = tile_size;
+                                let tile_h = tile_size;
+                                let card_meta_h = 40.0_f32;
+                                let spacing_x = 16.0_f32;
+                                let spacing_y = 20.0_f32;
+                                let avail_w = ui.available_width().max(tile_w);
+                                let cols = (((avail_w + spacing_x) / (tile_w + spacing_x)).floor()
+                                    as usize)
+                                    .max(1);
 
-                                    for entry in &filtered {
-                                        let is_selected =
-                                            self.selected_rom_path.as_ref() == Some(&entry.path);
+                                ui.spacing_mut().item_spacing = egui::vec2(spacing_x, spacing_y);
 
-                                        ui.allocate_ui_with_layout(
-                                            egui::vec2(tile_w, tile_h + 38.0),
-                                            Layout::top_down(Align::Min),
-                                            |ui| {
-                                                // 1. Cover Tile (1:1 square aspect ratio)
-                                                let (tile_rect, tile_resp) = ui.allocate_exact_size(
-                                                    egui::vec2(tile_w, tile_h),
-                                                    Sense::click(),
-                                                );
+                                for row_entries in sorted_entries.chunks(cols) {
+                                    ui.horizontal_top(|ui| {
+                                        ui.spacing_mut().item_spacing.x = spacing_x;
+                                        for entry in row_entries {
+                                            let is_selected =
+                                                self.selected_rom_path.as_ref() == Some(&entry.path);
 
-                                                if tile_resp.clicked() {
-                                                    self.selected_rom_path = Some(entry.path.clone());
-                                                }
-                                                if tile_resp.double_clicked() {
-                                                    launch_target = Some(entry.path.clone());
-                                                }
+                                            let (card_rect, _) = ui.allocate_exact_size(
+                                                egui::vec2(tile_w, tile_h + card_meta_h),
+                                                Sense::hover(),
+                                            );
+                                            ui.scope_builder(
+                                                egui::UiBuilder::new()
+                                                    .max_rect(card_rect)
+                                                    .layout(Layout::top_down(Align::Min)),
+                                                |ui| {
+                                                    ui.set_width(tile_w);
+                                                    ui.spacing_mut().item_spacing.y = 0.0;
 
-                                                tile_resp.context_menu(|ui| {
-                                                    if ui.button("▶ Play Game").clicked() {
-                                                        launch_target = Some(entry.path.clone());
-                                                        ui.close_menu();
+                                                    // 1. Cover Tile (1:1 square aspect ratio)
+                                                    let (tile_rect, tile_resp) = ui
+                                                        .allocate_exact_size(
+                                                            egui::vec2(tile_w, tile_h),
+                                                            Sense::click(),
+                                                        );
+
+                                                    if tile_resp.clicked() {
+                                                        self.selected_rom_path =
+                                                            Some(entry.path.clone());
                                                     }
-                                                    if ui.button("📁 Open Save Folder").clicked() {
-                                                        if let Some(parent) = entry.path.parent() {
-                                                            #[cfg(windows)]
+                                                    if tile_resp.double_clicked() {
+                                                        launch_target = Some(entry.path.clone());
+                                                    }
+
+                                                    tile_resp.context_menu(|ui| {
+                                                        if ui.button("▶ Play Game").clicked() {
+                                                            launch_target =
+                                                                Some(entry.path.clone());
+                                                            ui.close_menu();
+                                                        }
+                                                        if ui.button("📁 Open Save Folder").clicked()
+                                                        {
+                                                            if let Some(parent) = entry.path.parent()
                                                             {
-                                                                use std::os::windows::process::CommandExt;
-                                                                let _ = std::process::Command::new("explorer")
+                                                                #[cfg(windows)]
+                                                                {
+                                                                    use std::os::windows::process::CommandExt;
+                                                                    let _ = std::process::Command::new(
+                                                                        "explorer",
+                                                                    )
                                                                     .arg(parent)
                                                                     .creation_flags(0x08000000)
                                                                     .spawn();
-                                                            }
-                                                            #[cfg(not(windows))]
-                                                            {
-                                                                let _ = std::process::Command::new("xdg-open")
+                                                                }
+                                                                #[cfg(not(windows))]
+                                                                {
+                                                                    let _ = std::process::Command::new(
+                                                                        "xdg-open",
+                                                                    )
                                                                     .arg(parent)
                                                                     .spawn();
+                                                                }
                                                             }
+                                                            ui.close_menu();
                                                         }
-                                                        ui.close_menu();
-                                                    }
-                                                    if ui.button("🖼 Refresh / Download Cover").clicked() {
-                                                        self.cover_textures.remove(&entry.path);
-                                                        self.pending_cover_downloads.remove(&entry.path);
-                                                        trigger_cover_download(entry);
-                                                        ui.close_menu();
-                                                    }
-                                                    if ui.button("⚙ Game Settings...").clicked() {
-                                                        game_settings_entry = Some(entry.clone());
-                                                        ui.close_menu();
-                                                    }
-                                                    let is_fav = self.favorites.contains(&entry.path);
-                                                    if ui
-                                                        .button(if is_fav {
-                                                            "☆ Remove from Favorites"
-                                                        } else {
-                                                            "★ Add to Favorites"
-                                                        })
-                                                        .clicked()
-                                                    {
-                                                        if is_fav {
-                                                            self.favorites.remove(&entry.path);
-                                                        } else {
-                                                            self.favorites.insert(entry.path.clone());
+                                                        if ui
+                                                            .button("🖼 Refresh / Download Cover")
+                                                            .clicked()
+                                                        {
+                                                            self.cover_textures.remove(&entry.path);
+                                                            self.attempted_cover_downloads
+                                                                .insert(entry.path.clone());
+                                                            self.pending_cover_downloads
+                                                                .insert(entry.path.clone());
+                                                            trigger_cover_download(
+                                                                entry,
+                                                                Some(self.cover_download_tx.clone()),
+                                                            );
+                                                            ui.close_menu();
                                                         }
-                                                        self.save_persistent_config();
-                                                        ui.close_menu();
-                                                    }
-                                                    ui.separator();
-                                                    if ui.button("🗑 Remove Folder from Library").clicked() {
-                                                        if let Some(parent) = entry.path.parent() {
-                                                            self.rom_folders.retain(|f| f != parent);
+                                                        if ui.button("⚙ Game Settings...").clicked()
+                                                        {
+                                                            game_settings_entry =
+                                                                Some(entry.clone());
+                                                            ui.close_menu();
+                                                        }
+                                                        let is_fav =
+                                                            self.favorites.contains(&entry.path);
+                                                        if ui
+                                                            .button(if is_fav {
+                                                                "☆ Remove from Favorites"
+                                                            } else {
+                                                                "★ Add to Favorites"
+                                                            })
+                                                            .clicked()
+                                                        {
+                                                            if is_fav {
+                                                                self.favorites.remove(&entry.path);
+                                                            } else {
+                                                                self.favorites
+                                                                    .insert(entry.path.clone());
+                                                            }
                                                             self.save_persistent_config();
-                                                            rescan_needed = true;
+                                                            ui.close_menu();
                                                         }
-                                                        ui.close_menu();
-                                                    }
-                                                });
+                                                        ui.separator();
+                                                        if ui
+                                                            .button("🗑 Remove Folder from Library")
+                                                            .clicked()
+                                                        {
+                                                            remove_folder_path =
+                                                                Some(entry.path.clone());
+                                                            ui.close_menu();
+                                                        }
+                                                    });
 
-                                                // Base tile background
-                                                ui.painter()
-                                                    .rect_filled(tile_rect, RADIUS_DEFAULT, COLOR_TILE);
-
-                                                // Render cover image if loaded, aspect-fitted inside square tile
-                                                if let Some(tex) = self.cover_textures.get(&entry.path) {
-                                                    let tex_w = tex.size()[0] as f32;
-                                                    let tex_h = tex.size()[1] as f32;
-                                                    if tex_w > 0.0 && tex_h > 0.0 {
-                                                        let scale = (tile_w / tex_w).min(tile_h / tex_h);
-                                                        let draw_size = egui::vec2(tex_w * scale, tex_h * scale);
-                                                        let draw_rect = egui::Rect::from_center_size(tile_rect.center(), draw_size);
-                                                        ui.painter().image(
-                                                            tex.id(),
-                                                            draw_rect,
-                                                            egui::Rect::from_min_max(
-                                                                egui::pos2(0.0, 0.0),
-                                                                egui::pos2(1.0, 1.0),
-                                                            ),
-                                                            Color32::WHITE,
-                                                        );
-                                                    }
-                                                }
-
-                                                let stroke = if is_selected {
-                                                    STROKE_TEAL_2PX
-                                                } else {
-                                                    STROKE_BORDER
-                                                };
-                                                ui.painter().rect_stroke(
-                                                    tile_rect,
-                                                    RADIUS_DEFAULT,
-                                                    stroke,
-                                                    egui::StrokeKind::Inside,
-                                                );
-
-                                                // Subtle top-right Favorite star badge & hover full-title tooltip
-                                                let is_fav = self.favorites.contains(&entry.path);
-                                                let show_star = is_fav || tile_resp.hovered();
-                                                tile_resp.on_hover_text(&entry.display_name);
-                                                if show_star {
-                                                    let star_rect = egui::Rect::from_min_size(
-                                                        egui::pos2(
-                                                            tile_rect.right() - 26.0,
-                                                            tile_rect.top() + 4.0,
-                                                        ),
-                                                        egui::vec2(22.0, 22.0),
+                                                    // Base tile background
+                                                    ui.painter().rect_filled(
+                                                        tile_rect,
+                                                        RADIUS_DEFAULT,
+                                                        COLOR_TILE,
                                                     );
-                                                    let star_btn = egui::Button::new(
-                                                        RichText::new(if is_fav { "★" } else { "☆" })
+
+                                                    // Render cover image if loaded, aspect-fitted inside square tile
+                                                    if let Some(tex) =
+                                                        self.cover_textures.get(&entry.path)
+                                                    {
+                                                        let tex_w = tex.size()[0] as f32;
+                                                        let tex_h = tex.size()[1] as f32;
+                                                        if tex_w > 0.0 && tex_h > 0.0 {
+                                                            let scale = (tile_w / tex_w)
+                                                                .min(tile_h / tex_h);
+                                                            let draw_size = egui::vec2(
+                                                                tex_w * scale,
+                                                                tex_h * scale,
+                                                            );
+                                                            let draw_rect =
+                                                                egui::Rect::from_center_size(
+                                                                    tile_rect.center(),
+                                                                    draw_size,
+                                                                );
+                                                            ui.painter().image(
+                                                                tex.id(),
+                                                                draw_rect,
+                                                                egui::Rect::from_min_max(
+                                                                    egui::pos2(0.0, 0.0),
+                                                                    egui::pos2(1.0, 1.0),
+                                                                ),
+                                                                Color32::WHITE,
+                                                            );
+                                                        }
+                                                    }
+
+                                                    let stroke = if is_selected {
+                                                        STROKE_TEAL_2PX
+                                                    } else {
+                                                        STROKE_BORDER
+                                                    };
+                                                    ui.painter().rect_stroke(
+                                                        tile_rect,
+                                                        RADIUS_DEFAULT,
+                                                        stroke,
+                                                        egui::StrokeKind::Inside,
+                                                    );
+
+                                                    let tile_hovered = tile_resp.hovered();
+                                                    tile_resp.on_hover_text(&entry.display_name);
+
+                                                    // 2. Metadata Directly Below Tile
+                                                    ui.add_space(6.0);
+
+                                                    // Title 12px white, single-line ellipsis + full title tooltip
+                                                    let title_lbl = egui::Label::new(
+                                                        RichText::new(&entry.display_name)
+                                                            .color(COLOR_TEXT)
+                                                            .size(12.0),
+                                                    )
+                                                    .selectable(false)
+                                                    .truncate();
+                                                    let title_resp = ui
+                                                        .allocate_ui_with_layout(
+                                                            egui::vec2(tile_w, 16.0),
+                                                            Layout::left_to_right(Align::Center),
+                                                            |ui| ui.add(title_lbl),
+                                                        )
+                                                        .inner;
+                                                    if title_resp.clicked() {
+                                                        self.selected_rom_path =
+                                                            Some(entry.path.clone());
+                                                    }
+                                                    if title_resp.double_clicked() {
+                                                        launch_target = Some(entry.path.clone());
+                                                    }
+                                                    title_resp.on_hover_text(&entry.display_name);
+
+                                                    ui.add_space(2.0);
+
+                                                    // "REGION · SIZE" ("Homebrew · SIZE" for unheadered, or "SIZE" when region unknown)
+                                                    let size_str =
+                                                        format_rom_size_mb(entry.size_mb);
+                                                    let region_lbl = library_region_label(entry);
+                                                    let meta_str = if region_lbl.is_empty() {
+                                                        size_str
+                                                    } else {
+                                                        format!("{region_lbl} · {size_str}")
+                                                    };
+                                                    ui.label(
+                                                        RichText::new(meta_str)
+                                                            .color(COLOR_TEXT_SECONDARY)
+                                                            .size(11.0),
+                                                    );
+
+                                                    // Subtle top-right Favorite star badge rendered in its own scoped rect so it never shifts title/metadata below the tile
+                                                    let is_fav =
+                                                        self.favorites.contains(&entry.path);
+                                                    let show_star = is_fav || tile_hovered;
+                                                    if show_star {
+                                                        let star_rect = egui::Rect::from_min_size(
+                                                            egui::pos2(
+                                                                tile_rect.right() - 26.0,
+                                                                tile_rect.top() + 4.0,
+                                                            ),
+                                                            egui::vec2(22.0, 22.0),
+                                                        );
+                                                        let star_btn = egui::Button::new(
+                                                            RichText::new(if is_fav {
+                                                                "★"
+                                                            } else {
+                                                                "☆"
+                                                            })
                                                             .size(13.0)
                                                             .color(if is_fav {
                                                                 ACCENT_TEAL
                                                             } else {
                                                                 COLOR_TEXT_SECONDARY
                                                             }),
-                                                    )
-                                                    .fill(Color32::from_rgba_unmultiplied(
-                                                        0x12, 0x12, 0x12, 200,
-                                                    ))
-                                                    .stroke(STROKE_BORDER)
-                                                    .corner_radius(RADIUS_DEFAULT);
-                                                    let star_tip = if is_fav {
-                                                        "Remove from Favorites"
-                                                    } else {
-                                                        "Add to Favorites"
-                                                    };
-                                                    if ui
-                                                        .put(star_rect, star_btn)
-                                                        .on_hover_text(star_tip)
-                                                        .clicked()
-                                                    {
-                                                        toggle_favorite = Some(entry.path.clone());
+                                                        )
+                                                        .fill(Color32::from_rgba_unmultiplied(
+                                                            0x12, 0x12, 0x12, 200,
+                                                        ))
+                                                        .stroke(STROKE_BORDER)
+                                                        .corner_radius(RADIUS_DEFAULT);
+                                                        let star_tip = if is_fav {
+                                                            "Remove from Favorites"
+                                                        } else {
+                                                            "Add to Favorites"
+                                                        };
+                                                        ui.scope_builder(
+                                                            egui::UiBuilder::new()
+                                                                .max_rect(star_rect),
+                                                            |ui| {
+                                                                if ui
+                                                                    .add_sized(
+                                                                        star_rect.size(),
+                                                                        star_btn,
+                                                                    )
+                                                                    .on_hover_text(star_tip)
+                                                                    .clicked()
+                                                                {
+                                                                    toggle_favorite =
+                                                                        Some(entry.path.clone());
+                                                                }
+                                                            },
+                                                        );
                                                     }
-                                                }
-
-                                                // 2. Metadata Directly Below Tile
-                                                ui.add_space(4.0);
-
-                                                // Title 12px white, single-line ellipsis + full title tooltip
-                                                let title_lbl = egui::Label::new(
-                                                    RichText::new(&entry.display_name)
-                                                        .color(COLOR_TEXT)
-                                                        .size(12.0),
-                                                )
-                                                .selectable(false)
-                                                .truncate();
-                                                let title_resp = ui.add_sized([tile_w, 16.0], title_lbl);
-                                                if title_resp.clicked() {
-                                                    self.selected_rom_path = Some(entry.path.clone());
-                                                }
-                                                if title_resp.double_clicked() {
-                                                    launch_target = Some(entry.path.clone());
-                                                }
-                                                title_resp.on_hover_text(&entry.display_name);
-
-                                                // "REGION · SIZE" (or just "SIZE" if region unknown)
-                                                let size_str = format_rom_size_mb(entry.size_mb);
-                                                let meta_str = if entry.region.is_empty() {
-                                                    size_str
-                                                } else {
-                                                    format!("{} · {}", entry.region, size_str)
-                                                };
-                                                ui.label(
-                                                    RichText::new(meta_str)
-                                                        .color(COLOR_TEXT_SECONDARY)
-                                                        .size(11.0),
-                                                );
-                                            },
-                                        );
-                                    }
-                                });
+                                                },
+                                            );
+                                        }
+                                    });
+                                }
                             });
                     });
             }
@@ -1455,6 +1801,11 @@ impl RustboyApp {
             self.save_persistent_config();
         }
 
+        if let Some(rm_path) = remove_folder_path {
+            self.remove_rom_folder_for_entry(&rm_path);
+            rescan_needed = true;
+        }
+
         if rescan_needed {
             self.rescan_rom_folders();
         }
@@ -1463,10 +1814,8 @@ impl RustboyApp {
             self.open_game_settings_for_library_entry(&entry);
         }
 
-        if let Some(path) = launch_target
-            && let Err(e) = self.open_rom(&path, None, Some(ctx))
-        {
-            self.notify_error(&e);
+        if let Some(path) = launch_target {
+            self.launch_library_rom(&path, ctx);
         }
     }
 }
@@ -1574,5 +1923,197 @@ mod tests {
         assert_eq!(parsed.region, "");
 
         let _ = fs::remove_dir_all(&temp_dir);
+    }
+
+    #[test]
+    fn test_homebrew_unheadered_gba_shows_homebrew_and_is_not_rejected() {
+        let temp_dir = std::env::temp_dir().join("rba_test_homebrew_gba");
+        let _ = fs::remove_dir_all(&temp_dir);
+        fs::create_dir_all(&temp_dir).unwrap();
+
+        let tiny_path = temp_dir.join("tiny_demo.gba");
+        fs::write(&tiny_path, vec![0xEAu8; 64]).unwrap();
+        let large_zero_path = temp_dir.join("zero_homebrew.agb");
+        fs::write(&large_zero_path, vec![0x00u8; 512]).unwrap();
+        let arm_stub_path = temp_dir.join("arm_blob.gba");
+        let mut arm_bytes = vec![0xFFu8; 512];
+        arm_bytes[0xA0..0xB0].copy_from_slice(&[0x01, 0x02, 0x7F, 0x80].repeat(4));
+        fs::write(&arm_stub_path, &arm_bytes).unwrap();
+
+        for path in [&tiny_path, &large_zero_path, &arm_stub_path] {
+            let entry = RustboyApp::parse_rom_header(path).expect("homebrew .gba/.agb accepted");
+            assert_eq!(entry.internal_title, "Homebrew");
+            assert_eq!(entry.game_code, "HOME");
+            assert_eq!(entry.region, "");
+            assert_eq!(library_region_label(&entry), "Homebrew");
+        }
+
+        let _ = fs::remove_dir_all(&temp_dir);
+    }
+
+    #[test]
+    fn test_scan_filters_bin_and_exe_archives_and_refresh_clears_ghosts() {
+        use std::io::Write;
+        let temp_dir = std::env::temp_dir().join("rba_test_scan_filter_refresh");
+        let _ = fs::remove_dir_all(&temp_dir);
+        let sub_dir = temp_dir.join("gba");
+        fs::create_dir_all(&sub_dir).unwrap();
+
+        // 1. Valid GBA ROM in subfolder
+        let valid_gba = sub_dir.join("Summon Night.gba");
+        let mut gba = vec![0u8; 256];
+        gba[0xA0..0xAC].copy_from_slice(b"SUMMON NIGHT");
+        gba[0xAC..0xB0].copy_from_slice(b"ASNE");
+        gba[0xB2] = 0x96;
+        gba[0xBD] = crate::rom_loader::gba_header_complement(&gba);
+        fs::write(&valid_gba, &gba).unwrap();
+
+        // 2. Unheadered .gba homebrew (must remain visible)
+        let homebrew_gba = temp_dir.join("my_homebrew.gba");
+        fs::write(&homebrew_gba, vec![0u8; 256]).unwrap();
+
+        // 3. Junk .bin (must be rejected by header check)
+        let junk_bin = temp_dir.join("bios_payload.bin");
+        fs::write(&junk_bin, vec![0xAAu8; 512]).unwrap();
+
+        // 4. Windows release zip containing .exe + a .gba (must be rejected)
+        let app_zip = temp_dir.join("RustboyAdvance-v0.1.0-windows-x64.zip");
+        {
+            let f = std::fs::File::create(&app_zip).unwrap();
+            let mut zw = zip::ZipWriter::new(f);
+            let opts = zip::write::SimpleFileOptions::default();
+            zw.start_file("test.gba", opts).unwrap();
+            zw.write_all(&gba).unwrap();
+            zw.start_file("rustboy-advance.exe", opts).unwrap();
+            zw.write_all(b"MZ").unwrap();
+            zw.finish().unwrap();
+        }
+
+        let scan1 = RustboyApp::scan_folders_collect(std::slice::from_ref(&temp_dir));
+        assert!(scan1.error.is_none());
+        let names1: Vec<&str> = scan1.entries.iter().map(|e| e.display_name.as_str()).collect();
+        assert_eq!(names1, vec!["my_homebrew", "Summon Night"]);
+
+        // Delete one ROM from disk -> Refresh scan must remove the deleted ghost entry.
+        fs::remove_file(&homebrew_gba).unwrap();
+        let scan2 = RustboyApp::scan_folders_collect(std::slice::from_ref(&temp_dir));
+        let names2: Vec<&str> = scan2.entries.iter().map(|e| e.display_name.as_str()).collect();
+        assert_eq!(names2, vec!["Summon Night"]);
+
+        let _ = fs::remove_dir_all(&temp_dir);
+    }
+
+    #[test]
+    fn test_sort_missing_launch_subfolder_remove_and_idle_repaint() {
+        use std::mem::ManuallyDrop;
+
+        let mut app = ManuallyDrop::new(RustboyApp::new(crate::headless::CliConfig::default()));
+        app.library_scan_rx = None;
+        app.library_scanning = false;
+        app.rom_folders.clear();
+        app.library_entries.clear();
+        app.config.auto_download_covers = false;
+        app.selected_rom_path = None;
+        app.library_scan_error = None;
+
+        let make_entry = |name: &str, reg: &'static str, mb: f32, code: &str| RomLibraryEntry {
+            path: PathBuf::from(format!("C:\\roms\\sub\\{name}.gba")),
+            display_name: name.to_string(),
+            internal_title: name.to_string(),
+            game_code: code.to_string(),
+            region: reg,
+            size_mb: mb,
+            has_battery_sav: false,
+            source_kind: crate::rom_loader::RomSourceKind::Raw,
+            platform: RomPlatform::Gba,
+            cart_type_label: "GBA Cart".to_string(),
+        };
+
+        let mut entries = vec![
+            make_entry("Beta", "JPN", 4.0, "BBTJ"),
+            make_entry("Alpha", "USA", 16.0, "AALE"),
+            make_entry("Gamma", "EUR", 8.0, "CGMP"),
+        ];
+        app.table_sort_column = TableSortColumn::Size;
+        app.table_sort_descending = false;
+        app.sort_library_entries(&mut entries);
+        assert_eq!(
+            entries.iter().map(|e| e.display_name.as_str()).collect::<Vec<_>>(),
+            vec!["Beta", "Gamma", "Alpha"]
+        );
+        app.table_sort_descending = true;
+        app.sort_library_entries(&mut entries);
+        assert_eq!(
+            entries.iter().map(|e| e.display_name.as_str()).collect::<Vec<_>>(),
+            vec!["Alpha", "Gamma", "Beta"]
+        );
+
+        // Missing file launch prunes ghost entry and records clear persistent error banner.
+        let ghost_path = std::env::temp_dir().join("rba_missing_ghost_title.gba");
+        let _ = fs::remove_file(&ghost_path);
+        app.library_entries = vec![RomLibraryEntry {
+            path: ghost_path.clone(),
+            display_name: "Missing Title".into(),
+            internal_title: "MISSING".into(),
+            game_code: "MISS".into(),
+            region: "USA",
+            size_mb: 1.0,
+            has_battery_sav: false,
+            source_kind: crate::rom_loader::RomSourceKind::Raw,
+            platform: RomPlatform::Gba,
+            cart_type_label: "GBA Cart".into(),
+        }];
+        app.selected_rom_path = Some(ghost_path.clone());
+        let ctx = egui::Context::default();
+        app.launch_library_rom(&ghost_path, &ctx);
+        assert!(app.library_entries.is_empty());
+        assert!(app.selected_rom_path.is_none());
+        let err = app.library_scan_error.as_deref().unwrap_or("");
+        assert!(err.contains("Could not launch"));
+        assert!(err.contains("removed from the library list"));
+
+        // Subfolder ROM removes its parent root library folder cleanly.
+        let mut folders = vec![PathBuf::from("C:\\roms"), PathBuf::from("D:\\other")];
+        assert!(RustboyApp::remove_rom_folder_from_vec(
+            &mut folders,
+            Path::new("C:\\roms\\sub\\nested\\game.gba")
+        ));
+        assert_eq!(folders, vec![PathBuf::from("D:\\other")]);
+
+        // Simulate an in-flight cover download failing, completing, and idling with no timer repaints.
+        app.library_scan_error = None;
+        app.toast = None;
+        app.library_view_mode = LibraryViewMode::Grid;
+        app.config.auto_download_covers = true;
+        let sample_path = entries[0].path.clone();
+        app.pending_cover_downloads.insert(sample_path.clone());
+        for entry in &entries {
+            app.attempted_cover_downloads.insert(entry.path.clone());
+        }
+        app.library_entries = entries;
+        app.cover_download_tx.send((sample_path, false)).unwrap();
+        let raw_input = egui::RawInput {
+            screen_rect: Some(egui::Rect::from_min_size(
+                egui::Pos2::ZERO,
+                egui::vec2(1120.0, 720.0),
+            )),
+            ..Default::default()
+        };
+        let mut last_delay = std::time::Duration::ZERO;
+        for _ in 0..4 {
+            let out = ctx.run(raw_input.clone(), |ctx| {
+                app.update(ctx);
+            });
+            last_delay = out
+                .viewport_output
+                .get(&egui::ViewportId::ROOT)
+                .map(|v| v.repaint_delay)
+                .unwrap_or(std::time::Duration::MAX);
+        }
+        assert!(app.pending_cover_downloads.is_empty());
+        assert!(
+            last_delay > std::time::Duration::from_secs(60),
+            "expected idle library frame to sleep for input only, got repaint_delay={last_delay:?}"
+        );
     }
 }

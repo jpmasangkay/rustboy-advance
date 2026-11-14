@@ -155,9 +155,7 @@ impl RustboyApp {
                     if ui.button(lbl).on_hover_text(&entry.path).clicked() {
                         ui.close_menu();
                         let p = PathBuf::from(&entry.path);
-                        if let Err(e) = self.open_rom(&p, None, Some(ctx)) {
-                            self.notify_error(&e);
-                        }
+                        self.launch_library_rom(&p, ctx);
                     }
                 }
                 ui.separator();

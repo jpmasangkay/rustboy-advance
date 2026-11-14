@@ -71,13 +71,65 @@ pub(crate) struct RomHeaderSummary {
     pub(crate) source_kind: RomSourceKind,
 }
 
-pub(crate) fn is_gb_extension(name_or_path: &str) -> bool {
-    let ext = Path::new(name_or_path)
+const GB_NINTENDO_LOGO_PREFIX: [u8; 8] = [0xCE, 0xED, 0x66, 0x66, 0xCC, 0x0D, 0x00, 0x0B];
+
+fn extension_lower(name_or_path: &str) -> String {
+    Path::new(name_or_path)
         .extension()
         .and_then(|s| s.to_str())
         .unwrap_or("")
-        .to_ascii_lowercase();
-    matches!(ext.as_str(), "gb" | "gbc")
+        .to_ascii_lowercase()
+}
+
+pub(crate) fn is_gb_extension(name_or_path: &str) -> bool {
+    matches!(extension_lower(name_or_path).as_str(), "gb" | "gbc")
+}
+
+pub(crate) fn is_bin_extension(name_or_path: &str) -> bool {
+    extension_lower(name_or_path) == "bin"
+}
+
+pub(crate) fn is_executable_or_dll(name_or_path: &str) -> bool {
+    matches!(extension_lower(name_or_path).as_str(), "exe" | "dll")
+}
+
+/// Computes the GBA header complement checksum byte (`0xBD`) over `0xA0..=0xBC`.
+pub(crate) fn gba_header_complement(bytes: &[u8]) -> u8 {
+    let sum: u8 = bytes[0xA0..=0xBC]
+        .iter()
+        .fold(0u8, |acc, &b| acc.wrapping_add(b));
+    0u8.wrapping_sub(sum.wrapping_add(0x19))
+}
+
+/// Returns true if `bytes` begins with a structurally valid GBA cartridge header.
+pub(crate) fn is_valid_gba_rom_header(bytes: &[u8]) -> bool {
+    bytes.len() >= 0xC0 && bytes[0xB2] == 0x96 && gba_header_complement(bytes) == bytes[0xBD]
+}
+
+/// Computes the Game Boy header checksum byte (`0x014D`) over `0x0134..=0x014C`.
+pub(crate) fn gb_header_checksum(bytes: &[u8]) -> u8 {
+    let mut calc = 0u8;
+    for &b in &bytes[0x0134..=0x014C] {
+        calc = calc.wrapping_sub(b).wrapping_sub(1);
+    }
+    calc
+}
+
+/// Returns true if `bytes` begins with a valid Game Boy / Game Boy Color cartridge header.
+pub(crate) fn is_valid_gb_rom_header(bytes: &[u8]) -> bool {
+    bytes.len() >= 0x0150
+        && bytes[0x0104..0x010C] == GB_NINTENDO_LOGO_PREFIX
+        && gb_header_checksum(bytes) == bytes[0x014D]
+}
+
+/// Validates a ROM entry inside an archive according to its file extension and cartridge header.
+pub(crate) fn is_valid_archive_rom_entry(name_or_path: &str, header_or_rom: &[u8]) -> bool {
+    match extension_lower(name_or_path).as_str() {
+        "gba" | "agb" => is_valid_gba_rom_header(header_or_rom),
+        "gb" | "gbc" => is_valid_gb_rom_header(header_or_rom),
+        "bin" => is_valid_gba_rom_header(header_or_rom) || is_valid_gb_rom_header(header_or_rom),
+        _ => false,
+    }
 }
 
 pub(crate) fn detect_rom_platform(
@@ -86,11 +138,11 @@ pub(crate) fn detect_rom_platform(
     header_or_rom: &[u8],
 ) -> RomPlatform {
     let candidate = inner_name.unwrap_or_else(|| path.to_str().unwrap_or(""));
-    if is_gb_extension(candidate) {
-        let ext_is_gbc = Path::new(candidate)
-            .extension()
-            .and_then(|s| s.to_str())
-            .is_some_and(|e| e.eq_ignore_ascii_case("gbc"));
+    let is_gb_bin = is_bin_extension(candidate)
+        && is_valid_gb_rom_header(header_or_rom)
+        && !is_valid_gba_rom_header(header_or_rom);
+    if is_gb_extension(candidate) || is_gb_bin {
+        let ext_is_gbc = extension_lower(candidate) == "gbc";
         let cgb_flag = header_or_rom.get(0x0143).copied().unwrap_or(0);
         if ext_is_gbc || (cgb_flag & 0x80) != 0 {
             RomPlatform::Gbc
@@ -572,10 +624,22 @@ pub(crate) fn load_rom_bytes(path: &Path) -> Result<LoadedRomSource, String> {
     }
 }
 
+const ARCHIVE_EXEC_REJECT_MSG: &str =
+    "Archive contains executable/DLL files (.exe/.dll) and was rejected";
+
 fn load_rom_from_zip(path: &Path) -> Result<LoadedRomSource, String> {
     let file = File::open(path).map_err(|e| format!("Failed opening ZIP archive: {e}"))?;
     let mut archive = zip::ZipArchive::new(BufReader::new(file))
         .map_err(|e| format!("Invalid ZIP archive: {e}"))?;
+
+    for idx in 0..archive.len() {
+        let entry = archive
+            .by_index(idx)
+            .map_err(|e| format!("Failed reading ZIP entry: {e}"))?;
+        if !entry.is_dir() && is_executable_or_dll(entry.name()) {
+            return Err(ARCHIVE_EXEC_REJECT_MSG.into());
+        }
+    }
 
     for idx in 0..archive.len() {
         let mut entry = archive
@@ -585,22 +649,30 @@ fn load_rom_from_zip(path: &Path) -> Result<LoadedRomSource, String> {
             continue;
         }
         let entry_name = entry.name().to_string();
-        if has_rom_extension(&entry_name) {
-            if entry.size() > MAX_ROM_BYTES as u64 {
-                return Err("ROM inside ZIP archive exceeds 128 MB limit".into());
-            }
-            let mut bytes = Vec::with_capacity((entry.size() as usize).min(MAX_ROM_BYTES));
-            entry
-                .read_to_end(&mut bytes)
-                .map_err(|e| format!("Failed extracting '{entry_name}' from ZIP: {e}"))?;
-            return Ok(LoadedRomSource {
-                bytes,
-                inner_name: Some(entry_name),
-                source_kind: RomSourceKind::Zip,
-            });
+        if !has_rom_extension(&entry_name) {
+            continue;
         }
+        let mut header = [0u8; 0x150];
+        let hdr_len = read_up_to(&mut entry, &mut header)
+            .map_err(|e| format!("Failed reading header for '{entry_name}' in ZIP: {e}"))?;
+        if !is_valid_archive_rom_entry(&entry_name, &header[..hdr_len]) {
+            continue;
+        }
+        if entry.size() > MAX_ROM_BYTES as u64 {
+            return Err("ROM inside ZIP archive exceeds 128 MB limit".into());
+        }
+        let mut bytes = Vec::with_capacity((entry.size() as usize).min(MAX_ROM_BYTES));
+        bytes.extend_from_slice(&header[..hdr_len]);
+        entry
+            .read_to_end(&mut bytes)
+            .map_err(|e| format!("Failed extracting '{entry_name}' from ZIP: {e}"))?;
+        return Ok(LoadedRomSource {
+            bytes,
+            inner_name: Some(entry_name),
+            source_kind: RomSourceKind::Zip,
+        });
     }
-    Err("No .gba, .agb, .bin, .gb, or .gbc ROM found inside ZIP archive".into())
+    Err("No valid .gba, .agb, .bin, .gb, or .gbc ROM found inside ZIP archive".into())
 }
 
 fn load_rom_from_7z(path: &Path) -> Result<LoadedRomSource, String> {
@@ -609,23 +681,39 @@ fn load_rom_from_7z(path: &Path) -> Result<LoadedRomSource, String> {
 
     let mut extracted: Option<(String, Vec<u8>)> = None;
     let mut too_large = false;
+    let mut has_executable = false;
     reader
         .for_each_entries_with_decision(|entry, rdr| {
-            if !entry.is_directory() && has_rom_extension(entry.name()) {
-                if entry.size() > MAX_ROM_BYTES as u64 {
-                    too_large = true;
-                    return Ok(sevenz_rust2::EntryDecision::Stop);
-                }
-                let mut bytes = Vec::with_capacity((entry.size() as usize).min(MAX_ROM_BYTES));
-                rdr.read_to_end(&mut bytes)?;
-                extracted = Some((entry.name().to_string(), bytes));
-                Ok(sevenz_rust2::EntryDecision::Stop)
-            } else {
-                Ok(sevenz_rust2::EntryDecision::Continue)
+            if entry.is_directory() {
+                return Ok(sevenz_rust2::EntryDecision::Continue);
             }
+            if is_executable_or_dll(entry.name()) {
+                has_executable = true;
+                extracted = None;
+                return Ok(sevenz_rust2::EntryDecision::Stop);
+            }
+            if extracted.is_none() && !too_large && has_rom_extension(entry.name()) {
+                let mut header = [0u8; 0x150];
+                let hdr_len = read_up_to(&mut *rdr, &mut header)?;
+                if is_valid_archive_rom_entry(entry.name(), &header[..hdr_len]) {
+                    if entry.size() > MAX_ROM_BYTES as u64 {
+                        too_large = true;
+                    } else {
+                        let mut bytes =
+                            Vec::with_capacity((entry.size() as usize).min(MAX_ROM_BYTES));
+                        bytes.extend_from_slice(&header[..hdr_len]);
+                        rdr.read_to_end(&mut bytes)?;
+                        extracted = Some((entry.name().to_string(), bytes));
+                    }
+                }
+            }
+            Ok(sevenz_rust2::EntryDecision::Continue)
         })
         .map_err(|e| format!("Failed reading 7z archive: {e}"))?;
 
+    if has_executable {
+        return Err(ARCHIVE_EXEC_REJECT_MSG.into());
+    }
     if too_large {
         return Err("ROM inside 7z archive exceeds 128 MB limit".into());
     }
@@ -637,7 +725,7 @@ fn load_rom_from_7z(path: &Path) -> Result<LoadedRomSource, String> {
             source_kind: RomSourceKind::SevenZip,
         })
     } else {
-        Err("No .gba, .agb, .bin, .gb, or .gbc ROM found inside 7z archive".into())
+        Err("No valid .gba, .agb, .bin, .gb, or .gbc ROM found inside 7z archive".into())
     }
 }
 
@@ -654,11 +742,20 @@ pub(crate) fn read_rom_header_summary(path: &Path) -> Option<RomHeaderSummary> {
             let mut archive = zip::ZipArchive::new(BufReader::new(file)).ok()?;
             for idx in 0..archive.len() {
                 let entry = archive.by_index(idx).ok()?;
+                if !entry.is_dir() && is_executable_or_dll(entry.name()) {
+                    return None;
+                }
+            }
+            for idx in 0..archive.len() {
+                let entry = archive.by_index(idx).ok()?;
                 if !entry.is_dir() && has_rom_extension(entry.name()) {
                     let size = entry.size();
                     let inner_name = entry.name().to_string();
                     let mut header = [0u8; 0x150];
                     let bytes_read = read_up_to(entry, &mut header).ok()?;
+                    if !is_valid_archive_rom_entry(&inner_name, &header[..bytes_read]) {
+                        continue;
+                    }
                     return Some(RomHeaderSummary {
                         header,
                         bytes_read,
@@ -674,29 +771,44 @@ pub(crate) fn read_rom_header_summary(path: &Path) -> Option<RomHeaderSummary> {
             let mut reader =
                 sevenz_rust2::ArchiveReader::open(path, sevenz_rust2::Password::empty()).ok()?;
             let mut found: Option<RomHeaderSummary> = None;
+            let mut has_executable = false;
             let _ = reader.for_each_entries_with_decision(|entry, rdr| {
-                if !entry.is_directory() && has_rom_extension(entry.name()) {
+                if entry.is_directory() {
+                    return Ok(sevenz_rust2::EntryDecision::Continue);
+                }
+                if is_executable_or_dll(entry.name()) {
+                    has_executable = true;
+                    found = None;
+                    return Ok(sevenz_rust2::EntryDecision::Stop);
+                }
+                if found.is_none() && has_rom_extension(entry.name()) {
                     let mut header = [0u8; 0x150];
                     let bytes_read = read_up_to(rdr, &mut header)?;
-                    found = Some(RomHeaderSummary {
-                        header,
-                        bytes_read,
-                        rom_size_bytes: entry.size(),
-                        inner_name: Some(entry.name().to_string()),
-                        source_kind: RomSourceKind::SevenZip,
-                    });
-                    Ok(sevenz_rust2::EntryDecision::Stop)
-                } else {
-                    Ok(sevenz_rust2::EntryDecision::Continue)
+                    if is_valid_archive_rom_entry(entry.name(), &header[..bytes_read]) {
+                        found = Some(RomHeaderSummary {
+                            header,
+                            bytes_read,
+                            rom_size_bytes: entry.size(),
+                            inner_name: Some(entry.name().to_string()),
+                            source_kind: RomSourceKind::SevenZip,
+                        });
+                    }
                 }
+                Ok(sevenz_rust2::EntryDecision::Continue)
             });
-            found
+            if has_executable { None } else { found }
         }
         _ => {
             let mut file = File::open(path).ok()?;
             let meta = file.metadata().ok()?;
             let mut header = [0u8; 0x150];
             let bytes_read = read_up_to(&mut file, &mut header).ok()?;
+            if ext == "bin" {
+                let slice = &header[..bytes_read];
+                if !(is_valid_gba_rom_header(slice) || is_valid_gb_rom_header(slice)) {
+                    return None;
+                }
+            }
             Some(RomHeaderSummary {
                 header,
                 bytes_read,
@@ -954,6 +1066,25 @@ mod tests {
         let _ = fs::remove_dir_all(&temp_dir);
     }
 
+    fn make_valid_gba_rom(title: &[u8; 12], code: &[u8; 4], len: usize) -> Vec<u8> {
+        let mut rom = vec![0u8; len.max(256)];
+        rom[0xA0..0xAC].copy_from_slice(title);
+        rom[0xAC..0xB0].copy_from_slice(code);
+        rom[0xB2] = 0x96;
+        rom[0xBD] = gba_header_complement(&rom);
+        rom
+    }
+
+    fn make_valid_gbc_rom(title: &[u8; 11]) -> Vec<u8> {
+        let mut rom = vec![0u8; 0x8000];
+        rom[0x0104..0x010C].copy_from_slice(&GB_NINTENDO_LOGO_PREFIX);
+        rom[0x0134..0x013F].copy_from_slice(title);
+        rom[0x0143] = 0xC0; // CGB only
+        rom[0x0147] = 0x10; // MBC3+TIMER+RAM+BATTERY
+        rom[0x014D] = gb_header_checksum(&rom);
+        rom
+    }
+
     #[test]
     fn test_zip_archive_rom_extraction_and_header_summary() {
         let temp_dir = std::env::temp_dir().join("rba_test_zip_rom");
@@ -961,9 +1092,7 @@ mod tests {
         fs::create_dir_all(&temp_dir).unwrap();
         let zip_path = temp_dir.join("bundle.zip");
 
-        let mut rom = vec![0u8; 256];
-        rom[0xA0..0xAC].copy_from_slice(b"TESTZIPGAME\0");
-        rom[0xAC..0xB0].copy_from_slice(b"BTZE");
+        let rom = make_valid_gba_rom(b"TESTZIPGAME\0", b"BTZE", 256);
 
         {
             let f = File::create(&zip_path).unwrap();
@@ -997,10 +1126,7 @@ mod tests {
         fs::create_dir_all(&temp_dir).unwrap();
         let zip_path = temp_dir.join("gbc_bundle.zip");
 
-        let mut rom = vec![0u8; 0x8000];
-        rom[0x0134..0x013F].copy_from_slice(b"PKMNCRYSTAL");
-        rom[0x0143] = 0xC0; // CGB only
-        rom[0x0147] = 0x10; // MBC3+TIMER+RAM+BATTERY
+        let rom = make_valid_gbc_rom(b"PKMNCRYSTAL");
 
         {
             let f = File::create(&zip_path).unwrap();
@@ -1023,6 +1149,112 @@ mod tests {
         let loaded = load_rom_bytes(&zip_path).unwrap();
         assert_eq!(loaded.inner_name.as_deref(), Some("roms/crystal.gbc"));
         assert_eq!(loaded.bytes.len(), 0x8000);
+
+        let _ = fs::remove_dir_all(&temp_dir);
+    }
+
+    #[test]
+    fn test_bin_requires_valid_header_while_gba_accepts_homebrew() {
+        let temp_dir = std::env::temp_dir().join("rba_test_bin_vs_gba_headers");
+        let _ = fs::remove_dir_all(&temp_dir);
+        fs::create_dir_all(&temp_dir).unwrap();
+
+        let junk = vec![0xAAu8; 512];
+        let raw_gba_homebrew = temp_dir.join("homebrew_demo.gba");
+        let raw_agb_homebrew = temp_dir.join("homebrew_demo.agb");
+        let junk_bin = temp_dir.join("firmware.bin");
+        let valid_gba_bin = temp_dir.join("valid_gba.bin");
+        let valid_gbc_bin = temp_dir.join("valid_gbc.bin");
+
+        fs::write(&raw_gba_homebrew, &junk).unwrap();
+        fs::write(&raw_agb_homebrew, &junk).unwrap();
+        fs::write(&junk_bin, &junk).unwrap();
+        fs::write(&valid_gba_bin, make_valid_gba_rom(b"BINGBAGAME\0\0", b"BGBE", 256)).unwrap();
+        fs::write(&valid_gbc_bin, make_valid_gbc_rom(b"BINGBCGAME\0")).unwrap();
+
+        // Raw .gba/.agb homebrew without headers are NEVER rejected.
+        assert!(read_rom_header_summary(&raw_gba_homebrew).is_some());
+        assert!(read_rom_header_summary(&raw_agb_homebrew).is_some());
+
+        // Raw .bin files require valid GBA or GB/GBC headers.
+        assert!(read_rom_header_summary(&junk_bin).is_none());
+        let gba_bin_hdr = read_rom_header_summary(&valid_gba_bin).unwrap();
+        assert_eq!(
+            detect_rom_platform(&valid_gba_bin, None, &gba_bin_hdr.header),
+            RomPlatform::Gba
+        );
+        let gbc_bin_hdr = read_rom_header_summary(&valid_gbc_bin).unwrap();
+        assert_eq!(
+            detect_rom_platform(&valid_gbc_bin, None, &gbc_bin_hdr.header),
+            RomPlatform::Gbc
+        );
+
+        let _ = fs::remove_dir_all(&temp_dir);
+    }
+
+    #[test]
+    fn test_archives_reject_exe_dll_and_invalid_bin() {
+        let temp_dir = std::env::temp_dir().join("rba_test_archive_security");
+        let _ = fs::remove_dir_all(&temp_dir);
+        fs::create_dir_all(&temp_dir).unwrap();
+
+        let valid_rom = make_valid_gba_rom(b"SAFEGAME\0\0\0\0", b"ASFE", 256);
+
+        // Archive containing a valid ROM PLUS an .exe later in the archive -> rejected.
+        let exe_zip = temp_dir.join("RustboyAdvance-v0.1.0-windows-x64.zip");
+        {
+            let f = File::create(&exe_zip).unwrap();
+            let mut zw = zip::ZipWriter::new(f);
+            let opts = zip::write::SimpleFileOptions::default();
+            zw.start_file("test.gba", opts).unwrap();
+            zw.write_all(&valid_rom).unwrap();
+            zw.start_file("rustboy-advance.exe", opts).unwrap();
+            zw.write_all(b"MZ").unwrap();
+            zw.finish().unwrap();
+        }
+        assert!(read_rom_header_summary(&exe_zip).is_none());
+        assert!(load_rom_bytes(&exe_zip).is_err());
+
+        // Archive containing a valid ROM PLUS a .dll -> rejected.
+        let dll_zip = temp_dir.join("bundle_with_dll.zip");
+        {
+            let f = File::create(&dll_zip).unwrap();
+            let mut zw = zip::ZipWriter::new(f);
+            let opts = zip::write::SimpleFileOptions::default();
+            zw.start_file("plugin.DLL", opts).unwrap();
+            zw.write_all(b"MZ").unwrap();
+            zw.start_file("test.gba", opts).unwrap();
+            zw.write_all(&valid_rom).unwrap();
+            zw.finish().unwrap();
+        }
+        assert!(read_rom_header_summary(&dll_zip).is_none());
+        assert!(load_rom_bytes(&dll_zip).is_err());
+
+        // Archive containing only an unheadered .bin -> skipped by header validation.
+        let junk_bin_zip = temp_dir.join("assets_only.zip");
+        {
+            let f = File::create(&junk_bin_zip).unwrap();
+            let mut zw = zip::ZipWriter::new(f);
+            let opts = zip::write::SimpleFileOptions::default();
+            zw.start_file("payload.bin", opts).unwrap();
+            zw.write_all(&vec![0x11u8; 512]).unwrap();
+            zw.finish().unwrap();
+        }
+        assert!(read_rom_header_summary(&junk_bin_zip).is_none());
+        assert!(load_rom_bytes(&junk_bin_zip).is_err());
+
+        // Archive containing an unheadered .gba (even >= 256B) -> archive contents validate headers.
+        let unheadered_gba_zip = temp_dir.join("bad_gba_inside.zip");
+        {
+            let f = File::create(&unheadered_gba_zip).unwrap();
+            let mut zw = zip::ZipWriter::new(f);
+            let opts = zip::write::SimpleFileOptions::default();
+            zw.start_file("not_a_rom.gba", opts).unwrap();
+            zw.write_all(&vec![0u8; 256]).unwrap();
+            zw.finish().unwrap();
+        }
+        assert!(read_rom_header_summary(&unheadered_gba_zip).is_none());
+        assert!(load_rom_bytes(&unheadered_gba_zip).is_err());
 
         let _ = fs::remove_dir_all(&temp_dir);
     }

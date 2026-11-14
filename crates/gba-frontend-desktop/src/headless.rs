@@ -132,6 +132,7 @@ pub struct CliConfig {
     pub warmup_frames: usize,
     pub profile_sw: bool,
     pub selftest: bool,
+    pub scan_library: bool,
     pub no_gpu: bool,
     pub perf_log: Option<PathBuf>,
     pub perf_seconds: Option<f64>,
@@ -185,6 +186,7 @@ impl Default for CliConfig {
             warmup_frames: 0,
             profile_sw: false,
             selftest: false,
+            scan_library: false,
             no_gpu: false,
             perf_log: None,
             perf_seconds: None,
@@ -374,6 +376,10 @@ impl CliConfig {
                 }
                 "--selftest" => {
                     cfg.selftest = true;
+                    cfg.headless = true;
+                }
+                "--scan-library" => {
+                    cfg.scan_library = true;
                     cfg.headless = true;
                 }
                 "--verify-save-flush" => {
@@ -837,6 +843,49 @@ pub fn verify_micro_frameskip_throttled(rom_path: &Path, frames: usize) -> Resul
     Ok(())
 }
 
+fn run_scan_library_headless() -> Result<(), String> {
+    let cfg_path = crate::config::AppConfig::library_config_path();
+    println!("LIBRARY_CONFIG path={}", cfg_path.display());
+    let mut folders = Vec::new();
+    if let Ok(text) = fs::read_to_string(&cfg_path) {
+        for raw in text.lines() {
+            let line = raw.trim();
+            if let Some(folder) = line.strip_prefix("FOLDER=")
+                && !folder.is_empty()
+            {
+                let path = PathBuf::from(folder);
+                if !folders.contains(&path) {
+                    folders.push(path);
+                }
+            }
+        }
+    }
+    println!("LIBRARY_FOLDERS count={}", folders.len());
+    for (idx, f) in folders.iter().enumerate() {
+        println!("  folder[{idx}]={}", f.display());
+    }
+    let res = crate::RustboyApp::scan_folders_collect(&folders);
+    if let Some(err) = &res.error {
+        println!("LIBRARY_SCAN_WARNING={err}");
+    }
+    println!("LIBRARY_ENTRIES count={}", res.entries.len());
+    for (idx, entry) in res.entries.iter().enumerate() {
+        let reg = crate::library::library_region_label(entry);
+        println!(
+            "  [{idx}] name={:?} | title={:?} | code={:?} | region={:?} | size_mb={:.3} | kind={:?} | platform={:?} | path={}",
+            entry.display_name,
+            entry.internal_title,
+            entry.game_code,
+            reg,
+            entry.size_mb,
+            entry.source_kind,
+            entry.platform,
+            entry.path.display(),
+        );
+    }
+    Ok(())
+}
+
 pub fn run_headless(cfg: &CliConfig) -> Result<(), String> {
     if cfg.calibrate {
         return bench::run_calibrate();
@@ -844,6 +893,10 @@ pub fn run_headless(cfg: &CliConfig) -> Result<(), String> {
 
     if cfg.selftest {
         return bench::run_selftest(cfg);
+    }
+
+    if cfg.scan_library {
+        return run_scan_library_headless();
     }
 
     if cfg.gpu_probe {

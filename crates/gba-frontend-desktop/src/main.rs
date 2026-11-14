@@ -66,6 +66,7 @@ fn is_cli_headless_invocation() -> bool {
                 | "--calibrate"
                 | "--profile-sw"
                 | "--selftest"
+                | "--scan-library"
                 | "--verify-save-flush"
                 | "--gpu-probe"
                 | "--dump-hashes"

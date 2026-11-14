@@ -80,7 +80,8 @@ jobs:
           SYSROOT_DIR="$(rustc --print sysroot)"
           SEP=$'\x1f'
           export CARGO_ENCODED_RUSTFLAGS="--remap-path-prefix=${CARGO_HOME_DIR}=/cargo${SEP}--remap-path-prefix=${RUSTUP_HOME_DIR}=/rustup${SEP}--remap-path-prefix=${SYSROOT_DIR}=/rustc${SEP}--remap-path-prefix=${HOME}=/user${SEP}--remap-path-prefix=${PWD}=/workspace"
-          cargo build --release -p gba-frontend-desktop -p gba-libretro
+          cargo build --release -p gba-frontend-desktop
+          cargo build --profile libretro -p gba-libretro
           if grep -a -F "$HOME" target/release/rustboy-advance; then
             echo "ERROR: leaked HOME path found in release binary"
             exit 1
@@ -111,7 +112,9 @@ jobs:
             "--remap-path-prefix=$($workspace -replace '\\','/')=/workspace"
           )
           $env:CARGO_ENCODED_RUSTFLAGS = ($flags -join ([char]0x1f))
-          cargo build --release -p gba-frontend-desktop -p gba-libretro
+          cargo build --release -p gba-frontend-desktop
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          cargo build --profile libretro -p gba-libretro
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
           $exePath = "target\release\rustboy-advance.exe"
           $bytes = [System.IO.File]::ReadAllBytes($exePath)
@@ -181,7 +184,7 @@ jobs:
           CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_LINKER: aarch64-linux-gnu-gcc
         run: |
           cargo check --target aarch64-unknown-linux-gnu -p gba-core -p gb-core -p gba-debugger
-          cargo build --release --target aarch64-unknown-linux-gnu -p gba-libretro
+          cargo build --profile libretro --target aarch64-unknown-linux-gnu -p gba-libretro
 
   cross-platform-apple:
     name: Cross-Platform Checks (iOS & Apple Silicon)

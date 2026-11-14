@@ -26,7 +26,7 @@ cargo build -p gba-libretro
 For optimized gameplay builds:
 
 ```sh
-cargo build -p gba-libretro --release
+cargo build -p gba-libretro --profile libretro
 ```
 
 Cargo outputs the dynamic library in `target/<profile>/`:
@@ -46,7 +46,7 @@ Cargo outputs the dynamic library in `target/<profile>/`:
 You can also launch directly from the command line without installing into `cores/`:
 
 ```sh
-retroarch -L target/release/rustboy_advance_libretro.so path/to/game.gba
+retroarch -L target/libretro/rustboy_advance_libretro.so path/to/game.gba
 ```
 
 ## Running Tests

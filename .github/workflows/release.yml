@@ -82,7 +82,8 @@ jobs:
           SYSROOT_DIR="$(rustc --print sysroot)"
           SEP=$'\x1f'
           export CARGO_ENCODED_RUSTFLAGS="--remap-path-prefix=${CARGO_HOME_DIR}=/cargo${SEP}--remap-path-prefix=${RUSTUP_HOME_DIR}=/rustup${SEP}--remap-path-prefix=${SYSROOT_DIR}=/rustc${SEP}--remap-path-prefix=${HOME}=/user${SEP}--remap-path-prefix=${PWD}=/workspace"
-          cargo build --release --target "${{ matrix.target }}" -p gba-frontend-desktop -p gba-libretro
+          cargo build --release --target "${{ matrix.target }}" -p gba-frontend-desktop
+          cargo build --profile libretro --target "${{ matrix.target }}" -p gba-libretro
 
       - name: Build release binaries with path-prefix stripping (Windows)
         if: runner.os == 'Windows'
@@ -105,7 +106,9 @@ jobs:
             "--remap-path-prefix=$($workspace -replace '\\','/')=/workspace"
           )
           $env:CARGO_ENCODED_RUSTFLAGS = ($flags -join ([char]0x1f))
-          cargo build --release --target "${{ matrix.target }}" -p gba-frontend-desktop -p gba-libretro
+          cargo build --release --target "${{ matrix.target }}" -p gba-frontend-desktop
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          cargo build --profile libretro --target "${{ matrix.target }}" -p gba-libretro
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
 
       - name: Stage & package archive with forward-slash paths (Unix)
@@ -114,7 +117,7 @@ jobs:
         run: |
           mkdir -p dist "${{ matrix.artifact_name }}/docs"
           cp "target/${{ matrix.target }}/release/${{ matrix.exe_name }}" "${{ matrix.artifact_name }}/"
-          cp "target/${{ matrix.target }}/release/${{ matrix.libretro_name }}" "${{ matrix.artifact_name }}/"
+          cp "target/${{ matrix.target }}/libretro/${{ matrix.libretro_name }}" "${{ matrix.artifact_name }}/"
           chmod +x "${{ matrix.artifact_name }}/${{ matrix.exe_name }}"
           cp LICENSE README.md CHANGELOG.md THIRD-PARTY-NOTICES.md "${{ matrix.artifact_name }}/"
           cp docs/COMPATIBILITY.md docs/TEST_RESULTS.md "${{ matrix.artifact_name }}/docs/"
@@ -129,7 +132,7 @@ jobs:
           $stage = "${{ matrix.artifact_name }}"
           New-Item -ItemType Directory -Force -Path "dist", "$stage/docs" | Out-Null
           Copy-Item "target\${{ matrix.target }}\release\${{ matrix.exe_name }}" $stage
-          Copy-Item "target\${{ matrix.target }}\release\${{ matrix.libretro_name }}" $stage
+          Copy-Item "target\${{ matrix.target }}\libretro\${{ matrix.libretro_name }}" $stage
           Copy-Item LICENSE, README.md, CHANGELOG.md, THIRD-PARTY-NOTICES.md $stage
           Copy-Item docs/COMPATIBILITY.md, docs/TEST_RESULTS.md "$stage/docs"
           # Use bsdtar (`tar.exe -a`) instead of Compress-Archive so zip paths use '/' on Linux/macOS.

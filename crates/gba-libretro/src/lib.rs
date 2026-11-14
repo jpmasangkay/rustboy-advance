@@ -243,3 +243,14 @@ pub extern "C" fn retro_get_memory_data(id: c_uint) -> *mut c_void {
 pub extern "C" fn retro_get_memory_size(id: c_uint) -> usize {
     ffi_guard(0, || state::get_memory_size(id))
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn ffi_guard_catches_panic_and_returns_default() {
+        let fallback = ffi_guard(0xDEAD_BEEFu32, || panic!("simulated FFI panic"));
+        assert_eq!(fallback, 0xDEAD_BEEF);
+    }
+}

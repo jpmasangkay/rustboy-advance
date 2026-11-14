@@ -37,3 +37,7 @@ strip = "symbols"
 inherits = "release"
 debug = true
 
+[profile.libretro]
+inherits = "release"
+panic = "unwind"
+

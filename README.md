@@ -206,7 +206,8 @@ cargo run -p gba-testrunner -- --report docs/TEST_RESULTS.md --fail-on-unexpecte
      # Unix (Linux / macOS)
      SEP=$'\x1f'
      export CARGO_ENCODED_RUSTFLAGS="--remap-path-prefix=${CARGO_HOME:-$HOME/.cargo}=/cargo${SEP}--remap-path-prefix=${RUSTUP_HOME:-$HOME/.rustup}=/rustup${SEP}--remap-path-prefix=$(rustc --print sysroot)=/rustc${SEP}--remap-path-prefix=${PWD}=/workspace"
-     cargo build --release -p gba-frontend-desktop -p gba-libretro
+     cargo build --release -p gba-frontend-desktop
+     cargo build --profile libretro -p gba-libretro
      ```
 2. **Optional Profile-Guided Optimization (`cargo-pgo`):**
    - Interpreter emulation loops benefit measurably from PGO on top of `lto = "fat"` + `codegen-units = 1`:

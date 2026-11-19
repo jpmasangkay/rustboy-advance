@@ -1,6 +1,7 @@
 [CmdletBinding()]
 param(
-    [switch]$Force
+    [switch]$Force,
+    [switch]$RomsOnly
 )
 
 $ErrorActionPreference = "Stop"
@@ -32,13 +33,13 @@ function Download-File {
     $tmp = "$DestPath.tmp"
     if (Test-Path $tmp) { Remove-Item $tmp -Force }
     if ($CurlExe) {
-        & $CurlExe.Source -fsSL --retry 3 --retry-delay 2 --max-time 60 -o $tmp $Url
+        & $CurlExe.Source -fsSL --retry 3 --retry-delay 2 --connect-timeout 15 --max-time 180 -o $tmp $Url
         if ($LASTEXITCODE -ne 0) {
             throw "curl.exe failed ($LASTEXITCODE) downloading $Url"
         }
     } else {
         [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
-        Invoke-WebRequest -UseBasicParsing -Uri $Url -OutFile $tmp -TimeoutSec 60
+        Invoke-WebRequest -UseBasicParsing -Uri $Url -OutFile $tmp -TimeoutSec 180
     }
     if (-not (Test-Path $tmp) -or (Get-Item $tmp).Length -eq 0) {
         throw "Downloaded empty file from $Url"
@@ -96,22 +97,26 @@ $NbaFiles = @(
     "haltcnt/haltcnt.gba",
     "irq/irq-delay/irq-delay.gba",
     "ppu/bgpd/bgpd.gba",
-    "ppu/bgpd/expected.png",
     "ppu/bgx/bgx.gba",
-    "ppu/bgx/expected.png",
     "ppu/dispcnt-latch/dispcnt-latch.gba",
-    "ppu/dispcnt-latch/expected.png",
     "ppu/greenswap/greenswap.gba",
-    "ppu/greenswap/expected.png",
     "ppu/ram-access-timing/ram-access-timing.gba",
     "ppu/sprite-hmosaic/sprite-hmosaic.gba",
-    "ppu/sprite-hmosaic/expected.png",
     "ppu/status-irq-dma/status-irq-dma.gba",
     "ppu/vram-mirror/vram-mirror.gba",
     "timer/reload/reload.gba",
     "timer/start-stop/start-stop.gba",
     "timer/tick-before-reload/tick-before-reload.gba"
 )
+if (-not $RomsOnly) {
+    $NbaFiles += @(
+        "ppu/bgpd/expected.png",
+        "ppu/bgx/expected.png",
+        "ppu/dispcnt-latch/expected.png",
+        "ppu/greenswap/expected.png",
+        "ppu/sprite-hmosaic/expected.png"
+    )
+}
 foreach ($f in $NbaFiles) {
     Download-File "$NbaBase/$f" (Join-Path $OutRoot "nba-hw-test/$f")
 }

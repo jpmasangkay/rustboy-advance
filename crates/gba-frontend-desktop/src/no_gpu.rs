@@ -2227,18 +2227,47 @@ mod tests {
             1600,
             None,
         );
-        // Simulate a weaker CPU where 2560x1600 softbuffer MyBoySmooth exceeds budget under overload,
-        // while <=720x480 capped MyBoySmooth still fits easily.
-        let mut scaled_uncapped = uncapped_costs;
-        for c in &mut scaled_uncapped {
-            c.cost_ms *= 8.0;
-        }
+        assert_eq!(uncapped_costs.len(), DisplayFilter::ALL.len());
+        assert_eq!(capped_costs.len(), DisplayFilter::ALL.len());
+        // Normalize measured tables onto a deterministic simulated weak-CPU scale
+        // (preserving measured relative filter ratios) so the test does not depend on
+        // host CPU speed: uncapped MyBoySmooth = 6.8 ms, <=720x480 capped = 0.3 ms.
+        // Under 14.5 ms overload, capping predicts 14.5 - 6.8 + 0.3 = 8.0 ms <= 8.37 ms;
+        // under 1.5 ms idle, uncapping predicts (1.5 - 0.3) + 6.8 = 8.0 ms < 8.37 ms.
+        let myboy_uncapped = uncapped_costs
+            .iter()
+            .find(|c| c.filter == DisplayFilter::MyBoySmooth)
+            .expect("uncapped costs must include MyBoySmooth")
+            .cost_ms
+            .max(1e-6);
+        let uncapped_scale = 6.8 / myboy_uncapped;
+        let scaled_uncapped: Vec<FilterCost> = uncapped_costs
+            .iter()
+            .map(|c| FilterCost {
+                filter: c.filter,
+                cost_ms: c.cost_ms * uncapped_scale,
+            })
+            .collect();
+        let myboy_capped = capped_costs
+            .iter()
+            .find(|c| c.filter == DisplayFilter::MyBoySmooth)
+            .expect("capped costs must include MyBoySmooth")
+            .cost_ms
+            .max(1e-6);
+        let capped_scale = 0.3 / myboy_capped;
+        let scaled_capped: Vec<FilterCost> = capped_costs
+            .iter()
+            .map(|c| FilterCost {
+                filter: c.filter,
+                cost_ms: c.cost_ms * capped_scale,
+            })
+            .collect();
         let mut gov = QualityGovernor::with_measured_costs(
             DisplayFilter::MyBoySmooth,
             true,
             scaled_uncapped,
         );
-        gov.set_resolution_cap_support(true, Some(capped_costs));
+        gov.set_resolution_cap_support(true, Some(scaled_capped));
 
         let cap_tr = (0..(GOVERNOR_WINDOW_FRAMES + GOVERNOR_DOWN_SUSTAIN_FRAMES))
             .find_map(|_| gov.record_frame(14.5))

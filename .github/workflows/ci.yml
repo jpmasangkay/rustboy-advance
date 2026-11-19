@@ -66,12 +66,12 @@ jobs:
       - name: Fetch freely-redistributable test ROMs (Unix)
         if: runner.os != 'Windows'
         shell: bash
-        run: ./scripts/fetch-test-roms.sh
+        run: ./scripts/fetch-test-roms.sh --roms-only
 
       - name: Fetch freely-redistributable test ROMs (Windows)
         if: runner.os == 'Windows'
         shell: pwsh
-        run: ./scripts/fetch-test-roms.ps1
+        run: ./scripts/fetch-test-roms.ps1 -RomsOnly
 
       - name: Run GBA test ROM suite & generate TEST_RESULTS.md
         run: cargo run -p gba-testrunner -- --report TEST_RESULTS.md --fail-on-unexpected

@@ -2,9 +2,13 @@
 set -euo pipefail
 
 FORCE=0
-if [[ "${1:-}" == "--force" || "${1:-}" == "-f" ]]; then
-  FORCE=1
-fi
+ROMS_ONLY=0
+for arg in "$@"; do
+  case "$arg" in
+    --force|-f) FORCE=1 ;;
+    --roms-only) ROMS_ONLY=1 ;;
+  esac
+done
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
@@ -26,7 +30,7 @@ download_file() {
   echo "  [fetch]  $url -> $dest"
   local tmp="${dest}.tmp"
   rm -f "$tmp"
-  curl -fsSL --retry 3 --retry-delay 2 --max-time 60 -o "$tmp" "$url"
+  curl -fsSL --retry 3 --retry-delay 2 --connect-timeout 15 --max-time 180 -o "$tmp" "$url"
   if [[ ! -s "$tmp" ]]; then
     echo "Error: downloaded empty file from $url" >&2
     rm -f "$tmp"
@@ -73,16 +77,11 @@ for f in \
   haltcnt/haltcnt.gba \
   irq/irq-delay/irq-delay.gba \
   ppu/bgpd/bgpd.gba \
-  ppu/bgpd/expected.png \
   ppu/bgx/bgx.gba \
-  ppu/bgx/expected.png \
   ppu/dispcnt-latch/dispcnt-latch.gba \
-  ppu/dispcnt-latch/expected.png \
   ppu/greenswap/greenswap.gba \
-  ppu/greenswap/expected.png \
   ppu/ram-access-timing/ram-access-timing.gba \
   ppu/sprite-hmosaic/sprite-hmosaic.gba \
-  ppu/sprite-hmosaic/expected.png \
   ppu/status-irq-dma/status-irq-dma.gba \
   ppu/vram-mirror/vram-mirror.gba \
   timer/reload/reload.gba \
@@ -90,6 +89,16 @@ for f in \
   timer/tick-before-reload/tick-before-reload.gba; do
   download_file "$NBA_BASE/$f" "$OUT_ROOT/nba-hw-test/$f"
 done
+if [[ "$ROMS_ONLY" -eq 0 ]]; then
+  for f in \
+    ppu/bgpd/expected.png \
+    ppu/bgx/expected.png \
+    ppu/dispcnt-latch/expected.png \
+    ppu/greenswap/expected.png \
+    ppu/sprite-hmosaic/expected.png; do
+    download_file "$NBA_BASE/$f" "$OUT_ROOT/nba-hw-test/$f"
+  done
+fi
 
 echo "==> Fetching Tonc prebuilt demos (tonc-bin.zip)"
 TONC_DIR="$OUT_ROOT/tonc"

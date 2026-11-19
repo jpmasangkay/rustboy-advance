@@ -31,9 +31,22 @@ fn encode_arm_imm(val: u32) -> Option<u32> {
 }
 
 enum Patch {
-    Branch { word_idx: usize, cond: u32, link: bool, label: String },
-    LdrLitLabel { word_idx: usize, rd: u32, label: String },
-    LdrLitConst { word_idx: usize, rd: u32, value: u32 },
+    Branch {
+        word_idx: usize,
+        cond: u32,
+        link: bool,
+        label: String,
+    },
+    LdrLitLabel {
+        word_idx: usize,
+        rd: u32,
+        label: String,
+    },
+    LdrLitConst {
+        word_idx: usize,
+        rd: u32,
+        value: u32,
+    },
 }
 
 struct ArmBuilder {
@@ -52,13 +65,11 @@ impl ArmBuilder {
         let mut hdr = [0u8; 0xC0];
         hdr[0x04..0xA0].copy_from_slice(&NINTENDO_LOGO);
         let tb = title12.as_bytes();
-        for i in 0..12.min(tb.len()) {
-            hdr[0xA0 + i] = tb[i];
-        }
+        let tlen = 12.min(tb.len());
+        hdr[0xA0..0xA0 + tlen].copy_from_slice(&tb[..tlen]);
         let cb = game_code4.as_bytes();
-        for i in 0..4.min(cb.len()) {
-            hdr[0xAC + i] = cb[i];
-        }
+        let clen = 4.min(cb.len());
+        hdr[0xAC..0xAC + clen].copy_from_slice(&cb[..clen]);
         hdr[0xB0] = b'0';
         hdr[0xB1] = b'1';
         hdr[0xB2] = 0x96;
@@ -69,12 +80,8 @@ impl ArmBuilder {
         }
         hdr[0xBD] = chk.wrapping_sub(0x19) as u8;
         for i in 0..48 {
-            words[i] = u32::from_le_bytes([
-                hdr[i * 4],
-                hdr[i * 4 + 1],
-                hdr[i * 4 + 2],
-                hdr[i * 4 + 3],
-            ]);
+            words[i] =
+                u32::from_le_bytes([hdr[i * 4], hdr[i * 4 + 1], hdr[i * 4 + 2], hdr[i * 4 + 3]]);
         }
         // Entry branch at word 0 -> ROM 0x0800_00C0 (word 48), skip offset = 48 - 2 = 46 words
         words[0] = 0xEA00_0000 | 46;
@@ -261,7 +268,7 @@ impl ArmBuilder {
     }
 
     fn add_blob(&mut self, name: &str, mut data: Vec<u8>) {
-        while data.len() % 4 != 0 {
+        while !data.len().is_multiple_of(4) {
             data.push(0);
         }
         self.tail_blobs.push((name.to_string(), data));
@@ -293,7 +300,7 @@ impl ArmBuilder {
     }
 
     fn call_copy_blob(&mut self, blob_label: &str, dst_addr: u32, byte_len: usize) {
-        assert!(byte_len % 4 == 0);
+        assert!(byte_len.is_multiple_of(4));
         self.ldr_addr(0, blob_label);
         self.mov_u32(1, dst_addr);
         self.mov_u32(2, (byte_len / 4) as u32);
@@ -341,8 +348,8 @@ impl ArmBuilder {
         for (name, bytes) in self.tail_blobs {
             let start_word = self.words.len();
             self.labels.insert(name, start_word);
-            for chunk in bytes.chunks_exact(4) {
-                self.words.push(u32::from_le_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]));
+            for chunk in bytes.as_chunks::<4>().0 {
+                self.words.push(u32::from_le_bytes(*chunk));
             }
         }
 
@@ -369,20 +376,35 @@ impl ArmBuilder {
                         .get(&label)
                         .unwrap_or_else(|| panic!("undefined branch label `{label}`"));
                     let rel = (target_word as isize) - (word_idx as isize + 2);
-                    assert!(rel >= -(1 << 23) && rel < (1 << 23));
+                    assert!((-(1 << 23)..(1 << 23)).contains(&rel));
                     let link_bit = if link { 1 << 24 } else { 0 };
-                    self.words[word_idx] = (cond << 28) | (0x5 << 25) | link_bit | ((rel as u32) & 0x00FF_FFFF);
+                    self.words[word_idx] =
+                        (cond << 28) | (0x5 << 25) | link_bit | ((rel as u32) & 0x00FF_FFFF);
                 }
-                Patch::LdrLitConst { word_idx, rd, value } => {
+                Patch::LdrLitConst {
+                    word_idx,
+                    rd,
+                    value,
+                } => {
                     let pool_word = const_pool_idx[&value];
                     let byte_off = ((pool_word as isize) - (word_idx as isize + 2)) * 4;
-                    assert!((0..4096).contains(&byte_off), "const literal offset out of range: {byte_off}");
+                    assert!(
+                        (0..4096).contains(&byte_off),
+                        "const literal offset out of range: {byte_off}"
+                    );
                     self.words[word_idx] = 0xE59F_0000 | ((rd & 0xF) << 12) | (byte_off as u32);
                 }
-                Patch::LdrLitLabel { word_idx, rd, label } => {
+                Patch::LdrLitLabel {
+                    word_idx,
+                    rd,
+                    label,
+                } => {
                     let pool_word = label_pool_idx[&label];
                     let byte_off = ((pool_word as isize) - (word_idx as isize + 2)) * 4;
-                    assert!((0..4096).contains(&byte_off), "label literal offset out of range: {byte_off}");
+                    assert!(
+                        (0..4096).contains(&byte_off),
+                        "label literal offset out of range: {byte_off}"
+                    );
                     self.words[word_idx] = 0xE59F_0000 | ((rd & 0xF) << 12) | (byte_off as u32);
                 }
             }
@@ -419,6 +441,7 @@ fn build_palette() -> Vec<u8> {
 /// - Slots 0..31:  OBJWIN double-size affine
 /// - Slots 32..79: Semi-transparent double-size affine
 /// - Slots 80..127: Normal double-size affine
+///
 /// Plus 32 distinct rotation/scale affine matrices stored in OAM parameter slots.
 fn build_oam_128_double_aff(tile_base: u16, mosaic: bool) -> Vec<u8> {
     let mut oam = vec![0u8; 1024];
@@ -511,6 +534,7 @@ fn build_reg_bg_map_64x64(tile_count_mask: u16) -> Vec<u8> {
 }
 
 /// 1) `stress_aff_objwin.gba`
+///
 /// Mode 2: BG2 + BG3 (both 1024x1024 affine w/ wraparound & mosaic) + 128 OAM double-size affine
 /// sprites (OBJWIN + semi-transparent + normal, mosaic) + WIN0 + WIN1 + OBJWIN + 50/50 Alpha Blend.
 fn gen_stress_aff_objwin() -> Vec<u8> {
@@ -556,10 +580,10 @@ fn gen_stress_aff_objwin() -> Vec<u8> {
     // WIN0 + WIN1 + OBJWIN active across all scanlines 0..160
     b.write_io16(0x0400_0040, (24 << 8) | 216); // WIN0H
     b.write_io16(0x0400_0042, (48 << 8) | 192); // WIN1H
-    b.write_io16(0x0400_0044, (0 << 8) | 160);  // WIN0V
-    b.write_io16(0x0400_0046, (0 << 8) | 160);  // WIN1V
-    b.write_io16(0x0400_0048, 0x3F3F);          // WININ
-    b.write_io16(0x0400_004A, 0x3F3F);          // WINOUT
+    b.write_io16(0x0400_0044, 160); // WIN0V (top=0, bottom=160)
+    b.write_io16(0x0400_0046, 160); // WIN1V (top=0, bottom=160)
+    b.write_io16(0x0400_0048, 0x3F3F); // WININ
+    b.write_io16(0x0400_004A, 0x3F3F); // WINOUT
 
     // Mosaic 3x3 on BG & OBJ
     b.write_io16(0x0400_004C, 0x2222);
@@ -578,7 +602,7 @@ fn gen_stress_aff_objwin() -> Vec<u8> {
     // Shift BG2X / BG3X smoothly (1 pixel/frame = 0x100 in 24.8 fixed point)
     b.mov_u32(0, 0x0400_0028);
     b.mov_lsl(2, 8, 8);
-    b.str32(2, 0, 0);    // BG2X
+    b.str32(2, 0, 0); // BG2X
     b.str32(2, 0, 0x10); // BG3X
     b.b("main_loop");
 
@@ -590,6 +614,7 @@ fn gen_stress_aff_objwin() -> Vec<u8> {
 }
 
 /// 2) `stress_mode0_4bg_128spr.gba`
+///
 /// Mode 0: 4 full 8bpp scrolling BGs (64x64 tiles) + Mosaic + 128 overlapping sprites (Normal,
 /// Semi-Transparent, OBJWIN) + WIN0/WIN1/OBJWIN + alternating Brightness Fade & Alpha Blend.
 fn gen_stress_mode0_4bg_128spr() -> Vec<u8> {
@@ -620,8 +645,8 @@ fn gen_stress_mode0_4bg_128spr() -> Vec<u8> {
 
     b.write_io16(0x0400_0040, (20 << 8) | 220);
     b.write_io16(0x0400_0042, (50 << 8) | 190);
-    b.write_io16(0x0400_0044, (0 << 8) | 160);
-    b.write_io16(0x0400_0046, (0 << 8) | 160);
+    b.write_io16(0x0400_0044, 160);
+    b.write_io16(0x0400_0046, 160);
     b.write_io16(0x0400_0048, 0x3F3F);
     b.write_io16(0x0400_004A, 0x3F3F);
     b.write_io16(0x0400_004C, 0x1111); // Mosaic 2x2
@@ -694,6 +719,7 @@ fn build_mode5_bitmap() -> Vec<u8> {
 }
 
 /// 3) `stress_bitmap_345.gba`
+///
 /// Switches cleanly through Mode 3 (0..200), Mode 4 (200..400), Mode 5 (400..600) with
 /// non-identity affine scaling, Mosaic, Alpha Blend, WIN0/WIN1/OBJWIN, and 128 sprites (`tile >= 512`).
 fn gen_stress_bitmap_345() -> Vec<u8> {
@@ -717,8 +743,8 @@ fn gen_stress_bitmap_345() -> Vec<u8> {
     b.write_io16(0x0400_000C, 0x0041); // BG2CNT: mosaic + prio 1
     b.write_io16(0x0400_0040, (24 << 8) | 216);
     b.write_io16(0x0400_0042, (48 << 8) | 192);
-    b.write_io16(0x0400_0044, (0 << 8) | 160);
-    b.write_io16(0x0400_0046, (0 << 8) | 160);
+    b.write_io16(0x0400_0044, 160);
+    b.write_io16(0x0400_0046, 160);
     b.write_io16(0x0400_0048, 0x3F3F);
     b.write_io16(0x0400_004A, 0x3F3F);
     b.write_io16(0x0400_004C, 0x1111);

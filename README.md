@@ -15,8 +15,6 @@ A high-performance, cycle-accurate Game Boy Advance (GBA) and Game Boy / Game Bo
 [![wgpu](https://img.shields.io/badge/wgpu-24.0-4E8EE9?style=for-the-badge)](https://wgpu.rs)
 [![License: MPL-2.0](https://img.shields.io/badge/License-MPL--2.0-yellow.svg?style=for-the-badge)](LICENSE)
 
-🖥️ **Repository:** [github.com/jpmasangkay/rustboy-advance](https://github.com/jpmasangkay/rustboy-advance)
-
 ---
 
 ## ✨ Features

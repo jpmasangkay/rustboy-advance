@@ -230,12 +230,7 @@ impl RbmMovie {
 
     pub(crate) fn save_to_file(&self, path: &Path) -> Result<(), MovieError> {
         let encoded = self.encode()?;
-        if let Some(parent) = path.parent()
-            && !parent.as_os_str().is_empty()
-        {
-            fs::create_dir_all(parent).map_err(|e| MovieError::Io(e.to_string()))?;
-        }
-        fs::write(path, encoded).map_err(|e| MovieError::Io(e.to_string()))
+        crate::config::write_atomic(path, &encoded).map_err(|e| MovieError::Io(e.to_string()))
     }
 
     pub(crate) fn load_from_file(path: &Path) -> Result<Self, MovieError> {

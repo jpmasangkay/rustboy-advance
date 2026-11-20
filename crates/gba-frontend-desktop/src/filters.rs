@@ -179,6 +179,20 @@ pub fn fill_linear_rgba(fb_bgr555: &[u16; LCD_WIDTH * LCD_HEIGHT], dst_rgba: &mu
     }
 }
 
+/// Convert raw BGR555 framebuffer pixels directly through the active 32K color-profile LUT.
+pub fn fill_profile_rgba(
+    fb_bgr555: &[u16; LCD_WIDTH * LCD_HEIGHT],
+    color_correction: bool,
+    profile: ColorProfileChoice,
+    dst_rgba: &mut [u8],
+) {
+    let lut = lut_for_profile(color_correction, profile);
+    for (idx, &px) in fb_bgr555.iter().enumerate() {
+        let off = idx * 4;
+        dst_rgba[off..off + 4].copy_from_slice(&lut[(px & 0x7FFF) as usize]);
+    }
+}
+
 #[derive(Clone, Copy)]
 struct FrameComputeOptions {
     color_correction: bool,
@@ -505,30 +519,71 @@ impl VideoPostProcessor {
         green_swap: bool,
         grid_intensity: f32,
     ) -> &ColorImage {
+        self.process_display_filter_with_options(
+            fb_bgr555,
+            None,
+            color_correction,
+            ColorProfileChoice::Agb001,
+            false,
+            lcd_ghosting,
+            filter,
+            green_swap,
+            grid_intensity,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn process_display_filter_with_options(
+        &mut self,
+        fb_bgr555: &[u16; LCD_WIDTH * LCD_HEIGHT],
+        prev_fb_bgr555: Option<&[u16; LCD_WIDTH * LCD_HEIGHT]>,
+        color_correction: bool,
+        profile: ColorProfileChoice,
+        frame_blending: bool,
+        lcd_ghosting: bool,
+        filter: DisplayFilter,
+        green_swap: bool,
+        grid_intensity: f32,
+    ) -> &ColorImage {
         self.filter = filter;
         self.lcd_grid_intensity = grid_intensity;
-        let lut = if color_correction {
-            srgb_lut_3()
+        let lut = lut_for_profile(color_correction, profile);
+        let active_prev: Option<&[u16]> = if frame_blending {
+            prev_fb_bgr555
+                .map(|s| s.as_slice())
+                .or_else(|| self.has_prev_frame.then_some(self.prev_bgr555.as_slice()))
         } else {
-            raw_lut_3()
+            None
         };
 
-        // Pass 1: O(1) LUT Color Conversion + Integer LCD Ghosting (~0.05 ms)
+        // Pass 1: O(1) LUT Color Conversion + Frame Blending / Unified LCD Ghosting (~0.05 ms)
         for i in 0..(LCD_WIDTH * LCD_HEIGHT) {
             let mut bgr = (fb_bgr555[i] & 0x7FFF) as usize;
-            if green_swap && (i & 1) == 1 {
+            if green_swap {
                 let neighbor_g = fb_bgr555[i ^ 1] & 0x03E0;
                 bgr = (bgr & !0x03E0) | (neighbor_g as usize);
             }
 
-            let mut rgb = lut[bgr];
-            if lcd_ghosting {
+            let mapped = lut[bgr];
+            let mut rgb = if let Some(prev_buf) = active_prev {
+                let pm = lut[(prev_buf[i] & 0x7FFF) as usize];
+                [
+                    ((mapped[0] as u16 + pm[0] as u16) >> 1) as u8,
+                    ((mapped[1] as u16 + pm[1] as u16) >> 1) as u8,
+                    ((mapped[2] as u16 + pm[2] as u16) >> 1) as u8,
+                ]
+            } else {
+                [mapped[0], mapped[1], mapped[2]]
+            };
+
+            if lcd_ghosting && !frame_blending {
                 let prev = self.prev_rgb[i];
-                rgb[0] = ((rgb[0] as u16 * 3 + prev[0] as u16) >> 2) as u8;
-                rgb[1] = ((rgb[1] as u16 * 3 + prev[1] as u16) >> 2) as u8;
-                rgb[2] = ((rgb[2] as u16 * 3 + prev[2] as u16) >> 2) as u8;
-                self.prev_rgb[i] = rgb;
+                // Match unified ~65% new + ~35% previous TFT persistence weighting
+                rgb[0] = ((rgb[0] as u16 * 166 + prev[0] as u16 * 90) >> 8) as u8;
+                rgb[1] = ((rgb[1] as u16 * 166 + prev[1] as u16 * 90) >> 8) as u8;
+                rgb[2] = ((rgb[2] as u16 * 166 + prev[2] as u16 * 90) >> 8) as u8;
             }
+            self.prev_rgb[i] = rgb;
             self.base_rgb[i] = rgb;
 
             let off = i * 4;
@@ -537,6 +592,8 @@ impl VideoPostProcessor {
             self.curr_rgba[off + 2] = rgb[2];
             self.curr_rgba[off + 3] = 255;
         }
+        self.prev_bgr555.copy_from_slice(fb_bgr555);
+        self.has_prev_frame = true;
 
         // Pass 2: Fast Integer Display Filter (~0.15 - 0.25 ms)
         match filter {

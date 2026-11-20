@@ -2,7 +2,7 @@ use std::collections::VecDeque;
 use std::time::Instant;
 
 use egui::{self, Color32, CornerRadius, RichText, Stroke};
-use lz4_flex::block::{compress, decompress};
+use lz4_flex::block::{compress, decompress_into};
 
 use crate::app::{
     ACCENT_TEAL, ACCENT_TEAL_BG, BG_CARD, BG_PANEL, BORDER_HAIRLINE, GBA_FRAME_SECS, RustboyApp,
@@ -67,40 +67,52 @@ impl XorDelta {
         }
     }
 
-    /// Reconstructs `prev` given `curr` by decompressing and XORing the stored delta.
-    pub fn apply_backward(&self, curr: &[u8]) -> Result<Vec<u8>, String> {
+    /// Reconstructs `prev` into `buf` in place using a reusable `xor_scratch` buffer
+    /// (zero heap allocations during steady-state rewind).
+    pub fn apply_backward_in_place(
+        &self,
+        buf: &mut Vec<u8>,
+        xor_scratch: &mut Vec<u8>,
+    ) -> Result<(), String> {
         let max_len = self.prev_len.max(self.curr_len);
-        let xor = decompress(&self.compressed_xor, max_len)
+        if xor_scratch.len() < max_len {
+            xor_scratch.resize(max_len, 0);
+        }
+        let dec_len = decompress_into(&self.compressed_xor, &mut xor_scratch[..max_len])
             .map_err(|e| format!("Rewind delta decompress failed: {e}"))?;
-        if xor.len() != max_len {
+        if dec_len != max_len {
             return Err(format!(
-                "Rewind delta size mismatch: got {} bytes, expected {max_len}",
-                xor.len()
+                "Rewind delta size mismatch: got {dec_len} bytes, expected {max_len}"
             ));
         }
 
-        let mut prev = vec![0u8; self.prev_len];
-        let common = self.prev_len.min(curr.len()).min(xor.len());
-        let (curr_chunks, _) = curr[..common].as_chunks::<8>();
-        let (xor_chunks, _) = xor[..common].as_chunks::<8>();
-        let (prev_chunks, _) = prev[..common].as_chunks_mut::<8>();
-        let chunk_bytes = curr_chunks.len() * 8;
-        for ((cc, cx), cp) in curr_chunks
-            .iter()
-            .zip(xor_chunks.iter())
-            .zip(prev_chunks.iter_mut())
-        {
-            let vc = u64::from_ne_bytes(*cc);
+        let old_len = buf.len();
+        buf.resize(self.prev_len, 0);
+        let common = self.prev_len.min(old_len).min(max_len);
+        let (buf_chunks, _) = buf[..common].as_chunks_mut::<8>();
+        let (xor_chunks, _) = xor_scratch[..common].as_chunks::<8>();
+        let chunk_bytes = buf_chunks.len() * 8;
+        for (cb, cx) in buf_chunks.iter_mut().zip(xor_chunks.iter()) {
+            let vc = u64::from_ne_bytes(*cb);
             let vx = u64::from_ne_bytes(*cx);
-            *cp = (vc ^ vx).to_ne_bytes();
+            *cb = (vc ^ vx).to_ne_bytes();
         }
         for i in chunk_bytes..common {
-            prev[i] = curr[i] ^ xor[i];
+            buf[i] ^= xor_scratch[i];
         }
         if self.prev_len > common {
-            prev[common..self.prev_len].copy_from_slice(&xor[common..self.prev_len]);
+            buf[common..self.prev_len].copy_from_slice(&xor_scratch[common..self.prev_len]);
         }
-        Ok(prev)
+        Ok(())
+    }
+
+    /// Reconstructs `prev` given `curr` by decompressing and XORing the stored delta.
+    #[cfg(test)]
+    pub fn apply_backward(&self, curr: &[u8]) -> Result<Vec<u8>, String> {
+        let mut out = curr.to_vec();
+        let mut scratch = Vec::new();
+        self.apply_backward_in_place(&mut out, &mut scratch)?;
+        Ok(out)
     }
 
     pub fn byte_len(&self) -> usize {
@@ -108,30 +120,14 @@ impl XorDelta {
     }
 }
 
-enum RewindEntry {
-    Keyframe {
-        compressed: Vec<u8>,
-        #[allow(dead_code)]
-        uncompressed_len: usize,
-        back_delta: Option<XorDelta>,
-    },
-    Delta(XorDelta),
+struct RewindEntry {
+    back_delta: Option<XorDelta>,
+    is_keyframe_mark: bool,
 }
 
 impl RewindEntry {
     fn compressed_bytes(&self) -> usize {
-        match self {
-            Self::Keyframe {
-                compressed,
-                back_delta,
-                ..
-            } => {
-                compressed.len()
-                    + back_delta.as_ref().map_or(0, XorDelta::byte_len)
-                    + std::mem::size_of::<Self>()
-            }
-            Self::Delta(delta) => delta.byte_len() + std::mem::size_of::<usize>(),
-        }
+        self.back_delta.as_ref().map_or(0, XorDelta::byte_len) + std::mem::size_of::<Self>()
     }
 }
 
@@ -211,10 +207,7 @@ impl RewindBuffer {
 
     #[cfg(test)]
     pub(crate) fn keyframe_count(&self) -> usize {
-        self.entries
-            .iter()
-            .filter(|e| matches!(e, RewindEntry::Keyframe { .. }))
-            .count()
+        self.entries.iter().filter(|e| e.is_keyframe_mark).count()
     }
 
     /// Compresses and appends a serialized core state snapshot, evicting oldest entries to fit the budget.
@@ -226,12 +219,9 @@ impl RewindBuffer {
 
         match self.head_raw.take() {
             None => {
-                let compressed = compress(&state);
-                let uncompressed_len = state.len();
-                let entry = RewindEntry::Keyframe {
-                    compressed,
-                    uncompressed_len,
+                let entry = RewindEntry {
                     back_delta: None,
+                    is_keyframe_mark: true,
                 };
                 let needed = entry.compressed_bytes() + state.len();
                 if needed > self.budget_bytes {
@@ -246,16 +236,13 @@ impl RewindBuffer {
                 let delta = XorDelta::encode_with_scratch(&prev, &state, &mut self.xor_scratch);
                 self.frames_since_keyframe += 1;
 
-                let entry = if self.frames_since_keyframe >= KEYFRAME_INTERVAL {
-                    let compressed = compress(&state);
+                let is_kf = self.frames_since_keyframe >= KEYFRAME_INTERVAL;
+                if is_kf {
                     self.frames_since_keyframe = 0;
-                    RewindEntry::Keyframe {
-                        compressed,
-                        uncompressed_len: state.len(),
-                        back_delta: Some(delta),
-                    }
-                } else {
-                    RewindEntry::Delta(delta)
+                }
+                let entry = RewindEntry {
+                    back_delta: Some(delta),
+                    is_keyframe_mark: is_kf,
                 };
 
                 self.total_bytes = self
@@ -292,21 +279,16 @@ impl RewindBuffer {
             return Some(head);
         }
 
-        if let RewindEntry::Keyframe { .. } = &entry {
-            // Restored prior to a keyframe; reset counter conservatively for future appends.
+        if entry.is_keyframe_mark {
             self.frames_since_keyframe = KEYFRAME_INTERVAL.saturating_sub(1);
         } else {
             self.frames_since_keyframe = self.frames_since_keyframe.saturating_sub(1);
         }
 
-        let back_delta = match &entry {
-            RewindEntry::Delta(d) => Some(d),
-            RewindEntry::Keyframe { back_delta, .. } => back_delta.as_ref(),
-        };
-
-        if let Some(delta) = back_delta {
-            match delta.apply_backward(&head) {
-                Ok(prev) => {
+        if let Some(delta) = entry.back_delta {
+            let mut prev = head.clone();
+            match delta.apply_backward_in_place(&mut prev, &mut self.xor_scratch) {
+                Ok(()) => {
                     self.total_bytes += prev.len();
                     self.head_raw = Some(prev);
                 }
@@ -320,42 +302,85 @@ impl RewindBuffer {
         Some(head)
     }
 
-    /// Pops up to `steps` snapshots in one call, returning the oldest popped snapshot.
+    /// Pops up to `steps` snapshots in one call, unwinding intermediate deltas in-place
+    /// without intermediate allocations and returning the oldest popped snapshot.
     pub fn pop_steps(&mut self, steps: usize) -> Option<Vec<u8>> {
         let count = steps.max(1);
-        let mut target = None;
-        for _ in 0..count {
-            if let Some(snap) = self.pop_back() {
-                target = Some(snap);
-            } else {
+        let mut head = self.head_raw.take()?;
+        let mut remaining = count;
+        let mut popped_any = false;
+
+        while remaining > 0 {
+            let Some(entry) = self.entries.pop_back() else {
                 break;
+            };
+            popped_any = true;
+            self.total_bytes = self
+                .total_bytes
+                .saturating_sub(entry.compressed_bytes() + head.len());
+
+            if self.entries.is_empty() {
+                self.frames_since_keyframe = 0;
+                self.total_bytes = 0;
+                return Some(head);
             }
+
+            if entry.is_keyframe_mark {
+                self.frames_since_keyframe = KEYFRAME_INTERVAL.saturating_sub(1);
+            } else {
+                self.frames_since_keyframe = self.frames_since_keyframe.saturating_sub(1);
+            }
+
+            remaining -= 1;
+            let Some(delta) = entry.back_delta else {
+                self.clear();
+                return Some(head);
+            };
+
+            if remaining == 0 {
+                // Final requested step: return `head` and reconstruct new `head_raw` once.
+                let mut prev = head.clone();
+                match delta.apply_backward_in_place(&mut prev, &mut self.xor_scratch) {
+                    Ok(()) => {
+                        self.total_bytes += prev.len();
+                        self.head_raw = Some(prev);
+                    }
+                    Err(_) => {
+                        self.clear();
+                    }
+                }
+                return Some(head);
+            }
+
+            // Intermediate step: mutate `head` in place (zero allocation!).
+            if delta
+                .apply_backward_in_place(&mut head, &mut self.xor_scratch)
+                .is_err()
+            {
+                self.clear();
+                return None;
+            }
+            self.total_bytes += head.len();
         }
-        target
+
+        if popped_any {
+            self.head_raw = Some(head);
+            None
+        } else {
+            self.head_raw = Some(head);
+            None
+        }
     }
 
     fn evict_to_budget(&mut self) {
         while self.total_bytes > self.budget_bytes && self.entries.len() > 1 {
-            if let Some(rel_kf) = self
-                .entries
-                .iter()
-                .skip(1)
-                .position(|e| matches!(e, RewindEntry::Keyframe { .. }))
-            {
-                let drop_count = rel_kf + 1;
-                for _ in 0..drop_count {
-                    if let Some(evicted) = self.entries.pop_front() {
-                        self.total_bytes =
-                            self.total_bytes.saturating_sub(evicted.compressed_bytes());
-                    }
-                }
-                if let Some(RewindEntry::Keyframe { back_delta, .. }) = self.entries.front_mut()
-                    && let Some(delta) = back_delta.take()
+            if let Some(evicted) = self.entries.pop_front() {
+                self.total_bytes = self.total_bytes.saturating_sub(evicted.compressed_bytes());
+                if let Some(front) = self.entries.front_mut()
+                    && let Some(delta) = front.back_delta.take()
                 {
                     self.total_bytes = self.total_bytes.saturating_sub(delta.byte_len());
                 }
-            } else if let Some(evicted) = self.entries.pop_front() {
-                self.total_bytes = self.total_bytes.saturating_sub(evicted.compressed_bytes());
             } else {
                 break;
             }
@@ -364,22 +389,6 @@ impl RewindBuffer {
         if self.total_bytes > self.budget_bytes && self.entries.len() == 1 {
             self.clear();
         }
-    }
-
-    /// Decompresses the oldest keyframe if present (used for integrity verification in tests).
-    #[cfg(test)]
-    pub(crate) fn decode_oldest_keyframe(&self) -> Option<Result<Vec<u8>, String>> {
-        self.entries.front().and_then(|entry| match entry {
-            RewindEntry::Keyframe {
-                compressed,
-                uncompressed_len,
-                ..
-            } => Some(
-                decompress(compressed, *uncompressed_len)
-                    .map_err(|e| format!("Keyframe decompress failed: {e}")),
-            ),
-            RewindEntry::Delta(_) => None,
-        })
     }
 }
 
@@ -713,9 +722,6 @@ mod tests {
 
         assert!(rb.len() > 40);
         assert!(rb.keyframe_count() >= 2);
-        if let Some(res) = rb.decode_oldest_keyframe() {
-            assert!(res.is_ok());
-        }
 
         // Unwind everything currently in buffer and verify exact byte-for-byte match against tail of history
         let mut popped = Vec::new();

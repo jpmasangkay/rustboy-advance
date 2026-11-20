@@ -146,7 +146,19 @@ pub(crate) fn gb_short_game_code(rom_or_hdr: &[u8], is_cgb: bool) -> String {
     format!("{prefix}{hash:03X}")
 }
 
+fn is_metadata_archive_entry(name: &str) -> bool {
+    let normalized = name.replace('\\', "/");
+    if normalized.starts_with("__MACOSX/") || normalized.contains("/__MACOSX/") {
+        return true;
+    }
+    let file_name = normalized.rsplit('/').next().unwrap_or(&normalized);
+    file_name.starts_with("._")
+}
+
 pub(crate) fn has_rom_extension(name_or_path: &str) -> bool {
+    if is_metadata_archive_entry(name_or_path) {
+        return false;
+    }
     let ext = Path::new(name_or_path)
         .extension()
         .and_then(|s| s.to_str())
@@ -207,15 +219,22 @@ pub(crate) fn apply_ips(rom: &mut Vec<u8>, patch: &[u8]) -> Result<(), String> {
     if patch.len() < 8 || &patch[0..5] != b"PATCH" {
         return Err("Invalid IPS patch header (missing PATCH signature)".into());
     }
+    let mut out = rom.clone();
     let mut pos = 5;
     while pos + 3 <= patch.len() {
-        if &patch[pos..pos + 3] == b"EOF" {
-            if pos + 6 <= patch.len() {
+        // Only treat `b"EOF"` as the terminator when it is actually at the end of the patch
+        // (or followed solely by the optional 3-byte truncation length), so a valid record at
+        // offset 0x454F46 (`"EOF"`) in the middle of a patch is not misinterpreted as EOF.
+        if &patch[pos..pos + 3] == b"EOF"
+            && (pos + 3 == patch.len() || pos + 6 == patch.len())
+        {
+            if pos + 6 == patch.len() {
                 let trunc_len = ((patch[pos + 3] as usize) << 16)
                     | ((patch[pos + 4] as usize) << 8)
                     | (patch[pos + 5] as usize);
-                rom.truncate(trunc_len);
+                out.truncate(trunc_len);
             }
+            *rom = out;
             return Ok(());
         }
         if pos + 5 > patch.len() {
@@ -238,10 +257,10 @@ pub(crate) fn apply_ips(rom: &mut Vec<u8>, patch: &[u8]) -> Result<(), String> {
                 .checked_add(rle_len)
                 .filter(|&v| v <= MAX_ROM_BYTES)
                 .ok_or_else(|| "IPS RLE record target exceeds size limit".to_string())?;
-            if end > rom.len() {
-                rom.resize(end, 0xFF);
+            if end > out.len() {
+                out.resize(end, 0xFF);
             }
-            rom[offset..end].fill(val);
+            out[offset..end].fill(val);
         } else {
             if pos + size > patch.len() {
                 return Err("Truncated IPS data chunk".into());
@@ -250,10 +269,10 @@ pub(crate) fn apply_ips(rom: &mut Vec<u8>, patch: &[u8]) -> Result<(), String> {
                 .checked_add(size)
                 .filter(|&v| v <= MAX_ROM_BYTES)
                 .ok_or_else(|| "IPS record target exceeds size limit".to_string())?;
-            if end > rom.len() {
-                rom.resize(end, 0xFF);
+            if end > out.len() {
+                out.resize(end, 0xFF);
             }
-            rom[offset..end].copy_from_slice(&patch[pos..pos + size]);
+            out[offset..end].copy_from_slice(&patch[pos..pos + size]);
             pos += size;
         }
     }
@@ -288,21 +307,22 @@ pub(crate) fn apply_bps(source: &[u8], patch: &[u8]) -> Result<Vec<u8>, String> 
         ));
     }
 
+    let body = &patch[..footer_start];
     let mut pos = 4;
-    let source_size = decode_vlq(patch, &mut pos)?;
+    let source_size = decode_vlq(body, &mut pos)?;
     if source_size != source.len() as u64 {
         return Err(format!(
             "BPS source ROM size mismatch (patch expects {source_size} bytes, ROM is {} bytes)",
             source.len()
         ));
     }
-    let target_size_u64 = decode_vlq(patch, &mut pos)?;
+    let target_size_u64 = decode_vlq(body, &mut pos)?;
     let target_size = usize::try_from(target_size_u64)
         .ok()
         .filter(|&v| v <= MAX_ROM_BYTES)
         .ok_or_else(|| "BPS target ROM size exceeds limit".to_string())?;
 
-    let metadata_size = decode_vlq(patch, &mut pos)? as usize;
+    let metadata_size = decode_vlq(body, &mut pos)? as usize;
     pos = pos
         .checked_add(metadata_size)
         .filter(|&p| p <= footer_start)
@@ -313,7 +333,7 @@ pub(crate) fn apply_bps(source: &[u8], patch: &[u8]) -> Result<Vec<u8>, String> 
     let mut target_rel_offset: isize = 0;
 
     while pos < footer_start {
-        let data = decode_vlq(patch, &mut pos)?;
+        let data = decode_vlq(body, &mut pos)?;
         let cmd = data & 3;
         let len = usize::try_from((data >> 2) + 1)
             .map_err(|_| "BPS action length overflow".to_string())?;
@@ -337,12 +357,12 @@ pub(crate) fn apply_bps(source: &[u8], patch: &[u8]) -> Result<Vec<u8>, String> 
                 if pos + len > footer_start {
                     return Err("BPS TargetRead truncated before footer".into());
                 }
-                output.extend_from_slice(&patch[pos..pos + len]);
+                output.extend_from_slice(&body[pos..pos + len]);
                 pos += len;
             }
             2 => {
                 // SourceCopy
-                let off = decode_vlq(patch, &mut pos)?;
+                let off = decode_vlq(body, &mut pos)?;
                 let delta = signed_vlq_offset(off)?;
                 source_rel_offset = source_rel_offset
                     .checked_add(delta)
@@ -358,7 +378,7 @@ pub(crate) fn apply_bps(source: &[u8], patch: &[u8]) -> Result<Vec<u8>, String> 
             }
             3 => {
                 // TargetCopy (byte-by-byte to support overlapping RLE runs)
-                let off = decode_vlq(patch, &mut pos)?;
+                let off = decode_vlq(body, &mut pos)?;
                 let delta = signed_vlq_offset(off)?;
                 target_rel_offset = target_rel_offset
                     .checked_add(delta)
@@ -424,15 +444,16 @@ pub(crate) fn apply_ups(source: &[u8], patch: &[u8]) -> Result<Vec<u8>, String> 
         ));
     }
 
+    let body = &patch[..footer_start];
     let mut pos = 4;
-    let source_size = decode_vlq(patch, &mut pos)?;
+    let source_size = decode_vlq(body, &mut pos)?;
     if source_size != source.len() as u64 {
         return Err(format!(
             "UPS source ROM size mismatch (patch expects {source_size} bytes, ROM is {} bytes)",
             source.len()
         ));
     }
-    let target_size_u64 = decode_vlq(patch, &mut pos)?;
+    let target_size_u64 = decode_vlq(body, &mut pos)?;
     let target_size = usize::try_from(target_size_u64)
         .ok()
         .filter(|&v| v <= MAX_ROM_BYTES)
@@ -444,7 +465,7 @@ pub(crate) fn apply_ups(source: &[u8], patch: &[u8]) -> Result<Vec<u8>, String> 
 
     let mut out_pos: usize = 0;
     while pos < footer_start {
-        let rel = usize::try_from(decode_vlq(patch, &mut pos)?)
+        let rel = usize::try_from(decode_vlq(body, &mut pos)?)
             .map_err(|_| "UPS hunk offset overflow".to_string())?;
         out_pos = out_pos
             .checked_add(rel)
@@ -530,18 +551,42 @@ pub(crate) fn apply_patch_file(
     Ok(format)
 }
 
-/// Checks for sidecar `<rom>.bps`, `<rom>.ups`, then `<rom>.ips` (priority BPS > UPS > IPS).
+/// Checks for sidecar `<rom>.bps`, `<rom>.ups`, then `<rom>.ips` case-insensitively
+/// (priority BPS > UPS > IPS).
 pub(crate) fn apply_auto_patch_if_present(
     rom_path: &Path,
     rom: &mut Vec<u8>,
 ) -> Result<Option<PatchFormat>, String> {
+    let find_sidecar = |ext_lower: &str| -> Option<std::path::PathBuf> {
+        let direct = rom_path.with_extension(ext_lower);
+        if direct.is_file() {
+            return Some(direct);
+        }
+        let parent = rom_path.parent()?;
+        let stem = rom_path.file_stem()?.to_string_lossy();
+        let entries = fs::read_dir(parent).ok()?;
+        for entry in entries.flatten() {
+            let p = entry.path();
+            if p.is_file()
+                && p.file_stem()
+                    .and_then(|s| s.to_str())
+                    .is_some_and(|s| s.eq_ignore_ascii_case(&stem))
+                && p.extension()
+                    .and_then(|e| e.to_str())
+                    .is_some_and(|e| e.eq_ignore_ascii_case(ext_lower))
+            {
+                return Some(p);
+            }
+        }
+        None
+    };
+
     for (ext, format) in [
         ("bps", PatchFormat::Bps),
         ("ups", PatchFormat::Ups),
         ("ips", PatchFormat::Ips),
     ] {
-        let candidate = rom_path.with_extension(ext);
-        if candidate.is_file() {
+        if let Some(candidate) = find_sidecar(ext) {
             let patch_bytes = fs::read(&candidate)
                 .map_err(|e| format!("Failed reading {} patch: {e}", format.label()))?;
             apply_patch_bytes(format, rom, &patch_bytes)?;
@@ -549,6 +594,18 @@ pub(crate) fn apply_auto_patch_if_present(
         }
     }
     Ok(None)
+}
+
+fn read_bounded_rom<R: Read>(reader: R, hint_len: usize, source_desc: &str) -> Result<Vec<u8>, String> {
+    let mut bytes = Vec::with_capacity(hint_len.min(MAX_ROM_BYTES));
+    reader
+        .take(MAX_ROM_BYTES as u64 + 1)
+        .read_to_end(&mut bytes)
+        .map_err(|e| format!("Failed reading {source_desc}: {e}"))?;
+    if bytes.len() > MAX_ROM_BYTES {
+        return Err(format!("{source_desc} exceeds 128 MB limit"));
+    }
+    Ok(bytes)
 }
 
 pub(crate) fn load_rom_bytes(path: &Path) -> Result<LoadedRomSource, String> {
@@ -562,7 +619,12 @@ pub(crate) fn load_rom_bytes(path: &Path) -> Result<LoadedRomSource, String> {
         "zip" => load_rom_from_zip(path),
         "7z" => load_rom_from_7z(path),
         _ => {
-            let bytes = fs::read(path).map_err(|e| format!("Failed reading ROM: {e}"))?;
+            let file = File::open(path).map_err(|e| format!("Failed reading ROM: {e}"))?;
+            let meta_len = file.metadata().map(|m| m.len()).unwrap_or(0);
+            if meta_len > MAX_ROM_BYTES as u64 {
+                return Err("ROM file exceeds 128 MB limit".into());
+            }
+            let bytes = read_bounded_rom(BufReader::new(file), meta_len as usize, "ROM")?;
             Ok(LoadedRomSource {
                 bytes,
                 inner_name: None,
@@ -578,7 +640,7 @@ fn load_rom_from_zip(path: &Path) -> Result<LoadedRomSource, String> {
         .map_err(|e| format!("Invalid ZIP archive: {e}"))?;
 
     for idx in 0..archive.len() {
-        let mut entry = archive
+        let entry = archive
             .by_index(idx)
             .map_err(|e| format!("Failed reading ZIP entry: {e}"))?;
         if entry.is_dir() {
@@ -589,10 +651,8 @@ fn load_rom_from_zip(path: &Path) -> Result<LoadedRomSource, String> {
             if entry.size() > MAX_ROM_BYTES as u64 {
                 return Err("ROM inside ZIP archive exceeds 128 MB limit".into());
             }
-            let mut bytes = Vec::with_capacity((entry.size() as usize).min(MAX_ROM_BYTES));
-            entry
-                .read_to_end(&mut bytes)
-                .map_err(|e| format!("Failed extracting '{entry_name}' from ZIP: {e}"))?;
+            let hint = entry.size() as usize;
+            let bytes = read_bounded_rom(entry, hint, &format!("'{entry_name}' from ZIP"))?;
             return Ok(LoadedRomSource {
                 bytes,
                 inner_name: Some(entry_name),
@@ -617,7 +677,11 @@ fn load_rom_from_7z(path: &Path) -> Result<LoadedRomSource, String> {
                     return Ok(sevenz_rust2::EntryDecision::Stop);
                 }
                 let mut bytes = Vec::with_capacity((entry.size() as usize).min(MAX_ROM_BYTES));
-                rdr.read_to_end(&mut bytes)?;
+                rdr.take(MAX_ROM_BYTES as u64 + 1).read_to_end(&mut bytes)?;
+                if bytes.len() > MAX_ROM_BYTES {
+                    too_large = true;
+                    return Ok(sevenz_rust2::EntryDecision::Stop);
+                }
                 extracted = Some((entry.name().to_string(), bytes));
                 Ok(sevenz_rust2::EntryDecision::Stop)
             } else {

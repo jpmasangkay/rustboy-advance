@@ -145,6 +145,12 @@ pub struct Ppu {
     obj_win_rendered: bool,
     #[serde(skip, default)]
     obj_has_semi: bool,
+    #[serde(skip, default)]
+    mosaic_ref_x: [i32; 2],
+    #[serde(skip, default)]
+    mosaic_ref_y: [i32; 2],
+    #[serde(skip, default)]
+    mosaic_ref_valid: bool,
 }
 
 fn default_layer_enable_mask() -> u8 {
@@ -205,6 +211,9 @@ impl Ppu {
             obj_rendered_this_line: false,
             obj_win_rendered: false,
             obj_has_semi: false,
+            mosaic_ref_x: [0; 2],
+            mosaic_ref_y: [0; 2],
+            mosaic_ref_valid: false,
         }
     }
 
@@ -218,6 +227,7 @@ impl Ppu {
         let signed = ((val << 4) as i32) >> 4;
         self.bgx[idx] = signed;
         self.ref_x[idx] = signed;
+        self.mosaic_ref_x[idx] = signed;
     }
 
     #[inline]
@@ -225,6 +235,7 @@ impl Ppu {
         let signed = ((val << 4) as i32) >> 4;
         self.bgy[idx] = signed;
         self.ref_y[idx] = signed;
+        self.mosaic_ref_y[idx] = signed;
     }
 
     #[inline]
@@ -260,6 +271,9 @@ impl Ppu {
     pub fn reload_affine_refs(&mut self) {
         self.ref_x = self.bgx;
         self.ref_y = self.bgy;
+        self.mosaic_ref_x = self.bgx;
+        self.mosaic_ref_y = self.bgy;
+        self.mosaic_ref_valid = true;
     }
 
     pub fn step_affine_refs_scanline(&mut self) {
@@ -288,7 +302,16 @@ impl Ppu {
         self.obj_rendered_this_line = false;
         self.obj_win_rendered = false;
         self.obj_has_semi = false;
+        let mos_v = (((self.mosaic >> 4) & 0x0F) as usize) + 1;
+        if y == 0 || !self.mosaic_ref_valid || y.is_multiple_of(mos_v) {
+            self.mosaic_ref_x = self.ref_x;
+            self.mosaic_ref_y = self.ref_y;
+            self.mosaic_ref_valid = true;
+        }
         if self.skip_rendering {
+            if y == 159 {
+                self.skipped_frames = self.skipped_frames.saturating_add(1);
+            }
             return;
         }
 
@@ -448,14 +471,17 @@ impl Ppu {
         self.end_scanline();
     }
 
+    /// BG tilemap addresses wrap within the 64 KiB BG VRAM region (`0x0000..=0xFFFF`).
     #[inline(always)]
-    fn bg_vram_off(byte_off: usize) -> usize {
-        let masked = byte_off & 0x1FFFF;
-        if masked >= 0x18000 {
-            masked - 0x8000
-        } else {
-            masked
-        }
+    fn bg_map_off(byte_off: usize) -> usize {
+        byte_off & 0xFFFF
+    }
+
+    /// BG tile data reads strictly from BG VRAM (`0x0000..0x10000`); accesses into OBJ VRAM return transparent.
+    #[inline(always)]
+    fn bg_tile_off(byte_off: usize) -> Option<usize> {
+        let off = byte_off & 0x1FFFF;
+        if off < 0x10000 { Some(off) } else { None }
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -480,7 +506,7 @@ impl Ppu {
 
             let block_x_offset = if tile_x >= 32 { 1024 } else { 0 };
             let entry_idx = y_entry_offset + block_x_offset + (tile_x & 31);
-            let entry_off = Self::bg_vram_off(screen_base + entry_idx * 2) & !1;
+            let entry_off = Self::bg_map_off(screen_base + entry_idx * 2) & !1;
             let entry = u16::from_le_bytes([self.vram[entry_off], self.vram[entry_off + 1]]);
             let tile_num = (entry & 0x03FF) as usize;
             let h_flip = (entry & 0x0400) != 0;
@@ -488,7 +514,10 @@ impl Ppu {
             let ty = if v_flip { 7 - fine_y } else { fine_y };
 
             let (mut bits, pal_base, shift, mask): (u64, usize, u32, u64) = if BPP8 {
-                let row_off = Self::bg_vram_off(char_base + tile_num * 64 + ty * 8);
+                let Some(row_off) = Self::bg_tile_off(char_base + tile_num * 64 + ty * 8) else {
+                    x += run;
+                    continue;
+                };
                 let mut raw = u64::from_le_bytes([
                     self.vram[row_off],
                     self.vram[row_off + 1],
@@ -505,7 +534,10 @@ impl Ppu {
                 (raw >> (fine_x * 8), 0, 8, 0xFF)
             } else {
                 let pal_bank = ((entry >> 12) & 0x0F) as usize;
-                let row_off = Self::bg_vram_off(char_base + tile_num * 32 + ty * 4);
+                let Some(row_off) = Self::bg_tile_off(char_base + tile_num * 32 + ty * 4) else {
+                    x += run;
+                    continue;
+                };
                 let mut raw = u32::from_le_bytes([
                     self.vram[row_off],
                     self.vram[row_off + 1],
@@ -567,7 +599,7 @@ impl Ppu {
 
             if entry_idx != cached_entry_idx {
                 cached_entry_idx = entry_idx;
-                let entry_off = Self::bg_vram_off(screen_base + entry_idx * 2) & !1;
+                let entry_off = Self::bg_map_off(screen_base + entry_idx * 2) & !1;
                 let entry = u16::from_le_bytes([self.vram[entry_off], self.vram[entry_off + 1]]);
                 tile_num = (entry & 0x03FF) as usize;
                 h_flip = (entry & 0x0400) != 0;
@@ -579,11 +611,16 @@ impl Ppu {
             let ty = if v_flip { 7 - fine_y } else { fine_y };
 
             let (col_idx, pram_idx) = if BPP8 {
-                let off = Self::bg_vram_off(char_base + tile_num * 64 + ty * 8 + tx);
+                let Some(off) = Self::bg_tile_off(char_base + tile_num * 64 + ty * 8 + tx) else {
+                    continue;
+                };
                 let idx = self.vram[off] as usize;
                 (idx, idx)
             } else {
-                let off = Self::bg_vram_off(char_base + tile_num * 32 + ty * 4 + (tx >> 1));
+                let Some(off) = Self::bg_tile_off(char_base + tile_num * 32 + ty * 4 + (tx >> 1))
+                else {
+                    continue;
+                };
                 let byte = self.vram[off];
                 let idx = ((byte >> ((tx & 1) * 4)) & 0x0F) as usize;
                 (idx, pal_base + idx)
@@ -664,36 +701,72 @@ impl Ppu {
         tiles_per_row: usize,
         pa: i32,
         pc: i32,
-        mut cx: i32,
-        mut cy: i32,
+        ref_x: i32,
+        ref_y: i32,
+        mos_h: usize,
     ) {
         let map_mask = map_px - 1;
         let map_u32 = map_px as u32;
-        for x in x_start..x_end {
-            let mut px = cx >> 8;
-            let mut py = cy >> 8;
-            cx = cx.wrapping_add(pa);
-            cy = cy.wrapping_add(pc);
+        if mos_h <= 1 {
+            let mut cx = ref_x.wrapping_add(pa.wrapping_mul(x_start as i32));
+            let mut cy = ref_y.wrapping_add(pc.wrapping_mul(x_start as i32));
+            for x in x_start..x_end {
+                let mut px = cx >> 8;
+                let mut py = cy >> 8;
+                cx = cx.wrapping_add(pa);
+                cy = cy.wrapping_add(pc);
 
-            if WRAP {
-                px &= map_mask;
-                py &= map_mask;
-            } else if (px as u32) >= map_u32 || (py as u32) >= map_u32 {
-                continue;
+                if WRAP {
+                    px &= map_mask;
+                    py &= map_mask;
+                } else if (px as u32) >= map_u32 || (py as u32) >= map_u32 {
+                    continue;
+                }
+
+                let tile_x = (px >> 3) as usize;
+                let tile_y = (py >> 3) as usize;
+                let fine_x = (px & 7) as usize;
+                let fine_y = (py & 7) as usize;
+
+                let map_off = Self::bg_map_off(screen_base + tile_y * tiles_per_row + tile_x);
+                let tile_num = self.vram[map_off] as usize;
+                let Some(pixel_off) = Self::bg_tile_off(char_base + tile_num * 64 + fine_y * 8 + fine_x) else {
+                    continue;
+                };
+                let col_idx = self.vram[pixel_off] as usize;
+
+                if col_idx != 0 {
+                    self.bg_lines[bg][x] = self.read_pram_u16(col_idx) | 0x8000;
+                }
             }
+        } else {
+            for x in x_start..x_end {
+                let eff_x = (x - (x % mos_h)) as i32;
+                let mut px = ref_x.wrapping_add(pa.wrapping_mul(eff_x)) >> 8;
+                let mut py = ref_y.wrapping_add(pc.wrapping_mul(eff_x)) >> 8;
 
-            let tile_x = (px >> 3) as usize;
-            let tile_y = (py >> 3) as usize;
-            let fine_x = (px & 7) as usize;
-            let fine_y = (py & 7) as usize;
+                if WRAP {
+                    px &= map_mask;
+                    py &= map_mask;
+                } else if (px as u32) >= map_u32 || (py as u32) >= map_u32 {
+                    continue;
+                }
 
-            let map_off = Self::bg_vram_off(screen_base + tile_y * tiles_per_row + tile_x);
-            let tile_num = self.vram[map_off] as usize;
-            let pixel_off = Self::bg_vram_off(char_base + tile_num * 64 + fine_y * 8 + fine_x);
-            let col_idx = self.vram[pixel_off] as usize;
+                let tile_x = (px >> 3) as usize;
+                let tile_y = (py >> 3) as usize;
+                let fine_x = (px & 7) as usize;
+                let fine_y = (py & 7) as usize;
 
-            if col_idx != 0 {
-                self.bg_lines[bg][x] = self.read_pram_u16(col_idx) | 0x8000;
+                let map_off = Self::bg_map_off(screen_base + tile_y * tiles_per_row + tile_x);
+                let tile_num = self.vram[map_off] as usize;
+                let Some(pixel_off) = Self::bg_tile_off(char_base + tile_num * 64 + fine_y * 8 + fine_x) else {
+                    continue;
+                };
+                let col_idx = self.vram[pixel_off] as usize;
+
+                if col_idx != 0 {
+                    self.bg_lines[bg][x] = self.read_pram_u16(col_idx) | 0x8000;
+                }
             }
         }
     }
@@ -703,6 +776,7 @@ impl Ppu {
         let cnt = self.bgcnt[bg];
         let char_base = (((cnt >> 2) & 0x03) as usize) * 0x4000;
         let screen_base = (((cnt >> 8) & 0x1F) as usize) * 0x0800;
+        let mosaic_en = (cnt & 0x0040) != 0;
         let wraparound = (cnt & 0x2000) != 0;
         let size_mode = ((cnt >> 14) & 0x03) as usize;
         let map_px = 128i32 << size_mode;
@@ -710,8 +784,15 @@ impl Ppu {
 
         let pa = self.bgp_a[aff_idx] as i32;
         let pc = self.bgp_c[aff_idx] as i32;
-        let cx = self.ref_x[aff_idx].wrapping_add(pa.wrapping_mul(x_start as i32));
-        let cy = self.ref_y[aff_idx].wrapping_add(pc.wrapping_mul(x_start as i32));
+        let (rx, ry, mos_h) = if mosaic_en {
+            (
+                self.mosaic_ref_x[aff_idx],
+                self.mosaic_ref_y[aff_idx],
+                ((self.mosaic & 0x0F) as usize) + 1,
+            )
+        } else {
+            (self.ref_x[aff_idx], self.ref_y[aff_idx], 1)
+        };
 
         if wraparound {
             self.render_affine_bg_inner::<true>(
@@ -724,8 +805,9 @@ impl Ppu {
                 tiles_per_row,
                 pa,
                 pc,
-                cx,
-                cy,
+                rx,
+                ry,
+                mos_h,
             );
         } else {
             self.render_affine_bg_inner::<false>(
@@ -738,34 +820,58 @@ impl Ppu {
                 tiles_per_row,
                 pa,
                 pc,
-                cx,
-                cy,
+                rx,
+                ry,
+                mos_h,
             );
         }
     }
 
     fn render_mode3_bg(&mut self, x_start: usize, x_end: usize) {
+        let mosaic_en = (self.bgcnt[2] & 0x0040) != 0;
         let pa = self.bgp_a[0] as i32;
         let pc = self.bgp_c[0] as i32;
-        let mut cx = self.ref_x[0].wrapping_add(pa.wrapping_mul(x_start as i32));
-        let mut cy = self.ref_y[0].wrapping_add(pc.wrapping_mul(x_start as i32));
-        let wrap = (self.bgcnt[2] & 0x2000) != 0;
+        let (rx, ry, mos_h) = if mosaic_en {
+            (
+                self.mosaic_ref_x[0],
+                self.mosaic_ref_y[0],
+                ((self.mosaic & 0x0F) as usize) + 1,
+            )
+        } else {
+            (self.ref_x[0], self.ref_y[0], 1)
+        };
 
-        for x in x_start..x_end {
-            let mut px = cx >> 8;
-            let mut py = cy >> 8;
-            cx = cx.wrapping_add(pa);
-            cy = cy.wrapping_add(pc);
+        if mos_h <= 1 {
+            let mut cx = rx.wrapping_add(pa.wrapping_mul(x_start as i32));
+            let mut cy = ry.wrapping_add(pc.wrapping_mul(x_start as i32));
+            for x in x_start..x_end {
+                let px = cx >> 8;
+                let py = cy >> 8;
+                cx = cx.wrapping_add(pa);
+                cy = cy.wrapping_add(pc);
 
-            if wrap {
-                px = px.rem_euclid(LCD_WIDTH as i32);
-                py = py.rem_euclid(LCD_HEIGHT as i32);
-            } else if (px as u32) >= LCD_WIDTH as u32 || (py as u32) >= LCD_HEIGHT as u32 {
-                continue;
+                if (px as u32) >= LCD_WIDTH as u32 || (py as u32) >= LCD_HEIGHT as u32 {
+                    continue;
+                }
+
+                let offset = ((py as usize) * LCD_WIDTH + (px as usize)) * 2;
+                self.bg_lines[2][x] =
+                    u16::from_le_bytes([self.vram[offset], self.vram[offset + 1]]) | 0x8000;
             }
+        } else {
+            for x in x_start..x_end {
+                let eff_x = (x - (x % mos_h)) as i32;
+                let px = rx.wrapping_add(pa.wrapping_mul(eff_x)) >> 8;
+                let py = ry.wrapping_add(pc.wrapping_mul(eff_x)) >> 8;
 
-            let offset = ((py as usize) * LCD_WIDTH + (px as usize)) * 2;
-            self.bg_lines[2][x] = u16::from_le_bytes([self.vram[offset], self.vram[offset + 1]]) | 0x8000;
+                if (px as u32) >= LCD_WIDTH as u32 || (py as u32) >= LCD_HEIGHT as u32 {
+                    continue;
+                }
+
+                let offset = ((py as usize) * LCD_WIDTH + (px as usize)) * 2;
+                self.bg_lines[2][x] =
+                    u16::from_le_bytes([self.vram[offset], self.vram[offset + 1]]) | 0x8000;
+            }
         }
     }
 
@@ -775,25 +881,53 @@ impl Ppu {
         } else {
             0
         };
+        let mosaic_en = (self.bgcnt[2] & 0x0040) != 0;
         let pa = self.bgp_a[0] as i32;
         let pc = self.bgp_c[0] as i32;
-        let mut cx = self.ref_x[0].wrapping_add(pa.wrapping_mul(x_start as i32));
-        let mut cy = self.ref_y[0].wrapping_add(pc.wrapping_mul(x_start as i32));
+        let (rx, ry, mos_h) = if mosaic_en {
+            (
+                self.mosaic_ref_x[0],
+                self.mosaic_ref_y[0],
+                ((self.mosaic & 0x0F) as usize) + 1,
+            )
+        } else {
+            (self.ref_x[0], self.ref_y[0], 1)
+        };
 
-        for x in x_start..x_end {
-            let px = cx >> 8;
-            let py = cy >> 8;
-            cx = cx.wrapping_add(pa);
-            cy = cy.wrapping_add(pc);
+        if mos_h <= 1 {
+            let mut cx = rx.wrapping_add(pa.wrapping_mul(x_start as i32));
+            let mut cy = ry.wrapping_add(pc.wrapping_mul(x_start as i32));
+            for x in x_start..x_end {
+                let px = cx >> 8;
+                let py = cy >> 8;
+                cx = cx.wrapping_add(pa);
+                cy = cy.wrapping_add(pc);
 
-            if (px as u32) >= LCD_WIDTH as u32 || (py as u32) >= LCD_HEIGHT as u32 {
-                continue;
+                if (px as u32) >= LCD_WIDTH as u32 || (py as u32) >= LCD_HEIGHT as u32 {
+                    continue;
+                }
+
+                let offset = page_base + (py as usize) * LCD_WIDTH + (px as usize);
+                let col_idx = self.vram[offset] as usize;
+                if col_idx != 0 {
+                    self.bg_lines[2][x] = self.read_pram_u16(col_idx) | 0x8000;
+                }
             }
+        } else {
+            for x in x_start..x_end {
+                let eff_x = (x - (x % mos_h)) as i32;
+                let px = rx.wrapping_add(pa.wrapping_mul(eff_x)) >> 8;
+                let py = ry.wrapping_add(pc.wrapping_mul(eff_x)) >> 8;
 
-            let offset = page_base + (py as usize) * LCD_WIDTH + (px as usize);
-            let col_idx = self.vram[offset] as usize;
-            if col_idx != 0 {
-                self.bg_lines[2][x] = self.read_pram_u16(col_idx) | 0x8000;
+                if (px as u32) >= LCD_WIDTH as u32 || (py as u32) >= LCD_HEIGHT as u32 {
+                    continue;
+                }
+
+                let offset = page_base + (py as usize) * LCD_WIDTH + (px as usize);
+                let col_idx = self.vram[offset] as usize;
+                if col_idx != 0 {
+                    self.bg_lines[2][x] = self.read_pram_u16(col_idx) | 0x8000;
+                }
             }
         }
     }
@@ -804,23 +938,50 @@ impl Ppu {
         } else {
             0
         };
+        let mosaic_en = (self.bgcnt[2] & 0x0040) != 0;
         let pa = self.bgp_a[0] as i32;
         let pc = self.bgp_c[0] as i32;
-        let mut cx = self.ref_x[0].wrapping_add(pa.wrapping_mul(x_start as i32));
-        let mut cy = self.ref_y[0].wrapping_add(pc.wrapping_mul(x_start as i32));
+        let (rx, ry, mos_h) = if mosaic_en {
+            (
+                self.mosaic_ref_x[0],
+                self.mosaic_ref_y[0],
+                ((self.mosaic & 0x0F) as usize) + 1,
+            )
+        } else {
+            (self.ref_x[0], self.ref_y[0], 1)
+        };
 
-        for x in x_start..x_end {
-            let px = cx >> 8;
-            let py = cy >> 8;
-            cx = cx.wrapping_add(pa);
-            cy = cy.wrapping_add(pc);
+        if mos_h <= 1 {
+            let mut cx = rx.wrapping_add(pa.wrapping_mul(x_start as i32));
+            let mut cy = ry.wrapping_add(pc.wrapping_mul(x_start as i32));
+            for x in x_start..x_end {
+                let px = cx >> 8;
+                let py = cy >> 8;
+                cx = cx.wrapping_add(pa);
+                cy = cy.wrapping_add(pc);
 
-            if (px as u32) >= 160 || (py as u32) >= 128 {
-                continue;
+                if (px as u32) >= 160 || (py as u32) >= 128 {
+                    continue;
+                }
+
+                let offset = page_base + ((py as usize) * 160 + (px as usize)) * 2;
+                self.bg_lines[2][x] =
+                    u16::from_le_bytes([self.vram[offset], self.vram[offset + 1]]) | 0x8000;
             }
+        } else {
+            for x in x_start..x_end {
+                let eff_x = (x - (x % mos_h)) as i32;
+                let px = rx.wrapping_add(pa.wrapping_mul(eff_x)) >> 8;
+                let py = ry.wrapping_add(pc.wrapping_mul(eff_x)) >> 8;
 
-            let offset = page_base + ((py as usize) * 160 + (px as usize)) * 2;
-            self.bg_lines[2][x] = u16::from_le_bytes([self.vram[offset], self.vram[offset + 1]]) | 0x8000;
+                if (px as u32) >= 160 || (py as u32) >= 128 {
+                    continue;
+                }
+
+                let offset = page_base + ((py as usize) * 160 + (px as usize)) * 2;
+                self.bg_lines[2][x] =
+                    u16::from_le_bytes([self.vram[offset], self.vram[offset + 1]]) | 0x8000;
+            }
         }
     }
 
@@ -839,7 +1000,7 @@ impl Ppu {
         if col_idx == 0 {
             if !OBJ_WIN {
                 let cur = self.obj_line[sx];
-                if !cur.is_present() && prio < cur.prio() {
+                if prio < cur.prio() {
                     self.obj_line[sx] = cur.with_transparent_prio(prio, mosaic_en);
                     self.obj_line_dirty = true;
                 }
@@ -1079,11 +1240,9 @@ impl Ppu {
             let box_w = if is_double { spr_w * 2 } else { spr_w };
             let box_h = if is_double { spr_h * 2 } else { spr_h };
 
-            let mut spr_y = (attr0 & 0xFF) as i32;
-            if spr_y >= 160 {
-                spr_y -= 256;
-            }
-            if (y as i32) < spr_y || (y as i32) >= spr_y + box_h {
+            let raw_y = (attr0 & 0xFF) as i32;
+            let local_y = ((y as i32) - raw_y) & 0xFF;
+            if local_y >= box_h {
                 continue;
             }
 
@@ -1109,7 +1268,7 @@ impl Ppu {
             let mosaic_en = (attr0 & 0x1000) != 0;
             let is_8bpp = (attr0 & 0x2000) != 0;
             let mut tile_base = (attr2 & 0x03FF) as usize;
-            if is_8bpp {
+            if is_8bpp && !mapping_1d {
                 tile_base &= !1;
             }
             let prio = ((attr2 >> 10) & 0x03) as u8;
@@ -1118,11 +1277,12 @@ impl Ppu {
             let semi_transparent = obj_mode == 1;
             let is_obj_win = obj_mode == 2;
 
-            let eff_y = if mosaic_en {
-                let my = y - (y % mos_v);
-                (my as i32).max(spr_y) - spr_y
+            let eff_y = if mosaic_en && mos_v > 1 {
+                let my = (y - (y % mos_v)) as i32;
+                let m_local = (my - raw_y) & 0xFF;
+                if m_local < box_h { m_local } else { 0 }
             } else {
-                (y as i32) - spr_y
+                local_y
             };
 
             if is_affine {

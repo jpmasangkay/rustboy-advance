@@ -4,10 +4,10 @@ use egui::{self, Align, Align2, Color32, CornerRadius, Layout, RichText, Sense, 
 use gba_core::{LCD_HEIGHT, LCD_WIDTH};
 
 use crate::app::{ACCENT_TEAL, BG_CARD, BORDER_HAIRLINE, RustboyApp, TEXT_MUTED};
-use crate::config::{BezelStyle, ShaderPreset, ViewportScale};
+use crate::config::{BezelStyle, ViewportScale};
 use crate::gb_bridge::{GB_VIEW_OFFSET_X, GB_VIEW_OFFSET_Y};
 use crate::rom_loader::RomPlatform;
-use crate::shaders::{ShaderRenderParams, color_profile_uniform};
+use crate::shaders::ShaderRenderParams;
 
 impl RustboyApp {
     pub(crate) fn draw_status_bar(&mut self, ctx: &egui::Context) {
@@ -31,10 +31,21 @@ impl RustboyApp {
                     // Left: "N Games | N Folders" + core name
                     let n_games = self.library_entries.len();
                     let n_folders = self.rom_folders.len();
+                    let core_label = if let Some(gb) = &self.gb {
+                        if gb.platform == RomPlatform::Gbc {
+                            "Core: GBC-SM83"
+                        } else {
+                            "Core: GB-SM83"
+                        }
+                    } else if cfg!(feature = "jit") {
+                        "Core: GBA-ARM7TDMI (JIT)"
+                    } else {
+                        "Core: GBA-ARM7TDMI (Interpreter)"
+                    };
                     let left_text = if let Some(t) = &self.toast {
                         t.text.clone()
                     } else if (n_games == 0 && n_folders == 0) || self.has_active_game() {
-                        format!("{n_games} Games | {n_folders} Folders | Core: GBA-ARM7TDMI (Strict JIT)")
+                        format!("{n_games} Games | {n_folders} Folders | {core_label}")
                     } else {
                         format!("{n_games} Games | {n_folders} Folders")
                     };
@@ -42,8 +53,10 @@ impl RustboyApp {
 
                     // Right: FPS (mono) + BIOS status
                     ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                        let (bios_lbl, bios_color) = if self.bios_bytes.is_some() {
-                            ("BIOS: Official GBA (normatt)", crate::theme::ACCENT_TEAL)
+                        let (bios_lbl, bios_color) = if self.is_gb_active() {
+                            ("BIOS: Built-in", crate::theme::COLOR_TEXT_SECONDARY)
+                        } else if self.bios_bytes.is_some() {
+                            ("BIOS: Custom GBA", crate::theme::ACCENT_TEAL)
                         } else {
                             ("BIOS: HLE", crate::theme::COLOR_TEXT_SECONDARY)
                         };
@@ -52,7 +65,9 @@ impl RustboyApp {
                         ui.add_space(16.0);
 
                         let fps_text = if self.has_active_game() || self.measured_fps > 1.0 {
-                            format!("FPS: {:.2} (100%)", self.measured_fps)
+                            let pct = ((self.measured_fps as f64 / 59.72750057) * 100.0).round()
+                                as u32;
+                            format!("FPS: {:.2} ({pct}%)", self.measured_fps)
                         } else {
                             "FPS: 0.00".to_string()
                         };
@@ -220,8 +235,8 @@ impl RustboyApp {
             Color32::from_black_alpha(170),
         );
 
-        let card_w = 280.0;
-        let card_h = 280.0;
+        let card_w = 280.0_f32.min((disp_rect.width() - 16.0).max(200.0));
+        let card_h = 312.0_f32.min((disp_rect.height() - 16.0).max(240.0));
         let card_rect = egui::Rect::from_center_size(disp_rect.center(), Vec2::new(card_w, card_h));
 
         ui.painter()
@@ -333,6 +348,10 @@ impl RustboyApp {
         if resume {
             self.show_pause_overlay = false;
             self.paused = false;
+            self.sink.audio.set_paused(false);
+            self.playtime_timer = Instant::now();
+            self.last_step_time = Instant::now();
+            self.pacing_deadline = None;
             self.next_frame_due = Instant::now();
         }
         if quick_save {
@@ -403,9 +422,7 @@ impl RustboyApp {
         let shader_preset = self.config.effective_shader_preset();
         let frame_blending = self.config.frame_blending;
         let lcd_ghosting = self.config.lcd_ghosting;
-        let use_shader = !self.is_gb_active()
-            && !self.link.split_view_active()
-            && self.config.shader_preset == ShaderPreset::CrtScanlines;
+        let use_shader = !self.link.split_view_active() && self.wgpu_shaders.is_some();
         let mut shader_pipeline_arc = None;
 
         if use_shader
@@ -415,21 +432,12 @@ impl RustboyApp {
             if pipeline.is_preset_available(shader_preset) {
                 if self.sink.frame_dirty || pipeline.needs_initial_upload() {
                     let present_t0 = Instant::now();
-                    pipeline.stage_frames(
+                    pipeline.stage_frame_lut(
                         &self.sink.framebuffer,
                         &self.sink.prev_framebuffer,
                         self.sink.has_prev_frame,
-                    );
-                    self.postproc.sync_rgba_for_capture(
-                        &self.sink.framebuffer,
-                        self.sink
-                            .has_prev_frame
-                            .then_some(&self.sink.prev_framebuffer),
-                        self.sink.frame_seq,
                         color_correction,
                         color_profile,
-                        frame_blending,
-                        lcd_ghosting,
                     );
                     self.last_present_ms = present_t0.elapsed().as_secs_f32() * 1000.0;
                     self.sink.frame_dirty = false;
@@ -447,30 +455,19 @@ impl RustboyApp {
             let tex_options = self.config.display_filter.texture_options();
             if self.sink.frame_dirty || self.lcd_tex.is_none() {
                 let present_t0 = Instant::now();
-                if frame_blending {
-                    self.postproc.sync_rgba_for_capture(
-                        &self.sink.framebuffer,
-                        self.sink
-                            .has_prev_frame
-                            .then_some(&self.sink.prev_framebuffer),
-                        self.sink.frame_seq,
-                        color_correction,
-                        color_profile,
-                        frame_blending,
-                        lcd_ghosting,
-                    );
-                }
-                let green_swap = self
-                    .core
-                    .as_ref()
-                    .map(|c| (c.bus.ppu.greenswap & 1) != 0)
-                    .unwrap_or(false);
-                let _ = self.postproc.process_display_filter(
+                // gba-core already applies hardware GREENSWAP during scanline rendering,
+                // so pass green_swap = false here to avoid double-swapping green channels.
+                let _ = self.postproc.process_display_filter_with_options(
                     &self.sink.framebuffer,
+                    self.sink
+                        .has_prev_frame
+                        .then_some(&self.sink.prev_framebuffer),
                     color_correction,
+                    color_profile,
+                    frame_blending,
                     lcd_ghosting,
                     self.config.display_filter,
-                    green_swap,
+                    false,
                     self.config.lcd_grid_intensity,
                 );
 
@@ -510,9 +507,20 @@ impl RustboyApp {
 
         let avail = ui.available_size();
         let mut toggle_fullscreen = false;
+        let (shader_src_size, shader_tex_origin) = if self.is_gb_active() {
+            (
+                [gb_core::LCD_WIDTH as f32, gb_core::LCD_HEIGHT as f32],
+                [GB_VIEW_OFFSET_X as f32, GB_VIEW_OFFSET_Y as f32],
+            )
+        } else {
+            ([LCD_WIDTH as f32, LCD_HEIGHT as f32], [0.0, 0.0])
+        };
         let render_params = ShaderRenderParams {
             preset: shader_preset,
-            color_profile_id: color_profile_uniform(color_correction, color_profile),
+            src_size: shader_src_size,
+            tex_origin: shader_tex_origin,
+            // Color profile is already pre-applied via 32K LUT in `stage_frame_lut`.
+            color_profile_id: 0,
             frame_blend: if frame_blending && self.sink.has_prev_frame {
                 0.5
             } else {
@@ -523,6 +531,7 @@ impl RustboyApp {
             } else {
                 0.0
             },
+            lcd_grid_intensity: self.config.lcd_grid_intensity,
         };
 
         if self.link.split_view_active() {

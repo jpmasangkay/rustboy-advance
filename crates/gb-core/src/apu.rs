@@ -33,6 +33,10 @@ pub struct SquareChannel {
     pub duty_pos: u8,
     pub volume: u8,
     pub env_timer: u8,
+    #[serde(default)]
+    pub env_period: u8,
+    #[serde(default)]
+    pub env_add: bool,
 
     // Sweep state
     pub sweep_timer: u8,
@@ -57,6 +61,8 @@ impl SquareChannel {
             duty_pos: 0,
             volume: 0,
             env_timer: 0,
+            env_period: 0,
+            env_add: false,
             sweep_timer: 0,
             sweep_enabled: false,
             sweep_shadow: 0,
@@ -92,10 +98,28 @@ impl SquareChannel {
     }
 
     pub fn write_env(&mut self, val: u8) {
+        let old = self.nr_env;
         self.nr_env = val;
         self.dac_enabled = (val & 0xF8) != 0;
         if !self.dac_enabled {
             self.enabled = false;
+            return;
+        }
+        if self.enabled {
+            // Hardware "Zombie Mode" envelope adjustment when writing NRx2 while channel is active.
+            let old_period = old & 0x07;
+            let old_add = (old & 0x08) != 0;
+            let new_add = (val & 0x08) != 0;
+            if old_period == 0 && self.env_period == 0 {
+                if old_add {
+                    self.volume = self.volume.wrapping_add(1) & 0x0F;
+                }
+            } else if !old_add {
+                self.volume = self.volume.wrapping_add(2) & 0x0F;
+            }
+            if old_add != new_add {
+                self.volume = 16u8.wrapping_sub(self.volume) & 0x0F;
+            }
         }
     }
 
@@ -131,10 +155,13 @@ impl SquareChannel {
         }
         self.timer = self.period();
         self.volume = (self.nr_env >> 4) & 0x0F;
-        self.env_timer = self.nr_env & 0x07;
-        if self.env_timer == 0 {
-            self.env_timer = 8;
-        }
+        self.env_period = self.nr_env & 0x07;
+        self.env_add = (self.nr_env & 0x08) != 0;
+        self.env_timer = if self.env_period == 0 {
+            8
+        } else {
+            self.env_period
+        };
 
         if self.has_sweep {
             self.sweep_shadow = self.freq;
@@ -199,16 +226,15 @@ impl SquareChannel {
     }
 
     pub fn tick_envelope(&mut self) {
-        let period = self.nr_env & 0x07;
-        if period == 0 {
+        if self.env_period == 0 {
             return;
         }
         if self.env_timer > 0 {
             self.env_timer -= 1;
         }
         if self.env_timer == 0 {
-            self.env_timer = period;
-            if (self.nr_env & 0x08) != 0 {
+            self.env_timer = self.env_period;
+            if self.env_add {
                 if self.volume < 15 {
                     self.volume += 1;
                 }
@@ -236,6 +262,19 @@ impl SquareChannel {
     }
 
     #[inline]
+    pub fn digital_output(&self) -> u8 {
+        if !self.enabled {
+            return 0;
+        }
+        let duty = ((self.nr_len_duty >> 6) & 0x03) as usize;
+        if DUTY_TABLE[duty][self.duty_pos as usize] != 0 {
+            self.volume & 0x0F
+        } else {
+            0
+        }
+    }
+
+    #[inline]
     pub fn dac_output(&self) -> i32 {
         if !self.dac_enabled {
             return 0;
@@ -243,13 +282,7 @@ impl SquareChannel {
         if !self.enabled {
             return 15;
         }
-        let duty = ((self.nr_len_duty >> 6) & 0x03) as usize;
-        let sample = if DUTY_TABLE[duty][self.duty_pos as usize] != 0 {
-            self.volume as i32
-        } else {
-            0
-        };
-        15 - 2 * sample
+        15 - 2 * (self.digital_output() as i32)
     }
 }
 
@@ -265,6 +298,8 @@ pub struct WaveChannel {
     pub pos: u8,
     pub sample_buf: u8,
     pub wave_ram: [u8; 16],
+    #[serde(default)]
+    pub ticks_since_read: u8,
 }
 
 impl WaveChannel {
@@ -280,6 +315,7 @@ impl WaveChannel {
             pos: 0,
             sample_buf: 0,
             wave_ram: [0; 16],
+            ticks_since_read: 255,
         }
     }
 
@@ -361,6 +397,7 @@ impl WaveChannel {
         while rem > 0 {
             if self.timer > rem {
                 self.timer -= rem;
+                self.ticks_since_read = self.ticks_since_read.saturating_add(rem.min(255) as u8);
                 break;
             }
             rem -= self.timer;
@@ -372,6 +409,20 @@ impl WaveChannel {
             } else {
                 byte & 0x0F
             };
+            self.ticks_since_read = 0;
+        }
+    }
+
+    #[inline]
+    pub fn digital_output(&self) -> u8 {
+        if !self.enabled {
+            return 0;
+        }
+        match self.volume_code {
+            0 => 0,
+            1 => self.sample_buf & 0x0F,
+            2 => (self.sample_buf >> 1) & 0x0F,
+            _ => (self.sample_buf >> 2) & 0x0F,
         }
     }
 
@@ -383,13 +434,7 @@ impl WaveChannel {
         if !self.enabled {
             return 15;
         }
-        let sample = match self.volume_code {
-            0 => 0,
-            1 => self.sample_buf,
-            2 => self.sample_buf >> 1,
-            _ => self.sample_buf >> 2,
-        } as i32;
-        15 - 2 * sample
+        15 - 2 * (self.digital_output() as i32)
     }
 }
 
@@ -403,6 +448,10 @@ pub struct NoiseChannel {
     pub nr_poly: u8,
     pub volume: u8,
     pub env_timer: u8,
+    #[serde(default)]
+    pub env_period: u8,
+    #[serde(default)]
+    pub env_add: bool,
     pub lfsr: u16,
     pub timer: u32,
 }
@@ -418,6 +467,8 @@ impl NoiseChannel {
             nr_poly: 0,
             volume: 0,
             env_timer: 0,
+            env_period: 0,
+            env_add: false,
             lfsr: 0x7FFF,
             timer: 8,
         }
@@ -443,10 +494,28 @@ impl NoiseChannel {
     }
 
     pub fn write_env(&mut self, val: u8) {
+        let old = self.nr_env;
         self.nr_env = val;
         self.dac_enabled = (val & 0xF8) != 0;
         if !self.dac_enabled {
             self.enabled = false;
+            return;
+        }
+        if self.enabled {
+            // Hardware "Zombie Mode" envelope adjustment when writing NRx2 while channel is active.
+            let old_period = old & 0x07;
+            let old_add = (old & 0x08) != 0;
+            let new_add = (val & 0x08) != 0;
+            if old_period == 0 && self.env_period == 0 {
+                if old_add {
+                    self.volume = self.volume.wrapping_add(1) & 0x0F;
+                }
+            } else if !old_add {
+                self.volume = self.volume.wrapping_add(2) & 0x0F;
+            }
+            if old_add != new_add {
+                self.volume = 16u8.wrapping_sub(self.volume) & 0x0F;
+            }
         }
     }
 
@@ -477,10 +546,13 @@ impl NoiseChannel {
             self.lfsr = 0x7FFF;
             self.timer = self.period();
             self.volume = (self.nr_env >> 4) & 0x0F;
-            self.env_timer = self.nr_env & 0x07;
-            if self.env_timer == 0 {
-                self.env_timer = 8;
-            }
+            self.env_period = self.nr_env & 0x07;
+            self.env_add = (self.nr_env & 0x08) != 0;
+            self.env_timer = if self.env_period == 0 {
+                8
+            } else {
+                self.env_period
+            };
         }
     }
 
@@ -494,16 +566,15 @@ impl NoiseChannel {
     }
 
     pub fn tick_envelope(&mut self) {
-        let period = self.nr_env & 0x07;
-        if period == 0 {
+        if self.env_period == 0 {
             return;
         }
         if self.env_timer > 0 {
             self.env_timer -= 1;
         }
         if self.env_timer == 0 {
-            self.env_timer = period;
-            if (self.nr_env & 0x08) != 0 {
+            self.env_timer = self.env_period;
+            if self.env_add {
                 if self.volume < 15 {
                     self.volume += 1;
                 }
@@ -535,6 +606,18 @@ impl NoiseChannel {
     }
 
     #[inline]
+    pub fn digital_output(&self) -> u8 {
+        if !self.enabled {
+            return 0;
+        }
+        if (self.lfsr & 1) == 0 {
+            self.volume & 0x0F
+        } else {
+            0
+        }
+    }
+
+    #[inline]
     pub fn dac_output(&self) -> i32 {
         if !self.dac_enabled {
             return 0;
@@ -542,12 +625,7 @@ impl NoiseChannel {
         if !self.enabled {
             return 15;
         }
-        let sample = if (self.lfsr & 1) == 0 {
-            self.volume as i32
-        } else {
-            0
-        };
-        15 - 2 * sample
+        15 - 2 * (self.digital_output() as i32)
     }
 }
 
@@ -604,7 +682,7 @@ impl Apu {
         self.integ_r = 0;
     }
 
-    pub fn init_post_boot(&mut self) {
+    pub fn init_post_boot(&mut self, is_cgb: bool) {
         self.power_on = true;
         self.nr50 = 0x77;
         self.nr51 = 0xF3;
@@ -617,7 +695,34 @@ impl Apu {
         self.ch2.nr_len_duty = 0x3F;
         self.ch3.nr_len_duty_dummy();
         self.ch3.volume_code = 0;
+        self.ch3.wave_ram = if is_cgb {
+            [
+                0x00, 0xFF, 0x00, 0xFF, 0x00, 0xFF, 0x00, 0xFF, 0x00, 0xFF, 0x00, 0xFF, 0x00, 0xFF,
+                0x00, 0xFF,
+            ]
+        } else {
+            [
+                0x84, 0x40, 0x43, 0xAA, 0x2D, 0x78, 0x92, 0x3C, 0x60, 0x59, 0x59, 0xB0, 0x34, 0xB8,
+                0x2E, 0xDA,
+            ]
+        };
         self.ch4.length_counter = 1;
+    }
+
+    #[inline]
+    pub fn read_pcm12(&self) -> u8 {
+        if !self.power_on {
+            return 0;
+        }
+        (self.ch1.digital_output() & 0x0F) | ((self.ch2.digital_output() & 0x0F) << 4)
+    }
+
+    #[inline]
+    pub fn read_pcm34(&self) -> u8 {
+        if !self.power_on {
+            return 0;
+        }
+        (self.ch3.digital_output() & 0x0F) | ((self.ch4.digital_output() & 0x0F) << 4)
     }
 
     pub fn tick_frame_sequencer(&mut self) {
@@ -668,6 +773,11 @@ impl Apu {
                 }
             }
 
+            // Integrate the current channel output over `[t, t + step)` BEFORE stepping channels
+            // so waveform transitions occur at `t + step` rather than retroactively at `t`.
+            let (left, right) = self.mix_instantaneous();
+            self.integrate_cycles(step, left, right);
+
             if self.power_on {
                 self.ch1.step_cycles(step);
                 self.ch2.step_cycles(step);
@@ -675,8 +785,6 @@ impl Apu {
                 self.ch4.step_cycles(step);
             }
 
-            let (left, right) = self.mix_instantaneous();
-            self.integrate_cycles(step, left, right);
             rem -= step;
         }
     }
@@ -720,7 +828,8 @@ impl Apu {
 
         let vol_r = ((self.nr50 & 0x07) as i32) + 1;
         let vol_l = (((self.nr50 >> 4) & 0x07) as i32) + 1;
-        ((mix_l * vol_l * 48) as i64, (mix_r * vol_r * 48) as i64)
+        // Max steady amplitude = 60 * 8 * 32 = 15360 (~-6 dBFS), giving 2x headroom for HPF transients.
+        ((mix_l * vol_l * 32) as i64, (mix_r * vol_r * 32) as i64)
     }
 
     #[inline]
@@ -748,20 +857,23 @@ impl Apu {
 
     #[inline]
     fn push_filtered_sample(&mut self, raw_l: i32, raw_r: i32) {
-        let scaled_l = raw_l << 8;
-        let scaled_r = raw_r << 8;
-        let hp_l = scaled_l - self.hpf_cap_l;
-        let hp_r = scaled_r - self.hpf_cap_r;
-        self.hpf_cap_l += hp_l >> 8;
-        self.hpf_cap_r += hp_r >> 8;
+        // Sample-rate-independent ~28 Hz hardware DC-blocking HPF in Q16 fixed-point.
+        let scaled_l = (raw_l as i64) << 16;
+        let scaled_r = (raw_r as i64) << 16;
+        let hp_l = scaled_l - (self.hpf_cap_l as i64);
+        let hp_r = scaled_r - (self.hpf_cap_r as i64);
+        let coeff =
+            ((176u64 << 16) / (self.sample_rate_hz.max(8_000) as u64)).clamp(1, 32_768) as i64;
+        self.hpf_cap_l = (self.hpf_cap_l as i64 + ((hp_l * coeff) >> 16)) as i32;
+        self.hpf_cap_r = (self.hpf_cap_r as i64 + ((hp_r * coeff) >> 16)) as i32;
 
-        let out_l = (hp_l >> 8).clamp(-32768, 32767) as i16;
-        let out_r = (hp_r >> 8).clamp(-32768, 32767) as i16;
+        let out_l = (hp_l >> 16).clamp(-32768, 32767) as i16;
+        let out_r = (hp_r >> 16).clamp(-32768, 32767) as i16;
         self.output_buffer.push(out_l);
         self.output_buffer.push(out_r);
     }
 
-    pub fn read_reg(&self, addr: u16) -> u8 {
+    pub fn read_reg(&self, addr: u16, is_cgb: bool) -> u8 {
         match addr {
             0xFF10 => self.ch1.nr_sweep | 0x80,
             0xFF11 => (self.ch1.nr_len_duty & 0xC0) | 0x3F,
@@ -804,7 +916,17 @@ impl Apu {
                 v
             }
             0xFF27..=0xFF2F => 0xFF,
-            0xFF30..=0xFF3F => self.ch3.wave_ram[(addr - 0xFF30) as usize],
+            0xFF30..=0xFF3F => {
+                if self.ch3.enabled {
+                    if is_cgb || self.ch3.ticks_since_read == 0 {
+                        self.ch3.wave_ram[(self.ch3.pos >> 1) as usize]
+                    } else {
+                        0xFF
+                    }
+                } else {
+                    self.ch3.wave_ram[(addr - 0xFF30) as usize]
+                }
+            }
             _ => 0xFF,
         }
     }
@@ -828,7 +950,13 @@ impl Apu {
         }
 
         if (0xFF30..=0xFF3F).contains(&addr) {
-            self.ch3.wave_ram[(addr - 0xFF30) as usize] = val;
+            if self.ch3.enabled {
+                if is_cgb || self.ch3.ticks_since_read == 0 {
+                    self.ch3.wave_ram[(self.ch3.pos >> 1) as usize] = val;
+                }
+            } else {
+                self.ch3.wave_ram[(addr - 0xFF30) as usize] = val;
+            }
             return;
         }
 

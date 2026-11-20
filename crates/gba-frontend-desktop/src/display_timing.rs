@@ -11,7 +11,7 @@ pub struct SyncRateDecision {
     pub reason: String,
 }
 
-/// Returns `true` when the display refresh rate is cleanly within `±0.35 Hz` of a
+/// Returns `true` when the display refresh rate is cleanly within `±0.35 * k Hz` of a
 /// `60 Hz` integer multiple (`60, 120, 180, 240, ...`) so snapping GBA pacing from
 /// `59.7275 Hz` -> `60.000 Hz` (`+0.456%`, absorbed by +/-1% audio DRC) eliminates
 /// periodic vblank beat repeats/judder. Non-multiples (`100 Hz`, `144 Hz`, `165 Hz`,
@@ -21,7 +21,8 @@ pub fn should_snap_to_60hz(refresh_hz: f64) -> bool {
         return false;
     }
     let nearest_mult = (refresh_hz / 60.0).round().max(1.0);
-    (refresh_hz - nearest_mult * 60.0).abs() <= 0.35
+    // Scale tolerance proportionally with `nearest_mult` so e.g. 239.76 Hz (4x 59.94 Hz) snaps cleanly.
+    (refresh_hz - nearest_mult * 60.0).abs() <= 0.35 * nearest_mult
 }
 
 pub fn resolve_sync_decision(
@@ -529,7 +530,7 @@ pub struct VblankPhaseLock {
 
 impl VblankPhaseLock {
     pub fn new(sync_60hz: bool, display_refresh_hz: Option<f64>) -> Self {
-        Self::with_freq(sync_60hz, display_refresh_hz, qpc_frequency().unwrap_or(10_000_000))
+        Self::with_freq(sync_60hz, display_refresh_hz, qpc_frequency().unwrap_or(0))
     }
 
     pub fn with_freq(sync_60hz: bool, display_refresh_hz: Option<f64>, qpc_freq: u64) -> Self {

@@ -606,3 +606,113 @@ fn cgb_banking_hdma_stat_blocking_apu_and_reset() {
     core.bus.write8_immediate(0x0000, 0x0A);
     assert_eq!(core.peek8(0xA000), 0xCA);
 }
+
+#[test]
+fn gb_accuracy_regressions_hdma_ppu_apu_mbc3_serial_and_savestate() {
+    // 1. MBC3 unmapped RAM bank register returns 0xFF and does not alias bank 0
+    let rom_mbc3 = make_test_rom(&[0x18, 0xFE], "MBC3GUARD", 0x80, 0x10, 4, 0x03);
+    let mut c3 = GbCore::new(rom_mbc3, None, GbModel::Auto);
+    c3.bus.write8_immediate(0x0000, 0x0A);
+    c3.bus.write8_immediate(0x4000, 0x00);
+    c3.bus.write8_immediate(0xA000, 0x42);
+    c3.bus.write8_immediate(0x4000, 0x05); // unmapped on 32KB MBC3
+    assert_eq!(c3.bus.read8_immediate(0xA000), 0xFF);
+    c3.bus.write8_immediate(0xA000, 0x99); // must not overwrite bank 0
+    c3.bus.write8_immediate(0x4000, 0x00);
+    assert_eq!(c3.bus.read8_immediate(0xA000), 0x42);
+
+    // 2. MBC3 RTC O(1) advance_seconds + out-of-range sec=61 wraps at 64 without carrying min
+    c3.bus.cart.rtc.write_reg(0x08, 61);
+    c3.bus.cart.rtc.write_reg(0x09, 10);
+    c3.advance_rtc_seconds(4); // 61 -> 62 -> 63 -> 0 -> 1 (min stays 10)
+    assert_eq!(c3.bus.cart.rtc.current.sec, 1);
+    assert_eq!(c3.bus.cart.rtc.current.min, 10);
+    // Huge advance (100 days) completes instantaneously in O(1)
+    c3.advance_rtc_seconds(100 * 86_400);
+    assert_eq!(c3.bus.cart.rtc.current.day_lo, 100);
+
+    // 3. Non-battery RAM does NOT mark battery_dirty and clears on reset()
+    let rom_vol = make_test_rom(&[0x18, 0xFE], "VOLRAM", 0x00, 0x02, 4, 0x02);
+    let mut cv = GbCore::new(rom_vol, None, GbModel::Dmg);
+    assert!(!cv.has_battery());
+    cv.bus.write8_immediate(0x0000, 0x0A);
+    cv.bus.write8_immediate(0xA000, 0x55);
+    assert!(!cv.battery_dirty());
+    cv.reset();
+    cv.bus.write8_immediate(0x0000, 0x0A);
+    assert_eq!(cv.peek8(0xA000), 0xFF);
+
+    // 4. CGB HBlank HDMA started while LCD off transfers 1 block immediately; invalid VRAM src -> 0xFF
+    let mut rom_hdma = make_test_rom(&[0x18, 0xFE], "HDMATEST", 0xC0, 0x1B, 4, 0x03);
+    rom_hdma[0x2000] = 0xAB;
+    let mut ch = GbCore::new(rom_hdma, None, GbModel::Cgb);
+    ch.bus.write8_immediate(0xFF40, 0x00); // LCD off
+    ch.bus.write8_immediate(0xFF51, 0x20);
+    ch.bus.write8_immediate(0xFF52, 0x00);
+    ch.bus.write8_immediate(0xFF53, 0x82);
+    ch.bus.write8_immediate(0xFF54, 0x00);
+    ch.bus.write8_immediate(0xFF55, 0x81); // 2-block HBlank HDMA while LCD off -> 1 block immediate
+    assert_eq!(ch.peek8(0x8200), 0xAB);
+    assert_eq!(ch.bus.hdma_remaining, 1);
+    // Cancel and start GDMA from invalid VRAM source 0x8000 -> writes 0xFF
+    ch.bus.write8_immediate(0xFF55, 0x00); // cancel active HBlank HDMA
+    ch.bus.write8_immediate(0xFF51, 0x80);
+    ch.bus.write8_immediate(0xFF52, 0x00);
+    ch.bus.write8_immediate(0xFF53, 0x83);
+    ch.bus.write8_immediate(0xFF54, 0x00);
+    ch.bus.write8_immediate(0xFF55, 0x00); // 1-block GDMA from VRAM
+    assert_eq!(ch.peek8(0x8300), 0xFF);
+
+    // 5. PPU LY=153 wraps to LY=0 at dot 4 while staying Mode 1
+    let rom_ppu = make_test_rom(&[0x18, 0xFE], "PPUTEST", 0x00, 0x00, 2, 0x00);
+    let mut cp = GbCore::new(rom_ppu, None, GbModel::Dmg);
+    cp.bus.ppu.ly = 152;
+    cp.bus.ppu.mode = 1;
+    cp.bus.ppu.dot = 452;
+    cp.bus.ppu.step(4, false); // enters line 153 dot 0
+    assert_eq!(cp.bus.ppu.ly, 153);
+    cp.bus.ppu.step(4, false); // dot 4 -> wraps LY to 0 while still Mode 1
+    assert_eq!(cp.bus.ppu.ly, 0);
+    assert_eq!(cp.bus.ppu.mode, 1);
+
+    // 6. EI + HALT with pending IRQ pushes PC of HALT itself
+    // 0x0150: FB (EI), 76 (HALT), 00 (NOP)
+    let ei_halt_rom = make_test_rom(&[0xFB, 0x76, 0x00], "EIHALT", 0x00, 0x00, 2, 0x00);
+    let mut ce = GbCore::new(ei_halt_rom, None, GbModel::Dmg);
+    ce.bus.ie_flag = 0x01;
+    ce.bus.if_flag = 0x01;
+    ce.step_one(); // JP 0x0150
+    ce.step_one(); // EI (sets ime_delay)
+    ce.step_one(); // HALT (decrements PC back to 0x0151)
+    assert_eq!(ce.cpu.pc, 0x0151);
+    ce.step_one(); // services VBlank IRQ -> pushes 0x0151 onto stack
+    assert_eq!(ce.cpu.pc, 0x0040);
+    let pushed_lo = ce.peek8(ce.cpu.sp) as u16;
+    let pushed_hi = ce.peek8(ce.cpu.sp.wrapping_add(1)) as u16;
+    assert_eq!(pushed_lo | (pushed_hi << 8), 0x0151);
+
+    // 7. Savestate rejects mismatched ROM CRC32 and preserves host sample_rate/dmg_palette
+    let rom_a = make_test_rom(&[0x18, 0xFE], "ROMA", 0x00, 0x00, 2, 0x00);
+    let rom_b = make_test_rom(&[0x00, 0x18, 0xFD], "ROMB", 0x00, 0x00, 2, 0x00);
+    let mut ca = GbCore::new(rom_a, None, GbModel::Dmg);
+    ca.set_sample_rate(44_100);
+    ca.set_dmg_palette(DmgPalette::ClassicGreen);
+    let state_a = ca.save_state().unwrap();
+    let mut cb = GbCore::new(rom_b, None, GbModel::Dmg);
+    assert!(cb.load_state(&state_a).is_err());
+    ca.set_sample_rate(48_000);
+    ca.set_dmg_palette(DmgPalette::GbaColorized);
+    ca.load_state(&state_a).unwrap();
+    assert_eq!(ca.sample_rate(), 48_000);
+    assert_eq!(ca.dmg_palette(), DmgPalette::GbaColorized);
+
+    // 8. Serial write_sc switching to external clock cancels internal transfer
+    let rom_s = make_test_rom(&[0x18, 0xFE], "SERIAL", 0x00, 0x00, 2, 0x00);
+    let mut cs = GbCore::new(rom_s, None, GbModel::Dmg);
+    cs.bus.write8_immediate(0xFF01, 0xAA);
+    cs.bus.write8_immediate(0xFF02, 0x81); // start internal clock
+    cs.bus.write8_immediate(0xFF02, 0x80); // switch to external clock -> cancels internal shift
+    for _ in 0..2000 {
+        assert!(!cs.bus.serial.step_m_cycle());
+    }
+}

@@ -50,6 +50,7 @@ const SHIFT_NAMES: [&str; 4] = ["lsl", "lsr", "asr", "ror"];
 pub struct DisasmLine {
     pub addr: u32,
     pub opcode: u32,
+    pub size: u8,
     pub is_thumb: bool,
     pub text: String,
 }
@@ -111,21 +112,23 @@ fn format_arm_shift(instr: u32) -> String {
 }
 
 pub fn format_registers(core: &GbaCore) -> String {
+    use core::fmt::Write;
     let cpu = &core.cpu;
-    let mut out = String::new();
+    let mut out = String::with_capacity(256);
     for r in 0..16 {
         let sep = if r % 4 == 3 { '\n' } else { ' ' };
-        out.push_str(&format!("R{:02}={:08X}{}", r, cpu.gpr[r], sep));
+        let _ = write!(&mut out, "R{:02}={:08X}{}", r, cpu.gpr[r], sep);
     }
-    out.push_str(&format!(
-        "CPSR={:08X} ({}) VCOUNT={} IE={:04X} IF={:04X} IME={}\n",
+    let _ = writeln!(
+        &mut out,
+        "CPSR={:08X} ({}) VCOUNT={} IE={:04X} IF={:04X} IME={}",
         cpu.cpsr,
         if cpu.is_thumb() { "THUMB" } else { "ARM" },
         core.bus.ppu.vcount,
         core.bus.hw.ie,
         core.bus.hw.if_flag,
         core.bus.hw.ime
-    ));
+    );
     out
 }
 
@@ -152,6 +155,7 @@ pub fn disassemble_range(
                     out.push(DisasmLine {
                         addr,
                         opcode: (op as u32) | ((next as u32) << 16),
+                        size: 4,
                         is_thumb: true,
                         text: format!("bl 0x{target:08X}"),
                     });
@@ -163,6 +167,7 @@ pub fn disassemble_range(
             out.push(DisasmLine {
                 addr,
                 opcode: op as u32,
+                size: 2,
                 is_thumb: true,
                 text: disassemble_thumb(op, addr),
             });
@@ -172,6 +177,7 @@ pub fn disassemble_range(
             out.push(DisasmLine {
                 addr,
                 opcode: op,
+                size: 4,
                 is_thumb: false,
                 text: disassemble_arm(op, addr),
             });
@@ -515,6 +521,7 @@ pub fn disassemble_arm(instr: u32, addr: u32) -> String {
                         };
                         return format!("{mnemonic}{s}{c} {rdlo}, {rdhi}, {rm}, {rs}");
                     }
+                    return format!("udf{c} #0x{instr:08X}");
                 } else {
                     // Halfword & signed transfer
                     let load = (instr & (1 << 20)) != 0;
@@ -564,31 +571,36 @@ pub fn disassemble_arm(instr: u32, addr: u32) -> String {
                 } else {
                     "cpsr"
                 };
-                if (opcode & 1) == 0 && bits27_25 == 0 {
+                if bits27_25 == 0 && (instr & 0x0FBF_0FFF) == 0x010F_0000 {
                     let rd = reg((instr >> 12) & 0xF);
                     return format!("mrs{c} {rd}, {psr}");
                 }
-                let mut fields = String::new();
-                if (instr & (1 << 16)) != 0 {
-                    fields.push('c');
+                let valid_msr_reg = bits27_25 == 0 && (instr & 0x0FB0_FFF0) == 0x0120_F000;
+                let valid_msr_imm = bits27_25 == 1 && (instr & 0x0FB0_F000) == 0x0320_F000;
+                if valid_msr_reg || valid_msr_imm {
+                    let mut fields = String::new();
+                    if (instr & (1 << 16)) != 0 {
+                        fields.push('c');
+                    }
+                    if (instr & (1 << 17)) != 0 {
+                        fields.push('x');
+                    }
+                    if (instr & (1 << 18)) != 0 {
+                        fields.push('s');
+                    }
+                    if (instr & (1 << 19)) != 0 {
+                        fields.push('f');
+                    }
+                    let src = if valid_msr_imm {
+                        let rot = ((instr >> 8) & 0xF) * 2;
+                        let val = (instr & 0xFF).rotate_right(rot);
+                        format!("#0x{val:X}")
+                    } else {
+                        reg(instr & 0xF).to_string()
+                    };
+                    return format!("msr{c} {psr}_{fields}, {src}");
                 }
-                if (instr & (1 << 17)) != 0 {
-                    fields.push('x');
-                }
-                if (instr & (1 << 18)) != 0 {
-                    fields.push('s');
-                }
-                if (instr & (1 << 19)) != 0 {
-                    fields.push('f');
-                }
-                let src = if bits27_25 == 1 {
-                    let rot = ((instr >> 8) & 0xF) * 2;
-                    let val = (instr & 0xFF).rotate_right(rot);
-                    format!("#0x{val:X}")
-                } else {
-                    reg(instr & 0xF).to_string()
-                };
-                return format!("msr{c} {psr}_{fields}, {src}");
+                return format!("udf{c} #0x{instr:08X}");
             }
 
             // Standard Data Processing

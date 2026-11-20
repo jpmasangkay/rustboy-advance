@@ -398,14 +398,14 @@ fn run_probe_subprocess(
     };
 
     let (tx, rx) = mpsc::channel::<String>();
-    if let Some(stdout) = child.stdout.take() {
+    let stdout_handle = child.stdout.take().map(|stdout| {
         std::thread::spawn(move || {
             let reader = BufReader::new(stdout);
             for line in reader.lines().map_while(Result::ok) {
                 let _ = tx.send(line);
             }
-        });
-    }
+        })
+    });
     let stderr_handle = child.stderr.take().map(|stderr| {
         std::thread::spawn(move || {
             let mut buf = String::new();
@@ -448,6 +448,10 @@ fn run_probe_subprocess(
             }
             Err(e) => {
                 let _ = child.kill();
+                let _ = child.wait();
+                if let Some(h) = stdout_handle {
+                    let _ = h.join();
+                }
                 drain_lines(&rx);
                 let stderr_text = stderr_handle
                     .and_then(|h| h.join().ok())
@@ -463,6 +467,9 @@ fn run_probe_subprocess(
         }
     };
 
+    if let Some(h) = stdout_handle {
+        let _ = h.join();
+    }
     drain_lines(&rx);
     let stderr_text = stderr_handle
         .and_then(|h| h.join().ok())
@@ -1151,8 +1158,12 @@ pub fn ensure_gpu_startup_safe(cli: &CliConfig, config: &mut AppConfig) -> GpuGu
         return GpuGuardOutcome::AllowGpu;
     }
     let guard_start = Instant::now();
-    let peek_meta = if cli.retry_gpu
-        || !config
+    // Only touch wgpu in-process before the isolated child probe when we already have a
+    // verified-adapter cache entry (so a hostile driver crash stays isolated inside the child
+    // on first run or when `--retry-gpu` is requested).
+    let peek_meta = if !cli.retry_gpu
+        && !config.verified_gpu_adapters.is_empty()
+        && !config
             .blocked_gpu_adapters
             .contains_key(ADAPTER_ENUM_SENTINEL_KEY)
     {

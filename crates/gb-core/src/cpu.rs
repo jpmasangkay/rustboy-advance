@@ -248,10 +248,12 @@ impl Cpu {
         }
 
         if self.stopped {
-            if bus.joypad_wake || (bus.if_flag & bus.ie_flag & 0x1F) != 0 {
+            // STOP mode only wakes on a joypad button press (not timer/VBlank/STAT IRQs).
+            if bus.joypad_wake || bus.compute_p1_low() != 0x0F {
                 self.stopped = false;
                 bus.joypad_wake = false;
             } else {
+                bus.timer.reset_div_on_speed_switch();
                 bus.tick_m_cycle();
                 return;
             }
@@ -275,13 +277,14 @@ impl Cpu {
         }
 
         // Promote delayed IME enable after the instruction following `EI`.
+        let ei_just_enabled = self.ime_delay;
         if self.ime_delay {
             self.ime = true;
             self.ime_delay = false;
         }
 
         let op = self.fetch8(bus);
-        self.exec(bus, op);
+        self.exec(bus, op, ei_just_enabled);
     }
 
     fn service_interrupt(&mut self, bus: &mut GbBus) {
@@ -370,7 +373,7 @@ impl Cpu {
         sp.wrapping_add(e)
     }
 
-    fn exec(&mut self, bus: &mut GbBus, op: u8) {
+    fn exec(&mut self, bus: &mut GbBus, op: u8, ei_just_enabled: bool) {
         match op {
             0x00 => {} // NOP
 
@@ -516,10 +519,16 @@ impl Cpu {
                     bus.double_speed = !bus.double_speed;
                     bus.key1_arm = false;
                     bus.timer.reset_div_on_speed_switch();
+                    // CGB speed switch pauses CPU execution for 2050 M-cycles while DIV stays 0.
+                    for _ in 0..2050 {
+                        bus.tick_speed_switch_m_cycle();
+                    }
                 } else {
-                    self.stopped = true;
                     bus.joypad_wake = false;
                     bus.timer.reset_div_on_speed_switch();
+                    if bus.compute_p1_low() == 0x0F {
+                        self.stopped = true;
+                    }
                 }
             }
 
@@ -578,6 +587,10 @@ impl Cpu {
                 if pending != 0 {
                     if !self.ime {
                         self.halt_bug = true;
+                    } else if ei_just_enabled {
+                        // Hardware quirk: `EI` immediately followed by `HALT` with a pending IRQ
+                        // services the interrupt pushing the PC of `HALT` itself.
+                        self.pc = self.pc.wrapping_sub(1);
                     }
                 } else {
                     self.halted = true;

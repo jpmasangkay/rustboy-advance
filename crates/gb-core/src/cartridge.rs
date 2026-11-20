@@ -131,27 +131,89 @@ impl RtcState {
 
     pub fn advance_seconds(&mut self, seconds: u64) {
         self.timestamp = self.timestamp.wrapping_add(seconds);
-        if (self.current.day_hi & 0x40) != 0 {
+        if seconds == 0 || (self.current.day_hi & 0x40) != 0 {
             return;
         }
-        for _ in 0..seconds {
-            self.tick_one_second();
+
+        let mut rem = seconds;
+
+        // Hardware quirk: out-of-range sec (60..=63) wraps to 0 at 64 without carrying into min.
+        if self.current.sec >= 60 {
+            let to_wrap = (64 - self.current.sec) as u64;
+            if rem < to_wrap {
+                self.current.sec += rem as u8;
+                return;
+            }
+            rem -= to_wrap;
+            self.current.sec = 0;
         }
+
+        let total_sec = (self.current.sec as u64).saturating_add(rem);
+        self.current.sec = (total_sec % 60) as u8;
+        let mut rem_min = total_sec / 60;
+        if rem_min == 0 {
+            return;
+        }
+
+        // Hardware quirk: out-of-range min (60..=63) wraps to 0 at 64 without carrying into hour.
+        if self.current.min >= 60 {
+            let to_wrap = (64 - self.current.min) as u64;
+            if rem_min < to_wrap {
+                self.current.min += rem_min as u8;
+                return;
+            }
+            rem_min -= to_wrap;
+            self.current.min = 0;
+        }
+
+        let total_min = (self.current.min as u64).saturating_add(rem_min);
+        self.current.min = (total_min % 60) as u8;
+        let mut rem_hr = total_min / 60;
+        if rem_hr == 0 {
+            return;
+        }
+
+        // Hardware quirk: out-of-range hour (24..=31) wraps to 0 at 32 without carrying into day.
+        if self.current.hour >= 24 {
+            let to_wrap = (32 - self.current.hour) as u64;
+            if rem_hr < to_wrap {
+                self.current.hour += rem_hr as u8;
+                return;
+            }
+            rem_hr -= to_wrap;
+            self.current.hour = 0;
+        }
+
+        let total_hr = (self.current.hour as u64).saturating_add(rem_hr);
+        self.current.hour = (total_hr % 24) as u8;
+        let rem_days = total_hr / 24;
+        if rem_days == 0 {
+            return;
+        }
+
+        let cur_days = (self.current.day_lo as u64) | (((self.current.day_hi & 0x01) as u64) << 8);
+        let next_days = cur_days.saturating_add(rem_days);
+        if next_days >= 512 {
+            self.current.day_hi |= 0x80;
+        }
+        let wrapped = (next_days & 0x1FF) as u16;
+        self.current.day_lo = (wrapped & 0xFF) as u8;
+        self.current.day_hi = (self.current.day_hi & 0xFE) | (((wrapped >> 8) & 1) as u8);
     }
 
     fn tick_one_second(&mut self) {
         self.current.sec = (self.current.sec + 1) & 0x3F;
-        if self.current.sec < 60 {
+        if self.current.sec != 60 {
             return;
         }
         self.current.sec = 0;
         self.current.min = (self.current.min + 1) & 0x3F;
-        if self.current.min < 60 {
+        if self.current.min != 60 {
             return;
         }
         self.current.min = 0;
         self.current.hour = (self.current.hour + 1) & 0x1F;
-        if self.current.hour < 24 {
+        if self.current.hour != 24 {
             return;
         }
         self.current.hour = 0;
@@ -268,6 +330,16 @@ pub struct Cartridge {
     pub ram_or_rtc_reg: u8,
     pub rumble_active: bool,
     pub rtc: RtcState,
+
+    // Cached byte offsets for zero-modulo ROM/RAM reads (rebuilt on bank writes and state load)
+    #[serde(skip)]
+    cached_rom0_off: usize,
+    #[serde(skip)]
+    cached_rom1_off: usize,
+    #[serde(skip)]
+    cached_ram_off: usize,
+    #[serde(skip)]
+    cached_rom_crc32: u32,
 }
 
 impl Cartridge {
@@ -323,7 +395,8 @@ impl Cartridge {
             _ => header.ram_size_bytes,
         };
 
-        Self {
+        let rom_crc = compute_crc32(&rom);
+        let mut cart = Self {
             rom,
             ram: vec![0xFF; ram_len],
             header,
@@ -337,7 +410,51 @@ impl Cartridge {
             ram_or_rtc_reg: 0,
             rumble_active: false,
             rtc: RtcState::default(),
-        }
+            cached_rom0_off: 0,
+            cached_rom1_off: 0x4000,
+            cached_ram_off: 0,
+            cached_rom_crc32: rom_crc,
+        };
+        cart.rebuild_bank_cache();
+        cart
+    }
+
+    /// Returns the cached IEEE CRC32 of the cartridge ROM.
+    #[inline]
+    pub fn rom_crc32(&self) -> u32 {
+        self.cached_rom_crc32
+    }
+
+    /// Recomputes cached ROM/RAM bank byte offsets and ROM CRC32 (called after bank changes or state load).
+    pub fn rebuild_bank_cache(&mut self) {
+        let (b0, b1) = self.effective_rom_banks();
+        self.cached_rom0_off = b0 * 0x4000;
+        self.cached_rom1_off = b1 * 0x4000;
+        self.cached_ram_off = if self.ram.is_empty() {
+            0
+        } else {
+            let bank = match self.mbc {
+                MbcType::RomOnly | MbcType::Mbc2 => 0,
+                MbcType::Mbc1 { .. } => {
+                    if self.banking_mode != 0 {
+                        (self.bank_hi as usize) % self.ram_banks()
+                    } else {
+                        0
+                    }
+                }
+                MbcType::Mbc3 { .. } => {
+                    let mask = if self.ram.len() > 0x8000 { 0x07 } else { 0x03 };
+                    (self.ram_or_rtc_reg as usize & mask) % self.ram_banks()
+                }
+                MbcType::Mbc5 { .. } => (self.ram_or_rtc_reg as usize) % self.ram_banks(),
+            };
+            bank * 0x2000
+        };
+    }
+
+    /// Recomputes the ROM CRC32 after replacing `self.rom` (e.g. during savestate restore).
+    pub fn refresh_rom_crc32(&mut self) {
+        self.cached_rom_crc32 = compute_crc32(&self.rom);
     }
 
     /// Detects 1 MiB MBC1M multicarts (which shift the 2-bit upper bank by 4 instead of 5).
@@ -361,6 +478,7 @@ impl Cartridge {
         self.ram_or_rtc_reg = 0;
         self.rumble_active = false;
         self.rtc.prev_latch_write = 0;
+        self.rebuild_bank_cache();
     }
 
     #[inline]
@@ -413,14 +531,26 @@ impl Cartridge {
         }
     }
 
+    #[inline]
     pub fn read_rom(&self, addr: u16) -> u8 {
-        let (b0, b1) = self.effective_rom_banks();
         let offset = if addr < 0x4000 {
-            b0 * 0x4000 + (addr as usize)
+            self.cached_rom0_off + (addr as usize)
         } else {
-            b1 * 0x4000 + ((addr as usize) & 0x3FFF)
+            self.cached_rom1_off + ((addr as usize) & 0x3FFF)
         };
         self.rom.get(offset).copied().unwrap_or(0xFF)
+    }
+
+    /// Writes a byte directly to the currently mapped ROM bank for debugger/cheat patching.
+    pub fn poke_rom_mapped(&mut self, addr: u16, val: u8) {
+        let offset = if addr < 0x4000 {
+            self.cached_rom0_off + (addr as usize)
+        } else {
+            self.cached_rom1_off + ((addr as usize) & 0x3FFF)
+        };
+        if offset < self.rom.len() {
+            self.rom[offset] = val;
+        }
     }
 
     pub fn write_rom(&mut self, addr: u16, val: u8) {
@@ -428,9 +558,18 @@ impl Cartridge {
             MbcType::RomOnly => {}
             MbcType::Mbc1 { .. } => match addr {
                 0x0000..=0x1FFF => self.ram_enabled = (val & 0x0F) == 0x0A,
-                0x2000..=0x3FFF => self.rom_bank = (val & 0x1F) as u16,
-                0x4000..=0x5FFF => self.bank_hi = val & 0x03,
-                0x6000..=0x7FFF => self.banking_mode = val & 0x01,
+                0x2000..=0x3FFF => {
+                    self.rom_bank = (val & 0x1F) as u16;
+                    self.rebuild_bank_cache();
+                }
+                0x4000..=0x5FFF => {
+                    self.bank_hi = val & 0x03;
+                    self.rebuild_bank_cache();
+                }
+                0x6000..=0x7FFF => {
+                    self.banking_mode = val & 0x01;
+                    self.rebuild_bank_cache();
+                }
                 _ => {}
             },
             MbcType::Mbc2 => {
@@ -439,13 +578,20 @@ impl Cartridge {
                         self.ram_enabled = (val & 0x0F) == 0x0A;
                     } else {
                         self.rom_bank = (val & 0x0F) as u16;
+                        self.rebuild_bank_cache();
                     }
                 }
             }
             MbcType::Mbc3 { has_rtc } => match addr {
                 0x0000..=0x1FFF => self.ram_enabled = (val & 0x0F) == 0x0A,
-                0x2000..=0x3FFF => self.rom_bank = val as u16,
-                0x4000..=0x5FFF => self.ram_or_rtc_reg = val,
+                0x2000..=0x3FFF => {
+                    self.rom_bank = val as u16;
+                    self.rebuild_bank_cache();
+                }
+                0x4000..=0x5FFF => {
+                    self.ram_or_rtc_reg = val;
+                    self.rebuild_bank_cache();
+                }
                 0x6000..=0x7FFF => {
                     if has_rtc && self.rtc.prev_latch_write == 0x00 && val == 0x01 {
                         self.rtc.latch();
@@ -458,9 +604,11 @@ impl Cartridge {
                 0x0000..=0x1FFF => self.ram_enabled = (val & 0x0F) == 0x0A,
                 0x2000..=0x2FFF => {
                     self.rom_bank = (self.rom_bank & 0x0100) | (val as u16);
+                    self.rebuild_bank_cache();
                 }
                 0x3000..=0x3FFF => {
                     self.rom_bank = (self.rom_bank & 0x00FF) | (((val as u16) & 0x01) << 8);
+                    self.rebuild_bank_cache();
                 }
                 0x4000..=0x5FFF => {
                     if has_rumble {
@@ -469,10 +617,25 @@ impl Cartridge {
                     } else {
                         self.ram_or_rtc_reg = val & 0x0F;
                     }
+                    self.rebuild_bank_cache();
                 }
                 _ => {}
             },
         }
+    }
+
+    #[inline]
+    fn mbc3_ram_bank_selected(&self) -> bool {
+        let max_bank = if self.ram.len() > 0x8000 { 0x07 } else { 0x03 };
+        self.ram_or_rtc_reg <= max_bank
+    }
+
+    #[inline]
+    fn mapped_ram_offset(&self, addr: u16) -> usize {
+        let rel = (addr as usize) - 0xA000;
+        let len = self.ram.len();
+        let off = self.cached_ram_off + rel;
+        if off < len { off } else { off % len }
     }
 
     pub fn read_ram(&self, addr: u16) -> u8 {
@@ -481,20 +644,13 @@ impl Cartridge {
                 if self.ram.is_empty() {
                     return 0xFF;
                 }
-                let off = (addr as usize - 0xA000) % self.ram.len();
-                self.ram[off]
+                self.ram[self.mapped_ram_offset(addr)]
             }
             MbcType::Mbc1 { .. } => {
                 if !self.ram_enabled || self.ram.is_empty() {
                     return 0xFF;
                 }
-                let bank = if self.banking_mode != 0 {
-                    (self.bank_hi as usize) % self.ram_banks()
-                } else {
-                    0
-                };
-                let off = (bank * 0x2000 + (addr as usize - 0xA000)) % self.ram.len();
-                self.ram[off]
+                self.ram[self.mapped_ram_offset(addr)]
             }
             MbcType::Mbc2 => {
                 if !self.ram_enabled || self.ram.is_empty() {
@@ -510,21 +666,16 @@ impl Cartridge {
                 if has_rtc && (0x08..=0x0C).contains(&self.ram_or_rtc_reg) {
                     return self.rtc.read_reg(self.ram_or_rtc_reg);
                 }
-                if self.ram.is_empty() {
+                if self.ram.is_empty() || !self.mbc3_ram_bank_selected() {
                     return 0xFF;
                 }
-                let mask = if self.ram.len() > 0x8000 { 0x07 } else { 0x03 };
-                let bank = (self.ram_or_rtc_reg as usize & mask) % self.ram_banks();
-                let off = (bank * 0x2000 + (addr as usize - 0xA000)) % self.ram.len();
-                self.ram[off]
+                self.ram[self.mapped_ram_offset(addr)]
             }
             MbcType::Mbc5 { .. } => {
                 if !self.ram_enabled || self.ram.is_empty() {
                     return 0xFF;
                 }
-                let bank = (self.ram_or_rtc_reg as usize) % self.ram_banks();
-                let off = (bank * 0x2000 + (addr as usize - 0xA000)) % self.ram.len();
-                self.ram[off]
+                self.ram[self.mapped_ram_offset(addr)]
             }
         }
     }
@@ -533,23 +684,22 @@ impl Cartridge {
         match self.mbc {
             MbcType::RomOnly => {
                 if !self.ram.is_empty() {
-                    let off = (addr as usize - 0xA000) % self.ram.len();
+                    let off = self.mapped_ram_offset(addr);
                     self.ram[off] = val;
-                    self.battery_dirty = true;
+                    if self.has_battery {
+                        self.battery_dirty = true;
+                    }
                 }
             }
             MbcType::Mbc1 { .. } => {
                 if !self.ram_enabled || self.ram.is_empty() {
                     return;
                 }
-                let bank = if self.banking_mode != 0 {
-                    (self.bank_hi as usize) % self.ram_banks()
-                } else {
-                    0
-                };
-                let off = (bank * 0x2000 + (addr as usize - 0xA000)) % self.ram.len();
+                let off = self.mapped_ram_offset(addr);
                 self.ram[off] = val;
-                self.battery_dirty = true;
+                if self.has_battery {
+                    self.battery_dirty = true;
+                }
             }
             MbcType::Mbc2 => {
                 if !self.ram_enabled || self.ram.is_empty() {
@@ -557,7 +707,9 @@ impl Cartridge {
                 }
                 let off = (addr as usize - 0xA000) & 0x01FF;
                 self.ram[off] = val & 0x0F;
-                self.battery_dirty = true;
+                if self.has_battery {
+                    self.battery_dirty = true;
+                }
             }
             MbcType::Mbc3 { has_rtc } => {
                 if !self.ram_enabled {
@@ -565,26 +717,29 @@ impl Cartridge {
                 }
                 if has_rtc && (0x08..=0x0C).contains(&self.ram_or_rtc_reg) {
                     self.rtc.write_reg(self.ram_or_rtc_reg, val);
-                    self.battery_dirty = true;
+                    if self.has_battery {
+                        self.battery_dirty = true;
+                    }
                     return;
                 }
-                if self.ram.is_empty() {
+                if self.ram.is_empty() || !self.mbc3_ram_bank_selected() {
                     return;
                 }
-                let mask = if self.ram.len() > 0x8000 { 0x07 } else { 0x03 };
-                let bank = (self.ram_or_rtc_reg as usize & mask) % self.ram_banks();
-                let off = (bank * 0x2000 + (addr as usize - 0xA000)) % self.ram.len();
+                let off = self.mapped_ram_offset(addr);
                 self.ram[off] = val;
-                self.battery_dirty = true;
+                if self.has_battery {
+                    self.battery_dirty = true;
+                }
             }
             MbcType::Mbc5 { .. } => {
                 if !self.ram_enabled || self.ram.is_empty() {
                     return;
                 }
-                let bank = (self.ram_or_rtc_reg as usize) % self.ram_banks();
-                let off = (bank * 0x2000 + (addr as usize - 0xA000)) % self.ram.len();
+                let off = self.mapped_ram_offset(addr);
                 self.ram[off] = val;
-                self.battery_dirty = true;
+                if self.has_battery {
+                    self.battery_dirty = true;
+                }
             }
         }
     }
@@ -598,28 +753,15 @@ impl Cartridge {
                 let off = (addr as usize - 0xA000) & 0x01FF;
                 self.ram[off] = val & 0x0F;
             }
-            MbcType::RomOnly => {
-                let off = (addr as usize - 0xA000) % self.ram.len();
-                self.ram[off] = val;
-            }
-            MbcType::Mbc1 { .. } => {
-                let bank = if self.banking_mode != 0 {
-                    (self.bank_hi as usize) % self.ram_banks()
-                } else {
-                    0
-                };
-                let off = (bank * 0x2000 + (addr as usize - 0xA000)) % self.ram.len();
-                self.ram[off] = val;
-            }
             MbcType::Mbc3 { .. } => {
-                let mask = if self.ram.len() > 0x8000 { 0x07 } else { 0x03 };
-                let bank = (self.ram_or_rtc_reg as usize & mask) % self.ram_banks();
-                let off = (bank * 0x2000 + (addr as usize - 0xA000)) % self.ram.len();
+                if !self.mbc3_ram_bank_selected() {
+                    return;
+                }
+                let off = self.mapped_ram_offset(addr);
                 self.ram[off] = val;
             }
-            MbcType::Mbc5 { .. } => {
-                let bank = (self.ram_or_rtc_reg as usize) % self.ram_banks();
-                let off = (bank * 0x2000 + (addr as usize - 0xA000)) % self.ram.len();
+            _ => {
+                let off = self.mapped_ram_offset(addr);
                 self.ram[off] = val;
             }
         }
@@ -660,4 +802,16 @@ impl Cartridge {
         }
         self.battery_dirty = false;
     }
+}
+
+fn compute_crc32(data: &[u8]) -> u32 {
+    let mut crc = 0xFFFF_FFFFu32;
+    for &b in data {
+        crc ^= b as u32;
+        for _ in 0..8 {
+            let mask = (crc & 1).wrapping_neg();
+            crc = (crc >> 1) ^ (0xEDB8_8320 & mask);
+        }
+    }
+    !crc
 }

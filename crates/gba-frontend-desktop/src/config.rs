@@ -1,6 +1,57 @@
 use std::collections::BTreeMap;
 use std::fs;
+use std::io::Write;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
+
+static ATOMIC_TMP_COUNTER: AtomicU64 = AtomicU64::new(0);
+
+/// Atomically writes `data` to `path` by writing to a sibling temporary file,
+/// flushing to disk with `sync_all`, and renaming into place.
+pub(crate) fn write_atomic(path: &Path, data: &[u8]) -> std::io::Result<()> {
+    if let Some(parent) = path.parent()
+        && !parent.as_os_str().is_empty()
+    {
+        fs::create_dir_all(parent)?;
+    }
+    let pid = std::process::id();
+    let seq = ATOMIC_TMP_COUNTER.fetch_add(1, Ordering::Relaxed);
+    let file_name = path
+        .file_name()
+        .and_then(|n| n.to_str())
+        .unwrap_or("file");
+    let tmp_path = path.with_file_name(format!(".{file_name}.{pid}.{seq}.tmp"));
+
+    let write_res = (|| -> std::io::Result<()> {
+        let mut f = fs::File::create(&tmp_path)?;
+        f.write_all(data)?;
+        f.sync_all()?;
+        Ok(())
+    })();
+    if let Err(err) = write_res {
+        let _ = fs::remove_file(&tmp_path);
+        return Err(err);
+    }
+
+    match fs::rename(&tmp_path, path) {
+        Ok(()) => Ok(()),
+        Err(rename_err) => {
+            #[cfg(windows)]
+            {
+                // On Windows, `rename` can fail if destination exists and is temporarily locked;
+                // retry once after removing destination if needed.
+                if path.exists() {
+                    let _ = fs::remove_file(path);
+                    if fs::rename(&tmp_path, path).is_ok() {
+                        return Ok(());
+                    }
+                }
+            }
+            let _ = fs::remove_file(&tmp_path);
+            Err(rename_err)
+        }
+    }
+}
 
 use egui::Key;
 use gba_core::cartridge::SaveType;
@@ -388,6 +439,9 @@ impl HotkeyChord {
     pub fn display(&self) -> String {
         let mut parts = Vec::new();
         if self.ctrl {
+            #[cfg(target_os = "macos")]
+            parts.push("Cmd");
+            #[cfg(not(target_os = "macos"))]
             parts.push("Ctrl");
         }
         if self.shift {
@@ -1076,6 +1130,14 @@ fn default_legacy_consecutive_failures() -> u32 {
     2
 }
 
+fn default_ui_scale() -> f32 {
+    1.0
+}
+
+fn default_analog_deadzone() -> f32 {
+    0.40
+}
+
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct BlockedGpuAdapterEntry {
     pub adapter_name: String,
@@ -1179,6 +1241,10 @@ pub struct AppConfig {
     pub ra_rich_presence: bool,
     pub ra_username: String,
     pub ra_token: String,
+    #[serde(default = "default_ui_scale")]
+    pub ui_scale: f32,
+    #[serde(default = "default_analog_deadzone")]
+    pub analog_deadzone: f32,
 }
 
 impl Default for AppConfig {
@@ -1200,7 +1266,7 @@ impl Default for AppConfig {
             governor_settled_filters: BTreeMap::new(),
             blocked_gpu_adapters: BTreeMap::new(),
             verified_gpu_adapters: BTreeMap::new(),
-            shader_preset: ShaderPreset::Nearest,
+            shader_preset: ShaderPreset::SharpBilinear,
             frame_blending: false,
             dot_accurate_ppu: false,
             auto_frameskip: default_auto_frameskip(),
@@ -1233,6 +1299,8 @@ impl Default for AppConfig {
             ra_rich_presence: default_ra_rich_presence(),
             ra_username: String::new(),
             ra_token: String::new(),
+            ui_scale: default_ui_scale(),
+            analog_deadzone: default_analog_deadzone(),
         }
     }
 }
@@ -1272,7 +1340,7 @@ impl AppConfig {
                 } else if cfg.shader_preset == ShaderPreset::ScaleEdge {
                     cfg.display_filter = DisplayFilter::SmoothScale2x;
                 } else if cfg.shader_preset == ShaderPreset::Nearest {
-                    cfg.display_filter = DisplayFilter::RawNearest;
+                    cfg.display_filter = DisplayFilter::Sharp1x;
                 }
             }
             if val.get("shader_preset").is_none() && cfg.scanline_grid {
@@ -1282,6 +1350,11 @@ impl AppConfig {
                 cfg.lcd_grid_intensity = 0.08;
             }
         }
+        if cfg.display_filter == DisplayFilter::RawNearest {
+            cfg.display_filter = DisplayFilter::Sharp1x;
+        }
+        cfg.ui_scale = cfg.ui_scale.clamp(0.8, 2.0);
+        cfg.analog_deadzone = cfg.analog_deadzone.clamp(0.10, 0.85);
         cfg
     }
 
@@ -1298,16 +1371,25 @@ impl AppConfig {
         let Ok(raw) = fs::read_to_string(&path) else {
             return Self::default();
         };
+        if serde_json::from_str::<serde_json::Value>(&raw).is_err() {
+            let bak = path.with_extension("json.bak");
+            let _ = fs::copy(&path, &bak);
+            log::warn!(
+                "Corrupt config.json detected at {}; backed up to {} and reset to defaults",
+                path.display(),
+                bak.display()
+            );
+            return Self::default();
+        }
         Self::from_json_str(&raw)
     }
 
     pub fn save(&self) {
         let path = Self::config_file_path();
-        if let Some(parent) = path.parent() {
-            let _ = fs::create_dir_all(parent);
-        }
-        if let Ok(json) = serde_json::to_string_pretty(self) {
-            let _ = fs::write(path, json);
+        if let Ok(json) = serde_json::to_string_pretty(self)
+            && let Err(e) = write_atomic(&path, json.as_bytes())
+        {
+            log::warn!("Failed to atomically save config to {}: {e}", path.display());
         }
     }
 

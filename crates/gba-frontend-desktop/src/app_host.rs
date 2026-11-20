@@ -49,10 +49,9 @@ pub fn run_desktop(
     init_width: f32,
     init_height: f32,
     cli: crate::headless::CliConfig,
+    initial_config: crate::config::AppConfig,
 ) -> Result<(), String> {
-    let pre_filter = cli
-        .filter
-        .unwrap_or_else(|| crate::config::AppConfig::load().display_filter);
+    let pre_filter = cli.filter.unwrap_or(initial_config.display_filter);
     let decision = crate::shaders::choose_desktop_backend(
         cli.simulate_no_adapter,
         cli.no_gpu,
@@ -132,11 +131,6 @@ pub fn run_desktop(
             wgpu_setup: egui_wgpu::WgpuSetup::CreateNew(wgpu_setup),
             ..Default::default()
         },
-        #[cfg(windows)]
-        event_loop_builder: Some(Box::new(|builder| {
-            use winit::platform::windows::EventLoopBuilderExtWindows;
-            builder.with_any_thread(true);
-        })),
         ..Default::default()
     };
 
@@ -145,7 +139,9 @@ pub fn run_desktop(
         options,
         Box::new(move |cc| {
             configure_obsidian_style(&cc.egui_ctx);
-            let mut app = RustboyApp::new(cli);
+            cc.egui_ctx
+                .set_zoom_factor(initial_config.ui_scale.clamp(0.8, 2.0));
+            let mut app = RustboyApp::new(cli, initial_config);
             if let Some(rs) = &cc.wgpu_render_state {
                 app.init_wgpu(rs);
             }

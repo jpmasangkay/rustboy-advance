@@ -1,7 +1,5 @@
 //! mGBA-inspired Lua 5.4 scripting engine powered by pure-Rust `piccolo`.
 
-#![allow(dead_code)]
-
 use std::{
     cell::RefCell,
     collections::VecDeque,
@@ -457,11 +455,13 @@ impl LuaEngine {
     }
 
     /// Returns a cloned copy of queued HUD draw commands (convenient for testing/inspection).
+    #[cfg(test)]
     pub fn overlay_commands(&self) -> Vec<GuiDrawCmd> {
         self.shared.borrow().overlay_cmds.clone()
     }
 
     /// Returns a snapshot of all console log lines (up to `MAX_CONSOLE_LINES`).
+    #[cfg(test)]
     pub fn console_lines(&self) -> Vec<String> {
         self.shared.borrow().console_log.iter().cloned().collect()
     }
@@ -471,6 +471,7 @@ impl LuaEngine {
         self.last_error = Some(err.clone());
         let mut shared = self.shared.borrow_mut();
         shared.frame_callbacks.clear();
+        shared.overlay_cmds.clear();
         shared.joypad_set_mask = 0;
         shared.joypad_clear_mask = 0;
         shared.push_log(format!("[Error] {err}"));
@@ -717,7 +718,7 @@ impl LuaEngine {
                 );
             } else if hardcore {
                 ui.label(
-                    RichText::new("| RA Hardcore: emu.write* blocked")
+                    RichText::new("| RA Hardcore: emu.write* & joypad.set blocked")
                         .small()
                         .color(Color32::from_rgb(234, 179, 8)),
                 );
@@ -799,24 +800,24 @@ impl LuaEngine {
             .corner_radius(4.0)
             .inner_margin(egui::Margin::same(6))
             .show(ui, |ui| {
-                let lines = self.console_lines();
+                let shared = self.shared.borrow();
                 egui::ScrollArea::vertical()
                     .id_salt("lua_console_output_scroll")
                     .stick_to_bottom(true)
                     .min_scrolled_height(110.0)
                     .max_height(150.0)
                     .show(ui, |ui| {
-                        if lines.is_empty() {
+                        if shared.console_log.is_empty() {
                             ui.label(
                                 RichText::new(
-                                    "No console output yet. Call console.log(...) in your script and click Run.",
+                                    "No console output yet. Call console.log(...) or print(...) in your script and click Run.",
                                 )
                                 .small()
                                 .italics()
                                 .color(text_muted),
                             );
                         } else {
-                            for line in lines {
+                            for line in &shared.console_log {
                                 let color = if line.starts_with("[Error]") {
                                     Color32::from_rgb(252, 165, 165)
                                 } else if line.starts_with("[Lua]") {
@@ -824,7 +825,12 @@ impl LuaEngine {
                                 } else {
                                     Color32::from_rgb(220, 226, 236)
                                 };
-                                ui.label(RichText::new(line).monospace().size(11.5).color(color));
+                                ui.label(
+                                    RichText::new(line.as_str())
+                                        .monospace()
+                                        .size(11.5)
+                                        .color(color),
+                                );
                             }
                         }
                     });
@@ -1006,6 +1012,12 @@ fn register_joypad_table<'gc>(ctx: Context<'gc>, shared: Rc<RefCell<LuaSharedSta
             ctx,
             "set",
             Callback::from_fn(&ctx, move |ctx, _, stack| {
+                if s.borrow().hardcore_active {
+                    return Err(lua_err(
+                        ctx,
+                        "joypad.set is disabled while RetroAchievements Hardcore mode is active",
+                    ));
+                }
                 let Value::Table(tbl) = stack.get(0) else {
                     return Err(TypeError {
                         expected: "table",
@@ -1050,21 +1062,17 @@ fn register_joypad_table<'gc>(ctx: Context<'gc>, shared: Rc<RefCell<LuaSharedSta
 fn register_console_table<'gc>(ctx: Context<'gc>, shared: Rc<RefCell<LuaSharedState>>) {
     let console = Table::new(&ctx);
 
-    console
-        .set(
-            ctx,
-            "log",
-            Callback::from_fn(&ctx, move |_, _, stack| {
-                let mut parts = Vec::with_capacity(stack.len());
-                for v in &stack {
-                    parts.push(format_lua_value(v));
-                }
-                shared.borrow_mut().push_log(parts.join(" "));
-                Ok(CallbackReturn::Return)
-            }),
-        )
-        .unwrap();
+    let log_cb = Callback::from_fn(&ctx, move |_, _, stack| {
+        let mut parts = Vec::with_capacity(stack.len());
+        for v in &stack {
+            parts.push(format_lua_value(v));
+        }
+        shared.borrow_mut().push_log(parts.join(" "));
+        Ok(CallbackReturn::Return)
+    });
 
+    console.set(ctx, "log", log_cb).unwrap();
+    ctx.set_global("print", log_cb).unwrap();
     ctx.set_global("console", console).unwrap();
 }
 
@@ -1243,9 +1251,18 @@ fn format_lua_string(pattern: &str, args: &[Value<'_>]) -> Result<String, String
             i += 1;
         }
 
+        const MAX_FMT_WIDTH: usize = 256;
         let mut width: Option<usize> = None;
         while i < bytes.len() && bytes[i].is_ascii_digit() {
-            let w = width.unwrap_or(0) * 10 + usize::from(bytes[i] - b'0');
+            let d = usize::from(bytes[i] - b'0');
+            let w = width
+                .unwrap_or(0)
+                .checked_mul(10)
+                .and_then(|v| v.checked_add(d))
+                .filter(|&v| v <= MAX_FMT_WIDTH)
+                .ok_or_else(|| {
+                    format!("string.format field width exceeds limit ({MAX_FMT_WIDTH})")
+                })?;
             width = Some(w);
             i += 1;
         }
@@ -1255,7 +1272,14 @@ fn format_lua_string(pattern: &str, args: &[Value<'_>]) -> Result<String, String
             i += 1;
             let mut p = 0usize;
             while i < bytes.len() && bytes[i].is_ascii_digit() {
-                p = p * 10 + usize::from(bytes[i] - b'0');
+                let d = usize::from(bytes[i] - b'0');
+                p = p
+                    .checked_mul(10)
+                    .and_then(|v| v.checked_add(d))
+                    .filter(|&v| v <= MAX_FMT_WIDTH)
+                    .ok_or_else(|| {
+                        format!("string.format precision exceeds limit ({MAX_FMT_WIDTH})")
+                    })?;
                 i += 1;
             }
             precision = Some(p);
@@ -1517,6 +1541,32 @@ mod tests {
         assert_eq!(core.peek8(0x0200_0011), 0x11);
         assert!(!engine.running);
         assert!(engine.last_error.is_some());
+    }
+
+    #[test]
+    fn joypad_set_blocked_in_hardcore_and_print_and_fmt_limits() {
+        let mut core = new_test_core();
+        let mut engine = LuaEngine::new();
+        engine.script_source = "joypad.set({ A = true })".to_string();
+        assert!(
+            engine
+                .start_script(Some(&mut core), "LUATESTROM", "ALTE", 0, 0, true)
+                .is_err()
+        );
+        assert_eq!(engine.apply_joypad_override(0), 0);
+
+        engine.script_source = r#"print("hello", 42)"#.to_string();
+        engine
+            .start_script(Some(&mut core), "LUATESTROM", "ALTE", 0, 0, false)
+            .expect("print should alias console.log");
+        assert_eq!(engine.console_lines(), vec!["hello 42"]);
+
+        engine.script_source = r#"local _ = string.format("%999999999d", 1)"#.to_string();
+        assert!(
+            engine
+                .start_script(Some(&mut core), "LUATESTROM", "ALTE", 0, 0, false)
+                .is_err()
+        );
     }
 
     #[test]

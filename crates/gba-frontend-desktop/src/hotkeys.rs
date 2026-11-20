@@ -70,13 +70,21 @@ impl RustboyApp {
             } else if self.has_active_game() {
                 self.show_pause_overlay = !self.show_pause_overlay;
                 self.paused = self.show_pause_overlay;
+                self.sink.audio.set_paused(self.paused);
+                self.autofire_state.clear_latches();
+                if !self.paused {
+                    self.playtime_timer = std::time::Instant::now();
+                    self.last_step_time = std::time::Instant::now();
+                    self.pacing_deadline = None;
+                }
                 return;
             }
         }
 
-        // Ctrl+W returns to library when a game is running
+        // Ctrl/Cmd+W returns to library when a game is running
         let stop_game = ctx.input(|i| {
-            i.modifiers.ctrl && !i.modifiers.shift && !i.modifiers.alt && i.key_pressed(Key::W)
+            let cmd = i.modifiers.ctrl || i.modifiers.mac_cmd;
+            cmd && !i.modifiers.shift && !i.modifiers.alt && i.key_pressed(Key::W)
         });
         if stop_game && self.has_active_game() {
             self.close_rom(ctx);
@@ -85,6 +93,7 @@ impl RustboyApp {
 
         let hotkeys = self.config.keybindings.hotkeys.clone();
         let was_rewinding = self.rewinding;
+        let hardcore = self.is_ra_hardcore_active();
 
         let (
             rewind_held,
@@ -102,24 +111,41 @@ impl RustboyApp {
             open_rom,
             toggle_toolbar,
             toggle_status_bar,
+            toggle_menu_bar,
             undo_state,
             fn_slot,
             open_bracket,
             close_bracket,
         ) = ctx.input(|i| {
+            let cmd = i.modifiers.ctrl || i.modifiers.mac_cmd;
             let rw_chord = hotkeys.get(HotkeyAction::Rewind);
             let ff_chord = hotkeys.get(HotkeyAction::FastForward);
+
+            let is_bound_to_configured_hotkey = |key: Key, shift: bool| -> bool {
+                HotkeyAction::ALL.iter().any(|&action| {
+                    hotkeys.get(action).is_some_and(|c| {
+                        !c.ctrl && !c.alt && c.shift == shift && c.egui_key() == Some(key)
+                    })
+                })
+            };
 
             let extra_slot = [Key::F2, Key::F3, Key::F4, Key::F5]
                 .iter()
                 .enumerate()
                 .find_map(|(offset, &k)| {
-                    if !i.modifiers.ctrl && !i.modifiers.alt && i.key_pressed(k) {
+                    if !cmd
+                        && !i.modifiers.alt
+                        && i.key_pressed(k)
+                        && !is_bound_to_configured_hotkey(k, i.modifiers.shift)
+                    {
                         Some((offset + 2, i.modifiers.shift))
                     } else {
                         None
                     }
                 });
+
+            let menu_toggle = (cmd && i.modifiers.shift && !i.modifiers.alt && i.key_pressed(Key::M))
+                || (!i.modifiers.any() && i.key_pressed(Key::F10));
 
             (
                 rw_chord.is_some_and(|c| is_chord_held(i, c)),
@@ -134,10 +160,11 @@ impl RustboyApp {
                 is_hotkey_triggered(i, hotkeys.get(HotkeyAction::HardReset), false),
                 is_hotkey_triggered(i, hotkeys.get(HotkeyAction::Mute), false),
                 is_hotkey_triggered(i, hotkeys.get(HotkeyAction::Fullscreen), false),
-                i.modifiers.ctrl && !i.modifiers.shift && !i.modifiers.alt && i.key_pressed(Key::O),
-                i.modifiers.ctrl && !i.modifiers.shift && !i.modifiers.alt && i.key_pressed(Key::T),
-                i.modifiers.ctrl && !i.modifiers.shift && !i.modifiers.alt && i.key_pressed(Key::S),
-                i.modifiers.ctrl && !i.modifiers.shift && !i.modifiers.alt && i.key_pressed(Key::Z),
+                cmd && !i.modifiers.shift && !i.modifiers.alt && i.key_pressed(Key::O),
+                cmd && !i.modifiers.shift && !i.modifiers.alt && i.key_pressed(Key::T),
+                cmd && !i.modifiers.shift && !i.modifiers.alt && i.key_pressed(Key::S),
+                menu_toggle,
+                cmd && !i.modifiers.shift && !i.modifiers.alt && i.key_pressed(Key::Z),
                 extra_slot,
                 !i.modifiers.any() && i.key_pressed(Key::OpenBracket),
                 !i.modifiers.any() && i.key_pressed(Key::CloseBracket),
@@ -147,7 +174,12 @@ impl RustboyApp {
         self.tab_fast_forward = ff_held;
 
         if self.has_active_game() && rewind_held {
-            if !self.config.rewind_enabled {
+            if hardcore {
+                if !was_rewinding && rewind_pressed {
+                    self.notify_warn("Rewind is disabled in RetroAchievements Hardcore Mode");
+                }
+                self.rewinding = false;
+            } else if !self.config.rewind_enabled {
                 if !was_rewinding && rewind_pressed {
                     self.notify("Rewind is disabled in Emulation -> Rewind Settings");
                 }
@@ -189,31 +221,48 @@ impl RustboyApp {
             self.config.show_toolbar = !self.config.show_toolbar;
             self.config.save();
             self.notify(if self.config.show_toolbar {
-                "Toolbar Shown (Ctrl+T)"
+                "Toolbar Shown"
             } else {
-                "Toolbar Hidden (Ctrl+T)"
+                "Toolbar Hidden"
             });
         }
         if toggle_status_bar {
             self.config.show_status_bar = !self.config.show_status_bar;
             self.config.save();
             self.notify(if self.config.show_status_bar {
-                "Status Bar Shown (Ctrl+S)"
+                "Status Bar Shown"
             } else {
-                "Status Bar Hidden (Ctrl+S)"
+                "Status Bar Hidden"
+            });
+        }
+        if toggle_menu_bar {
+            self.config.show_menu_bar = !self.config.show_menu_bar;
+            self.config.save();
+            self.notify(if self.config.show_menu_bar {
+                "Menu Bar Shown"
+            } else {
+                "Menu Bar Hidden (F10 or Ctrl/Cmd+Shift+M to restore)"
             });
         }
         if undo_state {
             self.undo_last_state_action();
         }
         if state_mgr_trig {
-            self.show_state_manager = !self.show_state_manager;
+            if hardcore {
+                self.notify_warn("Save State Manager is disabled in RetroAchievements Hardcore Mode");
+            } else {
+                self.show_state_manager = !self.show_state_manager;
+            }
         }
         if open_rom {
             self.trigger_open_rom_dialog(ctx);
         }
         if frame_adv_trig {
-            self.step_single_frame(ctx);
+            if hardcore {
+                self.notify_warn("Frame Advance is disabled in RetroAchievements Hardcore Mode");
+            } else {
+                self.step_single_frame(ctx);
+            }
         }
         if hard_reset_trig {
             self.hard_reset();

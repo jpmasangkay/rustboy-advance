@@ -275,20 +275,53 @@ fn code_to_axis(code: GamepadAxisCode) -> Axis {
     }
 }
 
-fn is_gamepad_input_active(gamepad: &gilrs::Gamepad<'_>, input: GamepadInput) -> bool {
-    const AXIS_THRESHOLD: f32 = 0.45;
+fn is_gamepad_input_active(
+    gamepad: &gilrs::Gamepad<'_>,
+    input: GamepadInput,
+    deadzone: f32,
+) -> bool {
+    let threshold = deadzone.clamp(0.10, 0.85);
     match input {
         GamepadInput::Button(code) => gamepad.is_pressed(code_to_gilrs_button(code)),
         GamepadInput::AxisNegative(code) => gamepad
             .axis_data(code_to_axis(code))
-            .is_some_and(|d| d.value() < -AXIS_THRESHOLD),
+            .is_some_and(|d| d.value() < -threshold),
         GamepadInput::AxisPositive(code) => gamepad
             .axis_data(code_to_axis(code))
-            .is_some_and(|d| d.value() > AXIS_THRESHOLD),
+            .is_some_and(|d| d.value() > threshold),
     }
 }
 
 impl RustboyApp {
+    fn snapshot_gamepad_axis_baselines(&mut self) {
+        self.gamepad_bind_baseline.clear();
+        let Some(gilrs) = &self.gilrs else {
+            return;
+        };
+        let axes = [
+            Axis::LeftStickX,
+            Axis::LeftStickY,
+            Axis::RightStickX,
+            Axis::RightStickY,
+            Axis::DPadX,
+            Axis::DPadY,
+            Axis::LeftZ,
+            Axis::RightZ,
+        ];
+        for (id, gp) in gilrs.gamepads() {
+            if !gp.is_connected() {
+                continue;
+            }
+            for axis in axes {
+                if let Some(code) = axis_to_code(axis)
+                    && let Some(val) = gp.axis_data(axis).map(|d| d.value())
+                {
+                    self.gamepad_bind_baseline.insert((id, code), val);
+                }
+            }
+        }
+    }
+
     /// Drains pending `gilrs` events once per UI frame and handles active gamepad bind capture.
     pub(crate) fn pump_gamepad_events(&mut self, ctx: &egui::Context) {
         let mut captured_input: Option<GamepadInput> = None;
@@ -304,13 +337,22 @@ impl RustboyApp {
                                 captured_input = Some(GamepadInput::Button(code));
                             }
                         }
-                        EventType::AxisChanged(axis, value, _) if value.abs() >= 0.65 => {
+                        EventType::AxisChanged(axis, value, _) => {
                             if let Some(code) = axis_to_code(axis) {
-                                captured_input = Some(if value < 0.0 {
-                                    GamepadInput::AxisNegative(code)
-                                } else {
-                                    GamepadInput::AxisPositive(code)
-                                });
+                                let base = self
+                                    .gamepad_bind_baseline
+                                    .get(&(ev.id, code))
+                                    .copied()
+                                    .unwrap_or(0.0);
+                                // Require a genuine user movement away from the resting baseline
+                                // so resting `-1.0` analog triggers never auto-bind immediately!
+                                if (value - base).abs() >= 0.55 && value.abs() >= 0.55 {
+                                    captured_input = Some(if value < 0.0 {
+                                        GamepadInput::AxisNegative(code)
+                                    } else {
+                                        GamepadInput::AxisPositive(code)
+                                    });
+                                }
                             }
                         }
                         _ => {}
@@ -324,6 +366,7 @@ impl RustboyApp {
         {
             self.config.keybindings.gamepad.set(target, Some(inp));
             self.awaiting_input_bind = None;
+            self.gamepad_bind_baseline.clear();
             self.autofire_state.clear_latches();
             self.config.save();
             self.notify(&format!("Bound {} to {}", target.label(), inp.label()));
@@ -344,6 +387,10 @@ impl RustboyApp {
 
         if allow_kbd {
             ctx.input(|i| {
+                // Do not leak Ctrl/Cmd/Alt desktop shortcuts into live GBA buttons.
+                if i.modifiers.ctrl || i.modifiers.mac_cmd || i.modifiers.alt {
+                    return;
+                }
                 for btn in GbaButton::ALL {
                     if let Some(k) = self.config.keybindings.egui_key(btn)
                         && i.key_down(k)
@@ -370,6 +417,7 @@ impl RustboyApp {
             });
         }
 
+        let deadzone = self.config.analog_deadzone.clamp(0.10, 0.85);
         if self.awaiting_input_bind.is_none()
             && let Some(gilrs) = &self.gilrs
         {
@@ -386,18 +434,18 @@ impl RustboyApp {
                 connected_idx += 1;
                 for btn in GbaButton::ALL {
                     if let Some(binding) = gp_cfg.get(ControlTarget::Button(btn))
-                        && is_gamepad_input_active(&gamepad, binding)
+                        && is_gamepad_input_active(&gamepad, binding, deadzone)
                     {
                         mask |= btn.mask();
                     }
                 }
                 if let Some(binding) = gp_cfg.get(ControlTarget::TurboA)
-                    && is_gamepad_input_active(&gamepad, binding)
+                    && is_gamepad_input_active(&gamepad, binding, deadzone)
                 {
                     raw_turbo_a = true;
                 }
                 if let Some(binding) = gp_cfg.get(ControlTarget::TurboB)
-                    && is_gamepad_input_active(&gamepad, binding)
+                    && is_gamepad_input_active(&gamepad, binding, deadzone)
                 {
                     raw_turbo_b = true;
                 }
@@ -411,14 +459,14 @@ impl RustboyApp {
                         .axis_data(Axis::LeftStickY)
                         .map(|d| d.value())
                         .unwrap_or(0.0);
-                    if lx < -0.4 {
+                    if lx < -deadzone {
                         mask |= GbaButton::Left.mask();
-                    } else if lx > 0.4 {
+                    } else if lx > deadzone {
                         mask |= GbaButton::Right.mask();
                     }
-                    if ly > 0.4 {
+                    if ly > deadzone {
                         mask |= GbaButton::Up.mask();
-                    } else if ly < -0.4 {
+                    } else if ly < -deadzone {
                         mask |= GbaButton::Down.mask();
                     }
                 }
@@ -486,8 +534,8 @@ impl RustboyApp {
                 }
             }
 
-            // 2. Keyboard Alt + Arrows fallback
-            if rx == 0.0 && ry == 0.0 {
+            // 2. Keyboard Alt + Arrows fallback (guarded so typing in UI dialogs doesn't tilt)
+            if rx == 0.0 && ry == 0.0 && !ctx.wants_keyboard_input() {
                 ctx.input(|i| {
                     if i.key_down(egui::Key::ArrowLeft) && i.modifiers.alt {
                         rx -= 1.0;
@@ -539,6 +587,7 @@ impl RustboyApp {
 
     pub(crate) fn poll_p2_inputs(&self, ctx: &egui::Context) -> u16 {
         let mut kp = crate::link::p2_keyboard_mask(ctx);
+        let deadzone = self.config.analog_deadzone.clamp(0.10, 0.85);
         if self.awaiting_input_bind.is_none()
             && let Some(gilrs) = &self.gilrs
         {
@@ -548,7 +597,7 @@ impl RustboyApp {
                 let mut gp_mask = 0u16;
                 for btn in GbaButton::ALL {
                     if let Some(binding) = gp_cfg.get(ControlTarget::Button(btn))
-                        && is_gamepad_input_active(&gamepad, binding)
+                        && is_gamepad_input_active(&gamepad, binding, deadzone)
                     {
                         gp_mask |= btn.mask();
                     }
@@ -562,14 +611,14 @@ impl RustboyApp {
                         .axis_data(Axis::LeftStickY)
                         .map(|d| d.value())
                         .unwrap_or(0.0);
-                    if lx < -0.4 {
+                    if lx < -deadzone {
                         gp_mask |= GbaButton::Left.mask();
-                    } else if lx > 0.4 {
+                    } else if lx > deadzone {
                         gp_mask |= GbaButton::Right.mask();
                     }
-                    if ly > 0.4 {
+                    if ly > deadzone {
                         gp_mask |= GbaButton::Up.mask();
-                    } else if ly < -0.4 {
+                    } else if ly < -deadzone {
                         gp_mask |= GbaButton::Down.mask();
                     }
                 }
@@ -596,6 +645,11 @@ impl RustboyApp {
             return;
         };
         if matches!(pending, PendingInputBind::Gamepad(_)) {
+            if ctx.input(|i| i.key_pressed(Key::Escape)) {
+                self.awaiting_input_bind = None;
+                self.gamepad_bind_baseline.clear();
+                return;
+            }
             ctx.request_repaint();
             return;
         }
@@ -971,6 +1025,16 @@ impl RustboyApp {
         {
             self.config.save();
         }
+        ui.horizontal(|ui| {
+            ui.label("Analog Deadzone:");
+            let dz_slider = ui.add(
+                egui::Slider::new(&mut self.config.analog_deadzone, 0.10..=0.85)
+                    .custom_formatter(|v, _| format!("{:.0}%", v * 100.0)),
+            );
+            if dz_slider.drag_stopped() || dz_slider.lost_focus() {
+                self.config.save();
+            }
+        });
         ui.add_space(6.0);
 
         let all_unbound = ControlTarget::ALL
@@ -1028,11 +1092,13 @@ impl RustboyApp {
                         )
                         .clicked()
                     {
-                        self.awaiting_input_bind = if is_capturing {
-                            None
+                        if is_capturing {
+                            self.awaiting_input_bind = None;
+                            self.gamepad_bind_baseline.clear();
                         } else {
-                            Some(PendingInputBind::Gamepad(target))
-                        };
+                            self.snapshot_gamepad_axis_baselines();
+                            self.awaiting_input_bind = Some(PendingInputBind::Gamepad(target));
+                        }
                     }
 
                     if ui
@@ -1094,15 +1160,15 @@ impl RustboyApp {
                     .clamp(2, 16);
                 let hz = 59.7275 / (f32::from(interval));
                 ui.horizontal(|ui| {
-                    if ui
-                        .add(
-                            egui::Slider::new(&mut interval, 2..=16)
-                                .text("frames per cycle")
-                                .integer(),
-                        )
-                        .changed()
-                    {
+                    let af_slider = ui.add(
+                        egui::Slider::new(&mut interval, 2..=16)
+                            .text("frames per cycle")
+                            .integer(),
+                    );
+                    if af_slider.changed() {
                         self.config.keybindings.autofire_interval_frames = interval;
+                    }
+                    if af_slider.drag_stopped() || af_slider.lost_focus() {
                         self.config.save();
                     }
                     ui.label(

@@ -282,7 +282,7 @@ pub fn build_stress_mode0_4bg_128spr_rom() -> Vec<u8> {
 
     let pal = b.add_blob(build_palette());
     let bg_tiles = b.add_blob(build_4bpp_tiles(64)); // 2 KiB -> 0x0600_0000
-    let obj_tiles = b.add_blob(build_4bpp_tiles(512)); // 16 KiB -> 0x0601_0000
+    let obj_tiles = b.add_blob(build_4bpp_tiles(1024)); // 32 KiB -> 0x0601_0000..0x0601_8000 (covers all OAM tiles 0..1023)
     let map0 = b.add_blob(build_mode0_64x64_map(0));
     let map1 = b.add_blob(build_mode0_64x64_map(3));
     let map2 = b.add_blob(build_mode0_64x64_map(7));

@@ -16,7 +16,7 @@ const FIFO_INTERP_STEP_CYCLES: u64 = 128; // 131_072 Hz sub-stepping for smooth 
 
 #[derive(Clone, Serialize, Deserialize)]
 pub struct DmaAudioFifo {
-    pub buffer: [u32; 16],
+    pub buffer: [u32; 8],
     pub read_idx: u8,
     pub write_idx: u8,
     pub count: u8,
@@ -29,12 +29,14 @@ pub struct DmaAudioFifo {
     pub last_pop_cycle: u64,
     #[serde(default)]
     pub ramp_period: u64,
+    #[serde(default)]
+    pub partial_word: u32,
 }
 
 impl DmaAudioFifo {
     pub fn new() -> Self {
         Self {
-            buffer: [0; 16],
+            buffer: [0; 8],
             read_idx: 0,
             write_idx: 0,
             count: 0,
@@ -44,11 +46,12 @@ impl DmaAudioFifo {
             prev_sample: 0,
             last_pop_cycle: 0,
             ramp_period: 0,
+            partial_word: 0,
         }
     }
 
     pub fn reset(&mut self) {
-        self.buffer = [0; 16];
+        self.buffer = [0; 8];
         self.read_idx = 0;
         self.write_idx = 0;
         self.count = 0;
@@ -58,29 +61,40 @@ impl DmaAudioFifo {
         self.prev_sample = 0;
         self.last_pop_cycle = 0;
         self.ramp_period = 0;
+        self.partial_word = 0;
     }
 
     pub fn push_word(&mut self, val: u32) {
-        if self.count >= 16 {
+        self.partial_word = 0;
+        if self.count >= 8 {
             // Overwrite oldest on hardware overflow, keep FIFO intact
-            self.read_idx = (self.read_idx + 1) % 16;
+            self.read_idx = (self.read_idx + 1) & 7;
             self.count -= 1;
         }
-        self.buffer[self.write_idx as usize] = val;
-        self.write_idx = (self.write_idx + 1) % 16;
+        self.buffer[(self.write_idx & 7) as usize] = val;
+        self.write_idx = (self.write_idx + 1) & 7;
         self.count += 1;
     }
 
     pub fn push_half(&mut self, offset: u32, val: u16) {
-        let shift = (offset & 2) * 8;
-        let word = (val as u32) << shift;
-        self.push_word(word);
+        let lane = offset & 2;
+        if lane == 0 {
+            self.partial_word = (self.partial_word & 0xFFFF_0000) | (val as u32);
+        } else {
+            let word = (self.partial_word & 0x0000_FFFF) | ((val as u32) << 16);
+            self.push_word(word);
+        }
     }
 
     pub fn push_byte(&mut self, offset: u32, val: u8) {
-        let shift = (offset & 3) * 8;
-        let word = (val as u32) << shift;
-        self.push_word(word);
+        let lane = offset & 3;
+        let shift = lane * 8;
+        let mask = !(0xFFu32 << shift);
+        self.partial_word = (self.partial_word & mask) | ((val as u32) << shift);
+        if lane == 3 {
+            let word = self.partial_word;
+            self.push_word(word);
+        }
     }
 
     /// Consumes 1 signed byte from active latch (or pops next 32-bit word).
@@ -94,8 +108,8 @@ impl DmaAudioFifo {
         let prev_val = self.interpolated_sample(cycle).clamp(-128, 127) as i8;
         if self.latch_bytes_left == 0 {
             if self.count > 0 {
-                self.active_latch = self.buffer[self.read_idx as usize];
-                self.read_idx = (self.read_idx + 1) % 16;
+                self.active_latch = self.buffer[(self.read_idx & 7) as usize];
+                self.read_idx = (self.read_idx + 1) & 7;
                 self.count -= 1;
                 self.latch_bytes_left = 4;
             } else {
@@ -152,6 +166,8 @@ pub struct PsgSquare {
     pub sweep_timer: u8,
     pub sweep_enabled: bool,
     pub sweep_shadow: u16,
+    #[serde(default)]
+    pub sweep_negate_used: bool,
 
     pub duty: u8,
     pub duty_pos: u8,
@@ -184,6 +200,7 @@ impl PsgSquare {
             sweep_timer: 0,
             sweep_enabled: false,
             sweep_shadow: 0,
+            sweep_negate_used: false,
             duty: 0,
             duty_pos: 0,
             length_counter: 0,
@@ -206,7 +223,11 @@ impl PsgSquare {
     pub fn write_sweep(&mut self, val: u16) {
         self.reg_l = val;
         self.sweep_period = ((val >> 4) & 0x07) as u8;
-        self.sweep_negate = (val & 0x08) != 0;
+        let new_negate = (val & 0x08) != 0;
+        if self.sweep_negate_used && !new_negate {
+            self.enabled = false;
+        }
+        self.sweep_negate = new_negate;
         self.sweep_shift = (val & 0x07) as u8;
     }
 
@@ -253,6 +274,7 @@ impl PsgSquare {
 
         if self.has_sweep {
             self.sweep_shadow = self.freq;
+            self.sweep_negate_used = false;
             self.sweep_timer = if self.sweep_period == 0 {
                 8
             } else {
@@ -265,9 +287,10 @@ impl PsgSquare {
         }
     }
 
-    fn calc_sweep_freq(&self) -> u16 {
+    fn calc_sweep_freq(&mut self) -> u16 {
         let delta = self.sweep_shadow >> self.sweep_shift;
         if self.sweep_negate {
+            self.sweep_negate_used = true;
             self.sweep_shadow.saturating_sub(delta)
         } else {
             self.sweep_shadow + delta
@@ -506,13 +529,13 @@ impl PsgWave {
     }
 
     pub fn sample(&self) -> i16 {
-        if !self.enabled || !self.dac_enabled {
+        if !self.enabled || !self.dac_enabled || (self.volume_code == 0 && !self.force_75) {
             return 0;
         }
         let bank = if self.dimension_64 {
-            (self.sample_pos >> 5) as usize
+            ((self.bank_select as usize) ^ ((self.sample_pos >> 5) as usize)) & 1
         } else {
-            self.bank_select as usize
+            (self.bank_select & 1) as usize
         };
         let byte_idx = ((self.sample_pos & 31) >> 1) as usize;
         let byte = self.wave_ram[bank * 16 + byte_idx];
@@ -522,17 +545,18 @@ impl PsgWave {
             byte & 0x0F
         } as i16;
 
-        let scaled = if self.force_75 {
-            (nibble * 3) >> 2
+        // Center 4-bit sample around 0 before volume attenuation so volume changes don't inject DC pops.
+        let centered = (nibble * 2) - 15;
+        if self.force_75 {
+            (centered * 3) / 4
         } else {
             match self.volume_code {
                 0 => 0,
-                1 => nibble,
-                2 => nibble >> 1,
-                _ => nibble >> 2,
+                1 => centered,
+                2 => centered / 2,
+                _ => centered / 4,
             }
-        };
-        (scaled * 2) - 15
+        }
     }
 }
 
@@ -680,7 +704,7 @@ impl PsgNoise {
         let mask14 = !(1u16 << 14);
         let mask6 = !(1u16 << 6);
         let max_period_bits = if self.width_7 { 127 } else { 32767 };
-        let lfsr_steps = steps.min(max_period_bits);
+        let lfsr_steps = steps % max_period_bits;
         for _ in 0..lfsr_steps {
             let bit = (self.lfsr ^ (self.lfsr >> 1)) & 1;
             self.lfsr = ((self.lfsr >> 1) & mask14) | (bit << 14);
@@ -778,6 +802,9 @@ pub struct Apu {
     pub chan_scopes: [[i16; 128]; 6],
     #[serde(skip)]
     pub scope_cursor: usize,
+    /// Only sample per-channel oscilloscopes when a UI visualizer is actively displayed.
+    #[serde(skip, default)]
+    pub scopes_enabled: bool,
 
     /// Current CPU cycle timestamp to which PSG and mixer state are synchronized.
     #[serde(default)]
@@ -813,6 +840,7 @@ impl Apu {
             master_volume_pct: 100,
             chan_scopes: [[0; 128]; 6],
             scope_cursor: 0,
+            scopes_enabled: false,
             last_cycle: 0,
             next_frame_seq_cycle: crate::APU_FRAME_SEQ_INTERVAL,
             dsp,
@@ -891,15 +919,32 @@ impl Apu {
         self.soundcnt_h = val & 0x770F;
     }
 
-    /// Synchronizes all PSG and interpolated FIFO states up to exact CPU `target_cycle`.
+    /// Synchronizes all PSG, 512 Hz frame sequencer, and interpolated FIFO states up to exact CPU `target_cycle`.
     pub fn sync(&mut self, target_cycle: u64) {
         self.ensure_dsp_initialized();
         if target_cycle <= self.last_cycle {
             return;
         }
-        let max_chunk = self.dsp.blip.max_chunk_cycles();
+        if self.next_frame_seq_cycle == 0 {
+            self.next_frame_seq_cycle = self.last_cycle + crate::APU_FRAME_SEQ_INTERVAL;
+        }
+        while self.next_frame_seq_cycle <= target_cycle {
+            let seq_cycle = self.next_frame_seq_cycle;
+            self.sync_chunks(seq_cycle);
+            if self.master_enabled() {
+                self.tick_frame_sequencer();
+                self.commit_mix(seq_cycle);
+            }
+            self.next_frame_seq_cycle =
+                self.next_frame_seq_cycle.saturating_add(crate::APU_FRAME_SEQ_INTERVAL);
+        }
+        self.sync_chunks(target_cycle);
+    }
+
+    fn sync_chunks(&mut self, target_cycle: u64) {
         while self.last_cycle < target_cycle {
-            let chunk_end = target_cycle.min(self.last_cycle + max_chunk);
+            let max_chunk = self.dsp.blip.max_chunk_cycles();
+            let chunk_end = target_cycle.min(self.last_cycle.saturating_add(max_chunk));
             self.step_to(chunk_end);
             if self.last_cycle < target_cycle {
                 self.drain_blip(self.last_cycle);
@@ -956,19 +1001,6 @@ impl Apu {
     /// Advances audio up to `cycle`, ticking the 512 Hz PSG frame sequencer whenever due,
     /// and draining ready samples into `output_buffer`. Called once per scanline in HBlank.
     pub fn advance_scanline(&mut self, cycle: u64) {
-        self.ensure_dsp_initialized();
-        if self.next_frame_seq_cycle == 0 {
-            self.next_frame_seq_cycle = self.last_cycle + crate::APU_FRAME_SEQ_INTERVAL;
-        }
-        while self.next_frame_seq_cycle <= cycle {
-            let seq_cycle = self.next_frame_seq_cycle;
-            self.sync(seq_cycle);
-            if self.master_enabled() {
-                self.tick_frame_sequencer();
-                self.commit_mix(seq_cycle);
-            }
-            self.next_frame_seq_cycle += crate::APU_FRAME_SEQ_INTERVAL;
-        }
         self.sync(cycle);
         self.commit_mix(cycle);
         self.drain_blip(cycle);
@@ -998,17 +1030,28 @@ impl Apu {
 
     fn step_to(&mut self, target_cycle: u64) {
         if !self.master_enabled() {
-            while self.dsp.next_scope_cycle <= target_cycle {
-                let cur = self.scope_cursor;
-                for ch in &mut self.chan_scopes {
-                    ch[cur] = 0;
+            if self.scopes_enabled {
+                if self.dsp.next_scope_cycle < self.last_cycle {
+                    self.dsp.next_scope_cycle =
+                        (self.last_cycle & !(SCOPE_INTERVAL_CYCLES - 1)) + SCOPE_INTERVAL_CYCLES;
                 }
-                self.scope_cursor = (cur + 1) & 127;
-                self.dsp.next_scope_cycle += SCOPE_INTERVAL_CYCLES;
+                while self.dsp.next_scope_cycle <= target_cycle {
+                    let cur = self.scope_cursor;
+                    for ch in &mut self.chan_scopes {
+                        ch[cur] = 0;
+                    }
+                    self.scope_cursor = (cur + 1) & 127;
+                    self.dsp.next_scope_cycle += SCOPE_INTERVAL_CYCLES;
+                }
             }
             self.last_cycle = target_cycle;
             self.commit_mix(target_cycle);
             return;
+        }
+
+        if self.scopes_enabled && self.dsp.next_scope_cycle < self.last_cycle {
+            self.dsp.next_scope_cycle =
+                (self.last_cycle & !(SCOPE_INTERVAL_CYCLES - 1)) + SCOPE_INTERVAL_CYCLES;
         }
 
         let mask = self.channel_enable_mask;
@@ -1057,7 +1100,7 @@ impl Apu {
                 next_cycle = next_cycle.min(next_interp);
             }
 
-            if self.dsp.next_scope_cycle <= target_cycle {
+            if self.scopes_enabled && self.dsp.next_scope_cycle <= target_cycle {
                 next_cycle = next_cycle.min(self.dsp.next_scope_cycle);
             }
 
@@ -1070,7 +1113,7 @@ impl Apu {
                 self.last_cycle = next_cycle;
             }
 
-            if self.last_cycle == self.dsp.next_scope_cycle {
+            if self.scopes_enabled && self.last_cycle == self.dsp.next_scope_cycle {
                 self.record_scopes(self.last_cycle);
                 self.dsp.next_scope_cycle += SCOPE_INTERVAL_CYCLES;
             }

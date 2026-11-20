@@ -58,6 +58,14 @@ fn is_arm_b(op: u32) -> bool {
 }
 
 #[inline]
+fn is_arm_ldr_pc_indirect(op: u32) -> bool {
+    // LDR pc, [Rn, ...] (immediate or register offset, excluding stack pops handled as returns)
+    (op >> 28) != 0xF
+        && ((op & 0x0E50_F000) == 0x0410_F000 || (op & 0x0E50_F010) == 0x0610_F000)
+        && ((op >> 16) & 0xF) != 13
+}
+
+#[inline]
 fn is_thumb_bx_non_lr(op: u16) -> bool {
     (op & 0xFF87) == 0x4700 && ((op >> 3) & 0xF) != 14
 }
@@ -70,9 +78,9 @@ fn is_thumb_b_uncond(op: u16) -> bool {
 /// Returns the return address after the instruction at `pc` if it initiates a subroutine call.
 ///
 /// Recognizes:
-/// - ARM `BL` (`cond` != `0xF`) -> `pc + 4`
-/// - ARM `MOV LR, PC` followed by `B` or `BX Rm` (`Rm != LR`) -> `pc + 8`
-/// - ARM `BX Rm` (`Rm != LR`) / `B` when `LR & !1 == pc + 4` -> `pc + 4`
+/// - ARM `BL` (when condition passes) -> `pc + 4`
+/// - ARM `MOV LR, PC` followed by `B`, `BX Rm` (`Rm != LR`), or `LDR PC, [...]` -> `pc + 8`
+/// - ARM `BX Rm` (`Rm != LR`), `B`, or `LDR PC, [...]` when `LR & !1 == pc + 4` -> `pc + 4`
 /// - Thumb long `BL` (`0xF000..=0xF7FF` followed by `0xF800..=0xFFFF`) -> `pc + 4`
 /// - Thumb `MOV LR, PC` (`0x46FE`) followed by `B` or `BX Rm` (`Rm != LR`) -> `pc + 4`
 /// - Thumb `BX Rm` (`Rm != LR`) / `B` when `LR & !1 == pc + 2` -> `pc + 2`
@@ -99,7 +107,7 @@ pub fn is_call_instruction(core: &GbaCore, pc: u32, thumb: bool) -> Option<u32> 
         None
     } else {
         let op = core.peek32(pc);
-        if (op >> 28) == 0xF {
+        if !arm_cond_passed(core.cpu.cpsr, op >> 28) {
             return None;
         }
         if (op & 0x0F00_0000) == 0x0B00_0000 {
@@ -107,11 +115,13 @@ pub fn is_call_instruction(core: &GbaCore, pc: u32, thumb: bool) -> Option<u32> 
         }
         if (op & 0x0FFF_FFFF) == 0x01A0_E00F {
             let op2 = core.peek32(pc.wrapping_add(4));
-            if is_arm_bx_non_lr(op2) || is_arm_b(op2) {
+            if is_arm_bx_non_lr(op2) || is_arm_b(op2) || is_arm_ldr_pc_indirect(op2) {
                 return Some(pc.wrapping_add(8));
             }
         }
-        if (is_arm_bx_non_lr(op) || is_arm_b(op)) && (core.cpu.gpr[14] & !1) == pc.wrapping_add(4) {
+        if (is_arm_bx_non_lr(op) || is_arm_b(op) || is_arm_ldr_pc_indirect(op))
+            && (core.cpu.gpr[14] & !1) == pc.wrapping_add(4)
+        {
             return Some(pc.wrapping_add(4));
         }
         None
@@ -126,6 +136,16 @@ pub fn is_return_instruction(core: &GbaCore, pc: u32, thumb: bool, cpsr: u32) ->
         // BX LR
         if (op & 0xFF87) == 0x4700 && ((op >> 3) & 0xF) == 14 {
             return true;
+        }
+        // GCC/ARMv4T Thumb interworking epilogue: `pop {..., r0-r3}; bx r0-r3`
+        if (op & 0xFF87) == 0x4700 {
+            let reg = ((op >> 3) & 0xF) as u16;
+            if reg <= 3 {
+                let prev = core.peek16(pc.wrapping_sub(2));
+                if (prev & 0xFF00) == 0xBC00 && (prev & (1 << reg)) != 0 {
+                    return true;
+                }
+            }
         }
         // POP {..., pc}
         if (op & 0xFF00) == 0xBD00 {
@@ -192,6 +212,7 @@ enum PendingStepKind {
 pub struct PreStepSnapshot {
     old_pc: u32,
     old_cpsr: u32,
+    skip_retirement: bool,
     kind: PendingStepKind,
 }
 
@@ -242,8 +263,12 @@ impl CallStackTracker {
         let thumb = core.cpu.is_thumb();
         let sp = core.cpu.gpr[13];
         let lr = core.cpu.gpr[14];
+        let skip_retirement =
+            core.bus.hw.active_dma.is_some() || core.cpu.halted || core.cpu.stopped;
 
-        let kind = if thumb {
+        let kind = if skip_retirement {
+            PendingStepKind::None
+        } else if thumb {
             let op = core.peek16(old_pc);
             if (op & 0xF800) == 0xF800 {
                 // Second halfword of Thumb BL actually performs the jump & sets LR.
@@ -280,7 +305,7 @@ impl CallStackTracker {
                         return_addr: old_pc.wrapping_add(4),
                         sp,
                     }
-                } else if (is_arm_bx_non_lr(op) || is_arm_b(op))
+                } else if (is_arm_bx_non_lr(op) || is_arm_b(op) || is_arm_ldr_pc_indirect(op))
                     && (lr & !1) == old_pc.wrapping_add(4)
                 {
                     PendingStepKind::LinkedBranch {
@@ -302,6 +327,7 @@ impl CallStackTracker {
         PreStepSnapshot {
             old_pc,
             old_cpsr,
+            skip_retirement,
             kind,
         }
     }
@@ -310,11 +336,10 @@ impl CallStackTracker {
     pub fn finish_step(&mut self, core: &GbaCore, pre: PreStepSnapshot) {
         let new_pc = core.cpu.current_exec_pc();
         let new_cpsr = core.cpu.cpsr;
-        let old_mode = pre.old_cpsr & 0x1F;
         let new_mode = new_cpsr & 0x1F;
 
-        // Hardware IRQ entry preempts normal flow before normal step effects take place.
-        if new_mode == 0x12 && old_mode != 0x12 && new_pc == 0x0000_0018 {
+        // Hardware IRQ entry (including nested IRQs) preempts normal flow before step effects.
+        if new_mode == 0x12 && new_pc == 0x0000_0018 && pre.old_pc != 0x0000_0018 {
             let ret = core.cpu.gpr[14].wrapping_sub(4);
             self.push_frame(CallFrame {
                 call_site_pc: pre.old_pc,
@@ -327,8 +352,8 @@ impl CallStackTracker {
             return;
         }
 
-        // Software interrupt entry to BIOS SWI vector (real BIOS path).
-        if new_mode == 0x13 && old_mode != 0x13 && new_pc == 0x0000_0008 {
+        // Software interrupt entry to BIOS SWI vector (including nested SWIs).
+        if new_mode == 0x13 && new_pc == 0x0000_0008 && pre.old_pc != 0x0000_0008 {
             self.push_frame(CallFrame {
                 call_site_pc: pre.old_pc,
                 entry_addr: 0x0000_0008,
@@ -337,6 +362,10 @@ impl CallStackTracker {
                 thumb: (pre.old_cpsr & (1 << 5)) != 0,
                 is_irq: true,
             });
+            return;
+        }
+
+        if pre.skip_retirement {
             return;
         }
 
@@ -411,20 +440,28 @@ impl CallStackTracker {
     ) -> Option<StopReason> {
         let pre = self.prepare_step(core);
         let reason = core.step_one_debug(ctrl);
-        self.finish_step(core, pre);
+        // Breakpoint hits stop before retiring the instruction at `old_pc`.
+        if !matches!(reason, Some(StopReason::Breakpoint(_))) {
+            self.finish_step(core, pre);
+        }
         reason
     }
 }
 
 /// Computes the best Step-Out target return address for the current execution point.
 ///
-/// Prefers the innermost frame on `tracker`; falls back to `LR` (`gpr[14]`) when it
-/// holds a plausible GBA executable address distinct from the current PC.
+/// Prefers the innermost frame on `tracker`; falls back to `LR` (`gpr[14]`, or `LR - 4` in IRQ
+/// mode) when it holds a plausible GBA executable address distinct from the current PC.
 pub fn step_out_return_addr(core: &GbaCore, tracker: &CallStackTracker) -> Option<u32> {
     if let Some(ret) = tracker.current_return_addr() {
         return Some(ret & !1);
     }
-    let lr = core.cpu.gpr[14] & !1;
+    let raw_lr = if (core.cpu.cpsr & 0x1F) == 0x12 {
+        core.cpu.gpr[14].wrapping_sub(4)
+    } else {
+        core.cpu.gpr[14]
+    };
+    let lr = raw_lr & !1;
     let pc = core.cpu.current_exec_pc() & !1;
     let in_code_region = lr < 0x0000_4000
         || (0x0200_0000..0x0204_0000).contains(&lr)

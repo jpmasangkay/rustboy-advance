@@ -62,6 +62,37 @@ fn civil_from_days(days: i64) -> (i32, u32, u32) {
     (y, m, d)
 }
 
+pub(crate) struct CoverLoadResult {
+    pub(crate) rom_path: PathBuf,
+    pub(crate) display_name: String,
+    pub(crate) image: Option<egui::ColorImage>,
+}
+
+fn format_rom_size(size_mb: f32) -> String {
+    if size_mb < 1.0 {
+        let kb = (size_mb * 1024.0).round().max(1.0) as u32;
+        format!("{kb} KB")
+    } else {
+        format!("{size_mb:.1} MB")
+    }
+}
+
+fn lookup_playtime_for_entry<'a>(
+    config: &'a crate::config::AppConfig,
+    game_code: &str,
+) -> Option<&'a crate::config::RomPlaytime> {
+    if let Some(pt) = config.playtimes.get(game_code) {
+        return Some(pt);
+    }
+    let prefix = format!("{game_code}_");
+    config
+        .playtimes
+        .iter()
+        .filter(|(k, _)| k.starts_with(&prefix))
+        .max_by_key(|(_, v)| (v.last_played_timestamp, v.total_seconds))
+        .map(|(_, v)| v)
+}
+
 fn format_last_played_ts(ts: u64) -> String {
     if ts == 0 {
         return "-".to_string();
@@ -71,24 +102,24 @@ fn format_last_played_ts(ts: u64) -> String {
         .unwrap_or_default()
         .as_secs();
 
-    let days = (ts / 86400) as i64;
-    let now_days = (now_ts / 86400) as i64;
-    let time_of_day = ts % 86400;
-    let hour = time_of_day / 3600;
-    let min = (time_of_day % 3600) / 60;
-
-    if now_days == days {
-        format!("Today, {:02}:{:02}", hour, min)
-    } else if now_days == days + 1 {
-        format!("Yesterday, {:02}:{:02}", hour, min)
-    } else {
-        let (y, m, d) = civil_from_days(days);
-        let months = [
-            "Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec",
-        ];
-        let m_idx = (m.saturating_sub(1) as usize).min(11);
-        format!("{} {:02}, {}", months[m_idx], d, y)
+    if ts <= now_ts {
+        let diff = now_ts - ts;
+        if diff < 60 {
+            return "Just now".to_string();
+        } else if diff < 3600 {
+            return format!("{}m ago", diff / 60);
+        } else if diff < 86_400 {
+            return format!("{}h ago", diff / 3600);
+        }
     }
+
+    let days = (ts / 86400) as i64;
+    let (y, m, d) = civil_from_days(days);
+    let months = [
+        "Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec",
+    ];
+    let m_idx = (m.saturating_sub(1) as usize).min(11);
+    format!("{} {:02}, {}", months[m_idx], d, y)
 }
 
 fn format_playtime(seconds: u64) -> String {
@@ -170,81 +201,107 @@ pub(crate) fn find_cover_image(entry: &RomLibraryEntry) -> Option<PathBuf> {
     None
 }
 
-pub(crate) fn trigger_cover_download(entry: &RomLibraryEntry) {
+fn decode_cover_bytes(bytes: &[u8]) -> Option<egui::ColorImage> {
+    let img = image::load_from_memory(bytes).ok()?;
+    let rgba = img.to_rgba8();
+    let size = [rgba.width() as usize, rgba.height() as usize];
+    Some(egui::ColorImage::from_rgba_unmultiplied(
+        size,
+        &rgba.into_raw(),
+    ))
+}
+
+pub(crate) fn spawn_cover_loader_worker() -> (mpsc::Sender<RomLibraryEntry>, mpsc::Receiver<CoverLoadResult>) {
+    let (req_tx, req_rx) = mpsc::channel::<RomLibraryEntry>();
+    let (res_tx, res_rx) = mpsc::channel::<CoverLoadResult>();
+
+    std::thread::Builder::new()
+        .name("rba-cover-loader".into())
+        .spawn(move || {
+            while let Ok(entry) = req_rx.recv() {
+                let decoded = if let Some(cover_path) = find_cover_image(&entry) {
+                    fs::read(&cover_path).ok().and_then(|b| decode_cover_bytes(&b))
+                } else {
+                    download_and_cache_cover(&entry).and_then(|b| decode_cover_bytes(&b))
+                };
+                if res_tx
+                    .send(CoverLoadResult {
+                        rom_path: entry.path,
+                        display_name: entry.display_name,
+                        image: decoded,
+                    })
+                    .is_err()
+                {
+                    break;
+                }
+            }
+        })
+        .ok();
+
+    (req_tx, res_rx)
+}
+
+fn download_and_cache_cover(entry: &RomLibraryEntry) -> Option<Vec<u8>> {
     let display_name = entry.display_name.clone();
     let stem = entry
         .path
         .file_stem()
         .map(|s| s.to_string_lossy().to_string())
         .unwrap_or_else(|| display_name.clone());
-    let region = entry.region.to_string();
-    let platform = entry.platform;
+    let region = entry.region;
+    let repo_folder = match entry.platform {
+        RomPlatform::Gba => "Nintendo_-_Game_Boy_Advance",
+        RomPlatform::Gbc => "Nintendo_-_Game_Boy_Color",
+        RomPlatform::Gb => "Nintendo_-_Game_Boy",
+    };
 
-    std::thread::spawn(move || {
-        let repo_folder = match platform {
-            RomPlatform::Gba => "Nintendo_-_Game_Boy_Advance",
-            RomPlatform::Gbc => "Nintendo_-_Game_Boy_Color",
-            RomPlatform::Gb => "Nintendo_-_Game_Boy",
-        };
+    let mut candidates = vec![display_name.clone()];
+    if stem != display_name {
+        candidates.push(stem);
+    }
+    if !display_name.contains('(') && !region.is_empty() {
+        candidates.push(format!("{display_name} ({region})"));
+    }
 
-        // Try candidate names in order
-        let mut candidates = vec![display_name.clone()];
-        if stem != display_name {
-            candidates.push(stem.clone());
-        }
-        if !display_name.contains('(') && !region.is_empty() {
-            candidates.push(format!("{display_name} ({region})"));
-        }
-
-        let mut downloaded_bytes = None;
-        for cand in &candidates {
-            let encoded = url_encode_name(cand);
-            let url = format!(
-                "https://raw.githubusercontent.com/libretro-thumbnails/{repo_folder}/master/Named_Boxarts/{encoded}.png"
-            );
-            if let Ok(resp) = ureq::get(&url)
-                .timeout(std::time::Duration::from_secs(6))
-                .call()
-                && resp.status() == 200
+    let mut downloaded_bytes = None;
+    for cand in &candidates {
+        let encoded = url_encode_name(cand);
+        let url = format!(
+            "https://raw.githubusercontent.com/libretro-thumbnails/{repo_folder}/master/Named_Boxarts/{encoded}.png"
+        );
+        if let Ok(resp) = ureq::get(&url)
+            .timeout(std::time::Duration::from_secs(6))
+            .call()
+            && resp.status() == 200
+        {
+            let mut bytes = Vec::new();
+            use std::io::Read;
+            if resp
+                .into_reader()
+                .take(8 * 1024 * 1024)
+                .read_to_end(&mut bytes)
+                .is_ok()
+                && !bytes.is_empty()
             {
-                let mut bytes = Vec::new();
-                use std::io::Read;
-                if resp.into_reader().read_to_end(&mut bytes).is_ok() && !bytes.is_empty() {
-                    downloaded_bytes = Some(bytes);
-                    break;
-                }
+                downloaded_bytes = Some(bytes);
+                break;
             }
         }
+    }
 
-        if let Some(bytes) = downloaded_bytes {
-            let appdata_covers = crate::config::AppConfig::app_data_dir().join("covers");
-            let _ = std::fs::create_dir_all(&appdata_covers);
-            let _ = std::fs::write(appdata_covers.join(format!("{display_name}.png")), &bytes);
-
-            let cwd_covers = PathBuf::from("covers");
-            let _ = std::fs::create_dir_all(&cwd_covers);
-            let _ = std::fs::write(cwd_covers.join(format!("{display_name}.png")), &bytes);
-
-            if let Ok(exe) = std::env::current_exe()
-                && let Some(exe_dir) = exe.parent()
-            {
-                let _ = std::fs::create_dir_all(exe_dir.join("covers"));
-                let _ = std::fs::write(
-                    exe_dir.join("covers").join(format!("{display_name}.png")),
-                    &bytes,
-                );
-                if let Some(target_dir) = exe_dir.parent()
-                    && let Some(proj) = target_dir.parent()
-                {
-                    let _ = std::fs::create_dir_all(proj.join("covers"));
-                    let _ = std::fs::write(
-                        proj.join("covers").join(format!("{display_name}.png")),
-                        &bytes,
-                    );
-                }
-            }
-        }
-    });
+    if let Some(bytes) = downloaded_bytes {
+        // Persist downloaded covers ONLY inside the app data covers cache directory.
+        let appdata_covers = crate::config::AppConfig::app_data_dir().join("covers");
+        let safe_name: String = display_name
+            .chars()
+            .map(|c| if matches!(c, '/' | '\\' | ':' | '*' | '?' | '"' | '<' | '>' | '|') { '_' } else { c })
+            .collect();
+        let target = appdata_covers.join(format!("{safe_name}.png"));
+        let _ = crate::config::write_atomic(&target, &bytes);
+        Some(bytes)
+    } else {
+        None
+    }
 }
 
 fn url_encode_name(s: &str) -> String {
@@ -474,6 +531,27 @@ impl RustboyApp {
                 self.library_scanning = false;
                 self.library_scan_rx = None;
             }
+        }
+    }
+
+    pub(crate) fn poll_cover_loads(&mut self, ctx: &egui::Context) {
+        let mut updated = false;
+        while let Ok(res) = self.cover_result_rx.try_recv() {
+            self.pending_cover_downloads.remove(&res.rom_path);
+            if let Some(color_img) = res.image {
+                let tex = ctx.load_texture(
+                    format!("cover_{}", res.display_name),
+                    color_img,
+                    egui::TextureOptions::LINEAR,
+                );
+                self.cover_textures.insert(res.rom_path, tex);
+            } else {
+                self.failed_cover_downloads.insert(res.rom_path);
+            }
+            updated = true;
+        }
+        if updated {
+            ctx.request_repaint();
         }
     }
 
@@ -821,31 +899,19 @@ impl RustboyApp {
                             .partial_cmp(&b.size_mb)
                             .unwrap_or(std::cmp::Ordering::Equal),
                         TableSortColumn::LastPlayed => {
-                            let ts_a = self
-                                .config
-                                .playtimes
-                                .get(&a.game_code)
+                            let ts_a = lookup_playtime_for_entry(&self.config, &a.game_code)
                                 .map(|p| p.last_played_timestamp)
                                 .unwrap_or(0);
-                            let ts_b = self
-                                .config
-                                .playtimes
-                                .get(&b.game_code)
+                            let ts_b = lookup_playtime_for_entry(&self.config, &b.game_code)
                                 .map(|p| p.last_played_timestamp)
                                 .unwrap_or(0);
                             ts_a.cmp(&ts_b)
                         }
                         TableSortColumn::PlayTime => {
-                            let sec_a = self
-                                .config
-                                .playtimes
-                                .get(&a.game_code)
+                            let sec_a = lookup_playtime_for_entry(&self.config, &a.game_code)
                                 .map(|p| p.total_seconds)
                                 .unwrap_or(0);
-                            let sec_b = self
-                                .config
-                                .playtimes
-                                .get(&b.game_code)
+                            let sec_b = lookup_playtime_for_entry(&self.config, &b.game_code)
                                 .map(|p| p.total_seconds)
                                 .unwrap_or(0);
                             sec_a.cmp(&sec_b)
@@ -1005,20 +1071,7 @@ impl RustboyApp {
                                 }
                                 if ui.button("📁 Open Save Folder").clicked() {
                                     if let Some(parent) = entry.path.parent() {
-                                        #[cfg(windows)]
-                                        {
-                                            use std::os::windows::process::CommandExt;
-                                            let _ = std::process::Command::new("explorer")
-                                                .arg(parent)
-                                                .creation_flags(0x08000000)
-                                                .spawn();
-                                        }
-                                        #[cfg(not(windows))]
-                                        {
-                                            let _ = std::process::Command::new("xdg-open")
-                                                .arg(parent)
-                                                .spawn();
-                                        }
+                                        crate::menus::open_folder_in_file_manager(parent);
                                     }
                                     ui.close_menu();
                                 }
@@ -1045,8 +1098,9 @@ impl RustboyApp {
                                 }
                                 ui.separator();
                                 if ui.button("🗑 Remove Folder from Library").clicked() {
-                                    if let Some(parent) = entry.path.parent() {
-                                        self.rom_folders.retain(|f| f != parent);
+                                    let before = self.rom_folders.len();
+                                    self.rom_folders.retain(|f| !entry.path.starts_with(f));
+                                    if self.rom_folders.len() != before {
                                         self.save_persistent_config();
                                         rescan_needed = true;
                                     }
@@ -1073,13 +1127,13 @@ impl RustboyApp {
                                     .rect_filled(bar_rect, CornerRadius::ZERO, ACCENT_TEAL);
                             }
 
-                            let pt = self.config.playtimes.get(&entry.game_code);
+                            let pt = lookup_playtime_for_entry(&self.config, &entry.game_code);
                             let last_played_ts = pt.map(|p| p.last_played_timestamp).unwrap_or(0);
                             let total_seconds = pt.map(|p| p.total_seconds).unwrap_or(0);
 
                             let lp_str = format_last_played_ts(last_played_ts);
                             let pt_str = format_playtime(total_seconds);
-                            let size_str = format!("{:.1} MB", entry.size_mb);
+                            let size_str = format_rom_size(entry.size_mb);
 
                             ui.scope_builder(egui::UiBuilder::new().max_rect(row_rect), |ui| {
                                 ui.spacing_mut().item_spacing = egui::vec2(0.0, 0.0);
@@ -1151,32 +1205,19 @@ impl RustboyApp {
                     });
             }
             LibraryViewMode::Grid => {
-                // Ensure covers are loaded or scheduled for download
+                // Queue missing covers onto the single bounded background worker (never block UI thread!)
                 for entry in &filtered {
-                    if !self.cover_textures.contains_key(&entry.path) {
-                        if let Some(cover_path) = find_cover_image(entry) {
-                            if let Ok(img) = image::open(&cover_path) {
-                                let rgba = img.to_rgba8();
-                                let size = [rgba.width() as usize, rgba.height() as usize];
-                                let pixels = rgba.into_raw();
-                                let color_img =
-                                    egui::ColorImage::from_rgba_unmultiplied(size, &pixels);
-                                let tex = ctx.load_texture(
-                                    format!("cover_{}", entry.display_name),
-                                    color_img,
-                                    egui::TextureOptions::LINEAR,
-                                );
-                                self.cover_textures.insert(entry.path.clone(), tex);
-                            }
-                        } else if !self.pending_cover_downloads.contains(&entry.path) {
-                            self.pending_cover_downloads.insert(entry.path.clone());
-                            trigger_cover_download(entry);
-                        }
+                    if !self.cover_textures.contains_key(&entry.path)
+                        && !self.pending_cover_downloads.contains(&entry.path)
+                        && !self.failed_cover_downloads.contains(&entry.path)
+                    {
+                        self.pending_cover_downloads.insert(entry.path.clone());
+                        let _ = self.cover_req_tx.send(entry.clone());
                     }
                 }
 
                 if !self.pending_cover_downloads.is_empty() {
-                    ctx.request_repaint_after(std::time::Duration::from_millis(300));
+                    ctx.request_repaint_after(std::time::Duration::from_millis(250));
                 }
 
                 egui::ScrollArea::vertical()
@@ -1224,27 +1265,15 @@ impl RustboyApp {
                                                     }
                                                     if ui.button("📁 Open Save Folder").clicked() {
                                                         if let Some(parent) = entry.path.parent() {
-                                                            #[cfg(windows)]
-                                                            {
-                                                                use std::os::windows::process::CommandExt;
-                                                                let _ = std::process::Command::new("explorer")
-                                                                    .arg(parent)
-                                                                    .creation_flags(0x08000000)
-                                                                    .spawn();
-                                                            }
-                                                            #[cfg(not(windows))]
-                                                            {
-                                                                let _ = std::process::Command::new("xdg-open")
-                                                                    .arg(parent)
-                                                                    .spawn();
-                                                            }
+                                                            crate::menus::open_folder_in_file_manager(parent);
                                                         }
                                                         ui.close_menu();
                                                     }
                                                     if ui.button("🖼 Refresh / Download Cover").clicked() {
                                                         self.cover_textures.remove(&entry.path);
-                                                        self.pending_cover_downloads.remove(&entry.path);
-                                                        trigger_cover_download(entry);
+                                                        self.failed_cover_downloads.remove(&entry.path);
+                                                        self.pending_cover_downloads.insert(entry.path.clone());
+                                                        let _ = self.cover_req_tx.send(entry.clone());
                                                         ui.close_menu();
                                                     }
                                                     if ui.button("⚙ Game Settings...").clicked() {
@@ -1270,8 +1299,9 @@ impl RustboyApp {
                                                     }
                                                     ui.separator();
                                                     if ui.button("🗑 Remove Folder from Library").clicked() {
-                                                        if let Some(parent) = entry.path.parent() {
-                                                            self.rom_folders.retain(|f| f != parent);
+                                                        let before = self.rom_folders.len();
+                                                        self.rom_folders.retain(|f| !entry.path.starts_with(f));
+                                                        if self.rom_folders.len() != before {
                                                             self.save_persistent_config();
                                                             rescan_needed = true;
                                                         }
@@ -1334,11 +1364,10 @@ impl RustboyApp {
                                                 }
 
                                                 // "REGION · SIZE" in secondary text
-                                                let size_mb_int = entry.size_mb.round() as u32;
                                                 let meta_str = format!(
-                                                    "{} · {} MB",
+                                                    "{} · {}",
                                                     entry.region,
-                                                    size_mb_int.max(1)
+                                                    format_rom_size(entry.size_mb)
                                                 );
                                                 ui.label(
                                                     RichText::new(meta_str)

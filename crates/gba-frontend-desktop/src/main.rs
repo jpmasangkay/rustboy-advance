@@ -70,11 +70,60 @@ fn should_suppress_error_dialog() -> bool {
         || std::env::args().any(|a| a == "--perf-log" || a == "--perf-seconds")
 }
 
+struct DesktopLogger;
+
+impl log::Log for DesktopLogger {
+    fn enabled(&self, metadata: &log::Metadata) -> bool {
+        let target = metadata.target();
+        if target.starts_with("rustboy_advance")
+            || target.starts_with("gba_")
+            || target.starts_with("gb_")
+        {
+            metadata.level() <= log::Level::Info
+        } else {
+            metadata.level() <= log::Level::Warn
+        }
+    }
+
+    fn log(&self, record: &log::Record) {
+        if self.enabled(record.metadata()) {
+            eprintln!("[{}] {}: {}", record.level(), record.target(), record.args());
+        }
+    }
+
+    fn flush(&self) {}
+}
+
+static DESKTOP_LOGGER: DesktopLogger = DesktopLogger;
+
+fn install_logger() {
+    let max_level = match std::env::var("RUST_LOG")
+        .unwrap_or_default()
+        .to_ascii_lowercase()
+        .as_str()
+    {
+        "trace" => log::LevelFilter::Trace,
+        "debug" => log::LevelFilter::Debug,
+        "warn" => log::LevelFilter::Warn,
+        "error" => log::LevelFilter::Error,
+        "off" => log::LevelFilter::Off,
+        _ => log::LevelFilter::Info,
+    };
+    let _ = log::set_logger(&DESKTOP_LOGGER);
+    log::set_max_level(max_level);
+}
+
+fn write_diagnostic_log(filename: &str, content: &str) {
+    let dir = AppConfig::app_data_dir();
+    let _ = std::fs::create_dir_all(&dir);
+    let _ = std::fs::write(dir.join(filename), content);
+}
+
 fn install_panic_hook() {
     std::panic::set_hook(Box::new(|panic_info| {
         let msg = format!("{panic_info}");
         if !std::env::args().any(|a| a == "--gpu-probe") {
-            let _ = std::fs::write("rustboy-advance-crash.log", &msg);
+            write_diagnostic_log("rustboy-advance-crash.log", &msg);
         }
         eprintln!("Rustboy Advance - Fatal Crash:\n{msg}");
         if !should_suppress_error_dialog() {
@@ -88,7 +137,7 @@ fn install_panic_hook() {
 }
 
 fn show_startup_error(title: &str, description: &str) {
-    let _ = std::fs::write("rustboy-advance-startup-error.log", description);
+    write_diagnostic_log("rustboy-advance-startup-error.log", description);
     eprintln!("{title}: {description}");
     if !should_suppress_error_dialog() {
         rfd::MessageDialog::new()
@@ -100,19 +149,11 @@ fn show_startup_error(title: &str, description: &str) {
 }
 
 fn main() {
+    install_logger();
     install_panic_hook();
-
-    let builder = std::thread::Builder::new()
-        .name("rustboy-main".into())
-        .stack_size(16 * 1024 * 1024);
-
-    let handle = builder
-        .spawn(real_main)
-        .expect("failed to spawn main thread with 16MB stack");
-
-    if let Err(payload) = handle.join() {
-        std::panic::resume_unwind(payload);
-    }
+    // Run directly on the OS main thread so Cocoa/macOS, Wayland, X11, and Win32
+    // event loops all initialize legally (Windows stack size is configured in build.rs).
+    real_main();
 }
 
 fn real_main() {
@@ -143,11 +184,13 @@ fn real_main() {
     let init_w = ((LCD_WIDTH as f32) * scale + 24.0).max(1020.0);
     let init_h = ((LCD_HEIGHT as f32) * scale + 92.0).max(680.0);
 
+    let no_gpu_label = crate::shaders::ADAPTER_FALLBACK_ORDER
+        .last()
+        .copied()
+        .unwrap_or("No-GPU presenter (winit + softbuffer)");
+
     if cli.no_gpu {
-        println!(
-            "[backend] Selected: {} — reason: forced via --no-gpu flag",
-            crate::shaders::ADAPTER_FALLBACK_ORDER[3]
-        );
+        println!("[backend] Selected: {no_gpu_label} — reason: forced via --no-gpu flag");
         if let Err(err) = no_gpu::run_no_gpu_desktop(
             "Rustboy Advance",
             init_w,
@@ -168,10 +211,7 @@ fn real_main() {
         && let gpu_probe::GpuGuardOutcome::UseNoGpu { reason } =
             gpu_probe::ensure_gpu_startup_safe(&cli, &mut initial_config)
     {
-        println!(
-            "[backend] Selected: {} — reason: {reason}",
-            crate::shaders::ADAPTER_FALLBACK_ORDER[3]
-        );
+        println!("[backend] Selected: {no_gpu_label} — reason: {reason}");
         if let Err(no_gpu_err) =
             no_gpu::run_no_gpu_desktop("Rustboy Advance", init_w, init_h, cli, &reason)
         {
@@ -185,12 +225,9 @@ fn real_main() {
     }
 
     let cli_fallback = cli.clone();
-    if let Err(err) = app_host::run_desktop("Rustboy Advance", init_w, init_h, cli) {
+    if let Err(err) = app_host::run_desktop("Rustboy Advance", init_w, init_h, cli, initial_config) {
         log::warn!("wgpu desktop initialization unavailable ({err}); falling back to no-GPU presenter");
-        println!(
-            "[backend] Selected: {} — reason: wgpu fallback ({err})",
-            crate::shaders::ADAPTER_FALLBACK_ORDER[3]
-        );
+        println!("[backend] Selected: {no_gpu_label} — reason: wgpu fallback ({err})");
         if let Err(no_gpu_err) =
             no_gpu::run_no_gpu_desktop("Rustboy Advance", init_w, init_h, cli_fallback, &err)
         {

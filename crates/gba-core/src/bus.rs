@@ -1,4 +1,4 @@
-use alloc::{boxed::Box, vec::Vec};
+use alloc::{boxed::Box, collections::BTreeMap, vec::Vec};
 use core::ptr::NonNull;
 use serde::{Deserialize, Serialize};
 
@@ -96,7 +96,7 @@ impl PrefetchBuffer {
 
 const N_WAITSTATES: [u64; 4] = [4, 3, 2, 8];
 
-#[derive(Clone, Serialize, Deserialize)]
+#[derive(Serialize, Deserialize)]
 pub struct SysBus {
     #[serde(with = "box_bytes")]
     pub bios: Box<[u8; 0x4000]>,
@@ -123,7 +123,7 @@ pub struct SysBus {
     pub last_access_was_dma: bool,
     pub irq_sync_delay: u8,
 
-    // 16 KiB fastmem page pointers across 0x0000_0000..0x0FFF_FFFF (rebuilt on new/load_state).
+    // 16 KiB fastmem page pointers across 0x0000_0000..0x0FFF_FFFF (rebuilt on new/clone/load_state).
     #[serde(skip, default = "empty_fastmem")]
     pub(crate) fastmem_read: Box<[Option<NonNull<u8>>; 16384]>,
     #[serde(skip, default = "empty_fastmem")]
@@ -134,9 +134,9 @@ pub struct SysBus {
     pub last_cycles: u64,
     #[serde(skip)]
     pub instr_fetch_cycles: u64,
-    #[serde(skip)]
+    #[serde(default)]
     pub hdraw_start_cycle: u64,
-    #[serde(skip)]
+    #[serde(default)]
     pub scanline_dots_started: bool,
 
     // Debug watchpoints (fast-path `watchpoint_active` bool avoids overhead when empty).
@@ -144,7 +144,7 @@ pub struct SysBus {
     pub watchpoint_active: bool,
     #[serde(skip)]
     pub debug_pc: u32,
-    #[serde(skip)]
+    #[serde(default)]
     pub force_next_fetch_nseq: bool,
     #[serde(skip)]
     pub watchpoint_hit: Option<WatchpointHit>,
@@ -181,7 +181,65 @@ pub struct SysBus {
     #[serde(skip)]
     pub code_page_region: u8,
     #[serde(skip)]
-    pub code_page_invalidated: Option<u32>,
+    pub dirty_code_pages: Vec<u32>,
+    #[serde(skip)]
+    pub invalidate_all_jit: bool,
+    #[serde(skip)]
+    pub rom_patch_originals: BTreeMap<usize, u8>,
+}
+
+impl Clone for SysBus {
+    fn clone(&self) -> Self {
+        let mut cloned = Self {
+            bios: self.bios.clone(),
+            bios_present: self.bios_present,
+            ewram: self.ewram.clone(),
+            iwram: self.iwram.clone(),
+            ppu: self.ppu.clone(),
+            apu: self.apu.clone(),
+            hw: self.hw.clone(),
+            cart: self.cart.clone(),
+            scheduler: self.scheduler.clone(),
+            prefetch: self.prefetch,
+            sram_wait: self.sram_wait,
+            rom_n_wait: self.rom_n_wait,
+            rom_s_wait: self.rom_s_wait,
+            open_bus_latch: self.open_bus_latch,
+            bios_latch: self.bios_latch,
+            dma_latch: self.dma_latch,
+            last_access_was_dma: self.last_access_was_dma,
+            irq_sync_delay: self.irq_sync_delay,
+            fastmem_read: empty_fastmem(),
+            fastmem_write: empty_fastmem(),
+            rtc_cycles: self.rtc_cycles,
+            last_cycles: self.last_cycles,
+            instr_fetch_cycles: self.instr_fetch_cycles,
+            hdraw_start_cycle: self.hdraw_start_cycle,
+            scanline_dots_started: self.scanline_dots_started,
+            watchpoint_active: self.watchpoint_active,
+            debug_pc: self.debug_pc,
+            force_next_fetch_nseq: self.force_next_fetch_nseq,
+            watchpoint_hit: self.watchpoint_hit,
+            watchpoints: self.watchpoints.clone(),
+            bench_active: self.bench_active,
+            ppu_bench_time: self.ppu_bench_time,
+            apu_bench_time: self.apu_bench_time,
+            dma_bench_time: self.dma_bench_time,
+            fetch_bench_cycles: self.fetch_bench_cycles,
+            read_bench_cycles: self.read_bench_cycles,
+            write_bench_cycles: self.write_bench_cycles,
+            dma_bench_cycles: self.dma_bench_cycles,
+            waitstate_table: self.waitstate_table,
+            code_page_ptr: None,
+            code_page_tag: u32::MAX,
+            code_page_region: 0,
+            dirty_code_pages: Vec::new(),
+            invalidate_all_jit: true,
+            rom_patch_originals: self.rom_patch_originals.clone(),
+        };
+        cloned.rebuild_fastmem();
+        cloned
+    }
 }
 
 fn empty_fastmem() -> Box<[Option<NonNull<u8>>; 16384]> {
@@ -249,7 +307,9 @@ impl SysBus {
             code_page_ptr: None,
             code_page_tag: u32::MAX,
             code_page_region: 0,
-            code_page_invalidated: None,
+            dirty_code_pages: Vec::new(),
+            invalidate_all_jit: false,
+            rom_patch_originals: BTreeMap::new(),
         };
         bus.update_waitcnt(0x0000);
         bus.rebuild_fastmem();
@@ -279,43 +339,40 @@ impl SysBus {
     pub fn rebuild_fastmem(&mut self) {
         self.fastmem_read.fill(None);
         self.fastmem_write.fill(None);
+        let ewram_base = self.ewram.as_mut_ptr();
+        let iwram_base = self.iwram.as_mut_ptr();
+        let rom_base = self.cart.rom.as_ptr();
+        let rom_len = self.cart.rom.len();
+        let gpio_en = self.cart.gpio_enabled();
+        let eff_save = self.cart.effective_save_type();
+        let eeprom_possible = matches!(eff_save, SaveType::Eeprom512B | SaveType::Eeprom8K)
+            || (eff_save == SaveType::None && self.cart.save_type_override.is_none());
+
         for page in 0..16384usize {
             let addr = (page as u32) << 14;
             let region = (addr >> 24) & 0x0F;
             let (r_ptr, w_ptr): (Option<*const u8>, Option<*mut u8>) = match region {
                 0x02 => {
                     let off = (addr as usize) & 0x3FFFF;
-                    let p = unsafe { self.ewram.as_mut_ptr().add(off) };
+                    let p = unsafe { ewram_base.add(off) };
                     (Some(p as *const u8), Some(p))
                 }
                 0x03 => {
                     let off = (addr as usize) & 0x7FFF;
-                    let p = unsafe { self.iwram.as_mut_ptr().add(off) };
+                    let p = unsafe { iwram_base.add(off) };
                     (Some(p as *const u8), Some(p))
                 }
-                0x05 => {
-                    // Palette RAM is 1 KiB -> mirrors every 1 KiB inside a 16 KiB page, so don't fastmem PRAM.
-                    (None, None)
-                }
-                0x06 => {
-                    // VRAM mirroring depends dynamically on DISPCNT mode (Modes 0-2 vs 3-5),
-                    // so do not map to fastmem; route through Ppu::mirror_vram.
-                    (None, None)
-                }
+                0x05 | 0x06 => (None, None),
                 0x08..=0x0D => {
                     let off = (addr as usize) & 0x01FF_FFFF;
-                    // Exclude first page (0x0800_0000..0x0800_3FFF) when RTC/GPIO could be active,
-                    // and exclude EEPROM addresses in region 0x0D (`cart.is_eeprom_addr` covers <=16 MiB
-                    // mirror space and `>= 0x0DFF_FF00` for >16 MiB ROMs when auto-detecting).
-                    let is_gpio_page = region == 0x08 && off == 0;
+                    // Exclude first page of WS0/1/2 (0x08/0x0A/0x0C offset 0) when GPIO is enabled,
+                    // and exclude EEPROM pages in region 0x0D matching Cartridge::is_eeprom_addr.
+                    let is_gpio_page = gpio_en && off == 0;
                     let is_eeprom_page = region == 0x0D
-                        && (matches!(
-                            self.cart.effective_save_type(),
-                            SaveType::Eeprom512B | SaveType::Eeprom8K
-                        ) || (self.cart.save_type_override.is_none()
-                            && (self.cart.rom.len() <= 0x0100_0000 || off >= 0x01FF_C000)));
-                    if !is_gpio_page && !is_eeprom_page && off + 0x4000 <= self.cart.rom.len() {
-                        (Some(unsafe { self.cart.rom.as_ptr().add(off) }), None)
+                        && eeprom_possible
+                        && (rom_len <= 0x0100_0000 || off >= 0x01FF_C000);
+                    if !is_gpio_page && !is_eeprom_page && off + 0x4000 <= rom_len {
+                        (Some(unsafe { rom_base.add(off) }), None)
                     } else {
                         (None, None)
                     }
@@ -354,17 +411,20 @@ impl SysBus {
         self.prefetch.enabled = pref_en;
 
         self.rebuild_waitstate_table();
+        self.invalidate_all_jit = true;
     }
 
     pub fn rebuild_waitstate_table(&mut self) {
         // Clear all to 1 cycle default
         self.waitstate_table = [[[1; 2]; 3]; 16];
 
-        // Region 0x02: EWRAM (16-bit bus, 3 waitstates per halfword access)
-        // 8-bit & 16-bit: 3 cycles; 32-bit: 6 cycles
-        self.waitstate_table[0x02][0] = [3, 3];
-        self.waitstate_table[0x02][1] = [3, 3];
-        self.waitstate_table[0x02][2] = [6, 6];
+        // Region 0x02: EWRAM (16-bit bus; waitstates = 15 - MEMCNT[27:24], default 0xD -> 2 waitstates -> 3/6 cycles)
+        let ewram_ws = 15u8.saturating_sub(((self.hw.memcnt >> 24) & 0x0F) as u8);
+        let ewram_16 = 1u8.saturating_add(ewram_ws);
+        let ewram_32 = ewram_16.saturating_mul(2);
+        self.waitstate_table[0x02][0] = [ewram_16, ewram_16];
+        self.waitstate_table[0x02][1] = [ewram_16, ewram_16];
+        self.waitstate_table[0x02][2] = [ewram_32, ewram_32];
 
         // Region 0x03: IWRAM (32-bit bus, 1 cycle)
         self.waitstate_table[0x03] = [[1; 2]; 3];
@@ -404,33 +464,63 @@ impl SysBus {
         }
     }
 
+    /// Canonicalizes a 16 KiB page tag (`(addr >> 14) & 0x3FFF`) across EWRAM, IWRAM, and ROM mirrors.
+    #[inline(always)]
+    pub fn canonical_code_page(page: u32) -> u32 {
+        let region = (page >> 10) & 0x0F;
+        match region {
+            0x02 => (0x02 << 10) | (page & 0x0F),
+            0x03 => (0x03 << 10) | (page & 0x01),
+            0x08..=0x0D => (0x08 << 10) | (page & 0x07FF),
+            _ => page & 0x3FFF,
+        }
+    }
+
+    /// Drops the active interpreter instruction-page cache (used on branches/DMA without evicting JIT).
     #[inline(always)]
     pub fn invalidate_code_page(&mut self) {
-        if self.code_page_tag != u32::MAX {
-            self.code_page_invalidated = Some(self.code_page_tag);
-        }
         self.code_page_tag = u32::MAX;
         self.code_page_ptr = None;
     }
 
-    /// Invalidates cached code-page state if a write to `(region, page)` aliases the
-    /// currently cached execution page (including 256 KiB EWRAM / 32 KiB IWRAM mirrors).
+    /// Drops both the active interpreter code page cache and requests full JIT cache flush.
+    #[inline]
+    pub fn invalidate_all_code(&mut self) {
+        self.code_page_tag = u32::MAX;
+        self.code_page_ptr = None;
+        self.dirty_code_pages.clear();
+        self.invalidate_all_jit = true;
+    }
+
+    /// Invalidates cached code-page state and marks the canonical page dirty for JIT
+    /// whenever a write to `(region, page)` occurs (handling EWRAM/IWRAM/ROM mirrors).
     #[inline(always)]
-    fn invalidate_code_page_if_aliased(&mut self, region: u32, page: u32) {
-        self.code_page_invalidated = Some(page);
-        let matches = if region == 0x03 && self.code_page_region == 0x03 {
-            (page & 1) == (self.code_page_tag & 1)
-        } else if region == 0x02 && self.code_page_region == 0x02 {
-            (page & 0x0F) == (self.code_page_tag & 0x0F)
-        } else {
-            page == self.code_page_tag
-        };
-        if matches {
-            if region != self.code_page_region as u32 || page != self.code_page_tag {
-                self.code_page_invalidated = Some(self.code_page_tag);
+    pub(crate) fn invalidate_code_page_if_aliased(&mut self, region: u32, page: u32) {
+        let canon = Self::canonical_code_page(page);
+        if !self.invalidate_all_jit {
+            if self.dirty_code_pages.len() >= 64 {
+                self.dirty_code_pages.clear();
+                self.invalidate_all_jit = true;
+            } else if !self.dirty_code_pages.contains(&canon) {
+                self.dirty_code_pages.push(canon);
             }
-            self.code_page_tag = u32::MAX;
-            self.code_page_ptr = None;
+        }
+        if self.code_page_ptr.is_some() {
+            let matches = if region == 0x03 && self.code_page_region == 0x03 {
+                (page & 1) == (self.code_page_tag & 1)
+            } else if region == 0x02 && self.code_page_region == 0x02 {
+                (page & 0x0F) == (self.code_page_tag & 0x0F)
+            } else if (0x08..=0x0D).contains(&region)
+                && (0x08..=0x0D).contains(&(self.code_page_region as u32))
+            {
+                (page & 0x07FF) == (self.code_page_tag & 0x07FF)
+            } else {
+                page == self.code_page_tag
+            };
+            if matches {
+                self.code_page_tag = u32::MAX;
+                self.code_page_ptr = None;
+            }
         }
     }
 
@@ -465,17 +555,27 @@ impl SysBus {
         if !self.prefetch.enabled || !self.prefetch.active || cycles == 0 {
             return;
         }
+        // GamePak prefetch stops when reaching a 128 KiB boundary.
+        if (self.prefetch.tail_addr & 0x1FFFF) == 0 {
+            self.prefetch.cycle_acc = 0;
+            return;
+        }
         let ws = Self::rom_waitstate_idx(self.prefetch.tail_addr);
-        let s_cyc = self.rom_s_wait[ws];
-        self.prefetch.cycle_acc += cycles;
-        let max_steps = (8 - self.prefetch.count) as u64;
+        let s_cyc = self.rom_s_wait[ws].max(1);
+        self.prefetch.cycle_acc = self.prefetch.cycle_acc.saturating_add(cycles);
+        if self.prefetch.cycle_acc < s_cyc {
+            return;
+        }
+        let max_by_buf = (8u8.saturating_sub(self.prefetch.count)) as u64;
+        let rem_to_boundary = (0x20000 - (self.prefetch.tail_addr & 0x1FFFF)) >> 1;
+        let max_steps = max_by_buf.min(rem_to_boundary as u64);
         let steps = (self.prefetch.cycle_acc / s_cyc).min(max_steps);
         if steps > 0 {
             self.prefetch.cycle_acc -= steps * s_cyc;
             self.prefetch.count += steps as u8;
             self.prefetch.tail_addr = self.prefetch.tail_addr.wrapping_add((steps * 2) as u32);
         }
-        if self.prefetch.count >= 8 {
+        if self.prefetch.count >= 8 || (self.prefetch.tail_addr & 0x1FFFF) == 0 {
             self.prefetch.cycle_acc = 0;
         }
     }
@@ -517,6 +617,9 @@ impl SysBus {
                     };
 
                     if self.ppu.dot_accurate_mode || self.scanline_dots_started {
+                        if !self.scanline_dots_started {
+                            self.ppu.begin_scanline(self.ppu.vcount as usize);
+                        }
                         if (self.ppu.dot_x as usize) < 240 {
                             self.ppu.render_dot_range(
                                 self.ppu.vcount as usize,
@@ -536,6 +639,17 @@ impl SysBus {
                     }
 
                     self.trigger_dma_by_timing(2);
+                }
+                // DMA3 Video Capture (timing == 3) runs on scanlines 2..=161 and auto-disables on 162.
+                if (2..=161).contains(&self.ppu.vcount) {
+                    self.trigger_video_capture_dma();
+                } else if self.ppu.vcount == 162
+                    && self.hw.dma[3].enabled()
+                    && self.hw.dma[3].timing() == 3
+                {
+                    self.hw.dma[3].cnt &= !0x8000;
+                    self.hw.dma[3].active = false;
+                    self.hw.recompute_active_dma();
                 }
                 if (self.ppu.dispstat & 0x0010) != 0 {
                     self.hw.request_irq(IRQ_HBLANK);
@@ -565,7 +679,7 @@ impl SysBus {
                 if self.ppu.vcount == 0 {
                     self.ppu.dispstat &= !0x0001;
                     self.ppu.reload_affine_refs();
-                    if self.cart.has_rtc {
+                    if self.cart.effective_rtc() {
                         self.rtc_cycles = self.rtc_cycles.saturating_add(crate::CYCLES_PER_FRAME);
                         if self.rtc_cycles >= u64::from(crate::CPU_CLOCK_HZ) {
                             self.cart.rtc.advance_second();
@@ -596,11 +710,8 @@ impl SysBus {
                 if self.ppu.vcount < 160 {
                     self.hdraw_start_cycle = ev_cycle;
                     self.ppu.dot_x = 0;
-                    if self.ppu.dot_accurate_mode {
-                        self.ppu.begin_scanline(self.ppu.vcount as usize);
-                        self.scanline_dots_started = true;
-                        self.scheduler.schedule(ev_cycle + 4, EventType::PpuDotStep);
-                    }
+                    // On-demand dot-accurate sync runs on PPU/PRAM/VRAM/OAM writes and at PpuHDrawEnd,
+                    // avoiding 38,400 redundant 4-cycle scheduler wakeups per frame.
                 }
 
                 self.scheduler
@@ -731,7 +842,10 @@ impl SysBus {
             return self.fetch_16(addr, AccessType::NonSequential);
         }
         let aligned = addr & !1;
-        let page_tag = (aligned >> 14) & 0x3FFF;
+        if aligned >= 0x1000_0000 {
+            return self.fetch_16(addr, AccessType::Sequential);
+        }
+        let page_tag = aligned >> 14;
         if page_tag == self.code_page_tag
             && let Some(ptr) = self.code_page_ptr
         {
@@ -759,8 +873,14 @@ impl SysBus {
                         self.prefetch.cycle_acc = 0;
                         self.prefetch.head_addr = aligned.wrapping_add(2);
                         self.prefetch.tail_addr = aligned.wrapping_add(2);
-                        self.waitstate_table[region][1][1] as u64
+                        if (aligned & 0x1FFFF) == 0 {
+                            self.waitstate_table[region][1][0] as u64
+                        } else {
+                            self.waitstate_table[region][1][1] as u64
+                        }
                     }
+                } else if (aligned & 0x1FFFF) == 0 {
+                    self.waitstate_table[region][1][0] as u64
                 } else {
                     self.waitstate_table[region][1][1] as u64
                 }
@@ -782,8 +902,18 @@ impl SysBus {
     /// Updates `open_bus_latch` and accounts for GamePak prefetch without altering `last_access_was_dma`.
     pub fn fetch_16(&mut self, addr: u32, access: AccessType) -> (u16, u64) {
         let aligned = addr & !1;
+        if aligned >= 0x1000_0000 {
+            self.invalidate_code_page();
+            let val = self.read_open_bus_16(aligned, aligned, true);
+            self.step_prefetch(1);
+            self.open_bus_latch = (val as u32) | ((val as u32) << 16);
+            if self.bench_active {
+                self.fetch_bench_cycles += 1;
+            }
+            return (val, 1);
+        }
         let region = (aligned >> 24) & 0x0F;
-        let page_tag = (aligned >> 14) & 0x3FFF;
+        let page_tag = aligned >> 14;
         self.code_page_tag = page_tag;
         self.code_page_ptr = self.fastmem_read[page_tag as usize];
         self.code_page_region = region as u8;
@@ -818,7 +948,9 @@ impl SysBus {
             return res;
         }
 
+        let saved_dma = self.last_access_was_dma;
         let (val, cyc) = self.read_16_non_rom_raw(aligned, aligned, true);
+        self.last_access_was_dma = saved_dma;
         self.step_prefetch(cyc);
         self.open_bus_latch = (val as u32) | ((val as u32) << 16);
         if self.bench_active {
@@ -834,7 +966,10 @@ impl SysBus {
             return self.fetch_32(addr, AccessType::NonSequential);
         }
         let aligned = addr & !3;
-        let page_tag = (aligned >> 14) & 0x3FFF;
+        if aligned >= 0x1000_0000 {
+            return self.fetch_32(addr, AccessType::Sequential);
+        }
+        let page_tag = aligned >> 14;
         if page_tag == self.code_page_tag
             && let Some(ptr) = self.code_page_ptr
         {
@@ -871,8 +1006,14 @@ impl SysBus {
                         self.prefetch.cycle_acc = 0;
                         self.prefetch.head_addr = aligned.wrapping_add(4);
                         self.prefetch.tail_addr = aligned.wrapping_add(4);
-                        self.waitstate_table[region][2][1] as u64
+                        if (aligned & 0x1FFFF) == 0 {
+                            self.waitstate_table[region][2][0] as u64
+                        } else {
+                            self.waitstate_table[region][2][1] as u64
+                        }
                     }
+                } else if (aligned & 0x1FFFF) == 0 {
+                    self.waitstate_table[region][2][0] as u64
                 } else {
                     self.waitstate_table[region][2][1] as u64
                 }
@@ -894,8 +1035,18 @@ impl SysBus {
     /// Correctly keeps upper halfword sequential in GamePak prefetch!
     pub fn fetch_32(&mut self, addr: u32, access: AccessType) -> (u32, u64) {
         let aligned = addr & !3;
+        if aligned >= 0x1000_0000 {
+            self.invalidate_code_page();
+            let val = self.read_open_bus_32(aligned, aligned, false);
+            self.step_prefetch(1);
+            self.open_bus_latch = val;
+            if self.bench_active {
+                self.fetch_bench_cycles += 1;
+            }
+            return (val, 1);
+        }
         let region = (aligned >> 24) & 0x0F;
-        let page_tag = (aligned >> 14) & 0x3FFF;
+        let page_tag = aligned >> 14;
         self.code_page_tag = page_tag;
         self.code_page_ptr = self.fastmem_read[page_tag as usize];
         self.code_page_region = region as u8;
@@ -942,7 +1093,9 @@ impl SysBus {
             return res;
         }
 
+        let saved_dma = self.last_access_was_dma;
         let (val, cyc) = self.read_32_non_rom_raw(aligned, aligned, false);
+        self.last_access_was_dma = saved_dma;
         self.step_prefetch(cyc);
         self.open_bus_latch = val;
         if self.bench_active {
@@ -1035,7 +1188,7 @@ impl SysBus {
             if let Some(ptr) = self.fastmem_read[page] {
                 let region = (addr >> 24) & 0x0F;
                 let cyc = match region {
-                    0x02 => 3,
+                    0x02 => self.waitstate_table[0x02][0][0] as u64,
                     0x03 => 1,
                     0x06 => 1,
                     0x08..=0x0D => {
@@ -1080,11 +1233,15 @@ impl SysBus {
                     (self.read_open_bus_8(addr, pc, is_thumb), 1, false)
                 }
             }
-            0x02 => (self.ewram[(addr as usize) & 0x3FFFF], 3, true),
+            0x02 => (
+                self.ewram[(addr as usize) & 0x3FFFF],
+                self.waitstate_table[0x02][0][0] as u64,
+                true,
+            ),
             0x03 => (self.iwram[(addr as usize) & 0x7FFF], 1, true),
             0x04 => {
                 let off = addr & 0x0FFF_FFFF;
-                if off < 0x0400_0400 || (off & 0x0FFF) == 0x0800 || (off & 0x0FFF) == 0x0802 {
+                if off < 0x0400_0400 || matches!(off & 0xFFFF, 0x0800..=0x0803) {
                     let v16 = self.read_io_16(addr & !1, pc, is_thumb);
                     (((v16 >> ((addr & 1) * 8)) & 0xFF) as u8, 1, true)
                 } else {
@@ -1145,7 +1302,7 @@ impl SysBus {
             if let Some(ptr) = self.fastmem_read[page] {
                 let region = (aligned >> 24) & 0x0F;
                 let cyc = match region {
-                    0x02 => 3,
+                    0x02 => self.waitstate_table[0x02][1][0] as u64,
                     0x03 => 1,
                     0x06 => 1,
                     0x08..=0x0D => {
@@ -1231,7 +1388,7 @@ impl SysBus {
                 self.last_access_was_dma = false;
                 (
                     u16::from_le_bytes([self.ewram[off], self.ewram[off + 1]]),
-                    3,
+                    self.waitstate_table[0x02][1][0] as u64,
                 )
             }
             0x03 => {
@@ -1297,7 +1454,7 @@ impl SysBus {
             if let Some(ptr) = self.fastmem_read[page] {
                 let region = (aligned >> 24) & 0x0F;
                 let cyc = match region {
-                    0x02 => 6,
+                    0x02 => self.waitstate_table[0x02][2][0] as u64,
                     0x03 => 1,
                     0x06 => 2,
                     0x08..=0x0D => {
@@ -1385,7 +1542,7 @@ impl SysBus {
                         self.ewram[off + 2],
                         self.ewram[off + 3],
                     ]),
-                    6,
+                    self.waitstate_table[0x02][2][0] as u64,
                 )
             }
             0x03 => {
@@ -1478,12 +1635,16 @@ impl SysBus {
         cyc
     }
 
-    fn write_8_inner(&mut self, addr: u32, val: u8, _access: AccessType) -> u64 {
+    fn write_8_inner(&mut self, addr: u32, val: u8, access: AccessType) -> u64 {
         if addr < 0x1000_0000 {
             let page = (addr >> 14) as usize;
             if let Some(ptr) = self.fastmem_write[page] {
                 let region = (addr >> 24) & 0x0F;
-                let cyc = if region == 0x02 { 3 } else { 1 };
+                let cyc = if region == 0x02 {
+                    self.waitstate_table[0x02][0][0] as u64
+                } else {
+                    1
+                };
                 self.step_prefetch(cyc);
                 self.last_cycles = cyc;
                 self.last_access_was_dma = false;
@@ -1498,13 +1659,16 @@ impl SysBus {
         }
 
         let region = (addr >> 24) & 0x0F;
+        self.last_access_was_dma = false;
         let cyc = match addr >> 24 {
             0x02 => {
                 self.ewram[(addr as usize) & 0x3FFFF] = val;
-                3
+                self.invalidate_code_page_if_aliased(0x02, (addr >> 14) & 0x3FFF);
+                self.waitstate_table[0x02][0][0] as u64
             }
             0x03 => {
                 self.iwram[(addr as usize) & 0x7FFF] = val;
+                self.invalidate_code_page_if_aliased(0x03, (addr >> 14) & 0x3FFF);
                 1
             }
             0x04 => {
@@ -1512,6 +1676,7 @@ impl SysBus {
                 1
             }
             0x05 => {
+                self.sync_ppu_hdraw();
                 // 8-bit writes to PRAM duplicate the byte into both halves of the aligned halfword!
                 let off = (addr as usize) & 0x3FE;
                 self.ppu.pram[off] = val;
@@ -1519,8 +1684,8 @@ impl SysBus {
                 1
             }
             0x06 => {
-                // 8-bit writes to OBJ VRAM (0x06010000.. or bitmap? Actually BG VRAM only:
-                // Bitmap Modes 3-5 have OBJ VRAM starting at 0x14000, Tile Modes 0-2 at 0x10000).
+                self.sync_ppu_hdraw();
+                // 8-bit writes to BG VRAM only (OBJ VRAM starts at 0x14000 in bitmap modes, 0x10000 in tile modes).
                 if let Some(off) = Ppu::mirror_vram(addr as usize, self.ppu.dispcnt) {
                     let obj_start = if (self.ppu.dispcnt & 0x07) >= 3 {
                         0x14000
@@ -1539,6 +1704,10 @@ impl SysBus {
                 // 8-bit writes to OAM are completely ignored by GBA hardware!
                 1
             }
+            0x08..=0x0D => {
+                self.prefetch.invalidate();
+                self.rom_fetch_cycles(addr & !1, access)
+            }
             0x0E | 0x0F if addr < 0x1000_0000 => {
                 self.prefetch.invalidate();
                 self.cart.write_sram(addr, val);
@@ -1546,7 +1715,7 @@ impl SysBus {
             }
             _ => 1,
         };
-        if region < 0x0E || addr >= 0x1000_0000 {
+        if region < 0x08 || addr >= 0x1000_0000 {
             self.step_prefetch(cyc);
         }
         self.last_cycles = cyc;
@@ -1571,7 +1740,11 @@ impl SysBus {
             let page = (aligned >> 14) as usize;
             if let Some(ptr) = self.fastmem_write[page] {
                 let region = (aligned >> 24) & 0x0F;
-                let cyc = if region == 0x02 { 3 } else { 1 };
+                let cyc = if region == 0x02 {
+                    self.waitstate_table[0x02][1][0] as u64
+                } else {
+                    1
+                };
                 self.step_prefetch(cyc);
                 self.last_cycles = cyc;
                 self.last_access_was_dma = false;
@@ -1588,19 +1761,22 @@ impl SysBus {
         }
 
         let region = (aligned >> 24) & 0x0F;
+        self.last_access_was_dma = false;
         let cyc = match aligned >> 24 {
             0x02 => {
                 let off = (aligned as usize) & 0x3FFFE;
                 unsafe {
                     (self.ewram.as_mut_ptr().add(off) as *mut u16).write_unaligned(val.to_le());
                 }
-                3
+                self.invalidate_code_page_if_aliased(0x02, (aligned >> 14) & 0x3FFF);
+                self.waitstate_table[0x02][1][0] as u64
             }
             0x03 => {
                 let off = (aligned as usize) & 0x7FFE;
                 unsafe {
                     (self.iwram.as_mut_ptr().add(off) as *mut u16).write_unaligned(val.to_le());
                 }
+                self.invalidate_code_page_if_aliased(0x03, (aligned >> 14) & 0x3FFF);
                 1
             }
             0x04 => {
@@ -1608,6 +1784,7 @@ impl SysBus {
                 1
             }
             0x05 => {
+                self.sync_ppu_hdraw();
                 let off = (aligned as usize) & 0x3FE;
                 unsafe {
                     (self.ppu.pram.as_mut_ptr().add(off) as *mut u16).write_unaligned(val.to_le());
@@ -1615,6 +1792,7 @@ impl SysBus {
                 1
             }
             0x06 => {
+                self.sync_ppu_hdraw();
                 if let Some(off) = Ppu::mirror_vram(aligned as usize, self.ppu.dispcnt) {
                     let off = off & !1;
                     unsafe {
@@ -1625,6 +1803,7 @@ impl SysBus {
                 1
             }
             0x07 => {
+                self.sync_ppu_hdraw();
                 let off = (aligned as usize) & 0x3FE;
                 unsafe {
                     (self.ppu.oam.as_mut_ptr().add(off) as *mut u16).write_unaligned(val.to_le());
@@ -1633,7 +1812,16 @@ impl SysBus {
             }
             0x08..=0x0D => {
                 self.prefetch.invalidate();
-                self.cart.write_rom_16(aligned, val);
+                if self.cart.is_eeprom_addr(aligned) {
+                    self.cart.eeprom.write_bit(
+                        &mut self.cart.sram,
+                        &mut self.cart.save_dirty,
+                        val,
+                        0,
+                    );
+                } else {
+                    self.cart.write_rom_16(aligned, val);
+                }
                 self.rom_fetch_cycles(aligned, access)
             }
             0x0E | 0x0F => {
@@ -1670,7 +1858,11 @@ impl SysBus {
             let page = (aligned >> 14) as usize;
             if let Some(ptr) = self.fastmem_write[page] {
                 let region = (aligned >> 24) & 0x0F;
-                let cyc = if region == 0x02 { 6 } else { 1 };
+                let cyc = if region == 0x02 {
+                    self.waitstate_table[0x02][2][0] as u64
+                } else {
+                    1
+                };
                 self.step_prefetch(cyc);
                 self.last_cycles = cyc;
                 self.last_access_was_dma = false;
@@ -1687,19 +1879,22 @@ impl SysBus {
         }
 
         let region = (aligned >> 24) & 0x0F;
+        self.last_access_was_dma = false;
         let cyc = match aligned >> 24 {
             0x02 => {
                 let off = (aligned as usize) & 0x3FFFC;
                 unsafe {
                     (self.ewram.as_mut_ptr().add(off) as *mut u32).write_unaligned(val.to_le());
                 }
-                6
+                self.invalidate_code_page_if_aliased(0x02, (aligned >> 14) & 0x3FFF);
+                self.waitstate_table[0x02][2][0] as u64
             }
             0x03 => {
                 let off = (aligned as usize) & 0x7FFC;
                 unsafe {
                     (self.iwram.as_mut_ptr().add(off) as *mut u32).write_unaligned(val.to_le());
                 }
+                self.invalidate_code_page_if_aliased(0x03, (aligned >> 14) & 0x3FFF);
                 1
             }
             0x04 => {
@@ -1715,6 +1910,7 @@ impl SysBus {
                 1
             }
             0x05 => {
+                self.sync_ppu_hdraw();
                 let off = (aligned as usize) & 0x3FC;
                 unsafe {
                     (self.ppu.pram.as_mut_ptr().add(off) as *mut u32).write_unaligned(val.to_le());
@@ -1722,6 +1918,7 @@ impl SysBus {
                 2
             }
             0x06 => {
+                self.sync_ppu_hdraw();
                 if let Some(off) = Ppu::mirror_vram(aligned as usize, self.ppu.dispcnt) {
                     let off = off & !3;
                     unsafe {
@@ -1732,6 +1929,7 @@ impl SysBus {
                 2
             }
             0x07 => {
+                self.sync_ppu_hdraw();
                 let off = (aligned as usize) & 0x3FC;
                 unsafe {
                     (self.ppu.oam.as_mut_ptr().add(off) as *mut u32).write_unaligned(val.to_le());
@@ -1763,7 +1961,7 @@ impl SysBus {
     fn debug_read_io_16(&self, addr: u32) -> u16 {
         let off = addr & 0x0FFF_FFFE;
         if off >= 0x0400_0400 {
-            return match off & 0x0FFF {
+            return match off & 0xFFFF {
                 0x0800 => (self.hw.memcnt & 0xFFFF) as u16,
                 0x0802 => (self.hw.memcnt >> 16) as u16,
                 _ => 0,
@@ -1908,7 +2106,10 @@ impl SysBus {
                 let off = (addr as usize) & 0x01FF_FFFF;
                 if off < self.cart.rom.len() {
                     self.cart.rom[off] = val;
-                    self.rebuild_fastmem();
+                    self.invalidate_code_page_if_aliased(
+                        (addr >> 24) & 0x0F,
+                        (addr >> 14) & 0x3FFF,
+                    );
                 }
             }
             0x0E | 0x0F if addr < 0x1000_0000 => self.cart.debug_write_sram(addr, val),
@@ -1930,6 +2131,21 @@ impl SysBus {
         self.debug_write_8(a.wrapping_add(1), bytes[1]);
         self.debug_write_8(a.wrapping_add(2), bytes[2]);
         self.debug_write_8(a.wrapping_add(3), bytes[3]);
+    }
+
+    /// Restores any ROM bytes patched via [`Self::apply_cheat_write_8`].
+    pub fn restore_rom_patches(&mut self) {
+        if self.rom_patch_originals.is_empty() {
+            return;
+        }
+        let originals = core::mem::take(&mut self.rom_patch_originals);
+        for (off, orig) in originals {
+            if off < self.cart.rom.len() {
+                self.cart.rom[off] = orig;
+                let page = (0x08 << 10) | ((off as u32) >> 14);
+                self.invalidate_code_page_if_aliased(0x08, page);
+            }
+        }
     }
 
     /// Writes a cheat value into RAM, Video RAM, or ROM memory safely.
@@ -1954,8 +2170,14 @@ impl SysBus {
             0x08..=0x0D => {
                 let off = (addr as usize) & 0x01FF_FFFF;
                 if off < self.cart.rom.len() {
+                    self.rom_patch_originals
+                        .entry(off)
+                        .or_insert(self.cart.rom[off]);
                     self.cart.rom[off] = val;
-                    self.rebuild_fastmem();
+                    self.invalidate_code_page_if_aliased(
+                        (addr >> 24) & 0x0F,
+                        (addr >> 14) & 0x3FFF,
+                    );
                 }
             }
             _ => {}

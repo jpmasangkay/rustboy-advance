@@ -16,8 +16,8 @@ pub const COLOR_HOVER_SELECTED: Color32 = Color32::from_rgb(0x2A, 0x2A, 0x2A);
 pub const COLOR_BORDER: Color32 = Color32::from_rgb(0x2A, 0x2A, 0x2A);
 
 pub const COLOR_TEXT: Color32 = Color32::from_rgb(0xE6, 0xE6, 0xE6);
-pub const COLOR_TEXT_SECONDARY: Color32 = Color32::from_rgb(0x8A, 0x8A, 0x8A);
-pub const COLOR_TEXT_DISABLED: Color32 = Color32::from_rgb(0x5A, 0x5A, 0x5A);
+pub const COLOR_TEXT_SECONDARY: Color32 = Color32::from_rgb(0xA0, 0xA0, 0xA0);
+pub const COLOR_TEXT_DISABLED: Color32 = Color32::from_rgb(0x64, 0x64, 0x64);
 
 pub const ACCENT_TEAL: Color32 = Color32::from_rgb(46, 196, 182);
 pub const ACCENT_TEAL_BG: Color32 = Color32::from_rgb(26, 62, 62);

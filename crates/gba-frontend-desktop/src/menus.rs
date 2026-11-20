@@ -11,6 +11,36 @@ use crate::config::{
     ShaderPreset, ViewportScale,
 };
 
+fn primary_mod_label() -> &'static str {
+    #[cfg(target_os = "macos")]
+    {
+        "Cmd"
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        "Ctrl"
+    }
+}
+
+pub(crate) fn open_folder_in_file_manager(dir: &std::path::Path) {
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt;
+        let _ = std::process::Command::new("explorer")
+            .arg(dir)
+            .creation_flags(0x08000000)
+            .spawn();
+    }
+    #[cfg(target_os = "macos")]
+    {
+        let _ = std::process::Command::new("open").arg(dir).spawn();
+    }
+    #[cfg(all(not(windows), not(target_os = "macos")))]
+    {
+        let _ = std::process::Command::new("xdg-open").arg(dir).spawn();
+    }
+}
+
 fn toolbar_btn(ui: &mut egui::Ui, label: &str, active: bool, enabled: bool) -> egui::Response {
     let text_color = if !enabled {
         crate::theme::COLOR_TEXT_DISABLED
@@ -48,9 +78,10 @@ impl RustboyApp {
             .show(ctx, |ui| {
                 egui::menu::bar(ui, |ui| {
                     let has_rom = self.has_active_game();
+                    let mod_lbl = primary_mod_label();
 
                     ui.menu_button("File", |ui| {
-                        if ui.button("Open ROM... (Ctrl+O)").clicked() {
+                        if ui.button(format!("Open ROM... ({mod_lbl}+O)")).clicked() {
                             ui.close_menu();
                             self.trigger_open_rom_dialog(ctx);
                         }
@@ -103,7 +134,9 @@ impl RustboyApp {
                         ui.separator();
                         ui.add_enabled_ui(has_rom, |ui| {
                             if ui
-                                .button("⏹ Close Game / Return to Library (Esc / Ctrl+W)")
+                                .button(format!(
+                                    "⏹ Close Game / Return to Library (Esc / {mod_lbl}+W)"
+                                ))
                                 .clicked()
                             {
                                 ui.close_menu();
@@ -124,11 +157,22 @@ impl RustboyApp {
                                         }
                                     }
                                     ui.separator();
-                                    if ui.button("🖼️ Save State Manager... (F6)").clicked() {
+                                    let sm_key = self
+                                        .config
+                                        .keybindings
+                                        .hotkeys
+                                        .display(HotkeyAction::StateManager);
+                                    if ui
+                                        .button(format!("🖼️ Save State Manager... ({sm_key})"))
+                                        .clicked()
+                                    {
                                         ui.close_menu();
                                         self.show_state_manager = true;
                                     }
-                                    if ui.button("↩ Undo State Action (Ctrl+Z)").clicked() {
+                                    if ui
+                                        .button(format!("↩ Undo State Action ({mod_lbl}+Z)"))
+                                        .clicked()
+                                    {
                                         ui.close_menu();
                                         self.undo_last_state_action();
                                     }
@@ -152,7 +196,15 @@ impl RustboyApp {
                                         }
                                     }
                                     ui.separator();
-                                    if ui.button("🖼️ Save State Manager... (F6)").clicked() {
+                                    let sm_key = self
+                                        .config
+                                        .keybindings
+                                        .hotkeys
+                                        .display(HotkeyAction::StateManager);
+                                    if ui
+                                        .button(format!("🖼️ Save State Manager... ({sm_key})"))
+                                        .clicked()
+                                    {
                                         ui.close_menu();
                                         self.show_state_manager = true;
                                     }
@@ -172,13 +224,23 @@ impl RustboyApp {
                                 ui.close_menu();
                                 self.export_battery_save();
                             }
-                            if ui.button("Save Screenshot (F12)").clicked() {
+                            let snap_key = self
+                                .config
+                                .keybindings
+                                .hotkeys
+                                .display(HotkeyAction::Screenshot);
+                            if ui.button(format!("Save Screenshot ({snap_key})")).clicked() {
                                 ui.close_menu();
                                 self.capture_screenshot();
                             }
                         });
                         ui.separator();
-                        if ui.button("Exit (Alt+F4)").clicked() {
+                        let exit_lbl = if cfg!(target_os = "macos") {
+                            "Exit (Cmd+Q)"
+                        } else {
+                            "Exit (Alt+F4)"
+                        };
+                        if ui.button(exit_lbl).clicked() {
                             self.quit_requested = true;
                             ctx.send_viewport_cmd(egui::ViewportCommand::Close);
                         }
@@ -467,9 +529,11 @@ impl RustboyApp {
                                         .custom_formatter(|n, _| format!("{:.0}%", n * 100.0)),
                                 );
                                 if slider.changed() {
-                                    self.config.save();
                                     self.sink.frame_dirty = true;
                                     self.lcd_tex = None;
+                                }
+                                if slider.drag_stopped() || slider.lost_focus() {
+                                    self.config.save();
                                 }
                             });
                             ui.separator();
@@ -562,7 +626,7 @@ impl RustboyApp {
                             if ui
                                 .checkbox(
                                     &mut self.config.show_toolbar,
-                                    "Show Action Toolbar (Ctrl+T)",
+                                    format!("Show Action Toolbar ({mod_lbl}+T)"),
                                 )
                                 .changed()
                             {
@@ -571,18 +635,42 @@ impl RustboyApp {
                             if ui
                                 .checkbox(
                                     &mut self.config.show_status_bar,
-                                    "Show Status Bar (Ctrl+S)",
+                                    format!("Show Status Bar ({mod_lbl}+S)"),
                                 )
                                 .changed()
                             {
                                 self.config.save();
                             }
                             if ui
-                                .checkbox(&mut self.config.show_menu_bar, "Show Menu Bar in Window")
+                                .checkbox(
+                                    &mut self.config.show_menu_bar,
+                                    format!("Show Menu Bar ({mod_lbl}+Shift+M / F10)"),
+                                )
                                 .changed()
                             {
                                 self.config.save();
                             }
+                            ui.separator();
+                            ui.menu_button(
+                                format!("UI Scale ({:.0}%)", self.config.ui_scale * 100.0),
+                                |ui| {
+                                    for &(scale, lbl) in &[
+                                        (0.85f32, "85% (Compact)"),
+                                        (1.0f32, "100% (Default)"),
+                                        (1.25f32, "125% (Large)"),
+                                        (1.5f32, "150% (Extra Large)"),
+                                        (1.75f32, "175% (HiDPI)"),
+                                    ] {
+                                        let sel = (self.config.ui_scale - scale).abs() < 0.02;
+                                        if ui.selectable_label(sel, lbl).clicked() {
+                                            self.config.ui_scale = scale;
+                                            ctx.set_zoom_factor(scale);
+                                            self.config.save();
+                                            ui.close_menu();
+                                        }
+                                    }
+                                },
+                            );
                         });
                         ui.menu_button("Video Layers", |ui| {
                             for (bit, name) in [
@@ -631,20 +719,26 @@ impl RustboyApp {
                             }
                         });
                         ui.separator();
-                        if ui
-                            .add(
-                                egui::Slider::new(&mut self.config.master_volume, 0..=100)
-                                    .text("Master Volume %"),
-                            )
-                            .changed()
-                        {
+                        let vol_slider = ui.add(
+                            egui::Slider::new(&mut self.config.master_volume, 0..=100)
+                                .text("Master Volume %"),
+                        );
+                        if vol_slider.changed() {
+                            self.sink.audio.set_master_volume(self.config.master_volume);
                             if let Some(core) = &mut self.core {
-                                core.bus.apu.master_volume_pct = self.config.master_volume;
+                                core.bus.apu.master_volume_pct = 100;
                             }
+                        }
+                        if vol_slider.drag_stopped() || vol_slider.lost_focus() {
                             self.config.save();
                         }
+                        let mute_key = self
+                            .config
+                            .keybindings
+                            .hotkeys
+                            .display(HotkeyAction::Mute);
                         if ui
-                            .checkbox(&mut self.config.muted, "Mute Audio (Ctrl+M)")
+                            .checkbox(&mut self.config.muted, format!("Mute Audio ({mute_key})"))
                             .changed()
                         {
                             self.sink.audio.set_muted(self.config.muted);
@@ -792,18 +886,7 @@ impl RustboyApp {
                         if ui.button("Open Screenshots / Captures Folder").clicked() {
                             let dir = AppConfig::screenshots_dir();
                             let _ = fs::create_dir_all(&dir);
-                            #[cfg(windows)]
-                            {
-                                use std::os::windows::process::CommandExt;
-                                let _ = std::process::Command::new("explorer")
-                                    .arg(&dir)
-                                    .creation_flags(0x08000000)
-                                    .spawn();
-                            }
-                            #[cfg(not(windows))]
-                            {
-                                let _ = std::process::Command::new("xdg-open").arg(&dir).spawn();
-                            }
+                            open_folder_in_file_manager(&dir);
                             ui.close_menu();
                         }
                     });
@@ -838,12 +921,24 @@ impl RustboyApp {
                     .stroke(crate::theme::STROKE_BORDER),
             )
             .show(ctx, |ui| {
-                ui.horizontal(|ui| {
+                ui.horizontal_wrapped(|ui| {
                     let has_rom = self.has_active_game();
+                    let mod_lbl = primary_mod_label();
+                    let hk = &self.config.keybindings.hotkeys;
+                    let pause_hk = hk.display(HotkeyAction::Pause);
+                    let step_hk = hk.display(HotkeyAction::FrameAdvance);
+                    let rewind_hk = hk.display(HotkeyAction::Rewind);
+                    let reset_hk = hk.display(HotkeyAction::HardReset);
+                    let ff_hk = hk.display(HotkeyAction::FastForward);
+                    let save_hk = hk.display(HotkeyAction::SaveState);
+                    let load_hk = hk.display(HotkeyAction::LoadState);
+                    let sm_hk = hk.display(HotkeyAction::StateManager);
+                    let snap_hk = hk.display(HotkeyAction::Screenshot);
+                    let mute_hk = hk.display(HotkeyAction::Mute);
 
                     // Group 1: Open, Folder, Reload
                     if toolbar_btn(ui, "📂 Open", false, true)
-                        .on_hover_text("Open GBA / GB / GBC ROM File (Ctrl+O)")
+                        .on_hover_text(format!("Open GBA / GB / GBC ROM File ({mod_lbl}+O)"))
                         .clicked()
                     {
                         self.trigger_open_rom_dialog(ctx);
@@ -870,20 +965,20 @@ impl RustboyApp {
                     // Group 2: Pause, Stop, Step, Rewind, Reset, FF
                     let play_lbl = if self.paused { "▶ Resume" } else { "⏸ Pause" };
                     if toolbar_btn(ui, play_lbl, self.paused, has_rom)
-                        .on_hover_text("Pause / Resume emulation (P / Space)")
+                        .on_hover_text(format!("Pause / Resume emulation ({pause_hk})"))
                         .clicked()
                     {
                         self.toggle_pause();
                     }
                     if toolbar_btn(ui, "⏹ Stop", false, has_rom)
-                        .on_hover_text("Stop game and return to ROM Library (Esc / Ctrl+W)")
+                        .on_hover_text(format!("Stop game and return to ROM Library (Esc / {mod_lbl}+W)"))
                         .clicked()
                     {
                         self.close_rom(ctx);
                     }
                     let hardcore = self.is_ra_hardcore_active();
                     if toolbar_btn(ui, "⏭ Step", false, has_rom && !hardcore)
-                        .on_hover_text("Advance 1 Frame (Ctrl+N)")
+                        .on_hover_text(format!("Advance 1 Frame ({step_hk})"))
                         .clicked()
                     {
                         self.step_single_frame(ctx);
@@ -891,13 +986,13 @@ impl RustboyApp {
                     let rewind_enabled =
                         has_rom && !hardcore && self.config.rewind_enabled && !self.rewind_buffer.is_empty();
                     if toolbar_btn(ui, "⏪ Rewind", false, rewind_enabled)
-                        .on_hover_text("Rewind ~0.5s (or hold R key in-game)")
+                        .on_hover_text(format!("Rewind ~0.5s (or hold {rewind_hk} in-game)"))
                         .clicked()
                     {
                         self.rewind_manual_with_movie_sync();
                     }
                     if toolbar_btn(ui, "⟲ Reset", false, has_rom)
-                        .on_hover_text("Hard Reset (Ctrl+R)")
+                        .on_hover_text(format!("Hard Reset ({reset_hk})"))
                         .clicked()
                     {
                         self.hard_reset();
@@ -905,7 +1000,7 @@ impl RustboyApp {
                     let eff_speed = self.effective_speed_multiplier();
                     let turbo_on = self.tab_fast_forward || eff_speed > 1.05 || eff_speed <= 0.0;
                     if toolbar_btn(ui, "⏩ FF", turbo_on, has_rom)
-                        .on_hover_text("Toggle Fast-Forward (Tab / hotkey)")
+                        .on_hover_text(format!("Toggle Fast-Forward ({ff_hk})"))
                         .clicked()
                     {
                         let target_speed = if eff_speed > 1.05 || eff_speed <= 0.0 {
@@ -925,26 +1020,29 @@ impl RustboyApp {
                     ui.separator();
 
                     // Group 3: S1, L1, States, Snap
-                    if toolbar_btn(ui, "💾 S1", false, has_rom)
-                        .on_hover_text("Quick Save Slot 1 (F5)")
+                    if toolbar_btn(ui, "💾 S1", false, has_rom && !hardcore)
+                        .on_hover_text(format!("Quick Save Slot 1 ({save_hk})"))
+                        .on_disabled_hover_text("Disabled in RetroAchievements Hardcore Mode")
                         .clicked()
                     {
                         self.quick_save(1);
                     }
-                    if toolbar_btn(ui, "📂 L1", false, has_rom)
-                        .on_hover_text("Quick Load Slot 1 (F7)")
+                    if toolbar_btn(ui, "📂 L1", false, has_rom && !hardcore)
+                        .on_hover_text(format!("Quick Load Slot 1 ({load_hk})"))
+                        .on_disabled_hover_text("Disabled in RetroAchievements Hardcore Mode")
                         .clicked()
                     {
                         self.quick_load(1);
                     }
-                    if toolbar_btn(ui, "◈ States", self.show_state_manager, true)
-                        .on_hover_text("Open Visual Save State Manager (F6)")
+                    if toolbar_btn(ui, "◈ States", self.show_state_manager, !hardcore)
+                        .on_hover_text(format!("Open Visual Save State Manager ({sm_hk})"))
+                        .on_disabled_hover_text("Disabled in RetroAchievements Hardcore Mode")
                         .clicked()
                     {
                         self.show_state_manager = !self.show_state_manager;
                     }
                     if toolbar_btn(ui, "📷 Snap", false, has_rom)
-                        .on_hover_text("Save Screenshot alongside ROM (F12)")
+                        .on_hover_text(format!("Save Screenshot ({snap_hk})"))
                         .clicked()
                     {
                         self.capture_screenshot();
@@ -955,7 +1053,7 @@ impl RustboyApp {
                     // Group 4: Audio, sRGB, Filter: LCD Matrix
                     let audio_active = !self.config.muted;
                     if toolbar_btn(ui, "🔊 Audio", audio_active, true)
-                        .on_hover_text("Toggle Audio Output (M)")
+                        .on_hover_text(format!("Toggle Audio Output ({mute_hk})"))
                         .clicked()
                     {
                         self.config.muted = !self.config.muted;
@@ -1011,26 +1109,40 @@ impl RustboyApp {
                                     .custom_formatter(|n, _| format!("{:.0}%", n * 100.0)),
                             );
                             if slider.changed() {
-                                self.config.save();
                                 self.sink.frame_dirty = true;
                                 self.lcd_tex = None;
+                            }
+                            if slider.drag_stopped() || slider.lost_focus() {
+                                self.config.save();
                             }
                         });
                     });
 
                     ui.separator();
 
-                    // Group 5: CPU, Hex, VRAM, Audio, Link
-                    if toolbar_btn(ui, "CPU", self.debugger.show_cpu, true).clicked() {
+                    // Group 5: CPU, Hex, VRAM, APU, Link
+                    if toolbar_btn(ui, "CPU", self.debugger.show_cpu, true)
+                        .on_hover_text("ARM7TDMI CPU & Disassembler")
+                        .clicked()
+                    {
                         self.debugger.show_cpu = !self.debugger.show_cpu;
                     }
-                    if toolbar_btn(ui, "Hex", self.debugger.show_hex, true).clicked() {
+                    if toolbar_btn(ui, "Hex", self.debugger.show_hex, true)
+                        .on_hover_text("Memory Hex Viewer")
+                        .clicked()
+                    {
                         self.debugger.show_hex = !self.debugger.show_hex;
                     }
-                    if toolbar_btn(ui, "VRAM", self.debugger.show_vram, true).clicked() {
+                    if toolbar_btn(ui, "VRAM", self.debugger.show_vram, true)
+                        .on_hover_text("VRAM Tile Viewer")
+                        .clicked()
+                    {
                         self.debugger.show_vram = !self.debugger.show_vram;
                     }
-                    if toolbar_btn(ui, "Audio", self.debugger.show_audio, true).clicked() {
+                    if toolbar_btn(ui, "APU", self.debugger.show_audio, true)
+                        .on_hover_text("Audio Channel Visualizer")
+                        .clicked()
+                    {
                         self.debugger.show_audio = !self.debugger.show_audio;
                     }
                     let link_on = self.link.local_is_active()

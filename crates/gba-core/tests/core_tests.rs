@@ -488,17 +488,17 @@ fn cartridge_save_override_and_boktai_yoshi_warioware_peripherals() {
     assert_eq!(core.bus.cart.read_rom_16(0x0800_00C4) & 0x08, 0x08);
     core.bus.cart.solar_enabled = false;
 
-    // WarioWare Twisted Gyro + Rumble (GPIO)
+    // WarioWare Twisted Gyro + Rumble (GPIO: bit0=RES/SAMPLE, bit1=CLK, bit2=DATA_OUT(in), bit3=RUMBLE)
     core.bus.cart.rumble_enabled = true;
     core.bus.cart.gyro_enabled = true;
     core.bus.cart.gyro_val = 0x0A53; // 12-bit value
-    core.bus.cart.write_rom_16(0x0800_00C6, 0x000B); // bit0=CLK, bit1=SAMPLE, bit2=in, bit3=RUMBLE
+    core.bus.cart.write_rom_16(0x0800_00C6, 0x000B); // bit0=SAMPLE, bit1=CLK, bit2=in, bit3=RUMBLE
     core.bus.cart.write_rom_16(0x0800_00C4, 0x0008); // Rumble ON
     assert!(core.bus.cart.rumble_active);
     core.bus.cart.write_rom_16(0x0800_00C4, 0x0003); // Sample=1, CLK=1 -> latches gyro_val << 4
     let mut shifted = 0u16;
     for _ in 0..12 {
-        core.bus.cart.write_rom_16(0x0800_00C4, 0x0001); // CLK=1, Sample=0
+        core.bus.cart.write_rom_16(0x0800_00C4, 0x0002); // CLK=1, Sample=0
         core.bus.cart.write_rom_16(0x0800_00C4, 0x0000); // Falling edge shifts MSB onto pin 2
         let bit = (core.bus.cart.read_rom_16(0x0800_00C4) >> 2) & 1;
         shifted = (shifted << 1) | bit;
@@ -894,8 +894,8 @@ fn hle_swi_soundbias_midikey2freq_and_ppu_skip_rendering() {
     let rom = rom_from_arm_words(&[0xEAFF_FFFE]);
     let mut core = GbaCore::new(None, rom.clone());
 
-    // 1. Test SWI 0x19 SoundBias
-    core.cpu.gpr[0] = 0x0200;
+    // 1. Test SWI 0x19 SoundBias (r0 == 0 -> 0x0000, r0 != 0 -> 0x0200)
+    core.cpu.gpr[0] = 0x0001;
     core.bus.hle_swi(&mut core.cpu, 0x19);
     assert_eq!(core.bus.apu.soundbias & 0x03FE, 0x0200);
 
@@ -1065,137 +1065,35 @@ fn test_fastmem_vs_slow_path_random_addresses() {
 }
 
 #[test]
-fn test_prefetch_old_vs_new_logic_side_by_side() {
-    fn step_prefetch_old(
-        enabled: bool,
-        active: &mut bool,
-        count: &mut u8,
-        cycle_acc: &mut u64,
-        tail_addr: &mut u32,
-        cycles: u64,
-        s_cyc: u64,
-    ) {
-        if !enabled || !*active || cycles == 0 {
-            return;
-        }
-        for _ in 0..cycles {
-            if *count < 8 {
-                *cycle_acc += 1;
-                if *cycle_acc >= s_cyc {
-                    *cycle_acc -= s_cyc;
-                    *count += 1;
-                    *tail_addr = tail_addr.wrapping_add(2);
-                }
-            } else {
-                *cycle_acc = 0;
-                break;
-            }
-        }
-    }
+fn test_prefetch_real_sysbus_and_128kb_boundary() {
+    let rom = vec![0u8; 0x40000];
+    let mut core = GbaCore::new(None, rom);
+    // Enable prefetch with WS0 S=2 cycles
+    core.bus.update_waitcnt(0x4010);
+    core.bus.prefetch.active = true;
+    core.bus.prefetch.head_addr = 0x0801_FFF8;
+    core.bus.prefetch.tail_addr = 0x0801_FFF8;
+    core.bus.prefetch.count = 0;
+    core.bus.prefetch.cycle_acc = 0;
 
-    fn step_prefetch_new(
-        enabled: bool,
-        active: &mut bool,
-        count: &mut u8,
-        cycle_acc: &mut u64,
-        tail_addr: &mut u32,
-        cycles: u64,
-        s_cyc: u64,
-    ) {
-        if !enabled || !*active || cycles == 0 {
-            return;
-        }
-        *cycle_acc += cycles;
-        let max_steps = (8 - *count) as u64;
-        let steps = (*cycle_acc / s_cyc).min(max_steps);
-        if steps > 0 {
-            *cycle_acc -= steps * s_cyc;
-            *count += steps as u8;
-            *tail_addr = tail_addr.wrapping_add((steps * 2) as u32);
-        }
-        if *count >= 8 {
-            *cycle_acc = 0;
-        }
-    }
+    // 4 halfwords remain before 0x0802_0000 (128 KiB boundary). Stepping 100 cycles must stop at 4!
+    core.bus.step_prefetch(100);
+    assert_eq!(core.bus.prefetch.count, 4);
+    assert_eq!(core.bus.prefetch.tail_addr, 0x0802_0000);
+    assert_eq!(core.bus.prefetch.cycle_acc, 0);
 
-    for s_cyc in [1u64, 2, 3, 5, 9] {
-        let mut old_active = true;
-        let mut old_count = 0u8;
-        let mut old_acc = 0u64;
-        let mut old_tail = 0x0800_0000u32;
-
-        let mut new_active = true;
-        let mut new_count = 0u8;
-        let mut new_acc = 0u64;
-        let mut new_tail = 0x0800_0000u32;
-
-        let cycle_steps = [1, 2, 3, 4, 5, 7, 11, 16, 25, 42, 100];
-        for &cyc in &cycle_steps {
-            step_prefetch_old(
-                true,
-                &mut old_active,
-                &mut old_count,
-                &mut old_acc,
-                &mut old_tail,
-                cyc,
-                s_cyc,
-            );
-            step_prefetch_new(
-                true,
-                &mut new_active,
-                &mut new_count,
-                &mut new_acc,
-                &mut new_tail,
-                cyc,
-                s_cyc,
-            );
-
-            assert_eq!(
-                old_count, new_count,
-                "count mismatch for s_cyc={s_cyc}, cyc={cyc}"
-            );
-            assert_eq!(
-                old_acc, new_acc,
-                "acc mismatch for s_cyc={s_cyc}, cyc={cyc}"
-            );
-            assert_eq!(
-                old_tail, new_tail,
-                "tail mismatch for s_cyc={s_cyc}, cyc={cyc}"
-            );
-        }
-
-        // Test branch flush / invalidate
-        old_count = 0;
-        old_acc = 0;
-        new_count = 0;
-        new_acc = 0;
-
-        // Step up to full buffer
-        step_prefetch_old(
-            true,
-            &mut old_active,
-            &mut old_count,
-            &mut old_acc,
-            &mut old_tail,
-            500,
-            s_cyc,
-        );
-        step_prefetch_new(
-            true,
-            &mut new_active,
-            &mut new_count,
-            &mut new_acc,
-            &mut new_tail,
-            500,
-            s_cyc,
-        );
-
-        assert_eq!(old_count, 8);
-        assert_eq!(new_count, 8);
-        assert_eq!(old_acc, 0);
-        assert_eq!(new_acc, 0);
-        assert_eq!(old_tail, new_tail);
-    }
+    // Away from a boundary, stepping fills up to 8 halfwords accurately.
+    core.bus.prefetch.head_addr = 0x0800_0100;
+    core.bus.prefetch.tail_addr = 0x0800_0100;
+    core.bus.prefetch.count = 0;
+    core.bus.prefetch.cycle_acc = 0;
+    core.bus.step_prefetch(5); // 2 halfwords (4 cyc) + 1 remainder
+    assert_eq!(core.bus.prefetch.count, 2);
+    assert_eq!(core.bus.prefetch.cycle_acc, 1);
+    assert_eq!(core.bus.prefetch.tail_addr, 0x0800_0104);
+    core.bus.step_prefetch(200);
+    assert_eq!(core.bus.prefetch.count, 8);
+    assert_eq!(core.bus.prefetch.cycle_acc, 0);
 }
 
 #[test]
@@ -1285,6 +1183,7 @@ fn test_mode4_fast_path_pixel_identical_to_normal_path() {
                 .copy_from_slice(&core.bus.ppu.framebuffer[row_start..row_start + LCD_WIDTH]);
 
             // 2. Render using normal path (temporarily breaking identity affine to force normal path)
+            core.bus.ppu.ref_x[0] = 0;
             core.bus.ppu.ref_y[0] = (y as i32) << 8;
             core.bus.ppu.bgp_b[0] = 1; // Disables fast path!
             core.bus.ppu.render_scanline(y);
@@ -1304,16 +1203,27 @@ fn test_mode4_fast_path_pixel_identical_to_normal_path() {
 
 #[test]
 fn test_3_layer_save_detector_and_dma3_sizing() {
-    // 1. Layer 1: Library string takes primary precedence
+    // 1. Layer 1: Verified GameDB entry takes precedence over generic SDK strings
+    // (e.g., Classic NES Series contains "EEPROM_V" string but requires 512B EEPROM).
+    let mut rom_classic_nes = vec![0u8; 0x1000];
+    rom_classic_nes[0xAC..0xB0].copy_from_slice(b"FSME");
+    rom_classic_nes[0x200..0x208].copy_from_slice(b"EEPROM_V");
+    let cart_nes = gba_core::cartridge::Cartridge::new(rom_classic_nes);
+    assert_eq!(
+        cart_nes.save_type,
+        SaveType::Eeprom512B,
+        "GameDB entry for Classic NES must override generic EEPROM_V heuristic"
+    );
+
+    // Unknown game code falls back to SDK library string detection
     let mut rom_flash1m = vec![0u8; 0x1000];
-    rom_flash1m[0xAC..0xB0].copy_from_slice(b"A9DE"); // GameDB says Flash64K for Doom II
-    // Embed FLASH1M_V string -> Layer 1 must win over GameDB!
+    rom_flash1m[0xAC..0xB0].copy_from_slice(b"ZZZZ");
     rom_flash1m[0x200..0x209].copy_from_slice(b"FLASH1M_V");
     let cart = gba_core::cartridge::Cartridge::new(rom_flash1m);
     assert_eq!(
         cart.save_type,
         SaveType::Flash128K,
-        "FLASH1M_V string must override fallback GameDB"
+        "FLASH1M_V string must detect Flash128K for unknown game codes"
     );
 
     // 2. Layer 3: GameDB fallback when no string is present
@@ -1423,6 +1333,7 @@ fn test_state_hash_determinism_across_frames() {
 }
 
 #[test]
+#[ignore = "microbenchmark: runs 2M Instant::now() calls; invoke with -- --ignored"]
 fn test_timer_overhead_and_subsystem_breakdown() {
     let n = 2_000_000;
     let t0 = std::time::Instant::now();
@@ -1811,4 +1722,85 @@ fn test_eeprom_reads_through_fast_path_including_32mb_autodetect() {
         .bus
         .read_16(0x0DFF_FF00, AccessType::NonSequential, 0x0800_0000, false);
     assert_eq!(ready_bit, 1);
+}
+
+#[test]
+fn test_savestate_runahead_sram_isolation_and_clone_safety() {
+    // ROM writes 0x42 to SRAM[0] on frame 1
+    let rom = rom_from_arm_words(&[
+        0xE3A0_040E, // mov r0, #0x0E000000
+        0xE3A0_1042, // mov r1, #0x42
+        0xE5C0_1000, // strb r1, [r0]
+        0xEAFF_FFFE, // b .
+    ]);
+    let mut core = GbaCore::new(None, rom);
+    core.bus.cart.save_type = SaveType::Sram32K;
+    core.bus.cart.sram[0] = 0x11;
+
+    // 1. Run-ahead speculation must NOT leak speculative SRAM writes into live state.
+    let mut fe = HeadlessFrontend::new();
+    core.speculate_run_ahead_frame(&mut fe)
+        .expect("speculate_run_ahead_frame");
+    assert_eq!(
+        core.bus.cart.sram[0], 0x11,
+        "speculative run-ahead frame must roll back SRAM writes cleanly"
+    );
+
+    // 2. Save state & load state preserve SRAM contents AND keep heap buffer pointer stable.
+    let sram_ptr_before = core.bus.cart.sram.as_ptr();
+    let ewram_ptr_before = core.bus.ewram.as_ptr();
+    let state = core.save_state().expect("save_state");
+    core.run_frame(&mut fe);
+    assert_eq!(core.bus.cart.sram[0], 0x42);
+    core.load_state(&state).expect("load_state");
+    assert_eq!(core.bus.cart.sram[0], 0x11);
+    assert_eq!(
+        core.bus.cart.sram.as_ptr(),
+        sram_ptr_before,
+        "SRAM box pointer must remain stable across load_state"
+    );
+    assert_eq!(
+        core.bus.ewram.as_ptr(),
+        ewram_ptr_before,
+        "EWRAM box pointer must remain stable across load_state"
+    );
+
+    // 3. Cloning SysBus produces independent fastmem buffers with no aliasing.
+    let mut cloned_bus = core.bus.clone();
+    cloned_bus.write_32(0x0200_0000, 0xCAFE_BABE, AccessType::NonSequential);
+    assert_eq!(
+        core.bus.read_32(0x0200_0000, AccessType::NonSequential, 0x0800_0000),
+        0,
+        "writing to cloned SysBus must not alias original EWRAM"
+    );
+}
+
+#[test]
+fn test_hle_arctan_and_rtc_time_command_accuracy() {
+    let rom = rom_from_arm_words(&[0xEAFF_FFFE]);
+    let mut core = GbaCore::new(None, rom);
+
+    // SWI 0x09 ArcTan(1.0 = 0x4000) must return 0x2000 (45 deg), ArcTan(-1.0) -> -0x2000
+    core.cpu.gpr[0] = 0x4000;
+    core.bus.hle_swi(&mut core.cpu, 0x09);
+    assert_eq!(core.cpu.gpr[0] as i16, 0x2000);
+
+    core.cpu.gpr[0] = (-0x4000i16) as i32 as u32;
+    core.bus.hle_swi(&mut core.cpu, 0x09);
+    assert_eq!(core.cpu.gpr[0] as i16, -0x2000);
+
+    // SWI 0x09 with i16::MIN (-32768) must not overflow/panic
+    core.cpu.gpr[0] = i16::MIN as i32 as u32;
+    core.bus.hle_swi(&mut core.cpu, 0x09);
+
+    // RTC Time-Only read command (0x67 -> cmd=3, is_read=1) returns 3 bytes (Hour, Min, Sec)
+    core.bus.cart.has_rtc = true;
+    core.bus.cart.rtc.set_datetime(26, 2, 28, 6, 23, 59, 59);
+    core.bus.cart.rtc.advance_second();
+    // 2026 is not a leap year -> Feb 28 23:59:59 advances to Mar 1 00:00:00!
+    assert_eq!(core.bus.cart.rtc.regs[1], 0x03); // March
+    assert_eq!(core.bus.cart.rtc.regs[2], 0x01); // Day 1
+    assert_eq!(core.bus.cart.rtc.regs[4], 0x00); // 00h
+    assert_eq!(core.bus.cart.rtc.regs[5], 0x00); // 00m
+    assert_eq!(core.bus.cart.rtc.regs[6], 0x00); // 00s
 }

@@ -1500,7 +1500,6 @@ dependencies = [
 name = "gb-core"
 version = "0.1.0"
 dependencies = [
- "bitflags 2.13.2",
  "image",
  "log",
  "postcard",
@@ -1511,7 +1510,6 @@ dependencies = [
 name = "gba-core"
 version = "0.1.0"
 dependencies = [
- "bitflags 2.13.2",
  "cranelift-codegen",
  "cranelift-frontend",
  "cranelift-jit",
@@ -1528,7 +1526,6 @@ name = "gba-debugger"
 version = "0.1.0"
 dependencies = [
  "gba-core",
- "log",
 ]
 
 [[package]]

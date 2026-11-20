@@ -56,6 +56,9 @@ pub mod box_bytes {
             fn visit_seq<A: SeqAccess<'de>>(self, mut seq: A) -> Result<Self::Value, A::Error> {
                 let mut vec = Vec::with_capacity(N);
                 while let Some(b) = seq.next_element::<u8>()? {
+                    if vec.len() >= N {
+                        return Err(de::Error::invalid_length(N + 1, &self));
+                    }
                     vec.push(b);
                 }
                 if vec.len() != N {
@@ -78,7 +81,22 @@ pub mod box_u16s {
         val: &[u16; N],
         serializer: S,
     ) -> Result<S::Ok, S::Error> {
-        serializer.collect_seq(val.iter())
+        #[cfg(target_endian = "little")]
+        {
+            // SAFETY: `u16` has no padding and every bit pattern is valid; on little-endian
+            // targets its in-memory representation is identical to packed LE bytes.
+            let bytes =
+                unsafe { core::slice::from_raw_parts(val.as_ptr().cast::<u8>(), N * 2) };
+            serializer.serialize_bytes(bytes)
+        }
+        #[cfg(not(target_endian = "little"))]
+        {
+            let mut bytes = Vec::with_capacity(N * 2);
+            for &u in val {
+                bytes.extend_from_slice(&u.to_le_bytes());
+            }
+            serializer.serialize_bytes(&bytes)
+        }
     }
 
     pub fn deserialize<'de, const N: usize, D: Deserializer<'de>>(
@@ -90,12 +108,30 @@ pub mod box_u16s {
             type Value = Box<[u16; N]>;
 
             fn expecting(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
-                write!(f, "u16 sequence of exact length {N}")
+                write!(f, "u16 buffer of exact length {N} ({} LE bytes)", N * 2)
+            }
+
+            fn visit_bytes<E: de::Error>(self, v: &[u8]) -> Result<Self::Value, E> {
+                if v.len() != N * 2 {
+                    return Err(E::invalid_length(v.len(), &self));
+                }
+                let mut out = alloc_boxed_array::<u16, N>(0);
+                for (dst, chunk) in out.iter_mut().zip(v.chunks_exact(2)) {
+                    *dst = u16::from_le_bytes([chunk[0], chunk[1]]);
+                }
+                Ok(out)
+            }
+
+            fn visit_byte_buf<E: de::Error>(self, v: Vec<u8>) -> Result<Self::Value, E> {
+                self.visit_bytes(&v)
             }
 
             fn visit_seq<A: SeqAccess<'de>>(self, mut seq: A) -> Result<Self::Value, A::Error> {
                 let mut vec = Vec::with_capacity(N);
                 while let Some(v) = seq.next_element::<u16>()? {
+                    if vec.len() >= N {
+                        return Err(de::Error::invalid_length(N + 1, &self));
+                    }
                     vec.push(v);
                 }
                 if vec.len() != N {
@@ -107,6 +143,6 @@ pub mod box_u16s {
             }
         }
 
-        deserializer.deserialize_seq(BoxU16sVisitor::<N>)
+        deserializer.deserialize_bytes(BoxU16sVisitor::<N>)
     }
 }

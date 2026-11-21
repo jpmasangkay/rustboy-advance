@@ -273,9 +273,7 @@ name = "nba-hw-test/bus/128kb-boundary.gba"
 rom_path = "test-roms/nba-hw-test/bus/128kb-boundary/128kb-boundary.gba"
 frames = 60
 criterion = "screenshot"
-known_failure = true
-known_bad_crc32 = "0x8e9c5c44"
-notes = "13/16 pass; DMA DEC 07FFFFF8 (68 vs 63) & 0801FFF0/0803FFF0 (68 vs 70) fail"
+notes = "18/18 PASS (LDM, DMA INC, DMA DEC across 128 KiB ROM boundaries)"
 
 [[tests]]
 id = "nba_dma_burst_into_tears"
@@ -284,9 +282,7 @@ name = "nba-hw-test/dma/burst-into-tears.gba"
 rom_path = "test-roms/nba-hw-test/dma/burst-into-tears/burst-into-tears.gba"
 frames = 60
 criterion = "screenshot"
-known_failure = true
-known_bad_crc32 = "0x53e7d0fe"
-notes = "0/3 pass (1ST: 0x2e vs 0xea00, 2ND: 0xea00 vs 0xff24, DMA TIME: 43 vs 41)"
+notes = "3/3 PASS (1ST: 0xea00, 2ND: 0xff24, DMA TIME: 41)"
 
 [[tests]]
 id = "nba_dma_force_nseq_access"
@@ -295,9 +291,7 @@ name = "nba-hw-test/dma/force-nseq-access.gba"
 rom_path = "test-roms/nba-hw-test/dma/force-nseq-access/force-nseq-access.gba"
 frames = 60
 criterion = "screenshot"
-known_failure = true
-known_bad_crc32 = "0x72dcf1e2"
-notes = "0/2 pass (EWRAM DMA: 78 vs 88, ROM DMA: 78 vs 88)"
+notes = "2/2 PASS (EWRAM DMA: 88, ROM DMA: 88)"
 
 [[tests]]
 id = "nba_dma_latch"
@@ -322,9 +316,7 @@ name = "nba-hw-test/haltcnt.gba"
 rom_path = "test-roms/nba-hw-test/haltcnt/haltcnt.gba"
 frames = 60
 criterion = "screenshot"
-known_failure = true
-known_bad_crc32 = "0x467f7fbb"
-notes = "3/6 pass (HLE BIOS; CPUSET, POSTFLG, CPUSET DMA fail)"
+notes = "6/6 PASS (DIRECT: 12, CPUSET: 4155, POSTFLG: 1, CPUSET DMA: 4154, TIME IWRAM: 125, TIME ROM: 249)"
 
 [[tests]]
 id = "nba_irq_delay"
@@ -333,9 +325,7 @@ name = "nba-hw-test/irq/irq-delay.gba"
 rom_path = "test-roms/nba-hw-test/irq/irq-delay/irq-delay.gba"
 frames = 60
 criterion = "screenshot"
-known_failure = true
-known_bad_crc32 = "0x73b6a3c4"
-notes = "0/3 pass (IWRAM: 95 vs 92, EWRAM: 110 vs 112, ROM: 110 vs 120)"
+notes = "3/3 PASS (IWRAM: 92, EWRAM: 112, ROM: 120)"
 
 [[tests]]
 id = "nba_ppu_bgpd"
@@ -343,10 +333,8 @@ suite = "nba-hw-test"
 name = "nba-hw-test/ppu/bgpd.gba"
 rom_path = "test-roms/nba-hw-test/ppu/bgpd/bgpd.gba"
 frames = 30
-criterion = "fb_hash"
-known_failure = true
-known_bad_crc32 = "0x41b13174"
-notes = "Visual mismatch vs expected.png (3 linear grey ramps instead of 2 ramps)"
+criterion = "screenshot"
+notes = "Verified visually against upstream expected.png (2 smooth linear grey ramps)"
 
 [[tests]]
 id = "nba_ppu_bgx"
@@ -354,10 +342,8 @@ suite = "nba-hw-test"
 name = "nba-hw-test/ppu/bgx.gba"
 rom_path = "test-roms/nba-hw-test/ppu/bgx/bgx.gba"
 frames = 30
-criterion = "fb_hash"
-known_failure = true
-known_bad_crc32 = "0xd5370a26"
-notes = "Visual mismatch vs expected.png (solid green; missing center vertical white line)"
+criterion = "screenshot"
+notes = "Verified visually against upstream expected.png (white pixel at (0,0) and vertical white line at x=129)"
 
 [[tests]]
 id = "nba_ppu_dispcnt_latch"
@@ -365,10 +351,8 @@ suite = "nba-hw-test"
 name = "nba-hw-test/ppu/dispcnt-latch.gba"
 rom_path = "test-roms/nba-hw-test/ppu/dispcnt-latch/dispcnt-latch.gba"
 frames = 30
-criterion = "fb_hash"
-known_failure = true
-known_bad_crc32 = "0x7ccd9bca"
-notes = "Visual mismatch vs expected.png (full-height BCDEF/DEFGH; missing scanline latch delay)"
+criterion = "screenshot"
+notes = "Verified visually against upstream expected.png (2-scanline BG/OBJ/forced-blank latch, immediate WIN0)"
 
 [[tests]]
 id = "nba_ppu_greenswap"
@@ -376,10 +360,8 @@ suite = "nba-hw-test"
 name = "nba-hw-test/ppu/greenswap.gba"
 rom_path = "test-roms/nba-hw-test/ppu/greenswap/greenswap.gba"
 frames = 30
-criterion = "fb_hash"
-known_failure = true
-known_bad_crc32 = "0x9a420c77"
-notes = "Visual mismatch vs expected.png (mid-scanline GREENSWAP toggle requires dot-level PPU)"
+criterion = "screenshot"
+notes = "Verified visually against upstream expected.png (mid-scanline GREENSWAP toggle at x=86)"
 
 [[tests]]
 id = "nba_ppu_ram_access_timing"

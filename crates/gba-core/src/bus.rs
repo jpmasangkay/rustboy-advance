@@ -137,6 +137,8 @@ pub struct SysBus {
     #[serde(default)]
     pub hdraw_start_cycle: u64,
     #[serde(default)]
+    pub hblank_start_cycle: u64,
+    #[serde(default)]
     pub scanline_dots_started: bool,
 
     // Debug watchpoints (fast-path `watchpoint_active` bool avoids overhead when empty).
@@ -146,6 +148,10 @@ pub struct SysBus {
     pub debug_pc: u32,
     #[serde(default)]
     pub force_next_fetch_nseq: bool,
+    #[serde(default)]
+    pub rom_burst_active: bool,
+    #[serde(default)]
+    pub rom_burst_addr: u32,
     #[serde(skip)]
     pub watchpoint_hit: Option<WatchpointHit>,
     #[serde(skip)]
@@ -215,10 +221,13 @@ impl Clone for SysBus {
             last_cycles: self.last_cycles,
             instr_fetch_cycles: self.instr_fetch_cycles,
             hdraw_start_cycle: self.hdraw_start_cycle,
+            hblank_start_cycle: self.hblank_start_cycle,
             scanline_dots_started: self.scanline_dots_started,
             watchpoint_active: self.watchpoint_active,
             debug_pc: self.debug_pc,
             force_next_fetch_nseq: self.force_next_fetch_nseq,
+            rom_burst_active: self.rom_burst_active,
+            rom_burst_addr: self.rom_burst_addr,
             watchpoint_hit: self.watchpoint_hit,
             watchpoints: self.watchpoints.clone(),
             bench_active: self.bench_active,
@@ -262,7 +271,7 @@ impl SysBus {
         };
 
         let mut scheduler = Scheduler::new();
-        scheduler.schedule(960, EventType::PpuHDrawEnd);
+        scheduler.schedule(1006, EventType::PpuHDrawEnd);
 
         let mut bus = Self {
             bios: bios_buf,
@@ -289,10 +298,13 @@ impl SysBus {
             last_cycles: 0,
             instr_fetch_cycles: 0,
             hdraw_start_cycle: 0,
+            hblank_start_cycle: 0,
             scanline_dots_started: false,
             watchpoint_active: false,
             debug_pc: 0,
             force_next_fetch_nseq: false,
+            rom_burst_active: false,
+            rom_burst_addr: 0,
             watchpoint_hit: None,
             watchpoints: Vec::new(),
             bench_active: false,
@@ -322,6 +334,7 @@ impl SysBus {
         };
         // Vector table entries
         write_w(bios, 0x0000, 0xEA00_0006); // B 0x0020
+        write_w(bios, 0x0008, 0xEA00_0054); // SWI -> B 0x0160
         write_w(bios, 0x0018, 0xEA00_0042); // IRQ -> B 0x0128
         // Standard GBA BIOS IRQ trampoline at 0x0128
         write_w(bios, 0x0128, 0xE92D_500F); // STMDB SP!, {R0-R3, R12, LR}
@@ -334,6 +347,95 @@ impl SysBus {
         write_w(bios, 0x0140, 0xEFFE_00FE); // SWI 0xFE (encoded in both upper and lower fields)
         // Matches retail BIOS word at 0x0144 (prefetched when SUBS PC, LR, #4 at 0x013C finishes IRQ)
         write_w(bios, 0x0144, 0xE55E_C002);
+
+        // Clean-room ARM HLE SWI dispatcher (0x0160..0x01D0) + CpuSet (0x01D4..0x0274).
+        // Mirrors the real GBA BIOS SWI calling convention (SVC->SYS mode switch, reading the SWI
+        // comment byte from [lr, #-2], bounds-checked table dispatch, CpuSet subroutine, SYS->SVC return):
+        //  - HALTCNT/POSTFLG writes execute with genuine BIOS privilege (`PC < 0x4000`) and halt
+        //    mid-routine so wake-up and epilogue timing match real hardware.
+        //  - Reading `[lr, #-2]` from IWRAM vs ROM naturally reflects the ROM waitstate delta.
+        write_w(bios, 0x0160, 0xE92D_5800); // stmfd sp!, {r11, r12, lr}
+        write_w(bios, 0x0164, 0xE14F_B000); // mrs r11, spsr
+        write_w(bios, 0x0168, 0xE92D_0800); // stmfd sp!, {r11}
+        write_w(bios, 0x016C, 0xE31B_0020); // tst r11, #0x20 (Thumb check)
+        write_w(bios, 0x0170, 0xE55E_C002); // ldrb r12, [lr, #-2] (SWI comment byte)
+        write_w(bios, 0x0174, 0xE20B_B080); // and r11, r11, #0x80 (preserve caller I flag)
+        write_w(bios, 0x0178, 0xE38B_B01F); // orr r11, r11, #0x1F (SYS mode)
+        write_w(bios, 0x017C, 0xE121_F00B); // msr cpsr_c, r11
+        write_w(bios, 0x0180, 0xE92D_4004); // stmfd sp!, {r2, lr}
+        write_w(bios, 0x0184, 0xE35C_002B); // cmp r12, #0x2B (SWI table bounds check)
+        write_w(bios, 0x0188, 0x2A00_0004); // bhs 0x01A0 (swi_return)
+        write_w(bios, 0x018C, 0xE59F_B03C); // ldr r11, [pc, #0x3C] (0x01D0 -> table ptr)
+        write_w(bios, 0x0190, 0xE24C_C00B); // sub r12, r12, #0x0B
+        write_w(bios, 0x0194, 0xE79B_C10C); // ldr r12, [r11, r12, lsl #2]
+        write_w(bios, 0x0198, 0xE1A0_E00F); // mov lr, pc (0x01A0)
+        write_w(bios, 0x019C, 0xE12F_FF1C); // bx r12 (call CpuSet)
+        // SWI return epilogue (0x01A0):
+        write_w(bios, 0x01A0, 0xE8BD_4004); // ldmfd sp!, {r2, lr}
+        write_w(bios, 0x01A4, 0xE10F_B000); // mrs r11, cpsr
+        write_w(bios, 0x01A8, 0xE3CB_B01F); // bic r11, r11, #0x1F
+        write_w(bios, 0x01AC, 0xE38B_B093); // orr r11, r11, #0x93 (SVC + IRQ disabled)
+        write_w(bios, 0x01B0, 0xE121_F00B); // msr cpsr_c, r11
+        write_w(bios, 0x01B4, 0xE8BD_0800); // ldmfd sp!, {r11}
+        write_w(bios, 0x01B8, 0xE16F_F00B); // msr spsr_fsxc, r11
+        write_w(bios, 0x01BC, 0xE8BD_5800); // ldmfd sp!, {r11, r12, lr}
+        write_w(bios, 0x01C0, 0xE1B0_F00E); // movs pc, lr
+        // Prefetched BIOS open-bus words right after SWI return (matching retail GBA BIOS latch):
+        write_w(bios, 0x01C4, 0xE3A0_2004);
+        write_w(bios, 0x01C8, 0xE3A0_2004);
+        // SWI dispatch table entry for 0x0B -> CpuSet at 0x01D4, plus table base pointer literal:
+        write_w(bios, 0x01CC, 0x0000_01D4);
+        write_w(bios, 0x01D0, 0x0000_01CC);
+
+        // CpuSet subroutine at 0x01D4..0x0274:
+        write_w(bios, 0x01D4, 0xE92D_5FF8); // stmfd sp!, {r3-r12, lr}
+        write_w(bios, 0x01D8, 0xE350_0402); // cmp r0, #0x02000000 (BIOS source protection)
+        write_w(bios, 0x01DC, 0x3A00_0023); // blo 0x0270 (done)
+        write_w(bios, 0x01E0, 0xE351_0402); // cmp r1, #0x02000000 (BIOS dest protection)
+        write_w(bios, 0x01E4, 0x3A00_0021); // blo 0x0270 (done)
+        write_w(bios, 0x01E8, 0xE202_5401); // and r5, r2, #0x01000000 (fixed-src flag)
+        write_w(bios, 0x01EC, 0xE202_6301); // and r6, r2, #0x04000000 (32-bit flag)
+        write_w(bios, 0x01F0, 0xE1A0_3582); // mov r3, r2, lsl #11
+        write_w(bios, 0x01F4, 0xE1B0_35A3); // movs r3, r3, lsr #11 (count = cnt & 0x1FFFFF)
+        write_w(bios, 0x01F8, 0x0A00_001C); // beq 0x0270 (done)
+        write_w(bios, 0x01FC, 0xE356_0000); // cmp r6, #0
+        write_w(bios, 0x0200, 0x1A00_000D); // bne 0x023C (copy32)
+        // 16-bit CpuSet (r0 &= !1, r1 &= !1)
+        write_w(bios, 0x0204, 0xE3C0_0001); // bic r0, r0, #1
+        write_w(bios, 0x0208, 0xE3C1_1001); // bic r1, r1, #1
+        write_w(bios, 0x020C, 0xE355_0000); // cmp r5, #0
+        write_w(bios, 0x0210, 0x1A00_0004); // bne 0x0228 (fill16)
+        // copy16 loop (0x0214):
+        write_w(bios, 0x0214, 0xE0D0_40B2); // ldrh r4, [r0], #2
+        write_w(bios, 0x0218, 0xE0C1_40B2); // strh r4, [r1], #2
+        write_w(bios, 0x021C, 0xE253_3001); // subs r3, r3, #1
+        write_w(bios, 0x0220, 0x1AFF_FFFB); // bne 0x0214
+        write_w(bios, 0x0224, 0xEA00_0011); // b 0x0270 (done)
+        // fill16 loop (0x0228):
+        write_w(bios, 0x0228, 0xE1D0_40B0); // ldrh r4, [r0]
+        write_w(bios, 0x022C, 0xE0C1_40B2); // strh r4, [r1], #2
+        write_w(bios, 0x0230, 0xE253_3001); // subs r3, r3, #1
+        write_w(bios, 0x0234, 0x1AFF_FFFB); // bne 0x0228
+        write_w(bios, 0x0238, 0xEA00_000C); // b 0x0270 (done)
+        // copy32 (0x023C):
+        write_w(bios, 0x023C, 0xE3C0_0003); // bic r0, r0, #3
+        write_w(bios, 0x0240, 0xE3C1_1003); // bic r1, r1, #3
+        write_w(bios, 0x0244, 0xE355_0000); // cmp r5, #0
+        write_w(bios, 0x0248, 0x1A00_0004); // bne 0x0260 (fill32)
+        // copy32 loop (0x024C):
+        write_w(bios, 0x024C, 0xE490_4004); // ldr r4, [r0], #4
+        write_w(bios, 0x0250, 0xE481_4004); // str r4, [r1], #4
+        write_w(bios, 0x0254, 0xE253_3001); // subs r3, r3, #1
+        write_w(bios, 0x0258, 0x1AFF_FFFB); // bne 0x024C
+        write_w(bios, 0x025C, 0xEA00_0003); // b 0x0270 (done)
+        // fill32 loop (0x0260):
+        write_w(bios, 0x0260, 0xE590_4000); // ldr r4, [r0]
+        write_w(bios, 0x0264, 0xE481_4004); // str r4, [r1], #4
+        write_w(bios, 0x0268, 0xE253_3001); // subs r3, r3, #1
+        write_w(bios, 0x026C, 0x1AFF_FFFB); // bne 0x0260
+        // done (0x0270):
+        write_w(bios, 0x0270, 0xE8BD_5FF8); // ldmfd sp!, {r3-r12, lr}
+        write_w(bios, 0x0274, 0xE12F_FF1E); // bx lr
     }
 
     pub fn rebuild_fastmem(&mut self) {
@@ -546,6 +648,30 @@ impl SysBus {
         }
     }
 
+    /// Advances the Game Pak ROM 16-bit sequential burst address counter for a single halfword access.
+    ///
+    /// Returns `(effective_rom_addr, cycles)`. On real GBA hardware, Non-Sequential accesses latch the
+    /// full address into the cartridge ROM and start a sequential burst; Sequential accesses omit the
+    /// address phase and clock the cartridge's internal 16-bit halfword counter (`A1..A16`), while the
+    /// GBA SoC ends the burst (`rom_burst_active = false`) whenever `(addr & 0x1FFFF) == 0x1FFFE`
+    /// so the subsequent ROM access is forced Non-Sequential across 128 KiB boundaries.
+    #[inline]
+    pub fn rom_step_burst(&mut self, aligned: u32, access: AccessType) -> (u32, u64) {
+        let ws = Self::rom_waitstate_idx(aligned);
+        let (eff_addr, cyc) = if access == AccessType::NonSequential || !self.rom_burst_active {
+            let cyc = self.rom_n_wait[ws];
+            self.rom_burst_addr = (aligned & !0x1FFFF) | (aligned.wrapping_add(2) & 0x1FFFF);
+            (aligned, cyc)
+        } else {
+            let cyc = self.rom_s_wait[ws];
+            let eff = self.rom_burst_addr;
+            self.rom_burst_addr = (eff & !0x1FFFF) | (eff.wrapping_add(2) & 0x1FFFF);
+            (eff, cyc)
+        };
+        self.rom_burst_active = (aligned & 0x1FFFF) != 0x1FFFE;
+        (eff_addr, cyc)
+    }
+
     #[inline]
     pub fn step_internal(&mut self, cycles: u64) {
         self.step_prefetch(cycles);
@@ -586,18 +712,24 @@ impl SysBus {
         if !self.ppu.dot_accurate_mode {
             return;
         }
+        self.sync_ppu_hdraw_now();
+    }
+
+    #[inline]
+    pub fn sync_ppu_hdraw_now(&mut self) {
         if self.ppu.vcount < 160 && (self.ppu.dispstat & 0x0002) == 0 {
-            if !self.scanline_dots_started {
-                self.ppu.begin_scanline(self.ppu.vcount as usize);
-                self.scanline_dots_started = true;
-            }
             let elapsed = self
                 .scheduler
                 .current_cycle
                 .saturating_sub(self.hdraw_start_cycle);
-            let target_x = ((elapsed / 4) as usize).min(crate::LCD_WIDTH);
+            let target_x = ((elapsed.saturating_sub(46)) / 4) as usize;
+            let target_x = target_x.min(crate::LCD_WIDTH);
             let cur_x = self.ppu.dot_x as usize;
             if target_x > cur_x {
+                if !self.scanline_dots_started {
+                    self.ppu.begin_scanline(self.ppu.vcount as usize);
+                    self.scanline_dots_started = true;
+                }
                 self.ppu
                     .render_dot_range(self.ppu.vcount as usize, cur_x, target_x);
                 self.ppu.dot_x = target_x as u16;
@@ -608,6 +740,7 @@ impl SysBus {
     pub fn dispatch_event(&mut self, ev_cycle: u64, kind: EventType) {
         match kind {
             EventType::PpuHDrawEnd => {
+                self.hblank_start_cycle = ev_cycle;
                 self.ppu.dispstat |= 0x0002; // Enter HBlank
                 if self.ppu.vcount < 160 {
                     #[cfg(feature = "std")]
@@ -656,11 +789,14 @@ impl SysBus {
                     self.hw.request_irq(IRQ_HBLANK);
                 }
                 self.scheduler
-                    .schedule(ev_cycle + 272, EventType::PpuHBlank);
+                    .schedule(ev_cycle + 226, EventType::PpuHBlank);
             }
             EventType::PpuHBlank => {
                 self.ppu.dispstat &= !0x0002; // Exit HBlank
-                self.ppu.vcount = (self.ppu.vcount + 1) % 228;
+                let prev_vcount = self.ppu.vcount;
+                self.ppu.finish_hblank_affine(prev_vcount < 160);
+                self.ppu.vcount = (prev_vcount + 1) % 228;
+                self.ppu.advance_dispcnt_pipeline();
 
                 #[cfg(feature = "std")]
                 let t0 = if self.bench_active {
@@ -716,7 +852,7 @@ impl SysBus {
                 }
 
                 self.scheduler
-                    .schedule(ev_cycle + 960, EventType::PpuHDrawEnd);
+                    .schedule(ev_cycle + 1006, EventType::PpuHDrawEnd);
             }
             EventType::PpuDotStep => {
                 if self.ppu.dot_accurate_mode
@@ -1182,25 +1318,29 @@ impl SysBus {
         val
     }
 
-    fn read_8_inner(&mut self, addr: u32, access: AccessType, pc: u32, is_thumb: bool) -> u8 {
+    fn read_8_inner(&mut self, addr: u32, _access: AccessType, pc: u32, is_thumb: bool) -> u8 {
         self.last_cycles = 1;
         if addr < 0x1000_0000 {
             let page = (addr >> 14) as usize;
             if let Some(ptr) = self.fastmem_read[page] {
                 let region = (addr >> 24) & 0x0F;
+                if (0x08..=0x0D).contains(&region) {
+                    self.prefetch.invalidate();
+                    self.force_next_fetch_nseq = true;
+                    let aligned = addr & !1;
+                    let (_, cyc) = self.rom_step_burst(aligned, AccessType::NonSequential);
+                    self.last_cycles = cyc;
+                    self.last_access_was_dma = false;
+                    // SAFETY: `page` has an active `fastmem_read` pointer within ROM allocation.
+                    return unsafe { *ptr.as_ptr().add((addr & 0x3FFF) as usize) };
+                }
                 let cyc = match region {
                     0x02 => self.waitstate_table[0x02][0][0] as u64,
                     0x03 => 1,
                     0x06 => 1,
-                    0x08..=0x0D => {
-                        self.prefetch.invalidate();
-                        self.rom_fetch_cycles(addr & !1, access)
-                    }
                     _ => 1,
                 };
-                if !(0x08..=0x0D).contains(&region) {
-                    self.step_prefetch(cyc);
-                }
+                self.step_prefetch(cyc);
                 self.last_cycles = cyc;
                 self.last_access_was_dma = false;
                 // SAFETY: `page` has an active `fastmem_read` pointer only if `off + 0x4000` is within the
@@ -1259,16 +1399,18 @@ impl SysBus {
             0x07 => (self.ppu.oam[(addr as usize) & 0x3FF], 1, true),
             0x08..=0x0D => {
                 self.prefetch.invalidate();
+                self.force_next_fetch_nseq = true;
+                let (_, c) = self.rom_step_burst(addr & !1, AccessType::NonSequential);
                 let v16 = if self.cart.is_eeprom_addr(addr & !1) {
                     self.cart.eeprom.read_bit()
                 } else {
                     self.cart.read_rom_16(addr & !1)
                 };
-                let c = self.rom_fetch_cycles(addr & !1, access);
                 (((v16 >> ((addr & 1) * 8)) & 0xFF) as u8, c, true)
             }
             0x0E | 0x0F => {
                 self.prefetch.invalidate();
+                self.rom_burst_active = false;
                 (self.cart.read_sram(addr), self.sram_wait, true)
             }
             _ => (self.read_open_bus_8(addr, pc, is_thumb), 1, false),
@@ -1302,19 +1444,29 @@ impl SysBus {
             let page = (aligned >> 14) as usize;
             if let Some(ptr) = self.fastmem_read[page] {
                 let region = (aligned >> 24) & 0x0F;
+                if (0x08..=0x0D).contains(&region) {
+                    self.prefetch.invalidate();
+                    self.force_next_fetch_nseq = true;
+                    let (eff_addr, cyc) = self.rom_step_burst(aligned, access);
+                    self.last_cycles = cyc;
+                    self.last_access_was_dma = false;
+                    if eff_addr == aligned {
+                        let off = (aligned & 0x3FFE) as usize;
+                        return unsafe {
+                            (ptr.as_ptr().add(off) as *const u16)
+                                .read_unaligned()
+                                .to_le()
+                        };
+                    }
+                    return self.read_rom_half_raw(eff_addr);
+                }
                 let cyc = match region {
                     0x02 => self.waitstate_table[0x02][1][0] as u64,
                     0x03 => 1,
                     0x06 => 1,
-                    0x08..=0x0D => {
-                        self.prefetch.invalidate();
-                        self.rom_fetch_cycles(aligned, access)
-                    }
                     _ => 1,
                 };
-                if !(0x08..=0x0D).contains(&region) {
-                    self.step_prefetch(cyc);
-                }
+                self.step_prefetch(cyc);
                 self.last_cycles = cyc;
                 self.last_access_was_dma = false;
                 let off = (aligned & 0x3FFE) as usize;
@@ -1333,18 +1485,20 @@ impl SysBus {
         let region = (aligned >> 24) & 0x0F;
         if (0x08..=0x0D).contains(&region) && addr < 0x1000_0000 {
             self.prefetch.invalidate();
+            self.force_next_fetch_nseq = true;
+            let (eff_addr, cyc) = self.rom_step_burst(aligned, access);
             let v = if self.cart.is_eeprom_addr(aligned) {
                 self.cart.eeprom.read_bit()
             } else {
-                self.cart.read_rom_16(aligned)
+                self.cart.read_rom_16(eff_addr)
             };
-            let cyc = self.rom_fetch_cycles(aligned, access);
             self.last_cycles = cyc;
             self.last_access_was_dma = false;
             return v;
         }
         if (region == 0x0E || region == 0x0F) && addr < 0x1000_0000 {
             self.prefetch.invalidate();
+            self.rom_burst_active = false;
             let b = self.cart.read_sram(addr) as u16;
             self.last_cycles = self.sram_wait;
             self.last_access_was_dma = false;
@@ -1454,20 +1608,33 @@ impl SysBus {
             let page = (aligned >> 14) as usize;
             if let Some(ptr) = self.fastmem_read[page] {
                 let region = (aligned >> 24) & 0x0F;
+                if (0x08..=0x0D).contains(&region) {
+                    self.prefetch.invalidate();
+                    self.force_next_fetch_nseq = true;
+                    let (eff_lo, c0) = self.rom_step_burst(aligned, access);
+                    let (eff_hi, c1) =
+                        self.rom_step_burst(aligned.wrapping_add(2), AccessType::Sequential);
+                    self.last_cycles = c0 + c1;
+                    self.last_access_was_dma = false;
+                    if eff_lo == aligned && eff_hi == aligned.wrapping_add(2) {
+                        let off = (aligned & 0x3FFC) as usize;
+                        return unsafe {
+                            (ptr.as_ptr().add(off) as *const u32)
+                                .read_unaligned()
+                                .to_le()
+                        };
+                    }
+                    let lo = self.read_rom_half_raw(eff_lo) as u32;
+                    let hi = self.read_rom_half_raw(eff_hi) as u32;
+                    return lo | (hi << 16);
+                }
                 let cyc = match region {
                     0x02 => self.waitstate_table[0x02][2][0] as u64,
                     0x03 => 1,
                     0x06 => 2,
-                    0x08..=0x0D => {
-                        self.prefetch.invalidate();
-                        self.rom_fetch_cycles(aligned, access)
-                            + self.rom_fetch_cycles(aligned + 2, AccessType::Sequential)
-                    }
                     _ => 1,
                 };
-                if !(0x08..=0x0D).contains(&region) {
-                    self.step_prefetch(cyc);
-                }
+                self.step_prefetch(cyc);
                 self.last_cycles = cyc;
                 self.last_access_was_dma = false;
                 let off = (aligned & 0x3FFC) as usize;
@@ -1485,19 +1652,25 @@ impl SysBus {
         let region = (aligned >> 24) & 0x0F;
         if (0x08..=0x0D).contains(&region) && addr < 0x1000_0000 {
             self.prefetch.invalidate();
+            self.force_next_fetch_nseq = true;
+            let (eff_lo, c0) = self.rom_step_burst(aligned, access);
+            let (eff_hi, c1) = self.rom_step_burst(aligned.wrapping_add(2), AccessType::Sequential);
             let v = if self.cart.is_eeprom_addr(aligned) {
                 self.cart.eeprom.read_bit() as u32
-            } else {
+            } else if eff_lo == aligned && eff_hi == aligned.wrapping_add(2) {
                 self.cart.read_rom_32(aligned)
+            } else {
+                let lo = self.cart.read_rom_16(eff_lo) as u32;
+                let hi = self.cart.read_rom_16(eff_hi) as u32;
+                lo | (hi << 16)
             };
-            let cyc = self.rom_fetch_cycles(aligned, access)
-                + self.rom_fetch_cycles(aligned + 2, AccessType::Sequential);
-            self.last_cycles = cyc;
+            self.last_cycles = c0 + c1;
             self.last_access_was_dma = false;
             return v;
         }
         if (region == 0x0E || region == 0x0F) && addr < 0x1000_0000 {
             self.prefetch.invalidate();
+            self.rom_burst_active = false;
             let b = self.cart.read_sram(addr) as u32;
             self.last_cycles = self.sram_wait;
             self.last_access_was_dma = false;
@@ -1707,10 +1880,12 @@ impl SysBus {
             }
             0x08..=0x0D => {
                 self.prefetch.invalidate();
-                self.rom_fetch_cycles(addr & !1, access)
+                self.force_next_fetch_nseq = true;
+                self.rom_step_burst(addr & !1, access).1
             }
             0x0E | 0x0F if addr < 0x1000_0000 => {
                 self.prefetch.invalidate();
+                self.rom_burst_active = false;
                 self.cart.write_sram(addr, val);
                 self.sram_wait
             }
@@ -1813,6 +1988,8 @@ impl SysBus {
             }
             0x08..=0x0D => {
                 self.prefetch.invalidate();
+                self.force_next_fetch_nseq = true;
+                let (eff_addr, cyc) = self.rom_step_burst(aligned, access);
                 if self.cart.is_eeprom_addr(aligned) {
                     self.cart.eeprom.write_bit(
                         &mut self.cart.sram,
@@ -1821,12 +1998,13 @@ impl SysBus {
                         0,
                     );
                 } else {
-                    self.cart.write_rom_16(aligned, val);
+                    self.cart.write_rom_16(eff_addr, val);
                 }
-                self.rom_fetch_cycles(aligned, access)
+                cyc
             }
             0x0E | 0x0F => {
                 self.prefetch.invalidate();
+                self.rom_burst_active = false;
                 // 16-bit write to SRAM writes the low byte corresponding to addr & 1 (shifted!)
                 let byte = (val >> ((addr & 1) * 8)) as u8;
                 self.cart.write_sram(addr, byte);
@@ -1939,13 +2117,17 @@ impl SysBus {
             }
             0x08..=0x0D => {
                 self.prefetch.invalidate();
-                self.cart.write_rom_16(aligned, val as u16);
-                self.cart.write_rom_16(aligned + 2, (val >> 16) as u16);
-                self.rom_fetch_cycles(aligned, access)
-                    + self.rom_fetch_cycles(aligned + 2, AccessType::Sequential)
+                self.force_next_fetch_nseq = true;
+                let (eff_lo, c0) = self.rom_step_burst(aligned, access);
+                let (eff_hi, c1) =
+                    self.rom_step_burst(aligned.wrapping_add(2), AccessType::Sequential);
+                self.cart.write_rom_16(eff_lo, val as u16);
+                self.cart.write_rom_16(eff_hi, (val >> 16) as u16);
+                c0 + c1
             }
             0x0E | 0x0F => {
                 self.prefetch.invalidate();
+                self.rom_burst_active = false;
                 let byte = (val >> ((addr & 3) * 8)) as u8;
                 self.cart.write_sram(addr, byte);
                 self.sram_wait

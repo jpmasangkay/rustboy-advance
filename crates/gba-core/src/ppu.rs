@@ -151,6 +151,37 @@ pub struct Ppu {
     mosaic_ref_y: [i32; 2],
     #[serde(skip, default)]
     mosaic_ref_valid: bool,
+
+    // Hardware DISPCNT 3-scanline enable / forced-blank pipeline latches
+    #[serde(default)]
+    dispcnt_pipe_active: bool,
+    #[serde(default)]
+    bg_enable_pipe: [u8; 3],
+    #[serde(default = "default_forced_blank_pipe")]
+    forced_blank_pipe: [bool; 3],
+
+    // Hardware HBlank affine latches (PB/PD sampled ~18 cycles before HBlank end;
+    // BG2X/BG2Y HDraw writes deferred to next scanline; HBlank writes latched at HBlank end)
+    #[serde(default)]
+    latched_bgp_b: [i16; 2],
+    #[serde(default = "default_affine_diag")]
+    latched_bgp_d: [i16; 2],
+    #[serde(default)]
+    hblank_written_ref_x: [Option<i32>; 2],
+    #[serde(default)]
+    hblank_written_ref_y: [Option<i32>; 2],
+    #[serde(default)]
+    hdraw_bgx_dirty: [bool; 2],
+    #[serde(default)]
+    hdraw_bgy_dirty: [bool; 2],
+}
+
+fn default_forced_blank_pipe() -> [bool; 3] {
+    [true; 3]
+}
+
+fn default_affine_diag() -> [i16; 2] {
+    [0x0100; 2]
 }
 
 fn default_layer_enable_mask() -> u8 {
@@ -214,7 +245,77 @@ impl Ppu {
             mosaic_ref_x: [0; 2],
             mosaic_ref_y: [0; 2],
             mosaic_ref_valid: false,
+            dispcnt_pipe_active: false,
+            bg_enable_pipe: [0; 3],
+            forced_blank_pipe: [true; 3],
+            latched_bgp_b: [0; 2],
+            latched_bgp_d: [0x0100; 2],
+            hblank_written_ref_x: [None; 2],
+            hblank_written_ref_y: [None; 2],
+            hdraw_bgx_dirty: [false; 2],
+            hdraw_bgy_dirty: [false; 2],
         }
+    }
+
+    #[inline(always)]
+    pub fn effective_bg_enable(&self) -> u8 {
+        if self.dispcnt_pipe_active {
+            self.bg_enable_pipe[2]
+        } else {
+            ((self.dispcnt >> 8) & 0x1F) as u8
+        }
+    }
+
+    #[inline(always)]
+    pub fn effective_forced_blank(&self) -> bool {
+        if self.dispcnt_pipe_active {
+            self.forced_blank_pipe[2]
+        } else {
+            (self.dispcnt & 0x0080) != 0
+        }
+    }
+
+    /// Writes `REG_DISPCNT` through the GBA hardware 3-scanline enable/forced-blank latch pipeline:
+    /// - Clearing a BG/OBJ enable bit (1 -> 0) takes effect immediately across all stages.
+    /// - Setting a BG/OBJ enable bit (0 -> 1) takes 2 full scanlines to propagate.
+    /// - Enabling Forced Blank (0 -> 1) takes effect immediately across all stages.
+    /// - Disabling Forced Blank (1 -> 0) takes 2 full scanlines to propagate.
+    /// - Window enable bits (13..15) take effect immediately without pipeline delay.
+    #[inline]
+    pub fn write_dispcnt(&mut self, val: u16) {
+        if !self.dispcnt_pipe_active {
+            let prev_en = ((self.dispcnt >> 8) & 0x1F) as u8;
+            let prev_fb = (self.dispcnt & 0x0080) != 0;
+            self.bg_enable_pipe = [prev_en; 3];
+            self.forced_blank_pipe = [prev_fb; 3];
+            self.dispcnt_pipe_active = true;
+        }
+        let new_val = val & 0xFFF7;
+        let new_en = ((new_val >> 8) & 0x1F) as u8;
+        let new_fb = (new_val & 0x0080) != 0;
+        self.dispcnt = new_val;
+        for stage in &mut self.bg_enable_pipe {
+            *stage &= new_en;
+        }
+        if new_fb {
+            self.forced_blank_pipe = [true; 3];
+        }
+    }
+
+    /// Shifts the DISPCNT enable and forced-blank pipeline by one scanline (called at scanline start).
+    #[inline]
+    pub fn advance_dispcnt_pipeline(&mut self) {
+        if !self.dispcnt_pipe_active {
+            return;
+        }
+        let cur_en = ((self.dispcnt >> 8) & 0x1F) as u8;
+        let cur_fb = (self.dispcnt & 0x0080) != 0;
+        self.bg_enable_pipe[2] = self.bg_enable_pipe[1];
+        self.bg_enable_pipe[1] = self.bg_enable_pipe[0];
+        self.bg_enable_pipe[0] = cur_en;
+        self.forced_blank_pipe[2] = self.forced_blank_pipe[1];
+        self.forced_blank_pipe[1] = self.forced_blank_pipe[0];
+        self.forced_blank_pipe[0] = cur_fb;
     }
 
     #[inline]
@@ -236,6 +337,73 @@ impl Ppu {
         self.bgy[idx] = signed;
         self.ref_y[idx] = signed;
         self.mosaic_ref_y[idx] = signed;
+    }
+
+    #[inline]
+    pub fn set_bgx_timed(
+        &mut self,
+        idx: usize,
+        val: u32,
+        in_hblank: bool,
+        before_hblank_latch: bool,
+        in_vblank: bool,
+    ) {
+        let signed = ((val << 4) as i32) >> 4;
+        self.bgx[idx] = signed;
+        if in_vblank || self.effective_forced_blank() {
+            self.ref_x[idx] = signed;
+            self.mosaic_ref_x[idx] = signed;
+            self.hblank_written_ref_x[idx] = None;
+            self.hdraw_bgx_dirty[idx] = false;
+        } else if in_hblank {
+            if before_hblank_latch {
+                self.hblank_written_ref_x[idx] = Some(signed);
+            }
+        } else {
+            // Mid-HDraw writes to BG2X/BG3X do not alter the currently-rendering scanline.
+            self.hdraw_bgx_dirty[idx] = true;
+        }
+    }
+
+    #[inline]
+    pub fn set_bgy_timed(
+        &mut self,
+        idx: usize,
+        val: u32,
+        in_hblank: bool,
+        before_hblank_latch: bool,
+        in_vblank: bool,
+    ) {
+        let signed = ((val << 4) as i32) >> 4;
+        self.bgy[idx] = signed;
+        if in_vblank || self.effective_forced_blank() {
+            self.ref_y[idx] = signed;
+            self.mosaic_ref_y[idx] = signed;
+            self.hblank_written_ref_y[idx] = None;
+            self.hdraw_bgy_dirty[idx] = false;
+        } else if in_hblank {
+            if before_hblank_latch {
+                self.hblank_written_ref_y[idx] = Some(signed);
+            }
+        } else {
+            self.hdraw_bgy_dirty[idx] = true;
+        }
+    }
+
+    #[inline]
+    pub fn set_bgp_b(&mut self, idx: usize, val: i16, allow_hblank_latch: bool) {
+        self.bgp_b[idx] = val;
+        if allow_hblank_latch {
+            self.latched_bgp_b[idx] = val;
+        }
+    }
+
+    #[inline]
+    pub fn set_bgp_d(&mut self, idx: usize, val: i16, allow_hblank_latch: bool) {
+        self.bgp_d[idx] = val;
+        if allow_hblank_latch {
+            self.latched_bgp_d[idx] = val;
+        }
     }
 
     #[inline]
@@ -274,6 +442,12 @@ impl Ppu {
         self.mosaic_ref_x = self.bgx;
         self.mosaic_ref_y = self.bgy;
         self.mosaic_ref_valid = true;
+        self.latched_bgp_b = self.bgp_b;
+        self.latched_bgp_d = self.bgp_d;
+        self.hblank_written_ref_x = [None; 2];
+        self.hblank_written_ref_y = [None; 2];
+        self.hdraw_bgx_dirty = [false; 2];
+        self.hdraw_bgy_dirty = [false; 2];
     }
 
     pub fn step_affine_refs_scanline(&mut self) {
@@ -281,6 +455,48 @@ impl Ppu {
         self.ref_y[0] = self.ref_y[0].wrapping_add(self.bgp_d[0] as i32);
         self.ref_x[1] = self.ref_x[1].wrapping_add(self.bgp_b[1] as i32);
         self.ref_y[1] = self.ref_y[1].wrapping_add(self.bgp_d[1] as i32);
+    }
+
+    /// Commits HBlank affine updates (`ref += PB/PD` or latched HBlank `BG2X/Y` writes) at the end
+    /// of HBlank (`dot 1232`) before the next scanline begins.
+    pub fn finish_hblank_affine(&mut self, was_visible_line: bool) {
+        if was_visible_line {
+            let mode = self.dispcnt & 0x07;
+            // Affine vertical accumulation tracks the unpipelined DISPCNT forced-blank bit so
+            // scanline coordinates stay aligned immediately when leaving forced blank.
+            let step_ok = (self.dispcnt & 0x0080) == 0 && (1..=5).contains(&mode);
+            for i in 0..2 {
+                if let Some(v) = self.hblank_written_ref_x[i].take() {
+                    self.ref_x[i] = v;
+                    self.hdraw_bgx_dirty[i] = false;
+                } else {
+                    if self.hdraw_bgx_dirty[i] {
+                        self.ref_x[i] = self.bgx[i];
+                        self.hdraw_bgx_dirty[i] = false;
+                    }
+                    if step_ok {
+                        self.ref_x[i] = self.ref_x[i].wrapping_add(self.latched_bgp_b[i] as i32);
+                    }
+                }
+                if let Some(v) = self.hblank_written_ref_y[i].take() {
+                    self.ref_y[i] = v;
+                    self.hdraw_bgy_dirty[i] = false;
+                } else {
+                    if self.hdraw_bgy_dirty[i] {
+                        self.ref_y[i] = self.bgy[i];
+                        self.hdraw_bgy_dirty[i] = false;
+                    }
+                    if step_ok {
+                        self.ref_y[i] = self.ref_y[i].wrapping_add(self.latched_bgp_d[i] as i32);
+                    }
+                }
+            }
+        } else {
+            self.hblank_written_ref_x = [None; 2];
+            self.hblank_written_ref_y = [None; 2];
+        }
+        self.latched_bgp_b = self.bgp_b;
+        self.latched_bgp_d = self.bgp_d;
     }
 
     #[inline]
@@ -316,7 +532,7 @@ impl Ppu {
         }
 
         let mode = self.dispcnt & 0x07;
-        if (self.dispcnt & 0x0080) == 0 && (self.dispcnt & 0x1000) != 0 {
+        if !self.effective_forced_blank() && (self.effective_bg_enable() & 0x10) != 0 {
             if self.obj_line_dirty {
                 self.obj_line.fill(ObjPixel::empty());
                 self.obj_line_dirty = false;
@@ -338,14 +554,14 @@ impl Ppu {
         let row_start = y * LCD_WIDTH;
 
         // Forced Blank -> pure white
-        if (self.dispcnt & 0x0080) != 0 {
+        if self.effective_forced_blank() {
             self.framebuffer[row_start + x0..row_start + x1].fill(0x7FFF);
             return;
         }
 
         let mode = self.dispcnt & 0x07;
         let active_bg_mask =
-            ((self.dispcnt >> 8) as u8) & Self::mode_bg_mask(mode) & self.layer_enable_mask;
+            self.effective_bg_enable() & Self::mode_bg_mask(mode) & self.layer_enable_mask;
 
         for bg in 0..4 {
             if (active_bg_mask & (1 << bg)) != 0 {
@@ -400,10 +616,8 @@ impl Ppu {
     }
 
     pub fn end_scanline(&mut self) {
-        let mode = self.dispcnt & 0x07;
-        if (self.dispcnt & 0x0080) == 0 && (1..=5).contains(&mode) {
-            self.step_affine_refs_scanline();
-        }
+        // Affine vertical accumulation (ref += PB/PD) is committed at HBlank end in
+        // `finish_hblank_affine` to match real GBA HBlank latch timing.
     }
 
     pub fn render_scanline(&mut self, y: usize) {
@@ -421,18 +635,19 @@ impl Ppu {
         // Mode 4 Fast Path:
         // Active only when ALL of the following conditions hold:
         // 1. Mode 4 (bitmap 240x160 8bpp)
-        // 2. BG2 enabled in DISPCNT and layer_enable_mask
-        // 3. Forced blank is OFF
+        // 2. BG2 enabled in effective DISPCNT pipeline and layer_enable_mask
+        // 3. Forced blank is OFF (effective pipeline)
         // 4. Sprites and windows disabled: (dispcnt & 0xF000) == 0
         // 5. Special color effects disabled: (bldcnt & 0x00C0) == 0
         // 6. Mosaic disabled for BG2: (bgcnt[2] & 0x0040) == 0
         // 7. BG2 affine transform is identity: PA=0x0100, PB=0, PC=0, PD=0x0100, RefX=0, RefY/256 == y
         let mode = self.dispcnt & 0x07;
         let mode4_fast_path = mode == 4
-            && (self.dispcnt & 0x0400) != 0
+            && (self.effective_bg_enable() & 0x04) != 0
             && (self.layer_enable_mask & 0x04) != 0
-            && (self.dispcnt & 0x0080) == 0
-            && (self.dispcnt & 0xF000) == 0
+            && !self.effective_forced_blank()
+            && (self.effective_bg_enable() & 0x10) == 0
+            && (self.dispcnt & 0xE000) == 0
             && (self.bldcnt & 0x00C0) == 0
             && (self.bgcnt[2] & 0x0040) == 0
             && self.bgp_a[0] == 0x0100
@@ -1713,7 +1928,7 @@ impl Ppu {
             }
         }
 
-        let obj_layer_en = (self.dispcnt & 0x1000) != 0
+        let obj_layer_en = (self.effective_bg_enable() & 0x10) != 0
             && (self.layer_enable_mask & 0x10) != 0
             && self.obj_rendered_this_line
             && self.obj_line_dirty

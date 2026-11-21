@@ -256,9 +256,16 @@ impl Arm7tdmi {
         }
     }
 
-    pub fn trigger_irq(&mut self, bus: &mut SysBus) {
+    pub fn trigger_irq(&mut self, bus: &mut SysBus) -> u64 {
         self.halted = false;
         self.stopped = false;
+        // ARM7TDMI IRQ exception entry takes 2S + 1N: a discarded Non-Sequential fetch at the
+        // interrupted instruction's prefetch PC, plus 2 sequential vector fetches at 0x0000_0018.
+        let dummy_cyc = if self.is_thumb() {
+            bus.fetch_16(self.gpr[15], AccessType::NonSequential).1
+        } else {
+            bus.fetch_32(self.gpr[15], AccessType::NonSequential).1
+        };
         let lr_irq = if self.is_thumb() {
             self.gpr[15] // A + 4
         } else {
@@ -270,6 +277,7 @@ impl Arm7tdmi {
         self.gpr[14] = lr_irq;
         self.flush_cycles = 0;
         self.flush_pipeline(bus, 0x0000_0018);
+        dummy_cyc + self.flush_cycles
     }
 
     pub fn enter_undefined(&mut self, bus: &mut SysBus, was_thumb: bool) {
@@ -795,7 +803,7 @@ fn arm_bx(cpu: &mut Arm7tdmi, bus: &mut SysBus, instr: u32) -> u64 {
         cpu.cpsr &= !CPSR_T;
     }
     cpu.flush_pipeline(bus, target);
-    1
+    0
 }
 
 fn arm_branch<const LINK: bool>(cpu: &mut Arm7tdmi, bus: &mut SysBus, instr: u32) -> u64 {
@@ -805,7 +813,7 @@ fn arm_branch<const LINK: bool>(cpu: &mut Arm7tdmi, bus: &mut SysBus, instr: u32
     }
     let target = cpu.gpr[15].wrapping_add(offset as u32);
     cpu.flush_pipeline(bus, target);
-    1
+    0
 }
 
 fn arm_psr_reg<const CFG: u8>(cpu: &mut Arm7tdmi, _bus: &mut SysBus, instr: u32) -> u64 {
@@ -1196,6 +1204,7 @@ fn arm_single_transfer<const CFG: u8>(cpu: &mut Arm7tdmi, bus: &mut SysBus, inst
         } else {
             cyc += bus.write_32(access_addr, store_val, AccessType::NonSequential);
         }
+        bus.force_next_fetch_nseq = true;
         if (!pre || writeback) && rn != 15 {
             cpu.gpr[rn] = eff_addr;
         }
@@ -1283,6 +1292,7 @@ fn arm_halfword_transfer<const CFG: u8>(cpu: &mut Arm7tdmi, bus: &mut SysBus, in
         };
         if sh == 1 {
             cyc += bus.write_16(access_addr, store_val as u16, AccessType::NonSequential);
+            bus.force_next_fetch_nseq = true;
         }
         if (!pre || writeback) && rn != 15 {
             cpu.gpr[rn] = eff_addr;
@@ -1331,6 +1341,7 @@ fn arm_block_transfer<const CFG: u8>(cpu: &mut Arm7tdmi, bus: &mut SysBus, instr
         } else {
             let pc_val = cpu.gpr[15].wrapping_add(4);
             let wc = bus.write_32(addr, pc_val, AccessType::NonSequential);
+            bus.force_next_fetch_nseq = true;
             if writeback && rn != 15 {
                 cpu.gpr[rn] = new_base;
             }
@@ -1402,6 +1413,7 @@ fn arm_block_transfer<const CFG: u8>(cpu: &mut Arm7tdmi, bus: &mut SysBus, instr
         }
 
         let mut loaded_pc = None;
+        bus.rom_burst_active = false;
         for r in 0..16 {
             if (rlist & (1 << r)) == 0 {
                 continue;
@@ -1481,10 +1493,12 @@ fn arm_block_transfer<const CFG: u8>(cpu: &mut Arm7tdmi, bus: &mut SysBus, instr
                     if writeback && rn != 15 {
                         cpu.gpr[rn] = new_base;
                     }
+                    bus.force_next_fetch_nseq = true;
                     return total_cyc;
                 }
             }
         }
+        bus.rom_burst_active = false;
         for r in 0..16 {
             if (rlist & (1 << r)) == 0 {
                 continue;
@@ -1510,6 +1524,7 @@ fn arm_block_transfer<const CFG: u8>(cpu: &mut Arm7tdmi, bus: &mut SysBus, instr
         if writeback && rn != 15 {
             cpu.gpr[rn] = new_base;
         }
+        bus.force_next_fetch_nseq = true;
     }
 
     cyc
@@ -1772,9 +1787,13 @@ fn thumb_ldr_str_reg<const CFG: u8>(cpu: &mut Arm7tdmi, bus: &mut SysBus, instr:
         bus.step_internal(1);
         rc + 1
     } else if byte {
-        bus.write_8(addr, cpu.gpr[rd] as u8, AccessType::NonSequential)
+        let wc = bus.write_8(addr, cpu.gpr[rd] as u8, AccessType::NonSequential);
+        bus.force_next_fetch_nseq = true;
+        wc
     } else {
-        bus.write_32(addr, cpu.gpr[rd], AccessType::NonSequential)
+        let wc = bus.write_32(addr, cpu.gpr[rd], AccessType::NonSequential);
+        bus.force_next_fetch_nseq = true;
+        wc
     }
 }
 
@@ -1786,7 +1805,9 @@ fn thumb_ldr_str_half_sign<const OP: u8>(cpu: &mut Arm7tdmi, bus: &mut SysBus, i
 
     if OP == 0 {
         // STRH
-        return bus.write_16(addr, cpu.gpr[rd] as u16, AccessType::NonSequential);
+        let wc = bus.write_16(addr, cpu.gpr[rd] as u16, AccessType::NonSequential);
+        bus.force_next_fetch_nseq = true;
+        return wc;
     }
 
     let val: u32 = match OP {
@@ -1835,9 +1856,13 @@ fn thumb_ldr_str_imm<const CFG: u8>(cpu: &mut Arm7tdmi, bus: &mut SysBus, instr:
         bus.step_internal(1);
         rc + 1
     } else if byte {
-        bus.write_8(addr, cpu.gpr[rd] as u8, AccessType::NonSequential)
+        let wc = bus.write_8(addr, cpu.gpr[rd] as u8, AccessType::NonSequential);
+        bus.force_next_fetch_nseq = true;
+        wc
     } else {
-        bus.write_32(addr, cpu.gpr[rd], AccessType::NonSequential)
+        let wc = bus.write_32(addr, cpu.gpr[rd], AccessType::NonSequential);
+        bus.force_next_fetch_nseq = true;
+        wc
     }
 }
 
@@ -1862,7 +1887,9 @@ fn thumb_ldr_str_half_imm<const LOAD: bool>(
         bus.step_internal(1);
         rc + 1
     } else {
-        bus.write_16(addr, cpu.gpr[rd] as u16, AccessType::NonSequential)
+        let wc = bus.write_16(addr, cpu.gpr[rd] as u16, AccessType::NonSequential);
+        bus.force_next_fetch_nseq = true;
+        wc
     }
 }
 
@@ -1877,7 +1904,9 @@ fn thumb_ldr_str_sp<const LOAD: bool>(cpu: &mut Arm7tdmi, bus: &mut SysBus, inst
         bus.step_internal(1);
         rc + 1
     } else {
-        bus.write_32(addr, cpu.gpr[rd], AccessType::NonSequential)
+        let wc = bus.write_32(addr, cpu.gpr[rd], AccessType::NonSequential);
+        bus.force_next_fetch_nseq = true;
+        wc
     }
 }
 
@@ -1917,7 +1946,9 @@ fn thumb_push_pop<const CFG: u8>(cpu: &mut Arm7tdmi, bus: &mut SysBus, instr: u1
             sp = sp.wrapping_sub(0x40);
             cpu.gpr[13] = sp;
             let pc_val = cpu.gpr[15].wrapping_add(2);
-            return bus.write_32(sp, pc_val, AccessType::NonSequential);
+            let wc = bus.write_32(sp, pc_val, AccessType::NonSequential);
+            bus.force_next_fetch_nseq = true;
+            return wc;
         }
     }
 
@@ -1960,6 +1991,7 @@ fn thumb_push_pop<const CFG: u8>(cpu: &mut Arm7tdmi, bus: &mut SysBus, instr: u1
             }
         }
 
+        bus.rom_burst_active = false;
         for r in 0..8usize {
             if (rlist & (1 << r)) != 0 {
                 let acc = if first {
@@ -2030,11 +2062,13 @@ fn thumb_push_pop<const CFG: u8>(cpu: &mut Arm7tdmi, bus: &mut SysBus, instr: u1
                             dest.write_unaligned(cpu.gpr[14].to_le());
                         }
                     }
+                    bus.force_next_fetch_nseq = true;
                     return total_cyc;
                 }
             }
         }
 
+        bus.rom_burst_active = false;
         let mut addr = sp;
         for r in 0..8usize {
             if (rlist & (1 << r)) != 0 {
@@ -2056,6 +2090,7 @@ fn thumb_push_pop<const CFG: u8>(cpu: &mut Arm7tdmi, bus: &mut SysBus, instr: u1
             };
             cyc += bus.write_32(addr, cpu.gpr[14], acc);
         }
+        bus.force_next_fetch_nseq = true;
         cyc
     }
 }
@@ -2078,6 +2113,7 @@ fn thumb_ldm_stm<const LOAD: bool>(cpu: &mut Arm7tdmi, bus: &mut SysBus, instr: 
             let pc_val = cpu.gpr[15].wrapping_add(2);
             let wc = bus.write_32(base, pc_val, AccessType::NonSequential);
             cpu.gpr[rb] = new_base;
+            bus.force_next_fetch_nseq = true;
             return wc;
         }
     }
@@ -2126,6 +2162,7 @@ fn thumb_ldm_stm<const LOAD: bool>(cpu: &mut Arm7tdmi, bus: &mut SysBus, instr: 
             }
         }
 
+        bus.rom_burst_active = false;
         for r in 0..8usize {
             if (rlist & (1 << r)) != 0 {
                 let acc = if first {
@@ -2180,10 +2217,12 @@ fn thumb_ldm_stm<const LOAD: bool>(cpu: &mut Arm7tdmi, bus: &mut SysBus, instr: 
                         }
                     }
                     cpu.gpr[rb] = new_base;
+                    bus.force_next_fetch_nseq = true;
                     return total_cyc;
                 }
             }
         }
+        bus.rom_burst_active = false;
         for r in 0..8usize {
             if (rlist & (1 << r)) != 0 {
                 let acc = if first {
@@ -2202,6 +2241,7 @@ fn thumb_ldm_stm<const LOAD: bool>(cpu: &mut Arm7tdmi, bus: &mut SysBus, instr: 
             }
         }
         cpu.gpr[rb] = new_base;
+        bus.force_next_fetch_nseq = true;
         cyc
     }
 }

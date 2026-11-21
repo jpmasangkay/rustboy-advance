@@ -131,8 +131,10 @@ fn ppu_mode3_mode4_and_top2_compositor_prio() {
         .write_16(0x0500_0000, 0x03E0, AccessType::NonSequential);
 
     let mut fe = HeadlessFrontend::new();
+    // Run 1 settle frame so the hardware 2-scanline DISPCNT forced-blank/layer latch settles at y=0.
     core.run_frame(&mut fe);
-    assert_eq!(fe.frames, 1);
+    core.run_frame(&mut fe);
+    assert_eq!(fe.frames, 2);
     assert_eq!(fe.last_fb[0], 0x001F); // Red pixel at (0,0)
     assert_eq!(fe.last_fb[1], 0x0000); // VRAM black pixel at (1,0)
 
@@ -187,6 +189,8 @@ fn ppu_mode3_mode4_and_top2_compositor_prio() {
     // Alpha blend BG0 (1st target) + BG1 (2nd target) at 50%/50% (EVA=8, EVB=8)
     core.bus.write_io_16(0x0400_0050, 0x0241); // mode 1, top=BG0 (bit 0), bot=BG1 (bit 9)
     core.bus.write_io_16(0x0400_0052, 0x0808); // EVA=8, EVB=8
+    // Settle newly enabled BG0/BG1/OBJ DISPCNT latch pipeline across VBlank before checking y=0.
+    core.run_frame(&mut fe);
     core.run_frame(&mut fe);
     // Expected: (30*8)>>4 = 15 red, (30*8)>>4 = 15 green -> 15 | (15<<5)
     assert_eq!(fe.last_fb[0], 15 | (15 << 5));
@@ -366,6 +370,8 @@ fn ppu_dot_accurate_mode_matches_scanline_and_respects_layer_mask() {
         .write_16(0x0600_0020, 0x0011, AccessType::NonSequential); // Tile 1 pixels 0,1 = col 1
 
     let mut fe_scanline = HeadlessFrontend::new();
+    // Settle hardware 2-scanline DISPCNT forced-blank/BG0 latch pipeline before checking y=0.
+    core.run_frame(&mut fe_scanline);
     core.run_frame(&mut fe_scanline);
     assert_eq!(fe_scanline.last_fb[0], 0x001F);
 

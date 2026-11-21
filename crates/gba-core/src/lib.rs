@@ -474,7 +474,7 @@ impl GbaCore {
     }
 
     #[inline]
-    pub fn step_jit(&mut self) -> u64 {
+    pub fn step_jit(&mut self, limit_cycle: u64) -> u64 {
         self.sync_jit_invalidation();
         if self.bus.force_next_fetch_nseq || self.bus.irq_sync_delay > 0 {
             return self.cpu.step(&mut self.bus);
@@ -495,8 +495,7 @@ impl GbaCore {
             });
 
         if let Some((func_ptr, block_cyc)) = block {
-            if self.bus.scheduler.current_cycle.saturating_add(block_cyc)
-                >= self.bus.scheduler.next_event_cycle
+            if self.bus.scheduler.current_cycle.saturating_add(block_cyc) >= limit_cycle
                 || self.bus.hw.active_dma.is_some()
                 || (self.bus.hw.ime != 0
                     && (self.bus.hw.ie & self.bus.hw.if_flag) != 0
@@ -678,8 +677,8 @@ impl GbaCore {
             && self.bus.irq_sync_delay == 0
         {
             self.pending_idle_check_pc = None;
-            self.cpu.trigger_irq(&mut self.bus);
-            self.bus.scheduler.current_cycle += 3;
+            let irq_cyc = self.cpu.trigger_irq(&mut self.bus);
+            self.bus.scheduler.current_cycle += irq_cyc;
             return InternalStep::Continue;
         }
 
@@ -715,7 +714,10 @@ impl GbaCore {
             && breakpoints.is_empty()
             && !self.bus.watchpoint_active
         {
-            self.step_jit()
+            let limit = halt_end_cycle.map_or(self.bus.scheduler.next_event_cycle, |e| {
+                self.bus.scheduler.next_event_cycle.min(e)
+            });
+            self.step_jit(limit)
         } else {
             self.cpu.step(&mut self.bus)
         };
@@ -723,7 +725,13 @@ impl GbaCore {
 
         if allow_idle_skip {
             let next_pc = self.cpu.current_exec_pc();
-            if next_pc <= exec_pc && !self.cpu.halted && !self.cpu.stopped {
+            let max_back_edge = if self.cpu.is_thumb() { 4 } else { 8 };
+            if next_pc <= exec_pc
+                && (exec_pc - next_pc <= max_back_edge
+                    || self.bus.cart.idle_loop_addr == Some(next_pc))
+                && !self.cpu.halted
+                && !self.cpu.stopped
+            {
                 self.pending_idle_check_pc = Some(next_pc);
             } else {
                 self.pending_idle_check_pc = None;
@@ -1034,8 +1042,8 @@ impl GbaCore {
                 && self.bus.irq_sync_delay == 0
             {
                 self.pending_idle_check_pc = None;
-                self.cpu.trigger_irq(&mut self.bus);
-                self.bus.scheduler.current_cycle += 3;
+                let irq_cyc = self.cpu.trigger_irq(&mut self.bus);
+                self.bus.scheduler.current_cycle += irq_cyc;
                 continue;
             }
 
@@ -1069,7 +1077,11 @@ impl GbaCore {
                     && !self.cpu.stopped
                 {
                     let next_pc = self.cpu.current_exec_pc();
-                    if next_pc <= exec_pc {
+                    let max_back_edge = if self.cpu.is_thumb() { 4 } else { 8 };
+                    if next_pc <= exec_pc
+                        && (exec_pc - next_pc <= max_back_edge
+                            || self.bus.cart.idle_loop_addr == Some(next_pc))
+                    {
                         self.pending_idle_check_pc = Some(next_pc);
                     }
                 }
@@ -1312,8 +1324,8 @@ impl GbaCore {
                 && self.bus.irq_sync_delay == 0
             {
                 self.pending_idle_check_pc = None;
-                self.cpu.trigger_irq(&mut self.bus);
-                self.bus.scheduler.current_cycle += 3;
+                let irq_cyc = self.cpu.trigger_irq(&mut self.bus);
+                self.bus.scheduler.current_cycle += irq_cyc;
                 continue;
             }
 
@@ -1339,7 +1351,7 @@ impl GbaCore {
                 self.bus.debug_pc = exec_pc;
 
                 let cycles = if use_jit {
-                    self.step_jit()
+                    self.step_jit(self.bus.scheduler.next_event_cycle.min(end_cycle))
                 } else {
                     self.cpu.step(&mut self.bus)
                 };
@@ -1351,7 +1363,11 @@ impl GbaCore {
                     && !self.cpu.stopped
                 {
                     let next_pc = self.cpu.current_exec_pc();
-                    if next_pc <= exec_pc {
+                    let max_back_edge = if self.cpu.is_thumb() { 4 } else { 8 };
+                    if next_pc <= exec_pc
+                        && (exec_pc - next_pc <= max_back_edge
+                            || self.bus.cart.idle_loop_addr == Some(next_pc))
+                    {
                         self.pending_idle_check_pc = Some(next_pc);
                     }
                 }

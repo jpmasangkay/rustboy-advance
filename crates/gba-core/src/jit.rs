@@ -77,6 +77,8 @@ mod cranelift_backend {
     const MAX_JIT_BLOCKS: usize = 4096;
     const JIT_EXIT_BIT: u64 = 1u64 << 63;
 
+    type TracedBlock = (Vec<(u32, u32, u64)>, u32, u64, Vec<u32>);
+
     #[derive(Default)]
     pub struct JitEngine {
         pub available: bool,
@@ -218,10 +220,7 @@ mod cranelift_backend {
             self.blocks.get(&key)
         }
 
-        fn trace_block(
-            bus: &SysBus,
-            key: BlockKey,
-        ) -> Option<(Vec<(u32, u32, u64)>, u32, u64, Vec<u32>)> {
+        fn trace_block(bus: &SysBus, key: BlockKey) -> Option<TracedBlock> {
             let mut cur_pc = key.pc;
             let mut traced = Vec::new();
             let mut total_cycles = 0u64;
@@ -261,7 +260,19 @@ mod cranelift_backend {
                     let h = bus.debug_read_16(cur_pc);
                     traced.push((cur_pc, h as u32, fetch_cyc));
                     cur_pc = cur_pc.wrapping_add(2);
-                    total_cycles += fetch_cyc.max(1);
+                    // Conservative upper bound so `step_jit` never executes a block across a
+                    // pending scheduler event (e.g. PpuHBlank / TimerOverflow).
+                    let worst_extra: u64 = if (h & 0xF000) == 0xC000 || (h & 0xF600) == 0xB400 {
+                        // LDMIA / STMIA / PUSH / POP: up to 9 registers + bus waitstates
+                        160
+                    } else if (h & 0xFC00) == 0x4400 || (h & 0xFF00) == 0xB000 {
+                        // Pure ALU / SP adjust
+                        4
+                    } else {
+                        // Loads, stores, branches, multiplies, SWIs
+                        32
+                    };
+                    total_cycles += fetch_cyc.max(1) + worst_extra;
                     if is_thumb_block_boundary(h) {
                         break;
                     }
@@ -269,7 +280,17 @@ mod cranelift_backend {
                     let w = bus.debug_read_32(cur_pc);
                     traced.push((cur_pc, w, fetch_cyc));
                     cur_pc = cur_pc.wrapping_add(4);
-                    total_cycles += fetch_cyc.max(1);
+                    let worst_extra: u64 = if (w & 0x0E00_0000) == 0x0800_0000 {
+                        // LDM / STM: up to 16 registers + bus waitstates
+                        280
+                    } else if (w & 0x0E00_0000) == 0x0000_0000 && (w & 0x0000_0090) != 0x0000_0090 {
+                        // Data processing / shifts
+                        4
+                    } else {
+                        // Loads, stores, halfword transfers, branches, multiplies, SWIs
+                        32
+                    };
+                    total_cycles += fetch_cyc.max(1) + worst_extra;
                     if is_arm_block_boundary(w) {
                         break;
                     }

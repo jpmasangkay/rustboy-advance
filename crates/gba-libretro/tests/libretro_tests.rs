@@ -727,10 +727,12 @@ fn load_game_from_path_and_audio_sample_fallback() {
     };
     assert!(unsafe { retro_load_game(&raw const game) });
 
+    // Run 2 frames so the hardware 2-scanline DISPCNT forced-blank latch settles at y=0.
+    retro_run();
     retro_run();
     {
         let mock = lock_mock();
-        assert_eq!(mock.video_frames, 1);
+        assert_eq!(mock.video_frames, 2);
         assert_eq!(mock.last_frame_pixels[0], 0xF800);
         assert!(mock.audio_frames_received > 0);
     }

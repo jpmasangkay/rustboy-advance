@@ -1706,6 +1706,12 @@ pub fn run_bench_realtime(cfg: &CliConfig) -> Result<(), String> {
                 crate::filters::GovernorTransitionKind::StepUp => "GOVERNOR_STEP_UP",
                 crate::filters::GovernorTransitionKind::CapResolution => "GOVERNOR_CAP_720X480",
                 crate::filters::GovernorTransitionKind::UncapResolution => "GOVERNOR_UNCAP_RES",
+                crate::filters::GovernorTransitionKind::EnableFrameskip => {
+                    "GOVERNOR_ENABLE_FRAMESKIP"
+                }
+                crate::filters::GovernorTransitionKind::DisableFrameskip => {
+                    "GOVERNOR_DISABLE_FRAMESKIP"
+                }
             };
             let from_slug = filter_cli_slug(tr.from);
             let to_slug = filter_cli_slug(tr.to);

@@ -208,6 +208,7 @@ pub(crate) struct RustboyApp {
     pub(crate) governor_viewport_px: (u32, u32),
     pub(crate) governor_user_target: DisplayFilter,
     pub(crate) governor_cli_filter: bool,
+    pub(crate) governor_skip_toggle: bool,
     pub(crate) toast: Option<ToastMessage>,
     pub(crate) title_dirty: bool,
     pub(crate) quit_requested: bool,
@@ -327,8 +328,9 @@ impl RustboyApp {
 
         let scale_u32 = config.window_scale.clamp(1, 5) as u32;
         let governor_user_target = config.display_filter;
-        let quality_governor =
+        let mut quality_governor =
             QualityGovernor::new(config.display_filter, config.auto_quality_governor);
+        quality_governor.set_frameskip_support(true);
         let mut app = Self {
             config,
             core: None,
@@ -407,6 +409,7 @@ impl RustboyApp {
             governor_viewport_px: (LCD_WIDTH as u32 * scale_u32, LCD_HEIGHT as u32 * scale_u32),
             governor_user_target,
             governor_cli_filter: cli_filter_set,
+            governor_skip_toggle: false,
             toast: None,
             title_dirty: true,
             quit_requested: false,
@@ -505,28 +508,56 @@ impl RustboyApp {
         self.quality_governor
             .sync_external_filter(self.config.display_filter);
         if let Some(tr) = self.quality_governor.record_frame(work_ms) {
-            self.config.display_filter = tr.to;
-            self.config.shader_preset = tr.to.default_shader_preset();
-            self.config.scanline_grid = tr.to == DisplayFilter::AuthenticGbaLcd;
-            let key = self.current_governor_profile_key();
-            self.config.set_settled_filter(key, tr.to);
-            self.config.save();
-            self.sink.frame_dirty = true;
-            self.lcd_tex = None;
-            let verb = match tr.kind {
-                crate::filters::GovernorTransitionKind::StepDown => "switched",
-                crate::filters::GovernorTransitionKind::StepUp => "recovered",
-                crate::filters::GovernorTransitionKind::CapResolution => "capped output to 720x480",
-                crate::filters::GovernorTransitionKind::UncapResolution => {
-                    "uncapped output resolution"
-                }
+            let filter_changed = !matches!(
+                tr.kind,
+                crate::filters::GovernorTransitionKind::EnableFrameskip
+                    | crate::filters::GovernorTransitionKind::DisableFrameskip
+            );
+            if filter_changed {
+                self.config.display_filter = tr.to;
+                self.config.shader_preset = tr.to.default_shader_preset();
+                self.config.scanline_grid = tr.to == DisplayFilter::AuthenticGbaLcd;
+                let key = self.current_governor_profile_key();
+                self.config.set_settled_filter(key, tr.to);
+                self.config.save();
+                self.sink.frame_dirty = true;
+                self.lcd_tex = None;
+            }
+            let msg = match tr.kind {
+                crate::filters::GovernorTransitionKind::StepDown => format!(
+                    "Quality Governor: switched {} -> {} (p95 {:.1} ms)",
+                    tr.from.label(),
+                    tr.to.label(),
+                    tr.rolling_p95_ms
+                ),
+                crate::filters::GovernorTransitionKind::StepUp => format!(
+                    "Quality Governor: recovered {} -> {} (p95 {:.1} ms)",
+                    tr.from.label(),
+                    tr.to.label(),
+                    tr.rolling_p95_ms
+                ),
+                crate::filters::GovernorTransitionKind::CapResolution => format!(
+                    "Quality Governor: capped output to 720x480 {} -> {} (p95 {:.1} ms)",
+                    tr.from.label(),
+                    tr.to.label(),
+                    tr.rolling_p95_ms
+                ),
+                crate::filters::GovernorTransitionKind::UncapResolution => format!(
+                    "Quality Governor: uncapped output resolution {} -> {} (p95 {:.1} ms)",
+                    tr.from.label(),
+                    tr.to.label(),
+                    tr.rolling_p95_ms
+                ),
+                crate::filters::GovernorTransitionKind::EnableFrameskip => format!(
+                    "Quality Governor: enabled 1-frame auto-frameskip to keep audio smooth (p95 {:.1} ms)",
+                    tr.rolling_p95_ms
+                ),
+                crate::filters::GovernorTransitionKind::DisableFrameskip => format!(
+                    "Quality Governor: disabled auto-frameskip (p95 {:.1} ms)",
+                    tr.rolling_p95_ms
+                ),
             };
-            self.notify_warn(&format!(
-                "Quality Governor: {verb} {} -> {} (p95 {:.1} ms)",
-                tr.from.label(),
-                tr.to.label(),
-                tr.rolling_p95_ms
-            ));
+            self.notify_warn(&msg);
         }
     }
 
@@ -768,6 +799,7 @@ impl RustboyApp {
         self.slot_thumbnails = [None, None, None, None, None];
         self.slot_meta = [None, None, None, None, None];
         self.slot_exists_cache = [None; 5];
+        self.governor_skip_toggle = false;
         self.state_manager_error = None;
         self.playtime_timer = Instant::now();
 
@@ -819,6 +851,7 @@ impl RustboyApp {
         self.slot_thumbnails = [None, None, None, None, None];
         self.slot_meta = [None, None, None, None, None];
         self.slot_exists_cache = [None; 5];
+        self.governor_skip_toggle = false;
         self.state_manager_error = None;
         self.paused = false;
         self.sink.audio.set_paused(true);
@@ -1668,6 +1701,11 @@ impl RustboyApp {
         let mut executed = 0usize;
 
         let execution_threshold = target_frame_time;
+        let gov_frameskip_active =
+            self.quality_governor.is_frameskip_active() && is_normal_speed && !turbo;
+        if !gov_frameskip_active {
+            self.governor_skip_toggle = false;
+        }
 
         while executed < max_catchup && (turbo || self.time_accumulator >= execution_threshold) {
             if turbo && executed > 0 && now.elapsed() > Duration::from_millis(12) {
@@ -1678,8 +1716,15 @@ impl RustboyApp {
             }
             let start_t = Instant::now();
             let max_skip = (self.config.max_frameskip as usize).clamp(1, 8);
+            let gov_skip_this_frame = if gov_frameskip_active {
+                self.governor_skip_toggle = !self.governor_skip_toggle;
+                self.governor_skip_toggle
+            } else {
+                false
+            };
             let should_skip_render = (turbo && executed + 1 < max_catchup)
                 || (is_normal_speed && max_catchup > 1 && executed + 1 < max_catchup)
+                || gov_skip_this_frame
                 || (self.config.auto_frameskip
                     && executed < max_skip
                     && self.time_accumulator > target_frame_time);
@@ -1770,7 +1815,11 @@ impl RustboyApp {
                     }
                 }
             } else if self.gb.is_some() {
+                let prev_dirty = self.sink.frame_dirty;
                 self.step_gb_frame(self.sink.keypad, suppress_audio);
+                if should_skip_render {
+                    self.sink.frame_dirty = prev_dirty;
+                }
             }
 
             if let Some(had_prev) = saved_had_prev

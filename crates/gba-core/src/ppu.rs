@@ -1270,6 +1270,10 @@ impl Ppu {
 
         let cur = self.obj_line[sx];
         if !cur.is_present() || prio < cur.prio() {
+            // Hardware OAM line buffer rule: when the slot is empty (`color == 0`) or the new
+            // sprite has strictly higher priority (`prio < cur.prio()`), an opaque pixel writes
+            // its own `prio` directly (a *later* transparent sprite with lower `prio` is what
+            // overwrites an earlier opaque pixel's priority above).
             self.obj_line[sx] = ObjPixel::new(
                 self.read_pram_u16(pal_offset + col_idx),
                 prio,
@@ -1330,14 +1334,14 @@ impl Ppu {
                     row_part | ((col_base + tile_col * step) & 0x01F)
                 };
                 tile_valid = !bitmap_mode || tile_num >= 512;
-                row_off = 0x10000 + tile_num * 32 + fine_y * row_bytes;
+                row_off = (tile_num * 32 + fine_y * row_bytes) & 0x7FFF;
             }
             if tile_valid {
                 let fine_x = utx & 7;
                 let col_idx = if BPP8 {
-                    self.vram[row_off + fine_x] as usize
+                    self.vram[0x10000 + ((row_off + fine_x) & 0x7FFF)] as usize
                 } else {
-                    let byte = self.vram[row_off + (fine_x >> 1)];
+                    let byte = self.vram[0x10000 + ((row_off + (fine_x >> 1)) & 0x7FFF)];
                     ((byte >> ((fine_x & 1) * 4)) & 0x0F) as usize
                 };
                 self.plot_sprite_pixel::<OBJ_WIN>(
@@ -1416,11 +1420,11 @@ impl Ppu {
                 continue;
             }
 
-            let row_off = 0x10000 + tile_num * 32 + fine_y * row_bytes;
+            let row_off = (tile_num * 32 + fine_y * row_bytes) & 0x7FFF;
             let col_idx = if BPP8 {
-                self.vram[row_off + fine_x] as usize
+                self.vram[0x10000 + ((row_off + fine_x) & 0x7FFF)] as usize
             } else {
-                let byte = self.vram[row_off + (fine_x >> 1)];
+                let byte = self.vram[0x10000 + ((row_off + (fine_x >> 1)) & 0x7FFF)];
                 ((byte >> ((fine_x & 1) * 4)) & 0x0F) as usize
             };
 

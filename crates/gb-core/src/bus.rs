@@ -263,9 +263,10 @@ impl GbBus {
         self.cart.tick_rtc(normal_dots as u64);
     }
 
-    /// Advances PPU, APU, and RTC during CGB's 2050-M-cycle speed-switch pause while DIV is stopped.
+    /// Advances PPU, APU, and RTC during CGB's 2050-normal-M-cycle (8200-dot) speed-switch pause
+    /// while `DIV` stays stopped at 0.
     pub fn tick_speed_switch_m_cycle(&mut self) {
-        let normal_dots: u32 = if self.double_speed { 2 } else { 4 };
+        let normal_dots: u32 = 4;
         self.total_normal_dots += normal_dots as u64;
         self.timer.reset_div_on_speed_switch();
         let ppu_res = self.ppu.step(normal_dots, self.is_cgb);
@@ -281,18 +282,26 @@ impl GbBus {
 
     fn transfer_hdma_block(&mut self) {
         let vbank = ((self.ppu.vbk & 1) as usize) * 0x2000;
+        let mut dst_overflow = false;
         for _ in 0..16 {
             let val = self.hdma_read8(self.hdma_src);
             let vram_off = (self.hdma_dst as usize) & 0x1FFF;
             self.ppu.vram[vbank + vram_off] = val;
             self.hdma_src = self.hdma_src.wrapping_add(1);
-            self.hdma_dst = (self.hdma_dst + 1) & 0x1FFF;
+            self.hdma_dst = self.hdma_dst.wrapping_add(1);
+            if self.hdma_dst >= 0x2000 {
+                self.hdma_dst &= 0x1FFF;
+                dst_overflow = true;
+            }
         }
         self.hdma_stall_m_cycles += if self.double_speed { 16 } else { 8 };
         self.hdma_remaining = self.hdma_remaining.saturating_sub(1);
-        if self.hdma_remaining == 0 {
+        if self.hdma_remaining == 0 || dst_overflow {
             self.hdma_active = false;
             self.hdma_cancelled = false;
+            if dst_overflow {
+                self.hdma_remaining = 0;
+            }
         }
     }
 

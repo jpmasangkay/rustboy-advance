@@ -106,22 +106,52 @@ pub(crate) fn write_atomic(path: &Path, data: &[u8]) -> std::io::Result<()> {
         return Err(err);
     }
 
-    match fs::rename(&tmp_path, path) {
-        Ok(()) => Ok(()),
-        Err(rename_err) => {
-            #[cfg(windows)]
-            {
-                // On Windows, `rename` can fail if destination exists and is temporarily locked;
-                // retry once after removing destination if needed.
-                if path.exists() {
-                    let _ = fs::remove_file(path);
-                    if fs::rename(&tmp_path, path).is_ok() {
-                        return Ok(());
-                    }
-                }
+    #[cfg(windows)]
+    {
+        use std::os::windows::ffi::OsStrExt;
+        const MOVEFILE_REPLACE_EXISTING: u32 = 0x1;
+        const MOVEFILE_WRITE_THROUGH: u32 = 0x8;
+        unsafe extern "system" {
+            fn MoveFileExW(
+                lp_existing_file_name: *const u16,
+                lp_new_file_name: *const u16,
+                dw_flags: u32,
+            ) -> i32;
+        }
+        let src_w: Vec<u16> = tmp_path
+            .as_os_str()
+            .encode_wide()
+            .chain(std::iter::once(0))
+            .collect();
+        let dst_w: Vec<u16> = path
+            .as_os_str()
+            .encode_wide()
+            .chain(std::iter::once(0))
+            .collect();
+        // SAFETY: Both pointers are valid null-terminated UTF-16 buffers living for the call.
+        let ok = unsafe {
+            MoveFileExW(
+                src_w.as_ptr(),
+                dst_w.as_ptr(),
+                MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH,
+            )
+        };
+        if ok != 0 {
+            return Ok(());
+        }
+        let err = std::io::Error::last_os_error();
+        let _ = fs::remove_file(&tmp_path);
+        Err(err)
+    }
+
+    #[cfg(not(windows))]
+    {
+        match fs::rename(&tmp_path, path) {
+            Ok(()) => Ok(()),
+            Err(rename_err) => {
+                let _ = fs::remove_file(&tmp_path);
+                Err(rename_err)
             }
-            let _ = fs::remove_file(&tmp_path);
-            Err(rename_err)
         }
     }
 }

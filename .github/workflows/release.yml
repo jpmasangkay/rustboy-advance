@@ -24,22 +24,26 @@ jobs:
             os: windows-latest
             target: x86_64-pc-windows-msvc
             exe_name: rustboy-advance.exe
-            libretro_name: gba_libretro.dll
+            libretro_src: rustboy_advance_libretro.dll
+            libretro_dst: rustboy_advance_libretro.dll
           - artifact_name: rustboy-advance-linux-x86_64
             os: ubuntu-latest
             target: x86_64-unknown-linux-gnu
             exe_name: rustboy-advance
-            libretro_name: libgba_libretro.so
+            libretro_src: librustboy_advance_libretro.so
+            libretro_dst: rustboy_advance_libretro.so
           - artifact_name: rustboy-advance-macos-aarch64
             os: macos-latest
             target: aarch64-apple-darwin
             exe_name: rustboy-advance
-            libretro_name: libgba_libretro.dylib
+            libretro_src: librustboy_advance_libretro.dylib
+            libretro_dst: rustboy_advance_libretro.dylib
           - artifact_name: rustboy-advance-macos-x86_64
             os: macos-latest
             target: x86_64-apple-darwin
             exe_name: rustboy-advance
-            libretro_name: libgba_libretro.dylib
+            libretro_src: librustboy_advance_libretro.dylib
+            libretro_dst: rustboy_advance_libretro.dylib
 
     steps:
       - name: Checkout repository
@@ -117,7 +121,8 @@ jobs:
         run: |
           mkdir -p dist "${{ matrix.artifact_name }}/docs"
           cp "target/${{ matrix.target }}/release/${{ matrix.exe_name }}" "${{ matrix.artifact_name }}/"
-          cp "target/${{ matrix.target }}/libretro/${{ matrix.libretro_name }}" "${{ matrix.artifact_name }}/"
+          cp "target/${{ matrix.target }}/libretro/${{ matrix.libretro_src }}" "${{ matrix.artifact_name }}/${{ matrix.libretro_dst }}"
+          cp crates/gba-libretro/rustboy_advance_libretro.info "${{ matrix.artifact_name }}/"
           chmod +x "${{ matrix.artifact_name }}/${{ matrix.exe_name }}"
           cat << 'EOF' > "${{ matrix.artifact_name }}/uninstall.sh"
           #!/usr/bin/env sh
@@ -140,10 +145,15 @@ jobs:
           $stage = "${{ matrix.artifact_name }}"
           New-Item -ItemType Directory -Force -Path "dist", "$stage/docs" | Out-Null
           Copy-Item "target\${{ matrix.target }}\release\${{ matrix.exe_name }}" $stage
-          Copy-Item "target\${{ matrix.target }}\libretro\${{ matrix.libretro_name }}" $stage
+          Copy-Item "target\${{ matrix.target }}\libretro\${{ matrix.libretro_src }}" "$stage\${{ matrix.libretro_dst }}"
+          Copy-Item "crates\gba-libretro\rustboy_advance_libretro.info" $stage
           @(
             '@echo off',
-            '"%~dp0rustboy-advance.exe" --uninstall --yes',
+            'start "" /wait "%~dp0rustboy-advance.exe" --uninstall --yes',
+            'if errorlevel 1 (',
+            '  echo Uninstall failed with exit code %ERRORLEVEL%.',
+            '  exit /b %ERRORLEVEL%',
+            ')',
             'echo.',
             'echo All Rustboy Advance persistent app data, saves, states, covers, and credentials have been removed.',
             'echo You may now delete this folder to complete uninstallation.'

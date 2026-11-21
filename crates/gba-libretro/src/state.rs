@@ -37,10 +37,14 @@ use crate::options::{
 use crate::video::{OutputPixelFormat, convert_framebuffer, convert_pixels};
 
 const STATE_MAGIC: [u8; 4] = *b"RBLS";
-const STATE_VERSION: u32 = 2;
-const STATE_HEADER_SIZE: usize = 16;
+const STATE_VERSION: u32 = 3;
+const STATE_HEADER_SIZE: usize = 24;
 const STATE_MARGIN_BYTES: usize = 64 * 1024;
 const GB_RTC_BUF_SIZE: usize = 48;
+const MAX_ROM_BYTES: usize = 32 * 1024 * 1024;
+const MAX_STATE_BYTES: usize = 16 * 1024 * 1024;
+const CORE_TAG_GBA: u32 = 0;
+const CORE_TAG_GB: u32 = 1;
 
 const BIOS_SIZE: usize = 0x4000;
 const EWRAM_SIZE: usize = 0x40000;
@@ -103,6 +107,13 @@ impl ActiveCore {
             // in RetroArch and avoids per-frame LZ4 overhead.
             Self::Gba(core) => core.save_state_raw().map_err(|_| ()),
             Self::Gb(core) => core.save_state().map_err(|_| ()),
+        }
+    }
+
+    fn state_identity(&self) -> (u32, u32) {
+        match self {
+            Self::Gba(core) => (CORE_TAG_GBA, core.bus.cart.rom_crc32),
+            Self::Gb(core) => (CORE_TAG_GB, core.bus.cart.rom_crc32()),
         }
     }
 
@@ -183,18 +194,32 @@ struct LoadedCore {
     rtc_last_synced: [u8; GB_RTC_BUF_SIZE],
 }
 
+fn encode_rtc_trailer_stack(rtc: &gb_core::cartridge::RtcState) -> [u8; GB_RTC_BUF_SIZE] {
+    let mut buf = [0u8; GB_RTC_BUF_SIZE];
+    buf[0..4].copy_from_slice(&(rtc.current.sec as u32).to_le_bytes());
+    buf[4..8].copy_from_slice(&(rtc.current.min as u32).to_le_bytes());
+    buf[8..12].copy_from_slice(&(rtc.current.hour as u32).to_le_bytes());
+    buf[12..16].copy_from_slice(&(rtc.current.day_lo as u32).to_le_bytes());
+    buf[16..20].copy_from_slice(&((rtc.current.day_hi & 0xC1) as u32).to_le_bytes());
+    buf[20..24].copy_from_slice(&(rtc.latched.sec as u32).to_le_bytes());
+    buf[24..28].copy_from_slice(&(rtc.latched.min as u32).to_le_bytes());
+    buf[28..32].copy_from_slice(&(rtc.latched.hour as u32).to_le_bytes());
+    buf[32..36].copy_from_slice(&(rtc.latched.day_lo as u32).to_le_bytes());
+    buf[36..40].copy_from_slice(&((rtc.latched.day_hi & 0xC1) as u32).to_le_bytes());
+    buf[40..48].copy_from_slice(&rtc.timestamp.to_le_bytes());
+    buf
+}
+
 impl LoadedCore {
     fn sync_rtc_to_buf(&mut self) {
-        if let ActiveCore::Gb(ref mut gb) = self.core
+        if let ActiveCore::Gb(ref gb) = self.core
             && gb.bus.cart.has_rtc()
         {
-            gb.bus.cart.rtc.timestamp = current_unix_secs();
-            let mut tmp = Vec::with_capacity(GB_RTC_BUF_SIZE);
-            gb.bus.cart.rtc.append_48_byte_trailer(&mut tmp);
-            if tmp.len() == GB_RTC_BUF_SIZE {
-                self.rtc_buf.copy_from_slice(&tmp);
-                self.rtc_last_synced.copy_from_slice(&tmp);
-            }
+            // Keep `rtc.timestamp` deterministic (advanced by emulated seconds in `GbCore`)
+            // and write directly to a stack buffer with zero per-frame heap allocation.
+            let encoded = encode_rtc_trailer_stack(&gb.bus.cart.rtc);
+            self.rtc_buf.copy_from_slice(&encoded);
+            self.rtc_last_synced.copy_from_slice(&encoded);
         }
     }
 
@@ -210,12 +235,9 @@ impl LoadedCore {
                 gb.bus.cart.rtc.advance_seconds(elapsed);
             }
             gb.bus.cart.rtc.timestamp = now;
-            let mut tmp = Vec::with_capacity(GB_RTC_BUF_SIZE);
-            gb.bus.cart.rtc.append_48_byte_trailer(&mut tmp);
-            if tmp.len() == GB_RTC_BUF_SIZE {
-                self.rtc_buf.copy_from_slice(&tmp);
-                self.rtc_last_synced.copy_from_slice(&tmp);
-            }
+            let encoded = encode_rtc_trailer_stack(&gb.bus.cart.rtc);
+            self.rtc_buf.copy_from_slice(&encoded);
+            self.rtc_last_synced.copy_from_slice(&encoded);
         }
     }
 }
@@ -382,13 +404,14 @@ fn build_gb_memory_descriptors(core: &mut GbCore) -> Vec<retro_memory_descriptor
 
     // External cartridge RAM (0xA000..=0xBFFF)
     if !core.bus.cart.ram.is_empty() {
+        let is_mbc2 = matches!(core.bus.cart.mbc, gb_core::cartridge::MbcType::Mbc2);
         descs.push(retro_memory_descriptor {
             flags: RETRO_MEMDESC_SAVE_RAM,
             ptr: core.bus.cart.ram.as_mut_ptr().cast(),
             offset: 0,
             start: 0xA000,
             select: 0xFFFF_E000,
-            disconnect: 0,
+            disconnect: if is_mbc2 { 0x1E00 } else { 0 },
             len: core.bus.cart.ram.len().min(0x2000),
             addrspace: ptr::null(),
         });
@@ -502,15 +525,17 @@ impl<'a> GbBufferPinGuard<'a> {
         }
     }
 
-    fn commit(&mut self) {
+    fn commit(&mut self) -> bool {
+        if self.orig_ram.len() != self.core.bus.cart.ram.len() {
+            // Never reallocate `orig_ram`: frontend pointers from `retro_get_memory_data` and
+            // `SET_MEMORY_MAPS` point directly into `orig_ram`'s backing allocation.
+            return false;
+        }
         self.orig_wram.copy_from_slice(&*self.core.bus.wram);
         self.orig_vram.copy_from_slice(&*self.core.bus.ppu.vram);
         self.orig_oam.copy_from_slice(&*self.core.bus.ppu.oam);
-        if self.orig_ram.len() == self.core.bus.cart.ram.len() {
-            self.orig_ram.copy_from_slice(&self.core.bus.cart.ram);
-        } else {
-            self.orig_ram = self.core.bus.cart.ram.clone();
-        }
+        self.orig_ram.copy_from_slice(&self.core.bus.cart.ram);
+        true
     }
 }
 
@@ -527,13 +552,14 @@ fn preserve_gb_memory_buffers<E>(
     core: &mut GbCore,
     copy_ram_in: bool,
     op: impl FnOnce(&mut GbCore) -> Result<(), E>,
-) -> Result<(), E> {
+) -> bool {
     let mut guard = GbBufferPinGuard::new(core, copy_ram_in);
     let result = op(guard.core);
     if result.is_ok() {
-        guard.commit();
+        guard.commit()
+    } else {
+        false
     }
-    result
 }
 
 /// Unwind-safe RAII guard that keeps `GbaCore`'s exposed heap buffers (`ewram`, `iwram`, and
@@ -923,6 +949,9 @@ pub unsafe fn load_game(game: *const retro_game_info) -> bool {
         return false;
     }
 
+    // Stop active rumble and release any prior loaded core before loading a new game.
+    unload_game();
+
     let info = unsafe { &*game };
     let path_str_opt = if !info.path.is_null() {
         unsafe { CStr::from_ptr(info.path) }.to_str().ok()
@@ -931,10 +960,19 @@ pub unsafe fn load_game(game: *const retro_game_info) -> bool {
     };
 
     let rom_bytes = if !info.data.is_null() && info.size > 0 {
+        if info.size > MAX_ROM_BYTES {
+            return false;
+        }
         unsafe { core::slice::from_raw_parts(info.data.cast::<u8>(), info.size) }.to_vec()
     } else if let Some(path_str) = path_str_opt {
+        let Ok(meta) = std::fs::metadata(path_str) else {
+            return false;
+        };
+        if meta.len() == 0 || meta.len() > MAX_ROM_BYTES as u64 {
+            return false;
+        }
         match std::fs::read(path_str) {
-            Ok(bytes) if !bytes.is_empty() => bytes,
+            Ok(bytes) if !bytes.is_empty() && bytes.len() <= MAX_ROM_BYTES => bytes,
             _ => return false,
         }
     } else {
@@ -1289,7 +1327,7 @@ pub fn serialize_size() -> usize {
 /// # Safety
 /// `data` must point to at least `size` writable bytes when non-null.
 pub unsafe fn serialize(data: *mut c_void, size: usize) -> bool {
-    if data.is_null() || size < STATE_HEADER_SIZE {
+    if data.is_null() || !(STATE_HEADER_SIZE..=MAX_STATE_BYTES).contains(&size) {
         return false;
     }
 
@@ -1298,10 +1336,13 @@ pub unsafe fn serialize(data: *mut c_void, size: usize) -> bool {
         return false;
     };
 
+    let (core_tag, rom_crc32) = loaded.core.state_identity();
     let Ok(payload) = loaded.core.save_state_bytes() else {
         return false;
     };
-    let needed = STATE_HEADER_SIZE + payload.len();
+    let Some(needed) = STATE_HEADER_SIZE.checked_add(payload.len()) else {
+        return false;
+    };
     if size < needed {
         return false;
     }
@@ -1309,7 +1350,9 @@ pub unsafe fn serialize(data: *mut c_void, size: usize) -> bool {
     let dst = unsafe { core::slice::from_raw_parts_mut(data.cast::<u8>(), size) };
     dst[0..4].copy_from_slice(&STATE_MAGIC);
     dst[4..8].copy_from_slice(&STATE_VERSION.to_le_bytes());
-    dst[8..16].copy_from_slice(&(payload.len() as u64).to_le_bytes());
+    dst[8..12].copy_from_slice(&core_tag.to_le_bytes());
+    dst[12..16].copy_from_slice(&rom_crc32.to_le_bytes());
+    dst[16..24].copy_from_slice(&(payload.len() as u64).to_le_bytes());
     dst[STATE_HEADER_SIZE..needed].copy_from_slice(&payload);
     dst[needed..size].fill(0);
 
@@ -1319,7 +1362,7 @@ pub unsafe fn serialize(data: *mut c_void, size: usize) -> bool {
 /// # Safety
 /// `data` must point to at least `size` readable bytes when non-null.
 pub unsafe fn unserialize(data: *const c_void, size: usize) -> bool {
-    if data.is_null() || size < STATE_HEADER_SIZE {
+    if data.is_null() || !(STATE_HEADER_SIZE..=MAX_STATE_BYTES).contains(&size) {
         return false;
     }
 
@@ -1331,8 +1374,10 @@ pub unsafe fn unserialize(data: *const c_void, size: usize) -> bool {
     if version != STATE_VERSION {
         return false;
     }
+    let state_core_tag = u32::from_le_bytes([src[8], src[9], src[10], src[11]]);
+    let state_rom_crc32 = u32::from_le_bytes([src[12], src[13], src[14], src[15]]);
     let payload_len = u64::from_le_bytes([
-        src[8], src[9], src[10], src[11], src[12], src[13], src[14], src[15],
+        src[16], src[17], src[18], src[19], src[20], src[21], src[22], src[23],
     ]);
     let Ok(payload_len_usize) = usize::try_from(payload_len) else {
         return false;
@@ -1350,12 +1395,17 @@ pub unsafe fn unserialize(data: *const c_void, size: usize) -> bool {
         return false;
     };
 
+    let (expected_core_tag, expected_rom_crc32) = loaded.core.state_identity();
+    if state_core_tag != expected_core_tag || state_rom_crc32 != expected_rom_crc32 {
+        return false;
+    }
+
     let ok = match loaded.core {
-        ActiveCore::Gba(ref mut gba) => {
-            preserve_memory_buffers(gba, true, |c| c.load_state_raw(payload)).is_ok()
-        }
+        // `GbaCore::load_state_raw` copies `ewram`/`iwram`/`sram` in-place preserving heap addresses,
+        // so rewind avoids allocating/double-copying 416 KiB per frame.
+        ActiveCore::Gba(ref mut gba) => gba.load_state_raw(payload).is_ok(),
         ActiveCore::Gb(ref mut gb) => {
-            preserve_gb_memory_buffers(gb, true, |c| c.load_state(payload)).is_ok()
+            preserve_gb_memory_buffers(gb, true, |c| c.load_state(payload))
         }
     };
     if ok {

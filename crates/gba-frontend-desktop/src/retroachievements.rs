@@ -954,9 +954,12 @@ fn split_comparison(s: &str) -> Option<(&str, CmpOp, &str)> {
     None
 }
 
+const MAX_EXPR_DEPTH: usize = 64;
+
 struct ExprParser<'a> {
     bytes: &'a [u8],
     pos: usize,
+    depth: usize,
     next_history_idx: &'a mut usize,
 }
 
@@ -964,6 +967,7 @@ fn parse_expr(input: &str, next_history_idx: &mut usize) -> Result<OperandExpr, 
     let mut parser = ExprParser {
         bytes: input.as_bytes(),
         pos: 0,
+        depth: 0,
         next_history_idx,
     };
     let expr = parser.parse_add_sub()?;
@@ -1086,9 +1090,14 @@ impl<'a> ExprParser<'a> {
     fn parse_atom(&mut self) -> Result<OperandExpr, String> {
         self.skip_ws();
         if self.peek() == Some(b'-') {
+            if self.depth >= MAX_EXPR_DEPTH {
+                return Err("expression nesting too deep".to_string());
+            }
             self.pos += 1;
-            let inner = self.parse_atom()?;
-            return Ok(OperandExpr::UnaryNeg(Box::new(inner)));
+            self.depth += 1;
+            let inner = self.parse_atom();
+            self.depth -= 1;
+            return Ok(OperandExpr::UnaryNeg(Box::new(inner?)));
         }
 
         // Check memory reference prefixes (`d`, `p`, `b`, `~` followed by `0x`).

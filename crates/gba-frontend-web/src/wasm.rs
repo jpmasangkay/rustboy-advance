@@ -168,6 +168,22 @@ impl Emulator {
         self.inner.set_volume(pct);
     }
 
+    /// Synchronizes cartridge RTC date/time (`year` 0..99, `month` 1..12, `day` 1..31, `dow` 0..6, `hour` 0..23, `minute` 0..59, `second` 0..59).
+    #[allow(clippy::too_many_arguments)]
+    pub fn set_rtc_datetime(
+        &mut self,
+        year: u8,
+        month: u8,
+        day: u8,
+        dow: u8,
+        hour: u8,
+        minute: u8,
+        second: u8,
+    ) {
+        self.inner
+            .set_rtc_datetime(year, month, day, dow, hour, minute, second);
+    }
+
     /// Serializes a save state blob (`Uint8Array`).
     pub fn save_state(&self) -> Result<Vec<u8>, JsValue> {
         self.inner.save_state().map_err(|e| JsValue::from_str(&e))

@@ -82,6 +82,21 @@ impl AutofireState {
     }
 }
 
+/// Cancels physically impossible opposing D-Pad directions (Left+Right, Up+Down) to match
+/// real GBA hardware mechanics and prevent game glitches from simultaneous keyboard presses.
+#[inline]
+pub(crate) fn sanitize_opposing_dpad(mut mask: u16) -> u16 {
+    let lr = GbaButton::Left.mask() | GbaButton::Right.mask();
+    if (mask & lr) == lr {
+        mask &= !lr;
+    }
+    let ud = GbaButton::Up.mask() | GbaButton::Down.mask();
+    if (mask & ud) == ud {
+        mask &= !ud;
+    }
+    mask
+}
+
 /// Computes the GBA key bitmask contribution of Turbo A / Turbo B on `frame_counter`.
 ///
 /// `interval_frames` is the full square-wave period in GBA frames (clamped to `2..=16`),
@@ -471,6 +486,7 @@ impl RustboyApp {
             }
         }
 
+        mask = sanitize_opposing_dpad(mask);
         self.base_pressed_mask = mask;
         let (active_a, active_b) = self.autofire_state.update_latches(
             raw_turbo_a,
@@ -479,14 +495,14 @@ impl RustboyApp {
         );
         self.active_turbo_buttons = (active_a, active_b);
 
-        let effective_mask = self.lua.apply_joypad_override(
+        let effective_mask = sanitize_opposing_dpad(self.lua.apply_joypad_override(
             mask | autofire_pulse_mask(
                 active_a,
                 active_b,
                 self.frame_counter,
                 self.config.keybindings.autofire_interval_frames,
             ),
-        );
+        ));
         self.last_pressed_mask = effective_mask;
         encode_keyinput(effective_mask)
     }
@@ -565,7 +581,7 @@ impl RustboyApp {
     }
 
     pub(crate) fn effective_live_keypad_for_frame(&mut self) -> u16 {
-        let effective_mask = self.lua.apply_joypad_override(
+        let effective_mask = sanitize_opposing_dpad(self.lua.apply_joypad_override(
             self.base_pressed_mask
                 | autofire_pulse_mask(
                     self.active_turbo_buttons.0,
@@ -573,7 +589,7 @@ impl RustboyApp {
                     self.frame_counter,
                     self.config.keybindings.autofire_interval_frames,
                 ),
-        );
+        ));
         self.last_pressed_mask = effective_mask;
         encode_keyinput(effective_mask)
     }
@@ -620,10 +636,11 @@ impl RustboyApp {
                         gp_mask |= GbaButton::Down.mask();
                     }
                 }
-                kp &= encode_keyinput(gp_mask);
+                kp &= encode_keyinput(sanitize_opposing_dpad(gp_mask));
             }
         }
-        kp
+        let pressed = sanitize_opposing_dpad((!kp) & 0x03FF);
+        encode_keyinput(pressed)
     }
 
     pub(crate) fn connected_gamepad_names(&self) -> Vec<String> {
@@ -648,7 +665,7 @@ impl RustboyApp {
                 self.gamepad_bind_baseline.clear();
                 return;
             }
-            ctx.request_repaint();
+            ctx.request_repaint_after(std::time::Duration::from_millis(16));
             return;
         }
 
@@ -706,7 +723,7 @@ impl RustboyApp {
                 PendingInputBind::Gamepad(_) => {}
             }
         }
-        ctx.request_repaint();
+        ctx.request_repaint_after(std::time::Duration::from_millis(16));
     }
 
     fn draw_gba_button_diagram(&self, ui: &mut egui::Ui, pads: &[String]) {

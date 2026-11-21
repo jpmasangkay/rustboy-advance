@@ -92,6 +92,9 @@ enum ParseState {
     #[default]
     Idle,
     Payload,
+    OverflowDrain,
+    OverflowChecksum1,
+    OverflowChecksum2,
     Checksum1,
     Checksum2(u8),
 }
@@ -146,13 +149,33 @@ impl RspParser {
                     } else if b == b'#' {
                         self.state = ParseState::Checksum1;
                     } else if self.buf.len() >= MAX_RSP_PAYLOAD_BYTES {
-                        // Drop oversized payload to prevent unbounded memory growth.
+                        // Drain the rest of the oversized frame cleanly until `#xx` so trailing
+                        // payload bytes cannot be misparsed as Interrupt/Ack/Nack in Idle.
                         self.buf.clear();
-                        self.state = ParseState::Idle;
-                        events.push(RspEvent::BadChecksum);
+                        self.state = ParseState::OverflowDrain;
                     } else {
                         self.buf.push(b);
                     }
+                }
+                ParseState::OverflowDrain => {
+                    if b == b'$' {
+                        self.buf.clear();
+                        self.state = ParseState::Payload;
+                    } else if b == b'#' {
+                        self.state = ParseState::OverflowChecksum1;
+                    }
+                }
+                ParseState::OverflowChecksum1 => {
+                    if b == b'$' {
+                        self.buf.clear();
+                        self.state = ParseState::Payload;
+                    } else {
+                        self.state = ParseState::OverflowChecksum2;
+                    }
+                }
+                ParseState::OverflowChecksum2 => {
+                    self.state = ParseState::Idle;
+                    events.push(RspEvent::BadChecksum);
                 }
                 ParseState::Checksum1 => {
                     if let Some(hi) = hex_nibble(b) {
@@ -858,6 +881,9 @@ impl GdbSession {
         let data = ARM7TDMI_TARGET_XML.as_bytes();
         if offset >= data.len() {
             return String::from("l");
+        }
+        if length == 0 && offset < data.len() {
+            return String::from("E01");
         }
         let end = offset.saturating_add(length).min(data.len());
         let escaped = escape_rsp_bytes(&data[offset..end]);

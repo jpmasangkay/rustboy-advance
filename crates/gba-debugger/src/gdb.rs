@@ -32,6 +32,7 @@ const MAX_READ_BYTES_PER_POLL: usize = 64 * 1024;
 const MAX_EVENTS_PER_POLL: usize = 256;
 const MAX_WRITE_QUEUE_BYTES: usize = 256 * 1024;
 const MAX_DMA_STEP_TICKS: usize = 65_536;
+const MAX_ACCEPTS_PER_POLL: usize = 16;
 
 /// Non-blocking TCP GDB Remote Serial Protocol server for [`GbaCore`].
 pub struct GdbStub {
@@ -44,6 +45,9 @@ pub struct GdbStub {
     pub session: GdbSession,
     last_sent: Option<String>,
     write_queue: Vec<u8>,
+    /// One-shot PC exclusion so `c` / `vCont;c` from an active breakpoint retires that instruction
+    /// instead of deadlocking at the same address.
+    skip_bp_once_pc: Option<u32>,
 }
 
 impl std::fmt::Debug for GdbStub {
@@ -74,6 +78,7 @@ impl GdbStub {
             session: GdbSession::new(),
             last_sent: None,
             write_queue: Vec::new(),
+            skip_bp_once_pc: None,
         }
     }
 
@@ -217,6 +222,8 @@ impl GdbStub {
                     match pkt.action {
                         GdbAction::None => {}
                         GdbAction::Continue => {
+                            let cur_pc = core.cpu.current_exec_pc() & !1;
+                            self.skip_bp_once_pc = Some(cur_pc);
                             outcome.pause_request = Some(false);
                         }
                         GdbAction::Step => {
@@ -285,6 +292,12 @@ impl GdbStub {
         if self.client.is_some() && self.session.is_running() && outcome.stop_reason.is_none() {
             let mut merged = DebugControl::default();
             self.session.merge_debug_control(&empty, &mut merged);
+            if let Some(skip_pc) = self.skip_bp_once_pc.take() {
+                let cur_pc = core.cpu.current_exec_pc() & !1;
+                if cur_pc == skip_pc {
+                    merged.breakpoints.retain(|&bp| (bp & !1) != skip_pc);
+                }
+            }
             if let Some(hit) = core.step_one_debug(&merged) {
                 self.notify_stop(&hit);
                 outcome.pause_request = Some(true);
@@ -298,11 +311,11 @@ impl GdbStub {
         let Some(listener) = self.listener.as_ref() else {
             return;
         };
-        loop {
+        for _ in 0..MAX_ACCEPTS_PER_POLL {
             match listener.accept() {
                 Ok((stream, addr)) => {
                     if self.client.is_some() {
-                        // Replace stale client or reject secondary client? Keep active client clean.
+                        // Reject secondary client while an active debug session owns the connection.
                         drop(stream);
                         continue;
                     }
@@ -313,6 +326,7 @@ impl GdbStub {
                     self.session.reset_connection();
                     self.last_sent = None;
                     self.write_queue.clear();
+                    self.skip_bp_once_pc = None;
                     self.client_addr = Some(addr_str.clone());
                     self.client = Some(stream);
                     outcome.client_connected = Some(addr_str);
@@ -344,7 +358,13 @@ impl GdbStub {
 
     fn queue_packet(&mut self, payload: &str) {
         let frame = encode_rsp_packet(payload);
-        self.write_queue.extend_from_slice(frame.as_bytes());
+        if self.write_queue.len().saturating_add(frame.len()) <= MAX_WRITE_QUEUE_BYTES {
+            self.write_queue.extend_from_slice(frame.as_bytes());
+        } else {
+            // Queue is full: drop active client cleanly instead of allowing unbounded memory growth.
+            self.disconnect_client();
+            return;
+        }
         self.last_sent = Some(frame);
     }
 
@@ -378,5 +398,6 @@ impl GdbStub {
         self.session.reset_connection();
         self.last_sent = None;
         self.write_queue.clear();
+        self.skip_bp_once_pc = None;
     }
 }

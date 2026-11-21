@@ -186,8 +186,11 @@ pub struct SysBus {
     pub code_page_tag: u32,
     #[serde(skip)]
     pub code_page_region: u8,
+    /// Inline O(1) dirty 16 KiB page bitmasks for JIT code invalidation (EWRAM: 16 pages, IWRAM: 2 pages).
     #[serde(skip)]
-    pub dirty_code_pages: Vec<u32>,
+    pub dirty_ewram_pages: u16,
+    #[serde(skip)]
+    pub dirty_iwram_pages: u8,
     #[serde(skip)]
     pub invalidate_all_jit: bool,
     #[serde(skip)]
@@ -242,7 +245,8 @@ impl Clone for SysBus {
             code_page_ptr: None,
             code_page_tag: u32::MAX,
             code_page_region: 0,
-            dirty_code_pages: Vec::new(),
+            dirty_ewram_pages: 0,
+            dirty_iwram_pages: 0,
             invalidate_all_jit: true,
             rom_patch_originals: self.rom_patch_originals.clone(),
         };
@@ -319,7 +323,8 @@ impl SysBus {
             code_page_ptr: None,
             code_page_tag: u32::MAX,
             code_page_region: 0,
-            dirty_code_pages: Vec::new(),
+            dirty_ewram_pages: 0,
+            dirty_iwram_pages: 0,
             invalidate_all_jit: false,
             rom_patch_originals: BTreeMap::new(),
         };
@@ -591,22 +596,26 @@ impl SysBus {
     pub fn invalidate_all_code(&mut self) {
         self.code_page_tag = u32::MAX;
         self.code_page_ptr = None;
-        self.dirty_code_pages.clear();
+        self.dirty_ewram_pages = 0;
+        self.dirty_iwram_pages = 0;
         self.invalidate_all_jit = true;
     }
 
-    /// Invalidates cached code-page state and marks the canonical page dirty for JIT
+    #[inline(always)]
+    pub fn has_dirty_code_pages(&self) -> bool {
+        self.dirty_ewram_pages != 0 || self.dirty_iwram_pages != 0
+    }
+
+    /// Invalidates cached code-page state and sets the O(1) dirty-page bitmask for JIT
     /// whenever a write to `(region, page)` occurs (handling EWRAM/IWRAM/ROM mirrors).
     #[inline(always)]
     pub(crate) fn invalidate_code_page_if_aliased(&mut self, region: u32, page: u32) {
-        let canon = Self::canonical_code_page(page);
-        if !self.invalidate_all_jit {
-            if self.dirty_code_pages.len() >= 64 {
-                self.dirty_code_pages.clear();
-                self.invalidate_all_jit = true;
-            } else if !self.dirty_code_pages.contains(&canon) {
-                self.dirty_code_pages.push(canon);
-            }
+        if region == 0x02 {
+            self.dirty_ewram_pages |= 1u16 << (page & 0x0F);
+        } else if region == 0x03 {
+            self.dirty_iwram_pages |= 1u8 << (page & 1);
+        } else {
+            self.invalidate_all_jit = true;
         }
         if self.code_page_ptr.is_some() {
             let matches = if region == 0x03 && self.code_page_region == 0x03 {

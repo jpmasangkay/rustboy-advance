@@ -108,9 +108,9 @@ impl log::Log for DesktopLogger {
             || target.starts_with("gba_")
             || target.starts_with("gb_")
         {
-            metadata.level() <= log::Level::Info
+            metadata.level() <= log::max_level()
         } else {
-            metadata.level() <= log::Level::Warn
+            metadata.level() <= log::Level::Warn && metadata.level() <= log::max_level()
         }
     }
 
@@ -129,6 +129,7 @@ impl log::Log for DesktopLogger {
 }
 
 static DESKTOP_LOGGER: DesktopLogger = DesktopLogger;
+static MAIN_THREAD_ID: std::sync::OnceLock<std::thread::ThreadId> = std::sync::OnceLock::new();
 
 fn install_logger() {
     let max_level = match std::env::var("RUST_LOG")
@@ -158,7 +159,12 @@ fn install_panic_hook() {
             let _ = std::fs::write(log_path, &msg);
         }
         eprintln!("Rustboy Advance - Fatal Crash:\n{msg}");
-        if !should_suppress_error_dialog() {
+        // Only open a modal OS dialog from the UI main thread; calling rfd/Cocoa/Win32 UI
+        // APIs from a background audio/worker thread can abort or deadlock the process.
+        let on_main_thread = MAIN_THREAD_ID
+            .get()
+            .is_some_and(|&id| id == std::thread::current().id());
+        if on_main_thread && !should_suppress_error_dialog() {
             rfd::MessageDialog::new()
                 .set_title("Rustboy Advance - Fatal Crash")
                 .set_description(&msg)
@@ -185,6 +191,7 @@ fn show_startup_error(title: &str, description: &str) {
 }
 
 fn main() {
+    let _ = MAIN_THREAD_ID.set(std::thread::current().id());
     attach_parent_console_if_cli();
     config::init_portable_mode();
     install_logger();
@@ -208,6 +215,17 @@ fn real_main() {
 
     if cli.uninstall {
         let data_dir = AppConfig::app_data_dir();
+        if !cli.yes {
+            eprintln!(
+                "Refusing to delete all persistent Rustboy Advance data in {} without confirmation.",
+                data_dir.display()
+            );
+            eprintln!(
+                "This permanently removes config, battery saves, save states, covers, and credentials."
+            );
+            eprintln!("Re-run with `--uninstall --yes` to confirm.");
+            std::process::exit(2);
+        }
         match AppConfig::uninstall_all_data() {
             Ok(removed) => {
                 println!(

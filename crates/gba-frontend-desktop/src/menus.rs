@@ -1084,24 +1084,20 @@ impl RustboyApp {
                         self.request_hard_reset();
                     }
 
-                    // 4. Fast-Forward
+                    // 4. Fast-Forward (transient session toggle; never overwrites saved base speed)
                     let eff_speed = self.effective_speed_multiplier();
                     let turbo_on = self.tab_fast_forward || eff_speed > 1.05 || eff_speed <= 0.0;
                     if toolbar_btn(ui, "⏩ Fast", turbo_on, has_rom)
                         .on_hover_text(format!("Toggle Fast-Forward ({ff_key})"))
                         .clicked()
                     {
-                        let target_speed = if eff_speed > 1.05 || eff_speed <= 0.0 {
-                            1.0
+                        if eff_speed > 1.05 || eff_speed <= 0.0 {
+                            let base_is_normal = !self.has_per_game_speed_override()
+                                && (self.config.speed_multiplier - 1.0).abs() < 0.05;
+                            self.session_speed_override =
+                                if base_is_normal { None } else { Some(1.0) };
                         } else {
-                            self.config.fast_forward_speed
-                        };
-                        if self.has_per_game_speed_override() {
-                            self.session_speed_override = Some(target_speed);
-                        } else {
-                            self.session_speed_override = None;
-                            self.config.speed_multiplier = target_speed;
-                            self.config.save();
+                            self.session_speed_override = Some(self.config.fast_forward_speed);
                         }
                     }
 

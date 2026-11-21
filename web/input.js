@@ -68,6 +68,7 @@ export class InputManager {
     this.touchMask = 0;
     this.faceTouchMask = 0;
     this.dpadTouchMask = 0;
+    this.touchResetters = [];
     this.activeGamepadName = "";
     this.rebindingButton = null;
     this.onRebindComplete = null;
@@ -80,6 +81,9 @@ export class InputManager {
     this.touchMask = 0;
     this.faceTouchMask = 0;
     this.dpadTouchMask = 0;
+    for (const reset of this.touchResetters) {
+      reset();
+    }
   }
 
   loadBindings() {
@@ -204,13 +208,20 @@ export class InputManager {
       return;
     }
 
+    // Never hijack browser/OS modifier shortcuts (Ctrl+R, Cmd+W, Alt+Tab, etc.)
+    // or risk leaving held keys stuck when a modifier combo shifts window focus.
+    if (e.ctrlKey || e.metaKey || e.altKey) {
+      return;
+    }
+
     const mappedBit = this.codeToBit.get(e.code);
     const uiFocused = this.isUiInteractiveFocused();
 
     // User-configured game bindings always take precedence over built-in shortcuts
-    // (e.g. if the player maps Space, P, F, or M to a GBA button).
+    // (e.g. if the player maps Space, P, F, or M to a GBA button), while still letting
+    // focused UI controls (select dropdowns, toolbar buttons, sliders) handle keyboard input.
     if (mappedBit !== undefined) {
-      if (uiFocused && (e.code === "Enter" || e.code === "Space" || e.code === "Backspace")) {
+      if (uiFocused) {
         return;
       }
       e.preventDefault();
@@ -270,6 +281,10 @@ export class InputManager {
 
     for (const btn of standardButtons) {
       const activePointers = new Set();
+      this.touchResetters.push(() => {
+        activePointers.clear();
+        btn.removeAttribute("data-pressed");
+      });
       btn.addEventListener("pointerdown", (e) => {
         e.preventDefault();
         btn.setPointerCapture?.(e.pointerId);
@@ -304,6 +319,10 @@ export class InputManager {
           }
         }
       };
+      this.touchResetters.push(() => {
+        facePointers.clear();
+        recomputeFace();
+      });
       const faceMaskAt = (clientX, clientY) => {
         let mask = 0;
         const pad = 10;
@@ -354,6 +373,10 @@ export class InputManager {
         dpadEl.dataset.dirLeft = String(Boolean(mask & GBA_KEYS.LEFT));
         dpadEl.dataset.dirRight = String(Boolean(mask & GBA_KEYS.RIGHT));
       };
+      this.touchResetters.push(() => {
+        dpadPointers.clear();
+        recomputeDpad();
+      });
       const maskFromPoint = (clientX, clientY) => {
         const rect = dpadEl.getBoundingClientRect();
         const cx = rect.left + rect.width / 2;

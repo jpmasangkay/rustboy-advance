@@ -55,9 +55,28 @@ impl Timer {
     /// Advances the timer by one CPU M-cycle (4 CPU T-cycles).
     pub fn step_m_cycle(&mut self, double_speed: bool) -> TimerStepResult {
         self.reloaded_this_m_cycle = false;
-        let mut res = TimerStepResult::default();
         let apu_bit = if double_speed { 13 } else { 12 };
 
+        // O(1) fast path: since `tac_bit >= 3` (stride >= 8) and `apu_bit >= 12`, advancing by 4
+        // T-cycles can produce at most one falling edge on either bit. When no overflow reload is
+        // pending and no TIMA falling edge occurs across the 4 T-cycles, skip the per-T-cycle loop.
+        if self.overflow_countdown == 0 {
+            let old_clk = self.sys_clk;
+            let new_clk = old_clk.wrapping_add(4);
+            let new_mux = Self::compute_mux(new_clk, self.tac);
+            if !(self.prev_mux && !new_mux) {
+                self.sys_clk = new_clk;
+                self.prev_mux = new_mux;
+                let apu_frame_seq =
+                    ((old_clk >> apu_bit) & 1) != 0 && ((new_clk >> apu_bit) & 1) == 0;
+                return TimerStepResult {
+                    timer_irq: false,
+                    apu_frame_seq,
+                };
+            }
+        }
+
+        let mut res = TimerStepResult::default();
         for _ in 0..4 {
             if self.overflow_countdown > 0 {
                 self.overflow_countdown -= 1;

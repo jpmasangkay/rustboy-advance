@@ -1,7 +1,7 @@
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicI32, AtomicU8, AtomicU64, AtomicUsize, Ordering};
 use std::thread::{self, JoinHandle, Thread};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
 use gba_core::SAMPLE_RATE_HZ;
@@ -12,10 +12,11 @@ const RING_CAPACITY_SAMPLES: usize = 32_768; // 16,384 stereo frames (~500ms @ 3
 const INITIAL_TARGET_FILL_SAMPLES: usize = 4_096; // 2,048 stereo frames (~62.5ms @ 32.768kHz steady target)
 const MAX_TARGET_FILL_SAMPLES: usize = 16_384; // 8,192 stereo frames (~250ms adaptive upper bound)
 const ADAPTIVE_TARGET_STEP_SAMPLES: usize = 2_048; // +31.25ms headroom per underrun event
-const BASE_PLAY_RING_CAPACITY_F32: usize = 4_096; // 2,048 stereo host frames @ 48kHz
-const BASE_PLAY_TARGET_F32: usize = 1_024; // 512 stereo host frames (~10.7ms @ 48kHz)
-const BASE_PLAY_IDLE_FLOOR_F32: usize = 192; // 96 stereo host frames (~2.0ms @ 48kHz)
+const BASE_PLAY_RING_CAPACITY_F32: usize = 8_192; // 4,096 stereo host frames (~85ms @ 48kHz)
+const BASE_PLAY_TARGET_F32: usize = 2_048; // 1,024 stereo host frames (~21.3ms @ 48kHz — covers 20ms WASAPI/PipeWire buffers)
+const BASE_PLAY_IDLE_FLOOR_F32: usize = 384; // 192 stereo host frames (~4.0ms @ 48kHz)
 const CLEAN_DECAY_WINDOW_FRAMES: u64 = 327_680; // ~10s of clean 32.768kHz playback before stepping target_fill down
+const STREAM_RECOVERY_COOLDOWN: Duration = Duration::from_secs(2);
 
 fn scaled_play_ring_dims(sample_rate: u32) -> (usize, usize, usize) {
     let rate = (sample_rate as u64).clamp(48_000, 384_000);
@@ -139,9 +140,8 @@ pub(crate) mod win_mmcss {
         handle: *mut c_void,
         prev_thread_priority: Option<i32>,
     }
-
-    // Only owned and dropped on the thread where created (`!Sync` via handle).
-    unsafe impl Send for MmcssGuard {}
+    // Intentionally `!Send` and `!Sync` via `*mut c_void`: thread priority & MMCSS registration
+    // must always be reverted on the exact thread that entered them.
 
     impl MmcssGuard {
         fn enter_task(task: &[u16], avrt_prio: i32, fallback_prio: i32) -> Self {
@@ -289,6 +289,7 @@ pub(crate) mod win_mmcss {
         prev_qos: Option<(u32, i32)>,
         time_constraint_active: bool,
         elevated: bool,
+        _not_send: std::marker::PhantomData<*mut ()>,
     }
 
     impl MmcssGuard {
@@ -319,6 +320,7 @@ pub(crate) mod win_mmcss {
                     prev_qos: (got_prev && qos_ok).then_some((prev_class, prev_prio)),
                     time_constraint_active: tc_ok,
                     elevated: qos_ok || tc_ok,
+                    _not_send: std::marker::PhantomData,
                 }
             }
         }
@@ -589,17 +591,39 @@ impl AudioConsumer {
     }
 
     #[inline]
+    fn snapshot_controls(&self) -> AudioControlSnapshot {
+        let paused = self.paused.load(Ordering::Relaxed);
+        let target_gain = if paused || self.muted.load(Ordering::Relaxed) {
+            0.0f32
+        } else {
+            (self.master_volume.load(Ordering::Relaxed).min(100) as f32) / 100.0
+        };
+        let target_fill = self.target_fill.load(Ordering::Relaxed).max(1) as f64;
+        let ppm = self
+            .rate_offset_ppm
+            .load(Ordering::Relaxed)
+            .clamp(-10_000, 10_000);
+        let rate_scale = 1.0 + (ppm as f64) * 1e-6;
+        AudioControlSnapshot {
+            paused,
+            target_gain,
+            target_fill,
+            rate_scale,
+        }
+    }
+
+    #[inline]
     #[cfg(test)]
     fn step_frame(&mut self) -> (f32, f32) {
         let fill = self.cons.occupied_len();
         self.occupancy.store(fill, Ordering::Relaxed);
-        self.step_frame_with_fill(fill)
+        let ctl = self.snapshot_controls();
+        self.step_frame_with_controls(fill, ctl)
     }
 
     #[inline]
-    fn step_frame_with_fill(&mut self, fill: usize) -> (f32, f32) {
-        let is_paused = self.paused.load(Ordering::Relaxed);
-        let (l, r) = if is_paused {
+    fn step_frame_with_controls(&mut self, fill: usize, ctl: AudioControlSnapshot) -> (f32, f32) {
+        let (l, r) = if ctl.paused {
             // While paused, never drain the ring buffer, never count underruns, and never
             // ratchet `target_fill` upward. Smoothly fade out via `mute_gain`.
             self.was_underrunning = true;
@@ -607,19 +631,13 @@ impl AudioConsumer {
             (self.hist_l[newest_idx], self.hist_r[newest_idx])
         } else {
             let fill_f = fill as f64;
-            let target = self.target_fill.load(Ordering::Relaxed).max(1) as f64;
             // Smooth fill-level EMA suppresses callback-burst pitch wobble while locking latency.
             self.avg_fill += 0.0005 * (fill_f - self.avg_fill);
-            let fill_delta = ((self.avg_fill - target) / target).clamp(-1.0, 1.0);
+            let fill_delta = ((self.avg_fill - ctl.target_fill) / ctl.target_fill).clamp(-1.0, 1.0);
             // Dynamic Rate Control (DRC): skew input step by up to +/-1.0% keeping ring buffer centered at target_fill,
             // and fold vblank phase-lock rate adjustments seamlessly into audio resampling.
             let drc_adjust = (fill_delta * 0.010).clamp(-0.010, 0.010);
-            let ppm = self
-                .rate_offset_ppm
-                .load(Ordering::Relaxed)
-                .clamp(-10_000, 10_000);
-            let rate_scale = 1.0 + (ppm as f64) * 1e-6;
-            let r_dynamic = self.base_ratio * rate_scale * (1.0 + drc_adjust);
+            let r_dynamic = self.base_ratio * ctl.rate_scale * (1.0 + drc_adjust);
 
             while self.phase >= 1.0 {
                 self.phase -= 1.0;
@@ -633,11 +651,7 @@ impl AudioConsumer {
             out
         };
 
-        let target_gain = if is_paused || self.muted.load(Ordering::Relaxed) {
-            0.0f32
-        } else {
-            (self.master_volume.load(Ordering::Relaxed).min(100) as f32) / 100.0
-        };
+        let target_gain = ctl.target_gain;
         if (self.mute_gain - target_gain).abs() <= 0.005 {
             self.mute_gain = target_gain;
         } else if self.mute_gain < target_gain {
@@ -668,22 +682,42 @@ impl AudioConsumer {
     }
 }
 
+#[derive(Clone, Copy)]
+struct AudioControlSnapshot {
+    paused: bool,
+    target_gain: f32,
+    target_fill: f64,
+    rate_scale: f64,
+}
+
 struct PlayConsumer {
     cons: HeapCons<f32>,
     last_l: f32,
     last_r: f32,
     idle_floor: usize,
     wake_worker: Option<Thread>,
+    paused: Arc<AtomicBool>,
+    underruns: Arc<AtomicU64>,
+    was_starved: bool,
 }
 
 impl PlayConsumer {
-    fn new(cons: HeapCons<f32>, idle_floor: usize, wake_worker: Option<Thread>) -> Self {
+    fn new(
+        cons: HeapCons<f32>,
+        idle_floor: usize,
+        wake_worker: Option<Thread>,
+        paused: Arc<AtomicBool>,
+        underruns: Arc<AtomicU64>,
+    ) -> Self {
         Self {
             cons,
             last_l: 0.0,
             last_r: 0.0,
             idle_floor,
             wake_worker,
+            paused,
+            underruns,
+            was_starved: true,
         }
     }
 
@@ -694,11 +728,23 @@ impl PlayConsumer {
         {
             self.last_l = l;
             self.last_r = r;
+            self.was_starved = false;
             (l, r)
         } else {
             *starved = true;
+            if !self.was_starved && !self.paused.load(Ordering::Relaxed) {
+                self.underruns.fetch_add(1, Ordering::Relaxed);
+                self.was_starved = true;
+            }
             self.last_l *= 0.99;
             self.last_r *= 0.99;
+            // Flush subnormals to zero so idle underruns never trigger slow denormal FPU traps.
+            if self.last_l.abs() < 1e-6 {
+                self.last_l = 0.0;
+            }
+            if self.last_r.abs() < 1e-6 {
+                self.last_r = 0.0;
+            }
             (self.last_l, self.last_r)
         }
     }
@@ -896,6 +942,7 @@ pub struct AudioOutput {
     _stream: Option<cpal::Stream>,
     _worker: Option<AudioWorkerHandle>,
     host_sample_rate: u32,
+    last_recovery_attempt: Option<Instant>,
     #[allow(dead_code)]
     has_device: bool,
 }
@@ -947,6 +994,7 @@ impl AudioOutput {
             _stream: stream,
             _worker: worker,
             host_sample_rate,
+            last_recovery_attempt: None,
             has_device,
         }
     }
@@ -976,6 +1024,7 @@ impl AudioOutput {
             _stream: None,
             _worker: None,
             host_sample_rate: 48_000,
+            last_recovery_attempt: None,
             has_device: false,
         }
     }
@@ -1012,10 +1061,20 @@ impl AudioOutput {
     }
 
     /// Rebuilds the OS audio stream if CPAL reported a device error (e.g. Bluetooth/HDMI hot-plug).
+    /// Retries with a cooldown if no output device is immediately ready after unplug/replug.
     pub fn poll_recover_stream(&mut self) -> bool {
-        if !self.stream_error.swap(false, Ordering::AcqRel) || self.producer.is_none() {
+        if !self.stream_error.load(Ordering::Acquire) || self.producer.is_none() {
             return false;
         }
+        let now = Instant::now();
+        if let Some(last) = self.last_recovery_attempt
+            && now.duration_since(last) < STREAM_RECOVERY_COOLDOWN
+        {
+            return false;
+        }
+        self.last_recovery_attempt = Some(now);
+        self.stream_error.store(false, Ordering::Release);
+
         // Drop old stream before worker so callback stops cleanly.
         self._stream = None;
         self._worker = None;
@@ -1038,6 +1097,10 @@ impl AudioOutput {
             self.rate_offset_ppm.clone(),
         );
         let has_device = stream.is_some();
+        if !has_device {
+            // Keep recovery armed so hot-plugging headphones/DAC later automatically restores audio.
+            self.stream_error.store(true, Ordering::Release);
+        }
         self.producer = Some(AudioProducer {
             prod,
             play_gba_equiv,
@@ -1153,6 +1216,8 @@ impl AudioOutput {
         let stop = Arc::new(AtomicBool::new(false));
         let stop_thread = stop.clone();
         let worker_occupancy = occupancy.clone();
+        let play_paused = paused.clone();
+        let play_underruns = underruns.clone();
         let worker_join = thread::Builder::new()
             .name("gba-audio".to_string())
             .spawn(move || {
@@ -1168,6 +1233,7 @@ impl AudioOutput {
                     target_fill,
                     rate_offset_ppm,
                 );
+                let mut batch = [0.0f32; 128];
                 while !stop_thread.load(Ordering::Acquire) {
                     let mut out_occ = play_prod.occupied_len();
                     let gba_factor = consumer.base_ratio * 2.0;
@@ -1175,19 +1241,30 @@ impl AudioOutput {
                         let in_avail = consumer.cons.occupied_len();
                         let gba_in_out = (((out_occ / 2) as f64) * gba_factor).round() as usize;
                         let total_occ = in_avail + gba_in_out;
-                        let want_more = if in_avail >= 2 {
-                            out_occ < play_target
+                        let goal = if in_avail >= 2 {
+                            play_target
                         } else {
-                            out_occ < play_idle_floor
+                            play_idle_floor
                         };
-                        if !want_more || play_prod.vacant_len() < 2 {
+                        let needed = goal.saturating_sub(out_occ) & !1;
+                        let vacant = play_prod.vacant_len() & !1;
+                        let count = needed.min(vacant).min(batch.len());
+                        if count < 2 {
                             play_gba_equiv.store(gba_in_out, Ordering::Relaxed);
                             worker_occupancy.store(total_occ, Ordering::Relaxed);
                             break;
                         }
-                        let (l, r) = consumer.step_frame_with_fill(total_occ);
-                        let _ = play_prod.push_slice(&[l, r]);
-                        out_occ += 2;
+                        let ctl = consumer.snapshot_controls();
+                        for pair in batch[..count].as_chunks_mut::<2>().0 {
+                            let (l, r) = consumer.step_frame_with_controls(total_occ, ctl);
+                            pair[0] = l;
+                            pair[1] = r;
+                        }
+                        let pushed = play_prod.push_slice(&batch[..count]);
+                        out_occ += pushed;
+                        if pushed < count {
+                            break;
+                        }
                     }
                     thread::park_timeout(Duration::from_millis(2));
                 }
@@ -1203,8 +1280,13 @@ impl AudioOutput {
             join: Some(join),
         };
 
-        let mut play_cons =
-            PlayConsumer::new(play_cons, play_idle_floor, Some(wake_worker.clone()));
+        let mut play_cons = PlayConsumer::new(
+            play_cons,
+            play_idle_floor,
+            Some(wake_worker.clone()),
+            play_paused,
+            play_underruns,
+        );
         let stream = match config.sample_format() {
             cpal::SampleFormat::F32 => device
                 .build_output_stream(
@@ -1353,7 +1435,14 @@ mod tests {
     fn high_sample_rate_scales_play_ring_proportionally() {
         let (cap48, tgt48, flr48) = scaled_play_ring_dims(48_000);
         let (cap192, tgt192, flr192) = scaled_play_ring_dims(192_000);
-        assert_eq!((cap48, tgt48, flr48), (4_096, 1_024, 192));
-        assert_eq!((cap192, tgt192, flr192), (16_384, 4_096, 768));
+        assert_eq!(
+            (cap48, tgt48, flr48),
+            (
+                BASE_PLAY_RING_CAPACITY_F32,
+                BASE_PLAY_TARGET_F32,
+                BASE_PLAY_IDLE_FLOOR_F32
+            )
+        );
+        assert_eq!((cap192, tgt192, flr192), (cap48 * 4, tgt48 * 4, flr48 * 4));
     }
 }

@@ -119,13 +119,15 @@ pub struct RtcState {
 
 impl RtcState {
     pub fn tick_normal_cycles(&mut self, normal_cycles: u64) {
+        if (self.current.day_hi & 0x40) != 0 {
+            // RTC halted: sub-second counter stays frozen until unhalted.
+            return;
+        }
         self.cycle_acc += normal_cycles;
         while self.cycle_acc >= CYCLES_PER_SECOND {
             self.cycle_acc -= CYCLES_PER_SECOND;
             self.timestamp = self.timestamp.wrapping_add(1);
-            if (self.current.day_hi & 0x40) == 0 {
-                self.tick_one_second();
-            }
+            self.tick_one_second();
         }
     }
 
@@ -589,7 +591,7 @@ impl Cartridge {
                     self.rebuild_bank_cache();
                 }
                 0x4000..=0x5FFF => {
-                    self.ram_or_rtc_reg = val;
+                    self.ram_or_rtc_reg = val & 0x0F;
                     self.rebuild_bank_cache();
                 }
                 0x6000..=0x7FFF => {
@@ -804,14 +806,31 @@ impl Cartridge {
     }
 }
 
+const CRC32_TABLE: [u32; 256] = {
+    let mut table = [0u32; 256];
+    let mut i = 0;
+    while i < 256 {
+        let mut crc = i as u32;
+        let mut j = 0;
+        while j < 8 {
+            if (crc & 1) != 0 {
+                crc = (crc >> 1) ^ 0xEDB8_8320;
+            } else {
+                crc >>= 1;
+            }
+            j += 1;
+        }
+        table[i] = crc;
+        i += 1;
+    }
+    table
+};
+
 fn compute_crc32(data: &[u8]) -> u32 {
     let mut crc = 0xFFFF_FFFFu32;
     for &b in data {
-        crc ^= b as u32;
-        for _ in 0..8 {
-            let mask = (crc & 1).wrapping_neg();
-            crc = (crc >> 1) ^ (0xEDB8_8320 & mask);
-        }
+        let idx = ((crc ^ (b as u32)) & 0xFF) as usize;
+        crc = (crc >> 8) ^ CRC32_TABLE[idx];
     }
     !crc
 }

@@ -245,6 +245,23 @@ impl PsgSquare {
         }
     }
 
+    pub fn write_duty_len_byte(&mut self, val: u8) {
+        self.reg_h = (self.reg_h & 0xFF00) | (val as u16);
+        self.duty = (val >> 6) & 0x03;
+        self.length_counter = 64 - (val & 0x3F);
+    }
+
+    pub fn write_env_byte(&mut self, val: u8) {
+        self.reg_h = (self.reg_h & 0x00FF) | ((val as u16) << 8);
+        self.env_init_vol = (val >> 4) & 0x0F;
+        self.env_add = (val & 0x08) != 0;
+        self.env_period = val & 0x07;
+        self.dac_enabled = (val & 0xF8) != 0;
+        if !self.dac_enabled {
+            self.enabled = false;
+        }
+    }
+
     pub fn write_freq_ctrl(&mut self, val: u16) {
         self.reg_x = val;
         self.freq = val & 0x07FF;
@@ -455,6 +472,17 @@ impl PsgWave {
         self.force_75 = (val & 0x8000) != 0;
     }
 
+    pub fn write_len_byte(&mut self, val: u8) {
+        self.reg_h = (self.reg_h & 0xFF00) | (val as u16);
+        self.length_counter = 256 - (val as u16);
+    }
+
+    pub fn write_vol_byte(&mut self, val: u8) {
+        self.reg_h = (self.reg_h & 0x00FF) | ((val as u16) << 8);
+        self.volume_code = (val >> 5) & 0x03;
+        self.force_75 = (val & 0x80) != 0;
+    }
+
     pub fn write_x(&mut self, val: u16) {
         self.reg_x = val;
         self.freq = val & 0x07FF;
@@ -609,6 +637,22 @@ impl PsgNoise {
         self.env_add = (val & 0x0800) != 0;
         self.env_period = ((val >> 8) & 0x07) as u8;
         self.dac_enabled = (val & 0xF800) != 0;
+        if !self.dac_enabled {
+            self.enabled = false;
+        }
+    }
+
+    pub fn write_len_byte(&mut self, val: u8) {
+        self.reg_l = (self.reg_l & 0xFF00) | (val as u16);
+        self.length_counter = 64 - (val & 0x3F);
+    }
+
+    pub fn write_env_byte(&mut self, val: u8) {
+        self.reg_l = (self.reg_l & 0x00FF) | ((val as u16) << 8);
+        self.env_init_vol = (val >> 4) & 0x0F;
+        self.env_add = (val & 0x08) != 0;
+        self.env_period = val & 0x07;
+        self.dac_enabled = (val & 0xF8) != 0;
         if !self.dac_enabled {
             self.enabled = false;
         }
@@ -989,13 +1033,10 @@ impl Apu {
         (req_a, req_b)
     }
 
-    /// Advances audio to `cycle`, ticks the 512 Hz PSG frame sequencer, and drains ready samples.
+    /// Advances audio to `cycle`, ticking any due 512 Hz PSG frame sequencer steps, and drains ready samples.
     pub fn on_frame_sequencer_tick(&mut self, cycle: u64) {
         self.sync(cycle);
-        if self.master_enabled() {
-            self.tick_frame_sequencer();
-            self.commit_mix(cycle);
-        }
+        self.commit_mix(cycle);
         self.drain_blip(cycle);
     }
 
@@ -1306,7 +1347,12 @@ impl Apu {
                 psg_r >>= 1;
                 psg_l >>= 1;
             }
-            _ => {}
+            2 => {}
+            _ => {
+                // GBATEK: SOUNDCNT_H[1:0] == 3 is prohibited and outputs silence on hardware.
+                psg_r = 0;
+                psg_l = 0;
+            }
         }
 
         let (raw_a, raw_b) = self.fifo_samples(cycle);

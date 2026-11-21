@@ -81,11 +81,21 @@ pub mod box_u16s {
         val: &[u16; N],
         serializer: S,
     ) -> Result<S::Ok, S::Error> {
-        let mut bytes = Vec::with_capacity(N * 2);
-        for &v in val {
-            bytes.extend_from_slice(&v.to_le_bytes());
+        #[cfg(target_endian = "little")]
+        {
+            // SAFETY: `u16` has no padding and every bit pattern is valid; on little-endian
+            // targets its in-memory representation is identical to packed LE bytes.
+            let bytes = unsafe { core::slice::from_raw_parts(val.as_ptr().cast::<u8>(), N * 2) };
+            serializer.serialize_bytes(bytes)
         }
-        serializer.serialize_bytes(&bytes)
+        #[cfg(not(target_endian = "little"))]
+        {
+            let mut bytes = Vec::with_capacity(N * 2);
+            for &v in val {
+                bytes.extend_from_slice(&v.to_le_bytes());
+            }
+            serializer.serialize_bytes(&bytes)
+        }
     }
 
     pub fn deserialize<'de, const N: usize, D: Deserializer<'de>>(
@@ -104,13 +114,11 @@ pub mod box_u16s {
                 if v.len() != N * 2 {
                     return Err(E::invalid_length(v.len(), &self));
                 }
-                let mut vec = Vec::with_capacity(N);
-                for chunk in v.as_chunks::<2>().0 {
-                    vec.push(u16::from_le_bytes(*chunk));
+                let mut out = alloc_boxed_array::<u16, N>(0);
+                for (dst, chunk) in out.iter_mut().zip(v.as_chunks::<2>().0) {
+                    *dst = u16::from_le_bytes(*chunk);
                 }
-                vec.into_boxed_slice()
-                    .try_into()
-                    .map_err(|_| E::custom("length mismatch"))
+                Ok(out)
             }
 
             fn visit_byte_buf<E: de::Error>(self, v: Vec<u8>) -> Result<Self::Value, E> {
@@ -179,5 +187,45 @@ pub mod fixed_bytes {
         }
 
         deserializer.deserialize_bytes(FixedBytesVisitor::<N>)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde::{Deserialize, Serialize};
+
+    #[derive(Serialize, Deserialize, PartialEq, Eq, Debug)]
+    struct SampleState {
+        #[serde(with = "box_bytes")]
+        bytes: Box<[u8; 16]>,
+        #[serde(with = "box_u16s")]
+        words: Box<[u16; 8]>,
+        #[serde(with = "fixed_bytes")]
+        fixed: [u8; 4],
+    }
+
+    #[test]
+    fn serde_helpers_roundtrip_and_reject_truncated_payloads() {
+        let mut bytes = alloc_boxed_array::<u8, 16>(0);
+        for (i, b) in bytes.iter_mut().enumerate() {
+            *b = (i as u8) ^ 0xA5;
+        }
+        let mut words = alloc_boxed_array::<u16, 8>(0);
+        for (i, w) in words.iter_mut().enumerate() {
+            *w = 0x1234u16.wrapping_add((i as u16) * 0x1111);
+        }
+        let state = SampleState {
+            bytes,
+            words,
+            fixed: [0xDE, 0xAD, 0xBE, 0xEF],
+        };
+        let encoded = postcard::to_allocvec(&state).expect("serialize sample state");
+        let decoded: SampleState =
+            postcard::from_bytes(&encoded).expect("deserialize sample state");
+        assert_eq!(decoded, state);
+
+        // Truncated buffer must fail cleanly without panicking.
+        assert!(postcard::from_bytes::<SampleState>(&encoded[..encoded.len() - 3]).is_err());
     }
 }

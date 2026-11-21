@@ -245,13 +245,18 @@ mod tests {
         assert_eq!(emu.save_type_name(), "SRAM 32 KiB");
         assert_eq!(emu.export_sram()[0], 0x42);
 
-        // Enabling ghosting mid-game seeds prev_rgba from current frame (no black flash).
+        // Enabling ghosting mid-game preserves the current frame in-place (no black flash).
         emu.run_frame();
         emu.run_frame();
         assert_eq!(&emu.framebuffer()[0..4], &[255, 0, 0, 255]);
         emu.set_lcd_ghosting(true);
         emu.run_frame();
         assert_eq!(emu.framebuffer()[0], 255);
+
+        // RTC synchronization writes valid BCD registers on the active cartridge.
+        emu.set_rtc_datetime(26, 11, 21, 6, 14, 35, 9);
+        let rtc = &emu.core().expect("core active").bus.cart.rtc;
+        assert_eq!(rtc.regs, [0x26, 0x11, 0x21, 0x06, 0x14, 0x35, 0x09]);
     }
 
     #[test]

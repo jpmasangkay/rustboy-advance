@@ -425,7 +425,9 @@ impl RustboyApp {
         let shader_preset = self.config.effective_shader_preset();
         let frame_blending = self.config.frame_blending;
         let lcd_ghosting = self.config.lcd_ghosting;
-        let use_shader = !self.link.split_view_active() && self.wgpu_shaders.is_some();
+        let use_shader = !self.link.split_view_active()
+            && self.wgpu_shaders.is_some()
+            && self.config.display_filter != crate::config::DisplayFilter::XbrSmooth3x;
         let mut shader_pipeline_arc = None;
 
         if use_shader
@@ -550,9 +552,12 @@ impl RustboyApp {
                     || local.p2_last_filter_key != Some(filter_key)
                 {
                     let tex_options = self.config.display_filter.texture_options();
-                    let p2_img = local.p2_postproc.process_display_filter(
+                    let p2_img = local.p2_postproc.process_display_filter_with_options(
                         &local.p2_framebuffer,
+                        None,
                         color_correction,
+                        color_profile,
+                        false,
                         lcd_ghosting,
                         self.config.display_filter,
                         false,
@@ -811,7 +816,7 @@ impl RustboyApp {
                             rect,
                             toast,
                         );
-                        ctx.request_repaint();
+                        ctx.request_repaint_after(std::time::Duration::from_millis(16));
                     }
                 }
             });

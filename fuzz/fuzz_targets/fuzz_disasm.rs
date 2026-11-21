@@ -14,7 +14,7 @@ fuzz_target!(|data: &[u8]| {
         0x0800_0000
     };
 
-    for (idx, chunk) in data.chunks_exact(4).enumerate() {
+    for (idx, chunk) in data.chunks_exact(4).take(1024).enumerate() {
         let word = u32::from_le_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]);
         let cur_addr = addr.wrapping_add((idx as u32).wrapping_mul(4));
         let _ = disassemble_arm(word, cur_addr);

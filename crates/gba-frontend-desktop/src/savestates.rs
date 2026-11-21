@@ -628,6 +628,26 @@ impl RustboyApp {
         if !self.has_active_game() {
             return false;
         }
+        const MAX_SAVESTATE_FILE_BYTES: u64 = 16 * 1024 * 1024;
+        match fs::metadata(path) {
+            Ok(meta) if meta.len() > MAX_SAVESTATE_FILE_BYTES => {
+                let msg = format!(
+                    "Save state file too large ({} bytes; max {} MiB)",
+                    meta.len(),
+                    MAX_SAVESTATE_FILE_BYTES / (1024 * 1024)
+                );
+                self.state_manager_error = Some(msg.clone());
+                self.notify_error(&msg);
+                return false;
+            }
+            Err(e) => {
+                let msg = SaveStateError::Io(e.to_string()).to_string();
+                self.state_manager_error = Some(msg.clone());
+                self.notify_error(&msg);
+                return false;
+            }
+            Ok(_) => {}
+        }
         let bytes = match fs::read(path) {
             Ok(b) => b,
             Err(e) => {
@@ -693,6 +713,12 @@ impl RustboyApp {
             return;
         };
 
+        const MAX_SAVESTATE_FILE_BYTES: u64 = 16 * 1024 * 1024;
+        if fs::metadata(&state_file).is_ok_and(|m| m.len() > MAX_SAVESTATE_FILE_BYTES) {
+            self.slot_thumbnails[idx] = None;
+            self.slot_meta[idx] = Some(SlotMetaEntry::Corrupt("File exceeds 16 MiB limit".into()));
+            return;
+        }
         let bytes = match fs::read(&state_file) {
             Ok(b) => b,
             Err(e) => {
@@ -703,12 +729,21 @@ impl RustboyApp {
 
         match decode_container_meta(&bytes) {
             Ok(meta) => {
-                if !meta.thumbnail_png.is_empty()
-                    && let Ok(img) = image::load_from_memory_with_format(
-                        &meta.thumbnail_png,
+                let decoded_thumb = if !meta.thumbnail_png.is_empty() {
+                    let mut limits = image::Limits::default();
+                    limits.max_image_width = Some(1024);
+                    limits.max_image_height = Some(1024);
+                    limits.max_alloc = Some(8 * 1024 * 1024);
+                    let mut reader = image::ImageReader::with_format(
+                        std::io::Cursor::new(&meta.thumbnail_png),
                         image::ImageFormat::Png,
-                    )
-                {
+                    );
+                    reader.limits(limits);
+                    reader.decode().ok()
+                } else {
+                    None
+                };
+                if let Some(img) = decoded_thumb {
                     let rgba = img.to_rgba8();
                     let (w, h) = rgba.dimensions();
                     let cimg = ColorImage::from_rgba_unmultiplied(

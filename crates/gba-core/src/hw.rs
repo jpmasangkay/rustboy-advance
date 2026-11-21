@@ -471,11 +471,13 @@ impl SysBus {
                     } else {
                         self.hw.dma[ch].count as u32
                     };
-                    self.cart.eeprom.write_bit(
+                    let allow_autodetect = self.cart.save_type_override.is_none();
+                    self.cart.eeprom.write_bit_with_autodetect(
                         &mut self.cart.sram,
                         &mut self.cart.save_dirty,
                         val,
                         total_len,
+                        allow_autodetect,
                     );
                     if self.cart.save_type == crate::cartridge::SaveType::None {
                         self.cart.save_type = if self.cart.eeprom.detected_8k {
@@ -813,8 +815,17 @@ impl SysBus {
         } else {
             (cur & 0x00FF) | ((val as u16) << 8)
         };
-        // Avoid accidental trigger bit re-firing if only lower byte of SOUNDxCNT_X / TMxCNT_H written, etc.
+        // Avoid accidental length reload or trigger bit re-firing on single-byte PSG writes.
         match aligned {
+            0x0400_0062 => {
+                if self.apu.master_enabled() {
+                    if (off & 1) == 0 {
+                        self.apu.sq1.write_duty_len_byte(val);
+                    } else {
+                        self.apu.sq1.write_env_byte(val);
+                    }
+                }
+            }
             0x0400_0064 => {
                 if self.apu.master_enabled() {
                     if (off & 1) == 0 {
@@ -822,6 +833,15 @@ impl SysBus {
                         self.apu.sq1.reg_x = (self.apu.sq1.reg_x & 0xFF00) | (val as u16);
                     } else {
                         self.apu.sq1.write_freq_ctrl(new_val);
+                    }
+                }
+            }
+            0x0400_0068 => {
+                if self.apu.master_enabled() {
+                    if (off & 1) == 0 {
+                        self.apu.sq2.write_duty_len_byte(val);
+                    } else {
+                        self.apu.sq2.write_env_byte(val);
                     }
                 }
             }
@@ -835,6 +855,15 @@ impl SysBus {
                     }
                 }
             }
+            0x0400_0072 => {
+                if self.apu.master_enabled() {
+                    if (off & 1) == 0 {
+                        self.apu.wave.write_len_byte(val);
+                    } else {
+                        self.apu.wave.write_vol_byte(val);
+                    }
+                }
+            }
             0x0400_0074 => {
                 if self.apu.master_enabled() {
                     if (off & 1) == 0 {
@@ -842,6 +871,15 @@ impl SysBus {
                         self.apu.wave.reg_x = (self.apu.wave.reg_x & 0xFF00) | (val as u16);
                     } else {
                         self.apu.wave.write_x(new_val);
+                    }
+                }
+            }
+            0x0400_0078 => {
+                if self.apu.master_enabled() {
+                    if (off & 1) == 0 {
+                        self.apu.noise.write_len_byte(val);
+                    } else {
+                        self.apu.noise.write_env_byte(val);
                     }
                 }
             }
@@ -1470,15 +1508,17 @@ impl SysBus {
 
         match comment {
             0x00 => {
-                // SoftReset
+                // SoftReset: switch to System mode first so set_cpsr does not clobber SP_svc with 0.
                 let flag = self.iwram[0x7FFA];
                 self.iwram[0x7E00..0x8000].fill(0);
                 self.invalidate_all_code();
+                cpu.set_cpsr(0x0000_001F); // System mode, ARM
                 cpu.gpr.fill(0);
+                cpu.banked_r8_12_usr = [0; 5];
+                cpu.banked_r8_12_fiq = [0; 5];
                 cpu.banked_r13 = [0x0300_7F00, 0, 0x0300_7FA0, 0x0300_7FE0, 0, 0];
                 cpu.banked_r14 = [0; 6];
                 cpu.spsr_banked = [0; 6];
-                cpu.set_cpsr(0x0000_001F); // System mode, ARM
                 cpu.gpr[13] = 0x0300_7F00;
                 cpu.intr_wait = None;
                 let entry = if flag != 0 { 0x0200_0000 } else { 0x0800_0000 };
@@ -1489,7 +1529,8 @@ impl SysBus {
                 cpu.flush_pipeline(self, entry);
             }
             0x01 => {
-                // RegisterRamReset
+                // RegisterRamReset: real GBA BIOS unconditionally enables Forced Blank first.
+                self.ppu.write_dispcnt(0x0080);
                 let flags = cpu.gpr[0];
                 let mut reset_cycles = 96u64;
                 if (flags & 0x01) != 0 {
@@ -1678,9 +1719,14 @@ impl SysBus {
                 cpu.flush_pipeline(self, 0x0000_0008);
             }
             0x0C => {
-                // CpuFastSet(src, dst, cnt)
+                // CpuFastSet(src, dst, cnt): real BIOS rejects reads/writes below EWRAM (< 0x0200_0000).
                 let mut src = cpu.gpr[0] & !3;
                 let mut dst = cpu.gpr[1] & !3;
+                if src < 0x0200_0000 || dst < 0x0200_0000 {
+                    cpu.flush_cycles += 40;
+                    cpu.return_from_swi(self);
+                    return;
+                }
                 let cnt = cpu.gpr[2];
                 let count = ((cnt & 0x001F_FFFF) + 7) & !7;
                 let fixed_src = (cnt & (1 << 24)) != 0;

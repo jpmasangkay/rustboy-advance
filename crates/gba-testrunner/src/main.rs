@@ -189,13 +189,16 @@ fn main() -> ExitCode {
 
     if cli.allow_failures {
         ExitCode::SUCCESS
+    } else if results.is_empty() {
+        eprintln!("error: no tests matched the requested suite/filter");
+        ExitCode::from(1)
     } else if cli.fail_on_unexpected {
         if unexpected_failures > 0 {
             ExitCode::from(1)
         } else {
             ExitCode::SUCCESS
         }
-    } else if counts.failed > 0 {
+    } else if counts.failed > 0 || unexpected_failures > 0 {
         ExitCode::from(1)
     } else {
         ExitCode::SUCCESS

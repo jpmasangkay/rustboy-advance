@@ -244,7 +244,12 @@ pub fn disassemble_thumb(instr: u16, addr: u32) -> String {
                 let rd = (instr & 7) | ((instr >> 4) & 8);
                 let rs = ((instr >> 3) & 7) | ((instr >> 3) & 8);
                 if op == 3 {
-                    format!("bx {}", reg(rs as u32))
+                    // ARMv4T only defines BX (bit 7 = 0); bit 7 = 1 is ARMv5T BLX Rm (undefined on GBA).
+                    if (instr & 0x80) != 0 {
+                        format!("udf #0x{instr:04X}")
+                    } else {
+                        format!("bx {}", reg(rs as u32))
+                    }
                 } else if op == 2 && rd == 8 && rs == 8 {
                     "nop".to_string()
                 } else {
@@ -530,6 +535,9 @@ pub fn disassemble_arm(instr: u32, addr: u32) -> String {
                     let u = (instr & (1 << 23)) != 0;
                     let imm_flag = (instr & (1 << 22)) != 0;
                     let w = (instr & (1 << 21)) != 0;
+                    if (!imm_flag && (instr & 0x0000_0F00) != 0) || (!p && w) {
+                        return format!("udf{c} #0x{instr:08X}");
+                    }
                     let rd = reg((instr >> 12) & 0xF);
                     let rn = reg((instr >> 16) & 0xF);
                     let mnemonic = match (load, sh) {
@@ -554,7 +562,7 @@ pub fn disassemble_arm(instr: u32, addr: u32) -> String {
                         let wb = if w { "!" } else { "" };
                         format!("[{rn}{off_str}]{wb}")
                     } else if off_str.is_empty() {
-                        format!("[{rn}]")
+                        format!("[{rn}], #0")
                     } else {
                         format!("[{rn}]{off_str}")
                     };
@@ -598,6 +606,9 @@ pub fn disassemble_arm(instr: u32, addr: u32) -> String {
                     } else {
                         reg(instr & 0xF).to_string()
                     };
+                    if fields.is_empty() {
+                        return format!("msr{c} {psr}, {src}");
+                    }
                     return format!("msr{c} {psr}_{fields}, {src}");
                 }
                 return format!("udf{c} #0x{instr:08X}");

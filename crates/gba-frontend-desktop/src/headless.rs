@@ -1076,7 +1076,23 @@ pub fn run_headless(cfg: &CliConfig) -> Result<(), String> {
             }
             for (target_f, name) in &snapshot_targets {
                 if *target_f == frame_idx {
-                    let out_png = dir.join(format!("{frame_idx:04}_{name}.png"));
+                    let safe_name: String = name
+                        .chars()
+                        .map(|c| {
+                            if c.is_ascii_alphanumeric() || c == '-' || c == '_' {
+                                c
+                            } else {
+                                '_'
+                            }
+                        })
+                        .take(64)
+                        .collect();
+                    let safe_name = if safe_name.is_empty() {
+                        "scene".to_string()
+                    } else {
+                        safe_name
+                    };
+                    let out_png = dir.join(format!("{frame_idx:04}_{safe_name}.png"));
                     bench::save_rgb_png_from_bgr555(&wrapper.inner.last_fb, &out_png)?;
                 }
             }

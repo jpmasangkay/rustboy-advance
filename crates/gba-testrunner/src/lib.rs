@@ -124,6 +124,7 @@ pub struct TestResult {
     pub criterion: Criterion,
     pub outcome: TestOutcome,
     pub known_failure: bool,
+    pub interactive: bool,
     /// `true` when a `known_failure` test's CRC32 diverged from `known_bad_crc32` (unexpected
     /// regression or unacknowledged fix requiring manifest/golden update).
     pub known_bad_drift: bool,
@@ -136,8 +137,11 @@ pub struct TestResult {
 
 impl TestResult {
     /// Returns `true` when this result should fail `--fail-on-unexpected` / `cargo test`.
+    /// Non-interactive ROMs that exist on disk but are missing their golden reference also fail
+    /// so deleted/missing goldens cannot silently produce a green check.
     pub const fn is_unexpected_failure(&self) -> bool {
-        matches!(self.outcome, TestOutcome::Fail) && (!self.known_failure || self.known_bad_drift)
+        (matches!(self.outcome, TestOutcome::Fail) && (!self.known_failure || self.known_bad_drift))
+            || (matches!(self.outcome, TestOutcome::SkipMissingGolden) && !self.interactive)
     }
 }
 
@@ -445,6 +449,7 @@ pub fn run_single_test(
             criterion: entry.criterion,
             outcome: TestOutcome::SkipMissingRom,
             known_failure: entry.known_failure,
+            interactive: entry.interactive,
             known_bad_drift: false,
             frames_executed: 0,
             avg_frame_ms: 0.0,
@@ -469,6 +474,7 @@ pub fn run_single_test(
                 criterion: entry.criterion,
                 outcome: TestOutcome::Fail,
                 known_failure: entry.known_failure,
+                interactive: entry.interactive,
                 known_bad_drift: false,
                 frames_executed: 0,
                 avg_frame_ms: 0.0,
@@ -490,6 +496,7 @@ pub fn run_single_test(
                 criterion: entry.criterion,
                 outcome: TestOutcome::Fail,
                 known_failure: entry.known_failure,
+                interactive: entry.interactive,
                 known_bad_drift: false,
                 frames_executed: 0,
                 avg_frame_ms: 0.0,
@@ -581,6 +588,7 @@ pub fn run_single_test(
         criterion: entry.criterion,
         outcome,
         known_failure: entry.known_failure,
+        interactive: entry.interactive,
         known_bad_drift,
         frames_executed,
         avg_frame_ms,
@@ -977,5 +985,27 @@ mod tests {
         let (diffs, first) = compare_fb_with_png(&fb, &tmp_png).expect("compare png");
         let _ = fs::remove_file(&tmp_png);
         assert_eq!(diffs, 0, "unexpected diff: {first:?}");
+    }
+
+    #[test]
+    fn missing_golden_fails_for_non_interactive_only() {
+        let make = |interactive: bool| TestResult {
+            id: "test".to_string(),
+            suite: "unit".to_string(),
+            name: "unit/test.gba".to_string(),
+            rom_path: "unused.gba".to_string(),
+            criterion: Criterion::Screenshot,
+            outcome: TestOutcome::SkipMissingGolden,
+            known_failure: false,
+            interactive,
+            known_bad_drift: false,
+            frames_executed: 1,
+            avg_frame_ms: 0.1,
+            fb_hash: Some(0),
+            fb_crc32: Some(0),
+            notes: "missing golden".to_string(),
+        };
+        assert!(make(false).is_unexpected_failure());
+        assert!(!make(true).is_unexpected_failure());
     }
 }

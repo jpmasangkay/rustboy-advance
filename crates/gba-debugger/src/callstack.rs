@@ -115,7 +115,9 @@ pub fn is_call_instruction(core: &GbaCore, pc: u32, thumb: bool) -> Option<u32> 
         }
         if (op & 0x0FFF_FFFF) == 0x01A0_E00F {
             let op2 = core.peek32(pc.wrapping_add(4));
-            if is_arm_bx_non_lr(op2) || is_arm_b(op2) || is_arm_ldr_pc_indirect(op2) {
+            if arm_cond_passed(core.cpu.cpsr, op2 >> 28)
+                && (is_arm_bx_non_lr(op2) || is_arm_b(op2) || is_arm_ldr_pc_indirect(op2))
+            {
                 return Some(pc.wrapping_add(8));
             }
         }
@@ -177,8 +179,8 @@ pub fn is_return_instruction(core: &GbaCore, pc: u32, thumb: bool, cpsr: u32) ->
         if (op & 0x0FEF_FFFF) == 0x01A0_F00E {
             return true;
         }
-        // LDR pc, [sp, ...] (imm or unshifted/shifted reg, excluding [pc, ...])
-        if (op & 0x0E1F_F000) == 0x041D_F000 || (op & 0x0E1F_F010) == 0x061D_F000 {
+        // LDR pc, [sp, ...] (word-load only: B bit 22 must be 0, excluding LDRB)
+        if (op & 0x0E5F_F000) == 0x041D_F000 || (op & 0x0E5F_F010) == 0x061D_F000 {
             return true;
         }
         false

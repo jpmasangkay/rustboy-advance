@@ -108,8 +108,8 @@ pub struct IoChangeEntry {
     pub pc: u32,
     pub addr: u32,
     pub name: &'static str,
-    pub old_val: u16,
-    pub new_val: u16,
+    pub old_val: u32,
+    pub new_val: u32,
     pub summary: String,
 }
 
@@ -160,7 +160,7 @@ pub struct DebuggerWindows {
     pub io_search: String,
     pub io_tab_log: bool,
     pub io_hide_vcount_timers: bool,
-    pub io_prev_snapshot: Vec<(u32, u16)>,
+    pub io_prev_snapshot: Vec<(u32, u32)>,
     pub io_write_log: VecDeque<IoChangeEntry>,
     pub gdb_port_input: String,
     pub gdb_status: GdbUiStatus,
@@ -211,6 +211,24 @@ pub struct DebuggerWindows {
     pub draft_cheat_format: CheatFormat,
     pub cheat_error: Option<String>,
     about_logo_tex: Option<TextureHandle>,
+}
+
+impl DebuggerWindows {
+    pub fn any_open(&self) -> bool {
+        self.show_cpu
+            || self.show_hex
+            || self.show_palette
+            || self.show_vram
+            || self.show_bg
+            || self.show_oam
+            || self.show_audio
+            || self.show_overrides
+            || self.show_cheats
+            || self.show_about
+            || self.show_io_regs
+            || self.show_gdb
+            || self.mem_search.open
+    }
 }
 
 impl Default for DebuggerWindows {
@@ -1936,11 +1954,19 @@ fn parse_hex_addr(raw: &str) -> Option<u32> {
     u32::from_str_radix(trimmed, 16).ok()
 }
 
-fn read_io_raw_u16(core: &GbaCore, addr: u32) -> u16 {
-    if addr == 0x0400_0300 || addr == 0x0400_0301 {
-        core.peek8(addr) as u16
+fn read_io_raw_u32(core: &GbaCore, addr: u32) -> u32 {
+    match gba_debugger::io_regs::io_reg_access_width(addr).1 {
+        1 => u32::from(core.peek8(addr)),
+        4 => core.peek32(addr),
+        _ => u32::from(core.bus.debug_read_16(addr)),
+    }
+}
+
+fn format_io_raw(addr: u32, raw: u32) -> String {
+    if gba_debugger::io_regs::io_reg_access_width(addr).1 == 4 {
+        format!("0x{raw:08X}")
     } else {
-        core.bus.debug_read_16(addr)
+        format!("0x{raw:04X}")
     }
 }
 
@@ -1977,13 +2003,13 @@ impl DebuggerWindows {
         if self.io_prev_snapshot.len() != regs.len() {
             self.io_prev_snapshot = regs
                 .iter()
-                .map(|&(addr, _, _)| (addr, read_io_raw_u16(core, addr)))
+                .map(|&(addr, _, _)| (addr, read_io_raw_u32(core, addr)))
                 .collect();
             return;
         }
         let pc = core.cpu.current_exec_pc();
         for (idx, &(addr, name, _)) in regs.iter().enumerate() {
-            let new_val = read_io_raw_u16(core, addr);
+            let new_val = read_io_raw_u32(core, addr);
             let old_val = self.io_prev_snapshot[idx].1;
             if new_val != old_val {
                 self.io_prev_snapshot[idx].1 = new_val;
@@ -1992,7 +2018,7 @@ impl DebuggerWindows {
                 {
                     continue;
                 }
-                let summary = decode_io_reg(addr, new_val as u32)
+                let summary = decode_io_reg(addr, new_val)
                     .map(|d| d.summary)
                     .unwrap_or_default();
                 if self.io_write_log.len() >= 250 {
@@ -2251,14 +2277,15 @@ impl DebuggerWindows {
                                         continue;
                                     }
                                 }
-                                let raw = read_io_raw_u16(core, addr);
-                                let desc = decode_io_reg(addr, raw as u32);
+                                let raw = read_io_raw_u32(core, addr);
+                                let desc = decode_io_reg(addr, raw);
                                 let summary = desc
                                     .as_ref()
                                     .map(|d| d.summary.as_str())
                                     .unwrap_or("");
+                                let raw_str = format_io_raw(addr, raw);
                                 let title = format!(
-                                    "0x{addr:08X}  {name:<12}  0x{raw:04X}  |  {summary}"
+                                    "0x{addr:08X}  {name:<12}  {raw_str}  |  {summary}"
                                 );
                                 if let Some(d) = desc
                                     && !d.fields.is_empty()
@@ -2308,13 +2335,15 @@ impl DebuggerWindows {
                         .auto_shrink([false, false])
                         .show(ui, |ui| {
                             for entry in &self.io_write_log {
+                                let old_hex = format_io_raw(entry.addr, entry.old_val);
+                                let new_hex = format_io_raw(entry.addr, entry.new_val);
                                 ui.monospace(format!(
-                                    "PC 0x{:08X}  0x{:08X} {:<11} 0x{:04X} -> 0x{:04X}  {}",
+                                    "PC 0x{:08X}  0x{:08X} {:<11} {} -> {}  {}",
                                     entry.pc,
                                     entry.addr,
                                     entry.name,
-                                    entry.old_val,
-                                    entry.new_val,
+                                    old_hex,
+                                    new_hex,
                                     entry.summary
                                 ));
                             }
@@ -2415,5 +2444,43 @@ impl DebuggerWindows {
 
         self.show_gdb = open;
         action
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_read_io_raw_u32_preserves_32bit_memcnt_ewram_wait_control() {
+        let mut core = GbaCore::new(None, vec![0u8; 0x200]);
+        assert_eq!(read_io_raw_u32(&core, 0x0400_0800), 0x0D00_0020);
+        assert_eq!(format_io_raw(0x0400_0800, 0x0D00_0020), "0x0D000020");
+
+        let mut dbg = DebuggerWindows::default();
+        dbg.poll_io_changes(&core);
+        // Mutate MEMCNT[27:24] from 0xD (2 waitstates) to 0xE (1 waitstate).
+        core.bus.apply_cheat_write_32(0x0400_0800, 0x0E00_0020);
+        dbg.poll_io_changes(&core);
+        let entry = dbg
+            .io_write_log
+            .front()
+            .expect("MEMCNT upper-half write must be logged");
+        assert_eq!(entry.addr, 0x0400_0800);
+        assert_eq!(entry.old_val, 0x0D00_0020);
+        assert_eq!(entry.new_val, 0x0E00_0020);
+        assert!(
+            entry.summary.contains("EWRAM Wait=2c"),
+            "unexpected MEMCNT summary: {}",
+            entry.summary
+        );
+        let decoded = gba_debugger::decode_io_reg(0x0400_0800, 0x0E00_0020)
+            .expect("MEMCNT register must decode");
+        assert!(
+            decoded
+                .fields
+                .iter()
+                .any(|f| f.name == "EWRAM Wait Control" && f.value == 14)
+        );
     }
 }

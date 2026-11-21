@@ -960,7 +960,7 @@ impl RustboyApp {
                 self.library_scan_rx = None;
             }
             Err(mpsc::TryRecvError::Empty) => {
-                ctx.request_repaint();
+                ctx.request_repaint_after(std::time::Duration::from_millis(50));
             }
             Err(mpsc::TryRecvError::Disconnected) => {
                 self.library_scanning = false;
@@ -993,41 +993,26 @@ impl RustboyApp {
     pub(crate) fn sort_library_entries(&self, entries: &mut [RomLibraryEntry]) {
         entries.sort_by(|a, b| {
             let ord = match self.table_sort_column {
-                TableSortColumn::Title => a
-                    .display_name
-                    .to_lowercase()
-                    .cmp(&b.display_name.to_lowercase()),
+                TableSortColumn::Title => cmp_ignore_ascii_case(&a.display_name, &b.display_name),
                 TableSortColumn::Region => library_region_label(a).cmp(library_region_label(b)),
                 TableSortColumn::Size => a
                     .size_mb
                     .partial_cmp(&b.size_mb)
                     .unwrap_or(std::cmp::Ordering::Equal),
                 TableSortColumn::LastPlayed => {
-                    let ts_a = self
-                        .config
-                        .playtimes
-                        .get(&a.game_code)
+                    let ts_a = lookup_playtime_for_entry(&self.config, &a.game_code)
                         .map(|p| p.last_played_timestamp)
                         .unwrap_or(0);
-                    let ts_b = self
-                        .config
-                        .playtimes
-                        .get(&b.game_code)
+                    let ts_b = lookup_playtime_for_entry(&self.config, &b.game_code)
                         .map(|p| p.last_played_timestamp)
                         .unwrap_or(0);
                     ts_a.cmp(&ts_b)
                 }
                 TableSortColumn::PlayTime => {
-                    let sec_a = self
-                        .config
-                        .playtimes
-                        .get(&a.game_code)
+                    let sec_a = lookup_playtime_for_entry(&self.config, &a.game_code)
                         .map(|p| p.total_seconds)
                         .unwrap_or(0);
-                    let sec_b = self
-                        .config
-                        .playtimes
-                        .get(&b.game_code)
+                    let sec_b = lookup_playtime_for_entry(&self.config, &b.game_code)
                         .map(|p| p.total_seconds)
                         .unwrap_or(0);
                     sec_a.cmp(&sec_b)
@@ -1038,11 +1023,7 @@ impl RustboyApp {
             } else {
                 ord
             };
-            ordered.then_with(|| {
-                a.display_name
-                    .to_lowercase()
-                    .cmp(&b.display_name.to_lowercase())
-            })
+            ordered.then_with(|| cmp_ignore_ascii_case(&a.display_name, &b.display_name))
         });
     }
 
@@ -1729,9 +1710,20 @@ impl RustboyApp {
                                     ui.close_menu();
                                 }
                                 if ui.button("📁 Open Save Folder").clicked() {
-                                    if let Some(parent) = entry.path.parent() {
-                                        crate::menus::open_folder_in_file_manager(parent);
-                                    }
+                                    let save_dir =
+                                        crate::config::AppConfig::find_existing_sav_path_for_rom(
+                                            &entry.path,
+                                        )
+                                        .unwrap_or_else(|| {
+                                            crate::config::AppConfig::resolve_sav_path_for_rom(
+                                                &entry.path,
+                                            )
+                                        })
+                                        .parent()
+                                        .map(Path::to_path_buf)
+                                        .unwrap_or_else(crate::config::AppConfig::saves_dir);
+                                    let _ = fs::create_dir_all(&save_dir);
+                                    crate::menus::open_folder_in_file_manager(&save_dir);
                                     ui.close_menu();
                                 }
                                 if ui.button("⚙ Game Settings...").clicked() {
@@ -1996,10 +1988,13 @@ impl RustboyApp {
                                                         }
                                                         if ui.button("📁 Open Save Folder").clicked()
                                                         {
-                                                            if let Some(parent) = entry.path.parent()
-                                                            {
-                                                                crate::menus::open_folder_in_file_manager(parent);
-                                                            }
+                                                            let save_dir = crate::config::AppConfig::find_existing_sav_path_for_rom(&entry.path)
+                                                                .unwrap_or_else(|| crate::config::AppConfig::resolve_sav_path_for_rom(&entry.path))
+                                                                .parent()
+                                                                .map(Path::to_path_buf)
+                                                                .unwrap_or_else(crate::config::AppConfig::saves_dir);
+                                                            let _ = fs::create_dir_all(&save_dir);
+                                                            crate::menus::open_folder_in_file_manager(&save_dir);
                                                             ui.close_menu();
                                                         }
                                                         if ui
@@ -2112,7 +2107,8 @@ impl RustboyApp {
                                                         egui::StrokeKind::Inside,
                                                     );
 
-                                                    let tile_hovered = tile_resp.hovered();
+                                                    let tile_hovered = tile_resp.hovered()
+                                                        || ui.rect_contains_pointer(tile_rect);
                                                     tile_resp.on_hover_text(&entry.display_name);
 
                                                     // 2. Title Directly Below Tile (no region or MB size clutter in Grid view)
@@ -2238,6 +2234,13 @@ pub(crate) fn format_rom_size_mb(size_mb: f32) -> String {
     } else {
         format!("{size_mb:.1} MB")
     }
+}
+
+#[inline]
+fn cmp_ignore_ascii_case(a: &str, b: &str) -> std::cmp::Ordering {
+    a.bytes()
+        .map(|c| c.to_ascii_lowercase())
+        .cmp(b.bytes().map(|c| c.to_ascii_lowercase()))
 }
 
 #[cfg(test)]
@@ -2699,5 +2702,62 @@ mod tests {
             last_delay > std::time::Duration::from_secs(60),
             "welcome card must stay idle (repaint on input only), got {last_delay:?}"
         );
+    }
+
+    #[test]
+    fn test_sort_library_entries_with_crc_qualified_playtime_keys() {
+        let mut app = std::mem::ManuallyDrop::new(RustboyApp::new(
+            crate::headless::CliConfig::default(),
+            crate::config::AppConfig::default(),
+        ));
+        app.config.playtimes.insert(
+            "BPEE_12345678".to_string(),
+            crate::config::RomPlaytime {
+                total_seconds: 7200,
+                last_played_timestamp: 1_700_000_100,
+                launch_count: 3,
+            },
+        );
+        app.config.playtimes.insert(
+            "AGFE_87654321".to_string(),
+            crate::config::RomPlaytime {
+                total_seconds: 3600,
+                last_played_timestamp: 1_700_000_900,
+                launch_count: 2,
+            },
+        );
+
+        let make_entry = |name: &str, code: &str| RomLibraryEntry {
+            path: PathBuf::from(format!("{name}.gba")),
+            display_name: name.to_string(),
+            internal_title: name.to_uppercase(),
+            game_code: code.to_string(),
+            region: "USA",
+            size_mb: 16.0,
+            has_battery_sav: false,
+            source_kind: RomSourceKind::Raw,
+            platform: RomPlatform::Gba,
+            cart_type_label: "GBA".to_string(),
+        };
+
+        let mut entries = vec![
+            make_entry("Advance Wars", "AWRE"),
+            make_entry("Golden Sun", "AGFE"),
+            make_entry("Pokemon Emerald", "BPEE"),
+        ];
+
+        app.table_sort_column = TableSortColumn::PlayTime;
+        app.table_sort_descending = true;
+        app.sort_library_entries(&mut entries);
+        assert_eq!(entries[0].game_code, "BPEE");
+        assert_eq!(entries[1].game_code, "AGFE");
+        assert_eq!(entries[2].game_code, "AWRE");
+
+        app.table_sort_column = TableSortColumn::LastPlayed;
+        app.table_sort_descending = true;
+        app.sort_library_entries(&mut entries);
+        assert_eq!(entries[0].game_code, "AGFE");
+        assert_eq!(entries[1].game_code, "BPEE");
+        assert_eq!(entries[2].game_code, "AWRE");
     }
 }

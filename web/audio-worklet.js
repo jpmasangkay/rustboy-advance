@@ -14,7 +14,7 @@ class GbaAudioProcessor extends AudioWorkletProcessor {
     this.writeIdx = 0;
     this.count = 0;
 
-    this.inputRate = 32768;
+    this.inputRate = 48000;
     this.speed = 1.0;
     this.baseRatio = this.inputRate / sampleRate;
     this.phase = 0;
@@ -25,8 +25,10 @@ class GbaAudioProcessor extends AudioWorkletProcessor {
     this.muted = false;
     this.volume = 1.0;
     this.primed = false;
+    this.avgFill = 0;
 
     this.updateTargets();
+    this.avgFill = this.targetFill;
 
     this.port.onmessage = ({ data }) => {
       if (!data) return;
@@ -50,9 +52,9 @@ class GbaAudioProcessor extends AudioWorkletProcessor {
           break;
         }
         case "samples": {
-          const length = Number.isInteger(data.length)
-            ? data.length
-            : data.buffer.byteLength >> 1;
+          const maxElems = data.buffer.byteLength >> 1;
+          const rawLen = Number.isInteger(data.length) ? data.length : maxElems;
+          const length = Math.max(0, Math.min(rawLen, maxElems));
           const samples = new Int16Array(data.buffer, 0, length);
           this.pushSamples(samples);
           // Return ArrayBuffer to main thread pool to eliminate per-frame GC churn.
@@ -64,11 +66,8 @@ class GbaAudioProcessor extends AudioWorkletProcessor {
           this.writeIdx = 0;
           this.count = 0;
           this.phase = 0;
-          this.curL = 0;
-          this.curR = 0;
-          this.nextL = 0;
-          this.nextR = 0;
           this.primed = false;
+          this.avgFill = this.targetFill;
           break;
         }
         case "mute": {
@@ -118,13 +117,21 @@ class GbaAudioProcessor extends AudioWorkletProcessor {
     const toCopy = Math.min(len, free);
     const startOffset = len - toCopy;
 
-    for (let i = startOffset; i < len; i++) {
-      this.ring[this.writeIdx] = samples[i];
-      this.writeIdx = (this.writeIdx + 1) % RING_CAPACITY_SAMPLES;
+    if (toCopy > 0) {
+      const firstChunk = Math.min(toCopy, RING_CAPACITY_SAMPLES - this.writeIdx);
+      this.ring.set(samples.subarray(startOffset, startOffset + firstChunk), this.writeIdx);
+      if (firstChunk < toCopy) {
+        this.ring.set(
+          samples.subarray(startOffset + firstChunk, startOffset + toCopy),
+          0,
+        );
+      }
+      this.writeIdx = (this.writeIdx + toCopy) % RING_CAPACITY_SAMPLES;
+      this.count += toCopy;
     }
-    this.count += toCopy;
     if (!this.primed && this.count >= this.targetFill) {
       this.primed = true;
+      this.avgFill = this.count;
     }
   }
 
@@ -137,17 +144,28 @@ class GbaAudioProcessor extends AudioWorkletProcessor {
     const frames = leftOut.length;
 
     if (!this.primed) {
-      leftOut.fill(0);
-      if (rightOut) rightOut.fill(0);
+      // Smoothly decay any residual sample to zero to avoid pops after reset/clear.
+      for (let i = 0; i < frames; i++) {
+        this.curL *= 0.94;
+        this.curR *= 0.94;
+        if (Math.abs(this.curL) < 1e-6) this.curL = 0;
+        if (Math.abs(this.curR) < 1e-6) this.curR = 0;
+        leftOut[i] = rightOut ? this.curL : (this.curL + this.curR) * 0.5;
+        if (rightOut) rightOut[i] = this.curR;
+      }
+      this.nextL = this.curL;
+      this.nextR = this.curR;
       return true;
     }
 
+    // Smooth fill-level EMA suppresses 60 Hz callback-burst pitch warble.
+    this.avgFill += 0.04 * (this.count - this.avgFill);
     const fillNorm = Math.max(
       -1,
-      Math.min(1, (this.count - this.targetFill) / this.targetFill),
+      Math.min(1, (this.avgFill - this.targetFill) / this.targetFill),
     );
-    // Smooth +/-2.5% DRC skew keeps ring buffer locked near target latency.
-    const dynamicRatio = this.baseRatio * (1 + 0.025 * fillNorm);
+    // Gentle +/-0.5% DRC skew locks ring buffer latency without audible pitch wobble.
+    const dynamicRatio = this.baseRatio * (1 + 0.005 * fillNorm);
     const gain = this.muted ? 0 : this.volume;
 
     for (let i = 0; i < frames; i++) {
@@ -166,6 +184,8 @@ class GbaAudioProcessor extends AudioWorkletProcessor {
           // Gentle exponential fade prevents speaker clicks on brief underruns.
           this.nextL *= 0.96;
           this.nextR *= 0.96;
+          if (Math.abs(this.nextL) < 1e-6) this.nextL = 0;
+          if (Math.abs(this.nextR) < 1e-6) this.nextR = 0;
         }
       }
 

@@ -501,15 +501,20 @@ fn cartridge_save_override_and_boktai_yoshi_warioware_peripherals() {
     core.bus.cart.write_rom_16(0x0800_00C6, 0x000B); // bit0=SAMPLE, bit1=CLK, bit2=in, bit3=RUMBLE
     core.bus.cart.write_rom_16(0x0800_00C4, 0x0008); // Rumble ON
     assert!(core.bus.cart.rumble_active);
-    core.bus.cart.write_rom_16(0x0800_00C4, 0x0003); // Sample=1, CLK=1 -> latches gyro_val << 4
+    core.bus.cart.write_rom_16(0x0800_00C4, 0x0003); // Sample=1, CLK=1 -> latches 4 dummy zeros + 12-bit gyro_val
     let mut shifted = 0u16;
-    for _ in 0..12 {
+    for _ in 0..16 {
         core.bus.cart.write_rom_16(0x0800_00C4, 0x0002); // CLK=1, Sample=0
         core.bus.cart.write_rom_16(0x0800_00C4, 0x0000); // Falling edge shifts MSB onto pin 2
         let bit = (core.bus.cart.read_rom_16(0x0800_00C4) >> 2) & 1;
         shifted = (shifted << 1) | bit;
     }
-    assert_eq!(shifted, 0x0A53);
+    assert_eq!(
+        shifted & 0xF000,
+        0,
+        "top 4 gyro bits must be leading dummy zeros"
+    );
+    assert_eq!(shifted & 0x0FFF, 0x0A53);
 }
 
 fn setup_dma1_fifo_a_sine(
@@ -1286,11 +1291,13 @@ fn test_3_layer_save_detector_and_dma3_sizing() {
 
 #[test]
 fn test_state_hash_determinism_across_frames() {
-    let rom_path = std::path::Path::new("test-roms/tonc/pageflip.gba");
+    let rom_path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("../..")
+        .join("test-roms/tonc/pageflip.gba");
     if !rom_path.exists() {
         return;
     }
-    let rom = std::fs::read(rom_path).expect("Failed to read pageflip.gba");
+    let rom = std::fs::read(&rom_path).expect("Failed to read pageflip.gba");
 
     fn fnv1a_hash(data: &[u8]) -> u64 {
         let mut hash = 0xcbf29ce484222325u64;
@@ -2129,4 +2136,158 @@ fn test_hle_arctan_and_rtc_time_command_accuracy() {
     assert_eq!(core.bus.cart.rtc.regs[4], 0x00); // 00h
     assert_eq!(core.bus.cart.rtc.regs[5], 0x00); // 00m
     assert_eq!(core.bus.cart.rtc.regs[6], 0x00); // 00s
+}
+
+#[test]
+fn test_softreset_preserves_sp_svc_for_subsequent_cpuset() {
+    // Program at 0x0800_0000:
+    //   mov r0, #0x0200_0000  (src)
+    //   mov r1, #0x0200_0100  (dst)
+    //   mov r2, #0x0400_0004  (4 x 32-bit words, CpuSet 32-bit copy)
+    //   swi 0x0B0000          (CpuSet)
+    //   b .
+    let rom = rom_from_arm_words(&[
+        0xE3A0_0402, // mov r0, #0x02000000
+        0xE280_1C01, // add r1, r0, #0x100
+        0xE3A0_2301, // mov r2, #0x04000000
+        0xE282_2004, // add r2, r2, #4
+        0xEF0B_0000, // swi 0x0B
+        0xEAFF_FFFE, // b .
+    ]);
+    let mut core = GbaCore::new(None, rom);
+    // Execute SWI 0x00 SoftReset from SVC mode (matching real SWI entry)
+    core.cpu.set_cpsr(0x0000_0093); // SVC
+    core.bus.hle_swi(&mut core.cpu, 0x00);
+    assert_eq!(
+        core.cpu.banked_r13[3], 0x0300_7FE0,
+        "SWI 0x00 SoftReset must preserve SP_svc = 0x0300_7FE0"
+    );
+    assert_eq!(core.cpu.gpr[13], 0x0300_7F00);
+
+    // Seed source data in EWRAM and run until CpuSet completes.
+    for i in 0..4u32 {
+        core.bus.write_32(
+            0x0200_0000 + i * 4,
+            0xDEAD_0000 + i,
+            AccessType::NonSequential,
+        );
+    }
+    for _ in 0..200 {
+        core.step_one();
+    }
+    for i in 0..4u32 {
+        assert_eq!(
+            core.bus
+                .read_32(0x0200_0100 + i * 4, AccessType::NonSequential, 0x0800_0000),
+            0xDEAD_0000 + i,
+            "CpuSet after SoftReset must copy word {i} cleanly"
+        );
+    }
+}
+
+#[test]
+fn test_ppu_1d_8bpp_tile_1023_wraps_and_oam_transparent_prio_quirk() {
+    struct NullFe;
+    impl HostFrontend for NullFe {
+        fn present_frame(&mut self, _fb: &[u16; LCD_WIDTH * LCD_HEIGHT]) {}
+        fn push_audio_samples(&mut self, _samples: &[i16]) {}
+        fn poll_keypad(&mut self) -> u16 {
+            0x03FF
+        }
+    }
+
+    let rom = rom_from_arm_words(&[0xEAFF_FFFE]);
+    let mut core = GbaCore::new(None, rom);
+    let mut fe = NullFe;
+
+    // 1. 1D 8bpp sprite with tile_num = 1023 must wrap inside 32 KiB OBJ VRAM without panicking.
+    core.bus.ppu.write_dispcnt(0x1040); // OBJ enable + 1D mapping, Mode 0
+    core.bus.ppu.pram[0x200 + 2..0x200 + 4].copy_from_slice(&0x001Fu16.to_le_bytes()); // OBJ color 1 = red
+    // Tile 1023 starts at OBJ offset 1023*32 = 0x7FE0; row 4 wraps around to offset 0x0000!
+    core.bus.ppu.vram[0x10000] = 1;
+    // OAM #0: Y=0, 8bpp (bit 13), X=10, 8x8, tile=1023 (0x3FF)
+    core.bus.ppu.oam[0..2].copy_from_slice(&0x2000u16.to_le_bytes());
+    core.bus.ppu.oam[2..4].copy_from_slice(&10u16.to_le_bytes());
+    core.bus.ppu.oam[4..6].copy_from_slice(&0x03FFu16.to_le_bytes());
+    // Run a full frame so the 2-scanline DISPCNT pipeline latches cleanly; scanline y = 4
+    // hits fine_y = 4 -> wraps to OBJ offset 0 -> red pixel at x = 10.
+    core.run_frame(&mut fe);
+    assert_eq!(core.bus.ppu.framebuffer[4 * LCD_WIDTH + 10], 0x001F);
+
+    // 2. GBA hardware OAM transparent-pixel priority quirk:
+    // - At x=20: OAM #0 is opaque green (prio 2), OAM #1 is transparent (prio 0), BG0 is blue (prio 1).
+    //   On real GBA hardware, the later transparent pixel with prio 0 overwrites the opaque slot's
+    //   priority from 2 -> 0, so the opaque green sprite beats BG0 (prio 1)!
+    // - At x=40: OAM #2 is transparent (prio 0), OAM #3 is opaque green (prio 2), BG0 is blue (prio 1).
+    //   Because the slot is still empty (`color == 0`) when OAM #3 draws, OAM #3 writes its own
+    //   prio 2, so BG0 (prio 1) stays in front (matching Tonc `prio_demo`).
+    core.bus.ppu.oam.fill(0);
+    core.bus.ppu.vram.fill(0);
+    core.bus.ppu.pram.fill(0);
+    core.bus.ppu.write_dispcnt(0x1140); // BG0 + OBJ + 1D mapping
+    core.bus.ppu.bgcnt[0] = 0x0001; // BG0 priority = 1, charbase 0, screenbase 0
+    core.bus.ppu.pram[2..4].copy_from_slice(&0x7C00u16.to_le_bytes()); // BG color 1 = blue
+    core.bus.ppu.pram[0x200 + 2..0x200 + 4].copy_from_slice(&0x03E0u16.to_le_bytes()); // OBJ color 1 = green
+    // BG tile 1 filled with color 1 (4bpp); populate screen entries covering x=16..48 (tile cols 2..5)
+    for b in &mut core.bus.ppu.vram[32..64] {
+        *b = 0x11;
+    }
+    for col in 2..6usize {
+        core.bus.ppu.vram[col * 2..col * 2 + 2].copy_from_slice(&1u16.to_le_bytes());
+    }
+    // OBJ tile 1 = transparent (all 0), OBJ tile 2 = opaque color 1
+    for b in &mut core.bus.ppu.vram[0x10000 + 64..0x10000 + 96] {
+        *b = 0x11;
+    }
+    // OAM #0: Y=0, X=20, tile=2 (opaque green), prio=2 (0x0800)
+    core.bus.ppu.oam[0..2].copy_from_slice(&0u16.to_le_bytes());
+    core.bus.ppu.oam[2..4].copy_from_slice(&20u16.to_le_bytes());
+    core.bus.ppu.oam[4..6].copy_from_slice(&0x0802u16.to_le_bytes());
+    // OAM #1: Y=0, X=20, tile=1 (transparent), prio=0
+    core.bus.ppu.oam[8..10].copy_from_slice(&0u16.to_le_bytes());
+    core.bus.ppu.oam[10..12].copy_from_slice(&20u16.to_le_bytes());
+    core.bus.ppu.oam[12..14].copy_from_slice(&0x0001u16.to_le_bytes());
+    // OAM #2: Y=0, X=40, tile=1 (transparent), prio=0
+    core.bus.ppu.oam[16..18].copy_from_slice(&0u16.to_le_bytes());
+    core.bus.ppu.oam[18..20].copy_from_slice(&40u16.to_le_bytes());
+    core.bus.ppu.oam[20..22].copy_from_slice(&0x0001u16.to_le_bytes());
+    // OAM #3: Y=0, X=40, tile=2 (opaque green), prio=2 (0x0800)
+    core.bus.ppu.oam[24..26].copy_from_slice(&0u16.to_le_bytes());
+    core.bus.ppu.oam[26..28].copy_from_slice(&40u16.to_le_bytes());
+    core.bus.ppu.oam[28..30].copy_from_slice(&0x0802u16.to_le_bytes());
+
+    // Run 2 frames so BG0 enable in DISPCNT is latched from scanline 0 cleanly.
+    core.run_frame(&mut fe);
+    core.run_frame(&mut fe);
+    assert_eq!(
+        core.bus.ppu.framebuffer[20], 0x03E0,
+        "Later transparent OAM #1 (prio 0) must promote earlier opaque OAM #0 (prio 2) above BG0 (prio 1)"
+    );
+    assert_eq!(
+        core.bus.ppu.framebuffer[40], 0x7C00,
+        "Opaque OAM #3 (prio 2) over empty slot must keep prio 2 and stay behind BG0 (prio 1)"
+    );
+    assert_eq!(
+        core.bus.ppu.framebuffer[16], 0x7C00,
+        "BG0 blue must render at x=16"
+    );
+}
+
+#[test]
+fn test_apu_high_byte_env_write_does_not_reload_length_counter() {
+    let rom = rom_from_arm_words(&[0xEAFF_FFFE]);
+    let mut core = GbaCore::new(None, rom);
+    core.bus.write_io_16(0x0400_0084, 0x0080); // Master sound on
+    // Write full 16-bit SOUND1CNT_H: length load = 54 (length_counter = 10), env vol = 15
+    core.bus.write_io_16(0x0400_0062, 0xF036);
+    assert_eq!(core.bus.apu.sq1.length_counter, 10);
+    // Simulate length counter ticking down to 3
+    core.bus.apu.sq1.length_counter = 3;
+    // 8-bit STRB to high byte (0x0400_0063) changing envelope volume must NOT reload length_counter!
+    core.bus.write_io_8(0x0400_0063, 0x80);
+    assert_eq!(
+        core.bus.apu.sq1.length_counter, 3,
+        "high-byte write to SOUND1CNT_H must not clobber length_counter"
+    );
+    assert_eq!(core.bus.apu.sq1.env_init_vol, 8);
 }

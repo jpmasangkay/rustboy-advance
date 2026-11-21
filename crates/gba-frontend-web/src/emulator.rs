@@ -21,11 +21,11 @@ const MAX_AUDIO_BUFFER_SAMPLES: usize = (SAMPLE_RATE_HZ as usize) * 2;
 /// Host frontend adapter bridging [`GbaCore`] output to RGBA frame and PCM audio buffers.
 pub struct WebFrontend {
     pub rgba_frame: Vec<u8>,
-    pub prev_rgba: Vec<u8>,
     pub audio_samples: Vec<i16>,
     pub keyinput: u16,
     color_profile: ColorProfile,
     lcd_ghosting: bool,
+    has_prev_frame: bool,
     skip_rgba: bool,
 }
 
@@ -34,11 +34,11 @@ impl WebFrontend {
     pub fn new() -> Self {
         Self {
             rgba_frame: alloc::vec![0u8; RGBA_FRAME_BYTES],
-            prev_rgba: alloc::vec![0u8; RGBA_FRAME_BYTES],
             audio_samples: Vec::with_capacity(4096),
             keyinput: 0x03FF,
             color_profile: ColorProfile::Linear,
             lcd_ghosting: false,
+            has_prev_frame: false,
             skip_rgba: false,
         }
     }
@@ -70,18 +70,18 @@ impl WebFrontend {
 
     /// Enables or disables LCD frame persistence blending.
     pub fn set_lcd_ghosting(&mut self, enabled: bool) {
-        if enabled && !self.lcd_ghosting {
-            // Seed history from the current displayed frame so enabling ghosting
-            // mid-game does not flash/blend against stale or black pixels.
-            self.prev_rgba.copy_from_slice(&self.rgba_frame);
-        }
         self.lcd_ghosting = enabled;
+    }
+
+    /// Invalidates the previous frame history so the next frame does not blend against stale pixels.
+    pub fn reset_ghosting_history(&mut self) {
+        self.has_prev_frame = false;
     }
 
     /// Clears pending audio samples and resets frame buffers to transparent black.
     pub fn clear_buffers(&mut self) {
         self.rgba_frame.fill(0);
-        self.prev_rgba.fill(0);
+        self.has_prev_frame = false;
         self.audio_samples.clear();
     }
 }
@@ -98,25 +98,20 @@ impl HostFrontend for WebFrontend {
             return;
         }
         let lut = self.color_profile.lut();
-        if self.lcd_ghosting {
-            for (idx, &px) in fb.iter().enumerate() {
-                let off = idx * 4;
+        let dst_chunks = self.rgba_frame.as_chunks_mut::<4>().0;
+        if self.lcd_ghosting && self.has_prev_frame {
+            for (dst, &px) in dst_chunks.iter_mut().zip(fb.iter()) {
                 let mapped = lut[(px & 0x7FFF) as usize];
-                let r = ((mapped[0] as u16 * 166 + self.prev_rgba[off] as u16 * 90) >> 8) as u8;
-                let g = ((mapped[1] as u16 * 166 + self.prev_rgba[off + 1] as u16 * 90) >> 8) as u8;
-                let b = ((mapped[2] as u16 * 166 + self.prev_rgba[off + 2] as u16 * 90) >> 8) as u8;
-                self.rgba_frame[off] = r;
-                self.rgba_frame[off + 1] = g;
-                self.rgba_frame[off + 2] = b;
-                self.rgba_frame[off + 3] = 255;
+                dst[0] = ((mapped[0] as u16 * 166 + dst[0] as u16 * 90 + 128) >> 8) as u8;
+                dst[1] = ((mapped[1] as u16 * 166 + dst[1] as u16 * 90 + 128) >> 8) as u8;
+                dst[2] = ((mapped[2] as u16 * 166 + dst[2] as u16 * 90 + 128) >> 8) as u8;
+                dst[3] = 255;
             }
-            self.prev_rgba.copy_from_slice(&self.rgba_frame);
         } else {
-            for (idx, &px) in fb.iter().enumerate() {
-                let off = idx * 4;
-                let mapped = lut[(px & 0x7FFF) as usize];
-                self.rgba_frame[off..off + 4].copy_from_slice(&mapped);
+            for (dst, &px) in dst_chunks.iter_mut().zip(fb.iter()) {
+                *dst = lut[(px & 0x7FFF) as usize];
             }
+            self.has_prev_frame = true;
         }
     }
 
@@ -140,15 +135,32 @@ impl HostFrontend for WebFrontend {
     }
 }
 
+const CRC32_TABLE: [u32; 256] = {
+    let mut table = [0u32; 256];
+    let mut i = 0;
+    while i < 256 {
+        let mut crc = i as u32;
+        let mut j = 0;
+        while j < 8 {
+            if (crc & 1) != 0 {
+                crc = (crc >> 1) ^ 0xEDB8_8320;
+            } else {
+                crc >>= 1;
+            }
+            j += 1;
+        }
+        table[i] = crc;
+        i += 1;
+    }
+    table
+};
+
 /// Computes standard IEEE 802.3 CRC32 over a byte slice.
 pub fn crc32(bytes: &[u8]) -> u32 {
     let mut crc = 0xFFFF_FFFFu32;
     for &b in bytes {
-        crc ^= b as u32;
-        for _ in 0..8 {
-            let mask = (crc & 1).wrapping_neg();
-            crc = (crc >> 1) ^ (0xEDB8_8320 & mask);
-        }
+        let idx = ((crc ^ (b as u32)) & 0xFF) as usize;
+        crc = (crc >> 8) ^ CRC32_TABLE[idx];
     }
     !crc
 }
@@ -388,7 +400,28 @@ impl WebEmulator {
         let profile = ColorProfile::from_u8(profile_id);
         self.frontend.set_color_profile(profile);
         if let Some(core) = &self.core {
+            self.frontend.reset_ghosting_history();
             self.frontend.present_frame(&core.bus.ppu.framebuffer);
+        }
+    }
+
+    /// Synchronizes the cartridge Real-Time Clock with host calendar date/time components.
+    #[allow(clippy::too_many_arguments)]
+    pub fn set_rtc_datetime(
+        &mut self,
+        year: u8,
+        month: u8,
+        day: u8,
+        dow: u8,
+        hour: u8,
+        minute: u8,
+        second: u8,
+    ) {
+        if let Some(core) = &mut self.core {
+            core.bus
+                .cart
+                .rtc
+                .set_datetime(year, month, day, dow, hour, minute, second);
         }
     }
 
@@ -471,6 +504,7 @@ impl WebEmulator {
         core.bus.cart.save_dirty |= was_dirty || save_changed;
         core.bus.apu.master_volume_pct = self.volume_pct;
         self.frontend.audio_samples.clear();
+        self.frontend.reset_ghosting_history();
         self.frontend.present_frame(&core.bus.ppu.framebuffer);
         Ok(())
     }

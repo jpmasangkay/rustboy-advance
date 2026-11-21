@@ -825,4 +825,67 @@ fn gb_accuracy_regressions_hdma_ppu_apu_mbc3_serial_and_savestate() {
     for _ in 0..2000 {
         assert!(!cs.bus.serial.step_m_cycle());
     }
+
+    // 9. CGB speed switch takes 2050 normal M-cycles (8200 normal dots) in both directions
+    let speed_prog = [0x3E, 0x01, 0xE0, 0x4D, 0x10, 0x00, 0x18, 0xFE];
+    let srom = make_test_rom(&speed_prog, "SPD8200", 0xC0, 0x00, 2, 0x00);
+    let mut cspd = GbCore::new(srom, None, GbModel::Cgb);
+    cspd.step_one(); // JP 0x0150
+    cspd.step_one(); // LD A, 1
+    cspd.step_one(); // LDH (KEY1), A
+    let dots_before = cspd.bus.total_normal_dots;
+    cspd.step_one(); // STOP (speed switch)
+    let switch_dots = cspd.bus.total_normal_dots - dots_before;
+    assert!(cspd.bus.double_speed);
+    // 2 fetch M-cycles (8 dots) + 2050 normal M-cycles (8200 dots) = 8208 dots
+    assert_eq!(switch_dots, 8208);
+
+    // 10. Corrupted savestate with invalid PPU dot (>= 456) is rejected cleanly without panicking
+    let mut bad_core = GbCore::new(
+        make_test_rom(&[0x18, 0xFE], "SAVCHK", 0x00, 0x00, 2, 0x00),
+        None,
+        GbModel::Dmg,
+    );
+    bad_core.bus.ppu.dot = 500;
+    let corrupt_state = bad_core.save_state().unwrap();
+    let mut target_core = GbCore::new(
+        make_test_rom(&[0x18, 0xFE], "SAVCHK", 0x00, 0x00, 2, 0x00),
+        None,
+        GbModel::Dmg,
+    );
+    assert!(
+        target_core.load_state(&corrupt_state).is_err(),
+        "load_state must reject out-of-range ppu.dot >= 456"
+    );
+
+    // 11. CH4 NR43 shift dropping below 14 resets frozen timer instead of staying at u32::MAX
+    let mut c4 = GbCore::new(
+        make_test_rom(&[0x18, 0xFE], "CH4FIX", 0x00, 0x00, 2, 0x00),
+        None,
+        GbModel::Dmg,
+    );
+    c4.bus.write8_immediate(0xFF26, 0x80);
+    c4.bus.write8_immediate(0xFF21, 0xF0);
+    c4.bus.write8_immediate(0xFF22, 0xE0); // shift = 14 (frozen)
+    c4.bus.write8_immediate(0xFF23, 0x80); // trigger while frozen
+    c4.bus.write8_immediate(0xFF22, 0x00); // shift = 0 (unfreeze)
+    assert!(
+        c4.bus.apu.ch4.timer <= 64,
+        "CH4 timer must reset on shift < 14, got {}",
+        c4.bus.apu.ch4.timer
+    );
+
+    // 12. MBC3 halted RTC freezes sub-second cycle_acc and masks bank reg to 4 bits
+    let mut cmbc = GbCore::new(
+        make_test_rom(&[0x18, 0xFE], "MBC3HLT", 0x80, 0x10, 4, 0x03),
+        None,
+        GbModel::Auto,
+    );
+    cmbc.bus.write8_immediate(0x0000, 0x0A);
+    cmbc.bus.write8_immediate(0x4000, 0xF8); // upper nibble ignored -> 0x08 (RTC sec)
+    assert_eq!(cmbc.bus.cart.ram_or_rtc_reg, 0x08);
+    cmbc.bus.cart.rtc.write_reg(0x0C, 0x40); // halt RTC
+    let acc_before = cmbc.bus.cart.rtc.cycle_acc;
+    cmbc.bus.cart.tick_rtc(1_000_000);
+    assert_eq!(cmbc.bus.cart.rtc.cycle_acc, acc_before);
 }

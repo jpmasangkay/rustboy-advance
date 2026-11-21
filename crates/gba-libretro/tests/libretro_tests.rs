@@ -1034,3 +1034,53 @@ fn gb_memory_descriptors_non_battery_ram_and_mbc3_rtc() {
     assert_eq!(rb_hour, 12);
     assert_eq!(rb_min, 34);
 }
+
+#[test]
+fn libretro_rejects_cross_rom_gba_savestate() {
+    let (_lock, _guard) = TestGuard::acquire();
+
+    let mut rom_a = vec![0u8; 0x200];
+    rom_a[0..4].copy_from_slice(&0xEAFF_FFFEu32.to_le_bytes());
+    rom_a[0xA0..0xA6].copy_from_slice(b"CROSSA");
+    rom_a[0xAC..0xB0].copy_from_slice(b"CRSA");
+    rom_a[0xB2] = 0x96;
+
+    let mut rom_b = rom_from_words(&[0xE3A0_0001, 0xEAFF_FFFE]);
+    rom_b.resize(0x200, 0);
+    rom_b[0xA0..0xA6].copy_from_slice(b"CROSSB");
+    rom_b[0xAC..0xB0].copy_from_slice(b"CRSB");
+    rom_b[0xB2] = 0x96;
+
+    let info_a = retro_game_info {
+        path: ptr::null(),
+        data: rom_a.as_ptr().cast(),
+        size: rom_a.len(),
+        meta: ptr::null(),
+    };
+    assert!(unsafe { retro_load_game(&raw const info_a) });
+    retro_run();
+
+    let sz = retro_serialize_size();
+    let mut state_a = vec![0u8; sz];
+    assert!(unsafe { retro_serialize(state_a.as_mut_ptr().cast(), state_a.len()) });
+    retro_unload_game();
+
+    let info_b = retro_game_info {
+        path: ptr::null(),
+        data: rom_b.as_ptr().cast(),
+        size: rom_b.len(),
+        meta: ptr::null(),
+    };
+    assert!(unsafe { retro_load_game(&raw const info_b) });
+    assert!(
+        !unsafe { retro_unserialize(state_a.as_ptr().cast(), state_a.len()) },
+        "GBA savestate from ROM A must be rejected when ROM B is loaded"
+    );
+
+    // Reloading ROM A (via load_game without explicit unload_game) accepts state_a cleanly.
+    assert!(unsafe { retro_load_game(&raw const info_a) });
+    assert!(
+        unsafe { retro_unserialize(state_a.as_ptr().cast(), state_a.len()) },
+        "GBA savestate from ROM A must succeed when ROM A is loaded"
+    );
+}

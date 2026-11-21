@@ -485,11 +485,12 @@ impl RustboyApp {
         }
     }
 
-    /// Applies mute and master volume config to audio sink and active GBA APU.
+    /// Applies mute and master volume config to the host audio mixer (works uniformly for GBA and GB/GBC).
     pub(crate) fn sync_audio_volume(&mut self) {
         self.sink.audio.set_muted(self.config.muted);
+        self.sink.audio.set_master_volume(self.config.master_volume);
         if let Some(ref mut core) = self.core {
-            core.bus.apu.master_volume_pct = self.config.master_volume;
+            core.bus.apu.master_volume_pct = 100;
         }
     }
 

@@ -15,7 +15,7 @@
 
   --text-primary: #f1f3f5;
   --text-secondary: #a1a7b3;
-  --text-muted: #788090;
+  --text-muted: #8d96a6;
 
   --accent-emerald: #10b981;
   --accent-emerald-bg: rgba(16, 185, 129, 0.14);
@@ -35,7 +35,7 @@
   --radius-md: 10px;
   --radius-lg: 14px;
 
-  --font-sans: "Inter", system-ui, -apple-system, "Segoe UI", Roboto, sans-serif;
+  --font-sans: system-ui, -apple-system, "Segoe UI", "Helvetica Neue", Arial, sans-serif;
   --font-mono: ui-monospace, "Cascadia Mono", "SFMono-Regular", Consolas, monospace;
 
   --canvas-w: 480px;
@@ -322,8 +322,8 @@
     align-items: center;
     justify-content: space-between;
     gap: 0.75rem;
-    padding-inline: 0.9rem;
-    padding-block: 0.65rem;
+    padding-inline: 1rem;
+    padding-block: 0.75rem;
     background-color: var(--accent-danger-bg);
     border: 1px solid var(--accent-danger-border);
     border-radius: var(--radius-md);
@@ -432,13 +432,14 @@
     position: relative;
     inline-size: 100%;
     min-block-size: 240px;
-    flex: 1 1 auto;
+    flex: 1 1 0;
     display: grid;
     place-items: center;
     padding: 0.75rem;
     background-color: var(--bg-screen);
     border: 1px solid var(--border-hairline);
     border-radius: var(--radius-md);
+    overflow: clip;
   }
 
   .stage-shell:fullscreen .bezel-card {
@@ -571,7 +572,8 @@
     inline-size: var(--canvas-w);
     max-inline-size: 100%;
     block-size: var(--canvas-h);
-    border: 1px solid rgba(255, 255, 255, 0.06);
+    border: 0;
+    outline: 1px solid rgba(255, 255, 255, 0.08);
     background-color: #000000;
   }
 
@@ -579,8 +581,8 @@
     display: block;
     inline-size: 100%;
     block-size: 100%;
-    image-rendering: pixelated;
     image-rendering: crisp-edges;
+    image-rendering: pixelated;
   }
 
   .lcd-grid-overlay {
@@ -632,8 +634,8 @@
   }
 
   .drag-overlay-box {
-    padding-inline: 1rem;
-    padding-block: 0.6rem;
+    padding-inline: 1.1rem;
+    padding-block: 0.7rem;
     border-radius: var(--radius-sm);
     background-color: var(--bg-surface);
     border: 1px solid var(--accent-emerald-border);
@@ -856,6 +858,7 @@
     display: flex;
     align-items: center;
     gap: 0.85rem;
+    touch-action: none;
   }
 
   .touch-circle {
@@ -1108,14 +1111,16 @@
     min-inline-size: 78px;
   }
 
-  /* Toast Notification */
+  /* Toast Notification (Top-Layer popover="manual" stays visible in fullscreen) */
   .toast {
     position: fixed;
+    margin: 0;
+    inset: auto;
     inset-block-end: max(2.8rem, env(safe-area-inset-bottom, 0px) + 2.2rem);
     inset-inline-end: max(1rem, env(safe-area-inset-right, 0px));
     z-index: 40;
-    padding-inline: 0.85rem;
-    padding-block: 0.5rem;
+    padding-inline: 0.95rem;
+    padding-block: 0.6rem;
     font-size: 0.82rem;
     color: var(--text-primary);
     background-color: var(--bg-elevated);

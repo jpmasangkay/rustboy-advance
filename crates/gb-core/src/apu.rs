@@ -520,7 +520,12 @@ impl NoiseChannel {
     }
 
     pub fn write_poly(&mut self, val: u8) {
+        let was_frozen = ((self.nr_poly >> 4) & 0x0F) >= 14;
         self.nr_poly = val;
+        if was_frozen && ((val >> 4) & 0x0F) < 14 {
+            // Avoid leaving `timer == u32::MAX` (17+ minutes of silence) when shift drops below 14.
+            self.timer = self.period();
+        }
     }
 
     pub fn write_ctrl(&mut self, val: u8, frame_seq_step: u8) {
@@ -649,13 +654,21 @@ pub struct Apu {
     integ_r: i64,
     hpf_cap_l: i32,
     hpf_cap_r: i32,
+    #[serde(skip)]
+    hpf_coeff: i64,
 
     #[serde(skip)]
     pub output_buffer: Vec<i16>,
 }
 
 impl Apu {
+    #[inline]
+    fn compute_hpf_coeff(sample_rate_hz: u32) -> i64 {
+        ((176u64 << 16) / (sample_rate_hz.max(8_000) as u64)).clamp(1, 32_768) as i64
+    }
+
     pub fn new(sample_rate_hz: u32) -> Self {
+        let clamped_rate = sample_rate_hz.clamp(8_000, 192_000);
         Self {
             ch1: SquareChannel::new(true),
             ch2: SquareChannel::new(false),
@@ -665,18 +678,25 @@ impl Apu {
             nr51: 0,
             power_on: false,
             frame_seq_step: 0,
-            sample_rate_hz: sample_rate_hz.clamp(8_000, 192_000),
+            sample_rate_hz: clamped_rate,
             sample_acc: 0,
             integ_l: 0,
             integ_r: 0,
             hpf_cap_l: 0,
             hpf_cap_r: 0,
+            hpf_coeff: Self::compute_hpf_coeff(clamped_rate),
             output_buffer: Vec::with_capacity(2048),
         }
     }
 
+    #[inline]
+    pub fn refresh_hpf_coeff(&mut self) {
+        self.hpf_coeff = Self::compute_hpf_coeff(self.sample_rate_hz);
+    }
+
     pub fn set_sample_rate(&mut self, sample_rate_hz: u32) {
         self.sample_rate_hz = sample_rate_hz.clamp(8_000, 192_000);
+        self.hpf_coeff = Self::compute_hpf_coeff(self.sample_rate_hz);
         self.sample_acc = 0;
         self.integ_l = 0;
         self.integ_r = 0;
@@ -862,8 +882,13 @@ impl Apu {
         let scaled_r = (raw_r as i64) << 16;
         let hp_l = scaled_l - (self.hpf_cap_l as i64);
         let hp_r = scaled_r - (self.hpf_cap_r as i64);
-        let coeff =
-            ((176u64 << 16) / (self.sample_rate_hz.max(8_000) as u64)).clamp(1, 32_768) as i64;
+        let coeff = if self.hpf_coeff > 0 {
+            self.hpf_coeff
+        } else {
+            let c = Self::compute_hpf_coeff(self.sample_rate_hz);
+            self.hpf_coeff = c;
+            c
+        };
         self.hpf_cap_l = (self.hpf_cap_l as i64 + ((hp_l * coeff) >> 16)) as i32;
         self.hpf_cap_r = (self.hpf_cap_r as i64 + ((hp_r * coeff) >> 16)) as i32;
 

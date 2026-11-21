@@ -457,10 +457,15 @@ impl Ppu {
     fn render_scanline(&mut self, ly: u8, is_cgb: bool) {
         let row_offset = (ly as usize) * LCD_WIDTH;
         let dmg_cols = self.dmg_palette.colors();
+        let dmg_bgp_lut = [
+            dmg_cols[(self.bgp & 0x03) as usize],
+            dmg_cols[((self.bgp >> 2) & 0x03) as usize],
+            dmg_cols[((self.bgp >> 4) & 0x03) as usize],
+            dmg_cols[((self.bgp >> 6) & 0x03) as usize],
+        ];
 
         let mut bg_color_idx = [0u8; LCD_WIDTH];
         let mut bg_prio = [false; LCD_WIDTH];
-        let mut bg_rgb = [0u16; LCD_WIDTH];
 
         let bg_enabled_dmg = (self.lcdc & 0x01) != 0;
         let window_enabled = (self.lcdc & 0x20) != 0
@@ -486,7 +491,7 @@ impl Ppu {
         if !is_cgb && !bg_enabled_dmg {
             // Hardware quirk: when LCDC.0 == 0 on DMG, BG/Window render pure white (shade 0),
             // independent of BGP.
-            bg_rgb.fill(dmg_cols[0]);
+            self.framebuffer[row_offset..row_offset + LCD_WIDTH].fill(dmg_cols[0]);
         } else {
             let win_x_start = if window_enabled {
                 wx_start.clamp(0, LCD_WIDTH as i16) as usize
@@ -494,7 +499,7 @@ impl Ppu {
                 LCD_WIDTH
             };
 
-            // Render BG span [0..win_x_start) one 8-pixel tile at a time.
+            // Render BG span [0..win_x_start) one 8-pixel tile at a time directly into framebuffer.
             let bg_y = ly.wrapping_add(self.scy);
             let bg_tile_row = ((bg_y >> 3) as usize) * 32;
             let bg_fine_y = bg_y & 7;
@@ -537,16 +542,16 @@ impl Ppu {
                     let px = x + i;
                     bg_color_idx[px] = cidx;
                     bg_prio[px] = prio_flag;
-                    bg_rgb[px] = if is_cgb {
+                    self.framebuffer[row_offset + px] = if is_cgb {
                         Self::cgb_color(&self.bg_cram, pal_num, cidx)
                     } else {
-                        dmg_cols[((self.bgp >> (cidx * 2)) & 0x03) as usize]
+                        dmg_bgp_lut[cidx as usize]
                     };
                 }
                 x += span;
             }
 
-            // Render Window span [win_x_start..LCD_WIDTH) one 8-pixel tile at a time.
+            // Render Window span [win_x_start..LCD_WIDTH) one 8-pixel tile at a time directly into framebuffer.
             if win_x_start < LCD_WIDTH {
                 window_rendered = true;
                 let win_y = self.win_line;
@@ -591,10 +596,10 @@ impl Ppu {
                         let px = x + i;
                         bg_color_idx[px] = cidx;
                         bg_prio[px] = prio_flag;
-                        bg_rgb[px] = if is_cgb {
+                        self.framebuffer[row_offset + px] = if is_cgb {
                             Self::cgb_color(&self.bg_cram, pal_num, cidx)
                         } else {
-                            dmg_cols[((self.bgp >> (cidx * 2)) & 0x03) as usize]
+                            dmg_bgp_lut[cidx as usize]
                         };
                     }
                     x += span;
@@ -606,28 +611,30 @@ impl Ppu {
             self.win_line = self.win_line.wrapping_add(1);
         }
 
-        // Copy BG/Window pixels into framebuffer first; sprites composite on top.
-        self.framebuffer[row_offset..row_offset + LCD_WIDTH].copy_from_slice(&bg_rgb);
-
         if (self.lcdc & 0x02) == 0 {
             return;
         }
 
         let sprite_h: i16 = if (self.lcdc & 0x04) != 0 { 16 } else { 8 };
         let ly_i16 = ly as i16;
-        let mut sprites: [Option<OamEntry>; 10] = [None; 10];
+        let mut sprites = [OamEntry {
+            y: 0,
+            x: 0,
+            tile: 0,
+            flags: 0,
+        }; 10];
         let mut count = 0usize;
 
         for i in 0..40 {
             let base = i * 4;
             let sy = (self.oam[base] as i16) - 16;
             if ly_i16 >= sy && ly_i16 < sy + sprite_h {
-                sprites[count] = Some(OamEntry {
+                sprites[count] = OamEntry {
                     y: sy,
                     x: (self.oam[base + 1] as i16) - 8,
                     tile: self.oam[base + 2],
                     flags: self.oam[base + 3],
-                });
+                };
                 count += 1;
                 if count == 10 {
                     break;
@@ -642,13 +649,12 @@ impl Ppu {
         let dmg_obj_priority = !is_cgb || (self.opri & 1) != 0;
         if dmg_obj_priority {
             // DMG (or CGB with OPRI.0 = 1) sorts sprites by X ascending, preserving OAM order on ties.
-            sprites[..count].sort_by_key(|entry| entry.unwrap().x);
+            sprites[..count].sort_by_key(|entry| entry.x);
         }
 
         // Inverted sprite loop: decode each sprite row once and plot up to 8 pixels in priority order.
         let mut obj_drawn = [false; LCD_WIDTH];
-        for entry in &sprites[..count] {
-            let s = entry.unwrap();
+        for &s in &sprites[..count] {
             if s.x <= -8 || s.x >= LCD_WIDTH as i16 {
                 continue;
             }

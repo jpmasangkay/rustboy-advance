@@ -67,7 +67,7 @@ Captured directly from the headless release renderer using freely-redistributabl
 - **Unsupported GBA peripherals (not implemented):** **e-Reader**, **GBA Wireless Adapter**, **Play-Yan**, and **64 MiB GBA Video** bank-switching mappers (`GbaVideo64M` performs size detection only; video bank-switching is not emulated).
 
 ### Save States, Rewind, TAS, Cheats, Lua, Debugger & Frontends
-- **Versioned Binary Save States (`RBAS` v1)** — quick slots `F1–F5` (`Shift+F1–F5` load) and visual state manager (`F6`) storing format version, timestamp, ROM CRC32, game code, and thumbnails.
+- **Versioned Binary Save States (`RBAS` v1 container / `gba-core` `RBAS` v2 payload)** — quick slots `F1–F5` (`Shift+F1–F5` load) and visual state manager (`F6`) storing format version, timestamp, ROM CRC32, game code, LZ4-compressed core state, and PNG thumbnails.
 - **Per-Game Settings** — per-ROM overrides (save type, color profile, speed, filter) stored by game code and ROM CRC32.
 - **XOR-Delta Rewind & Media Capture** — rolling XOR-delta rewind (`Hold R`), WAV audio capture, and animated GIF recording.
 - **TAS Input Movies (`.rbm`)** — `RBMV` v1 binary movie recording and deterministic replay (`rerecord` tracking, initial state embedding).

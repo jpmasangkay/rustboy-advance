@@ -58,23 +58,62 @@ fn test_jit_code_page_invalidation() {
 
     let mut fe = TestNullFrontend;
     core.run_frame(&mut fe);
-    core.bus.dirty_code_pages.clear();
+    core.bus.dirty_ewram_pages = 0;
+    core.bus.dirty_iwram_pages = 0;
     core.bus.invalidate_all_jit = false;
 
-    // Write to mirrored EWRAM code page (0x0204_0000 aliases 0x0200_0000 -> canonical page 0x0200_0000 >> 14)
+    // Write to mirrored EWRAM code page (0x0204_0000 aliases 0x0200_0000 -> canonical EWRAM page bit 0)
     core.bus.write_32(
         0x0204_0000,
         0x1234_5678,
         gba_core::bus::AccessType::NonSequential,
     );
-    let expected = SysBus::canonical_code_page(0x0200_0000 >> 14);
-    assert!(
-        core.bus.dirty_code_pages.contains(&expected),
-        "mirrored EWRAM write must record canonical dirty code page"
+    assert_ne!(
+        core.bus.dirty_ewram_pages & 1,
+        0,
+        "mirrored EWRAM write must set canonical dirty EWRAM page bit 0"
     );
-    for page in core.bus.dirty_code_pages.drain(..) {
-        core.jit.invalidate_page(page);
+    let expected = SysBus::canonical_code_page(0x0200_0000 >> 14);
+    assert_eq!(expected, 0x02 << 10);
+    core.jit.invalidate_page(expected);
+}
+
+#[test]
+#[cfg(feature = "jit")]
+fn test_differential_lockstep_mid_block_timer_reads() {
+    // Regression test: two consecutive LDRH [TM0CNT_L] reads inside a single JIT block
+    // MUST observe advancing `scheduler.current_cycle` (matching the interpreter bit-for-bit).
+    let words: [u32; 14] = [
+        0xE3A0_0404, // mov r0, #0x04000000
+        0xE280_0C01, // add r0, r0, #0x100 (0x0400_0100 = TM0CNT_L)
+        0xE3A0_1000, // mov r1, #0
+        0xE1C0_10B0, // strh r1, [r0]      (TM0CNT_L = 0)
+        0xE3A0_1080, // mov r1, #0x80      (Enable timer, prescaler 1)
+        0xE1C0_10B2, // strh r1, [r0, #2]  (TM0CNT_H = 0x0080)
+        0xE282_2001, // add r2, r2, #1     (IR-lowered instruction)
+        0xE282_2002, // add r2, r2, #2     (IR-lowered instruction)
+        0xE1D0_30B0, // ldrh r3, [r0]      (1st read of TM0CNT_L)
+        0xE282_2003, // add r2, r2, #3     (IR-lowered instruction between timer reads)
+        0xE1D0_40B0, // ldrh r4, [r0]      (2nd read of TM0CNT_L — must be strictly > r3!)
+        0xE044_5003, // sub r5, r4, r3     (delta between consecutive timer reads)
+        0xEAFF_FFFE, // b .
+        0xE1A0_0000, // nop
+    ];
+    let mut rom = vec![0u8; 0x1000];
+    for (i, &w) in words.iter().enumerate() {
+        rom[i * 4..i * 4 + 4].copy_from_slice(&w.to_le_bytes());
     }
+
+    let mut core = GbaCore::new(None, rom.clone());
+    let mut fe = TestNullFrontend;
+    core.run_differential_test(&mut fe, &rom, 2)
+        .expect("JIT mid-block timer reads must match interpreter bit-for-bit");
+    assert!(
+        core.cpu.gpr[5] > 0,
+        "consecutive mid-block TM0CNT_L reads must advance (r3={}, r4={})",
+        core.cpu.gpr[3],
+        core.cpu.gpr[4]
+    );
 }
 
 #[test]

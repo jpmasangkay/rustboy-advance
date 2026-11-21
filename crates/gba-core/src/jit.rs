@@ -98,7 +98,8 @@ mod cranelift_backend {
             engine
         }
 
-        fn init_cranelift() -> Self {
+        fn create_module_and_ctx() -> Option<(cranelift_jit::JITModule, cranelift_codegen::Context)>
+        {
             use cranelift_codegen::settings::{self, Configurable};
             use cranelift_jit::{JITBuilder, JITModule};
             use cranelift_module::Module;
@@ -106,29 +107,34 @@ mod cranelift_backend {
             let mut flag_builder = settings::builder();
             let _ = flag_builder.set("opt_level", "speed");
 
-            let isa_builder = cranelift_native::builder();
-            let isa = match isa_builder {
+            let isa = match cranelift_native::builder() {
                 Ok(b) => match b.finish(settings::Flags::new(flag_builder)) {
                     Ok(isa) => isa,
                     Err(e) => {
                         log::warn!(
                             "JIT: Failed to create target ISA: {e}; falling back to interpreter"
                         );
-                        return Self::disabled();
+                        return None;
                     }
                 },
                 Err(e) => {
                     log::warn!(
                         "JIT: Host architecture unsupported by Cranelift: {e}; falling back to interpreter"
                     );
-                    return Self::disabled();
+                    return None;
                 }
             };
 
             let jit_builder = JITBuilder::with_isa(isa, cranelift_module::default_libcall_names());
             let module = JITModule::new(jit_builder);
-
             let ctx = module.make_context();
+            Some((module, ctx))
+        }
+
+        fn init_cranelift() -> Self {
+            let Some((module, ctx)) = Self::create_module_and_ctx() else {
+                return Self::disabled();
+            };
             let func_ctx = cranelift_frontend::FunctionBuilderContext::new();
 
             log::info!("JIT: Cranelift basic block JIT compiler initialized successfully");
@@ -178,6 +184,24 @@ mod cranelift_backend {
         pub fn clear(&mut self) {
             self.blocks.clear();
             self.page_to_blocks.clear();
+            self.ctx = None;
+            if let Some(old_module) = self.module.take() {
+                // SAFETY: `self.blocks` was cleared above so no cached function pointers
+                // into `old_module` remain reachable.
+                unsafe {
+                    old_module.free_memory();
+                }
+            }
+            self.block_counter = 0;
+            if self.available {
+                if let Some((module, ctx)) = Self::create_module_and_ctx() {
+                    self.module = Some(module);
+                    self.ctx = Some(ctx);
+                } else {
+                    self.available = false;
+                    self.enabled = false;
+                }
+            }
         }
 
         pub fn compile_block(
@@ -186,8 +210,15 @@ mod cranelift_backend {
             bus: &mut SysBus,
             key: BlockKey,
         ) -> Option<&JitBlock> {
-            if !self.available || !self.enabled || self.block_counter as usize >= MAX_JIT_BLOCKS {
+            if !self.available || !self.enabled {
                 return None;
+            }
+            if self.block_counter as usize >= MAX_JIT_BLOCKS {
+                // Recycle executable memory cleanly rather than permanently disabling the JIT.
+                self.clear();
+                if !self.available || !self.enabled {
+                    return None;
+                }
             }
 
             let region = (key.pc >> 24) & 0xFF;
@@ -368,14 +399,17 @@ mod cranelift_backend {
                 sync_sig.params.push(AbiParam::new(types::I32)); // p0
                 sync_sig.params.push(AbiParam::new(types::I32)); // p1
                 sync_sig.params.push(AbiParam::new(types::I32)); // open_bus_latch
+                sync_sig.params.push(AbiParam::new(types::I64)); // ir_cycles_delta
                 let sync_sig_ref = builder.import_signature(sync_sig);
 
                 let mut total_cyc_val = builder.ins().iconst(types::I64, 0);
                 let step_bytes = if is_thumb { 2u32 } else { 4u32 };
                 let mut ir_dirty_end_pc: Option<u32> = None;
+                let mut pending_ir_cyc: u64 = 0;
 
                 let emit_sync = |builder: &mut FunctionBuilder,
                                  end_pc: u32,
+                                 ir_cyc: u64,
                                  cpu_val,
                                  bus_val,
                                  sync_sig_ref,
@@ -392,10 +426,11 @@ mod cranelift_backend {
                     let p0_v = builder.ins().iconst(types::I32, p0 as i64);
                     let p1_v = builder.ins().iconst(types::I32, p1 as i64);
                     let latch_v = builder.ins().iconst(types::I32, latch as i64);
+                    let cyc_v = builder.ins().iconst(types::I64, ir_cyc as i64);
                     builder.ins().call_indirect(
                         sync_sig_ref,
                         sync_imm,
-                        &[cpu_val, bus_val, p0_v, p1_v, latch_v],
+                        &[cpu_val, bus_val, p0_v, p1_v, latch_v, cyc_v],
                     );
                 };
 
@@ -403,17 +438,20 @@ mod cranelift_backend {
                     let is_last = idx + 1 == traced.len();
                     if allow_ir && try_lower_ir(&mut builder, cpu_val, instr, is_thumb) {
                         total_cyc_val = builder.ins().iadd_imm_s(total_cyc_val, fetch_cyc as i64);
+                        pending_ir_cyc = pending_ir_cyc.saturating_add(fetch_cyc);
                         ir_dirty_end_pc = Some(pc.wrapping_add(step_bytes));
                     } else {
                         if let Some(end_pc) = ir_dirty_end_pc.take() {
                             emit_sync(
                                 &mut builder,
                                 end_pc,
+                                pending_ir_cyc,
                                 cpu_val,
                                 bus_val,
                                 sync_sig_ref,
                                 sync_imm,
                             );
+                            pending_ir_cyc = 0;
                         }
                         let call_inst = builder.ins().call_indirect(
                             step_sig_ref,
@@ -447,6 +485,7 @@ mod cranelift_backend {
                     emit_sync(
                         &mut builder,
                         end_pc,
+                        pending_ir_cyc,
                         cpu_val,
                         bus_val,
                         sync_sig_ref,
@@ -651,6 +690,7 @@ mod cranelift_backend {
         p0: u32,
         p1: u32,
         open_bus_latch: u32,
+        ir_cycles_delta: u64,
     ) {
         let cpu = unsafe { &mut *cpu_ptr };
         let bus = unsafe { &mut *bus_ptr };
@@ -659,6 +699,7 @@ mod cranelift_backend {
         cpu.pipeline_flushed = false;
         cpu.flush_cycles = 0;
         bus.open_bus_latch = open_bus_latch;
+        bus.scheduler.current_cycle += ir_cycles_delta;
     }
 
     unsafe extern "C" fn run_step_checked(cpu_ptr: *mut Arm7tdmi, bus_ptr: *mut SysBus) -> u64 {
@@ -676,6 +717,7 @@ mod cranelift_backend {
 
         bus.debug_pc = cpu.current_exec_pc();
         let c = cpu.step(bus).max(1);
+        bus.scheduler.current_cycle += c;
         let need_exit = cpu.pipeline_flushed
             || cpu.halted
             || cpu.stopped
@@ -683,7 +725,7 @@ mod cranelift_backend {
             || bus.hw.stop_requested
             || bus.hw.active_dma.is_some()
             || bus.invalidate_all_jit
-            || !bus.dirty_code_pages.is_empty()
+            || bus.has_dirty_code_pages()
             || bus.force_next_fetch_nseq
             || bus.irq_sync_delay > 0
             || (bus.hw.ime != 0 && (bus.hw.ie & bus.hw.if_flag) != 0 && !cpu.is_irq_disabled());

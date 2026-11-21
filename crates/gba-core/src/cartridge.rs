@@ -319,19 +319,33 @@ impl EepromState {
         val: u16,
         dma_count: u32,
     ) {
+        self.write_bit_with_autodetect(sram, dirty, val, dma_count, true);
+    }
+
+    pub fn write_bit_with_autodetect(
+        &mut self,
+        sram: &mut [u8; 0x20000],
+        dirty: &mut bool,
+        val: u16,
+        dma_count: u32,
+        allow_autodetect: bool,
+    ) {
         let bit = (val & 1) as u64;
         match self.stage {
-            EepromStage::Idle => {
+            EepromStage::Idle | EepromStage::ReadDummy | EepromStage::ReadData => {
                 if bit == 0 {
+                    self.stage = EepromStage::Idle;
                     return;
                 }
                 self.cmd_bits = bit;
                 self.cmd_len = 1;
                 self.stage = EepromStage::Command;
-                if dma_count == 17 || dma_count == 81 {
-                    self.detected_8k = true;
-                } else if dma_count == 9 || dma_count == 73 {
-                    self.detected_8k = false;
+                if allow_autodetect {
+                    if dma_count == 17 || dma_count == 81 {
+                        self.detected_8k = true;
+                    } else if dma_count == 9 || dma_count == 73 {
+                        self.detected_8k = false;
+                    }
                 }
             }
             EepromStage::Command => {
@@ -376,9 +390,6 @@ impl EepromState {
                     sram[self.addr + (7 - i)] = ((self.write_word >> (56 - i * 8)) & 0xFF) as u8;
                 }
                 *dirty = true;
-                self.stage = EepromStage::Idle;
-            }
-            _ => {
                 self.stage = EepromStage::Idle;
             }
         }
@@ -1066,7 +1077,8 @@ impl Cartridge {
                 let sample_start = (self.rtc.data & 0x01) != 0;
                 let clk = (self.rtc.data & 0x02) != 0;
                 if sample_start {
-                    self.gyro_shift = (self.gyro_val & 0x0FFF) << 4;
+                    // GBATEK: ADC outputs 4 leading dummy zero bits followed by 12 data bits (MSB first).
+                    self.gyro_shift = self.gyro_val & 0x0FFF;
                 } else if self.gyro_prev_clk && !clk {
                     let bit = (self.gyro_shift >> 15) & 1;
                     if (self.rtc.dir & 0x04) == 0 {

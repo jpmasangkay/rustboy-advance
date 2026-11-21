@@ -297,6 +297,21 @@ impl GbCore {
         }
 
         let mut payload: SaveStatePayload = postcard::from_bytes(&bytes[12..])?;
+        // Validate critical invariants before committing so corrupted/tampered states can
+        // never trigger OOB indexing, integer underflow, or reallocate pinned frontend RAM buffers.
+        if payload.bus.ppu.dot >= 456
+            || payload.bus.ppu.ly > 153
+            || payload.bus.ppu.mode > 3
+            || payload.bus.apu.ch1.duty_pos >= 8
+            || payload.bus.apu.ch2.duty_pos >= 8
+            || payload.bus.apu.ch3.pos >= 32
+            || payload.bus.apu.frame_seq_step >= 8
+            || payload.bus.oam_dma_index > 160
+            || payload.bus.cart.ram.len() != self.bus.cart.ram.len()
+        {
+            return Err(postcard::Error::DeserializeBadEncoding);
+        }
+
         let rom = core::mem::take(&mut self.bus.cart.rom);
         let boot_rom = core::mem::take(&mut self.bus.boot_rom);
         let host_sample_rate = self.config.sample_rate_hz;
@@ -306,7 +321,11 @@ impl GbCore {
         payload.bus.cart.refresh_rom_crc32();
         payload.bus.cart.rebuild_bank_cache();
         payload.bus.boot_rom = boot_rom;
-        payload.bus.apu.set_sample_rate(host_sample_rate);
+        if payload.bus.apu.sample_rate_hz != host_sample_rate {
+            payload.bus.apu.set_sample_rate(host_sample_rate);
+        } else {
+            payload.bus.apu.refresh_hpf_coeff();
+        }
         payload.bus.apu.output_buffer.clear();
         payload.bus.serial.output_buffer.clear();
         payload.bus.ppu.dmg_palette = host_dmg_palette;

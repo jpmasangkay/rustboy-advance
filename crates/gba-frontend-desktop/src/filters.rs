@@ -319,8 +319,15 @@ impl VideoPostProcessor {
             None
         };
 
-        for (idx, &px) in fb_bgr555.iter().enumerate() {
-            let off = idx * 4;
+        let dst_chunks = self.curr_rgba.as_chunks_mut::<4>().0;
+        let prev_rgba_chunks = self.prev_rgba.as_chunks::<4>().0;
+
+        for (idx, ((dst, prev_rgba), &px)) in dst_chunks
+            .iter_mut()
+            .zip(prev_rgba_chunks.iter())
+            .zip(fb_bgr555.iter())
+            .enumerate()
+        {
             let mapped = lut[(px & 0x7FFF) as usize];
             let blended = if let Some(prev_buf) = active_prev {
                 let prev_mapped = lut[(prev_buf[idx] & 0x7FFF) as usize];
@@ -336,17 +343,12 @@ impl VideoPostProcessor {
 
             if opts.lcd_ghosting && !opts.frame_blending {
                 // Blend ~65% new frame + ~35% previous frame for authentic TFT persistence.
-                let r = ((blended[0] as u16 * 166 + self.prev_rgba[off] as u16 * 90) >> 8) as u8;
-                let g =
-                    ((blended[1] as u16 * 166 + self.prev_rgba[off + 1] as u16 * 90) >> 8) as u8;
-                let b =
-                    ((blended[2] as u16 * 166 + self.prev_rgba[off + 2] as u16 * 90) >> 8) as u8;
-                self.curr_rgba[off] = r;
-                self.curr_rgba[off + 1] = g;
-                self.curr_rgba[off + 2] = b;
-                self.curr_rgba[off + 3] = 255;
+                dst[0] = ((blended[0] as u16 * 166 + prev_rgba[0] as u16 * 90) >> 8) as u8;
+                dst[1] = ((blended[1] as u16 * 166 + prev_rgba[1] as u16 * 90) >> 8) as u8;
+                dst[2] = ((blended[2] as u16 * 166 + prev_rgba[2] as u16 * 90) >> 8) as u8;
+                dst[3] = 255;
             } else {
-                self.curr_rgba[off..off + 4].copy_from_slice(&blended);
+                *dst = blended;
             }
         }
 
@@ -1272,8 +1274,12 @@ impl HostFrontend for FrontendBridge {
                     + (cur_r as f32 - self.prev_audio_r as f32) * frac)
                     * self.volume;
 
-                let _ = self.audio_prod.try_push(l.clamp(-32768.0, 32767.0) as i16);
-                let _ = self.audio_prod.try_push(r.clamp(-32768.0, 32767.0) as i16);
+                if self.audio_prod.vacant_len() >= 2 {
+                    let _ = self.audio_prod.push_slice(&[
+                        l.clamp(-32768.0, 32767.0) as i16,
+                        r.clamp(-32768.0, 32767.0) as i16,
+                    ]);
+                }
                 self.resample_phase += step;
             }
             self.resample_phase -= 1.0;

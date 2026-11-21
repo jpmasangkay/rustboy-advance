@@ -419,10 +419,12 @@ impl GbaCore {
         self.bus.hw.ime = 0;
         self.bus.hw.ie = 0;
         self.bus.hw.if_flag = 0;
+        self.cpu.set_cpsr(0x1F); // System mode, ARM, IRQ/FIQ enabled
+        self.cpu.banked_r8_12_usr = [0; 5];
+        self.cpu.banked_r8_12_fiq = [0; 5];
         self.cpu.banked_r13 = [0x0300_7F00, 0, 0x0300_7FA0, 0x0300_7FE0, 0, 0];
         self.cpu.banked_r14 = [0; 6];
         self.cpu.spsr_banked = [0; 6];
-        self.cpu.set_cpsr(0x1F); // System mode, ARM, IRQ/FIQ enabled
         for r in &mut self.cpu.gpr[..13] {
             *r = 0;
         }
@@ -462,13 +464,32 @@ impl GbaCore {
 
     #[inline]
     fn sync_jit_invalidation(&mut self) {
+        if !self.jit.enabled || !self.jit.available {
+            return;
+        }
         if self.bus.invalidate_all_jit {
             self.bus.invalidate_all_jit = false;
-            self.bus.dirty_code_pages.clear();
+            self.bus.dirty_ewram_pages = 0;
+            self.bus.dirty_iwram_pages = 0;
             self.jit.clear();
-        } else if !self.bus.dirty_code_pages.is_empty() {
-            for page in self.bus.dirty_code_pages.drain(..) {
-                self.jit.invalidate_page(page);
+        } else {
+            let mut ewram_mask = self.bus.dirty_ewram_pages;
+            if ewram_mask != 0 {
+                self.bus.dirty_ewram_pages = 0;
+                while ewram_mask != 0 {
+                    let bit = ewram_mask.trailing_zeros();
+                    ewram_mask &= ewram_mask - 1;
+                    self.jit.invalidate_page((0x02 << 10) | bit);
+                }
+            }
+            let mut iwram_mask = self.bus.dirty_iwram_pages;
+            if iwram_mask != 0 {
+                self.bus.dirty_iwram_pages = 0;
+                while iwram_mask != 0 {
+                    let bit = iwram_mask.trailing_zeros();
+                    iwram_mask &= iwram_mask - 1;
+                    self.jit.invalidate_page((0x03 << 10) | bit);
+                }
             }
         }
     }
@@ -503,7 +524,15 @@ impl GbaCore {
             {
                 return self.cpu.step(&mut self.bus);
             }
-            unsafe { (func_ptr)(&mut self.cpu as *mut _, &mut self.bus as *mut _) }
+            // JIT helpers advance `bus.scheduler.current_cycle` live between instructions so
+            // mid-block timer/IO/APU accesses see exact timestamps matching the interpreter.
+            // Snapshot `before` and return `elapsed` so callers' `current_cycle += cycles.max(1)`
+            // lands on the exact post-block cycle without double-counting.
+            let before = self.bus.scheduler.current_cycle;
+            let _ = unsafe { (func_ptr)(&mut self.cpu as *mut _, &mut self.bus as *mut _) };
+            let elapsed = self.bus.scheduler.current_cycle.saturating_sub(before);
+            self.bus.scheduler.current_cycle = before;
+            elapsed.max(1)
         } else {
             self.cpu.step(&mut self.bus)
         }
@@ -1055,7 +1084,12 @@ impl GbaCore {
                 }
 
                 let exec_pc = self.cpu.current_exec_pc();
+                let irq_pending_now = self.bus.irq_sync_delay > 0
+                    || (self.bus.hw.ime != 0
+                        && (self.bus.hw.ie & self.bus.hw.if_flag) != 0
+                        && !self.cpu.is_irq_disabled());
                 if allow_idle_skip
+                    && !irq_pending_now
                     && let Some(check_pc) = self.pending_idle_check_pc.take()
                     && check_pc == exec_pc
                     && self.is_safe_idle_loop(exec_pc)
@@ -1197,8 +1231,7 @@ impl GbaCore {
                         / u64::from(CPU_CLOCK_HZ))
                     .max(1) as usize
                         * 2;
-                    let silence = alloc::vec![0i16; silence_samples];
-                    frontend.push_audio_samples(&silence);
+                    Self::push_silence_samples(frontend, silence_samples);
                     if has_watchpoints {
                         self.bus.clear_watchpoints();
                     }
@@ -1238,6 +1271,20 @@ impl GbaCore {
         StopReason::FrameComplete
     }
 
+    #[inline]
+    fn push_silence_samples<F: HostFrontend + ?Sized>(frontend: &mut F, mut total_samples: usize) {
+        const SILENCE_CHUNK: [i16; 1280] = [0i16; 1280];
+        const MAX_SILENCE_CHUNKS: usize = 64;
+        for _ in 0..MAX_SILENCE_CHUNKS {
+            if total_samples == 0 {
+                break;
+            }
+            let chunk_len = total_samples.min(SILENCE_CHUNK.len());
+            frontend.push_audio_samples(&SILENCE_CHUNK[..chunk_len]);
+            total_samples -= chunk_len;
+        }
+    }
+
     fn run_frame_fast<F: HostFrontend + ?Sized>(
         &mut self,
         frontend: &mut F,
@@ -1245,7 +1292,7 @@ impl GbaCore {
     ) {
         let end_cycle = self.bus.scheduler.current_cycle + CYCLES_PER_FRAME;
         while self.bus.scheduler.current_cycle < end_cycle {
-            if self.jit.available {
+            if self.jit.enabled && self.jit.available {
                 self.sync_jit_invalidation();
             }
 
@@ -1291,8 +1338,7 @@ impl GbaCore {
                         / u64::from(CPU_CLOCK_HZ))
                     .max(1) as usize
                         * 2;
-                    let silence = alloc::vec![0i16; silence_samples];
-                    frontend.push_audio_samples(&silence);
+                    Self::push_silence_samples(frontend, silence_samples);
                     return;
                 }
             }
@@ -1339,7 +1385,12 @@ impl GbaCore {
                 }
 
                 let exec_pc = self.cpu.current_exec_pc();
+                let irq_pending_now = self.bus.irq_sync_delay > 0
+                    || (self.bus.hw.ime != 0
+                        && (self.bus.hw.ie & self.bus.hw.if_flag) != 0
+                        && !self.cpu.is_irq_disabled());
                 if allow_idle_skip
+                    && !irq_pending_now
                     && let Some(check_pc) = self.pending_idle_check_pc.take()
                     && check_pc == exec_pc
                     && self.is_safe_idle_loop(exec_pc)

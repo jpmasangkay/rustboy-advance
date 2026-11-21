@@ -489,6 +489,7 @@ impl RustboyApp {
         };
 
         app.load_persistent_config();
+        app.sync_audio_volume();
         app.config.run_ahead_frames = app.config.run_ahead_frames.min(1);
         app.rescan_rom_folders();
 
@@ -2228,17 +2229,31 @@ impl RustboyApp {
             self.last_mouse_activity = now;
         }
         let pointer_y = ctx.input(|i| i.pointer.latest_pos().map(|p| p.y).unwrap_or(999.0));
-        let hover_near_top = pointer_y <= 36.0;
+        let any_popup_open = self.show_volume_popup || ctx.memory(|m| m.any_popup_open());
+        // Keep fullscreen top chrome mounted across both the menu bar + toolbar height (~68px)
+        // and whenever a dropdown/popup menu is open so clicks never dismiss the menu mid-action.
+        let hover_near_top = pointer_y <= 68.0 || any_popup_open;
+
+        let any_dialog_open = self.show_pause_overlay
+            || self.show_state_manager
+            || self.show_settings
+            || self.show_controls_dialog
+            || self.show_rewind_settings
+            || self.show_game_settings
+            || self.show_uninstall_confirm
+            || self.show_perf_check
+            || self.show_movies
+            || self.show_volume_popup
+            || self.pending_confirm_action.is_some()
+            || self.link.show_window
+            || self.ra.show_window
+            || self.lua.show_console
+            || self.debugger.any_open();
 
         let cursor_should_hide = self.has_active_game()
             && !self.paused
-            && !self.show_pause_overlay
-            && !self.show_state_manager
-            && !self.show_settings
-            && !self.show_uninstall_confirm
-            && !self.show_perf_check
-            && !self.show_volume_popup
-            && !self.link.show_window
+            && !any_dialog_open
+            && !any_popup_open
             && now.duration_since(self.last_mouse_activity) > Duration::from_millis(2200);
 
         if cursor_should_hide {
@@ -2749,7 +2764,11 @@ impl RustboyApp {
             let _ = self.capture.stop_gif();
             self.notify(&format!("GIF recording error: {err}"));
         }
-        if video_ready && !self.first_frame_cover_saved && self.frame_counter >= 30 {
+        if video_ready
+            && !self.first_frame_cover_saved
+            && self.frame_counter >= 30
+            && (self.frame_counter.is_multiple_of(30) || self.frame_counter >= 180)
+        {
             self.try_capture_first_frame_cover();
         }
     }

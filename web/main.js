@@ -113,7 +113,10 @@ class RustboyWebApp {
     this.audioCtx = null;
     this.audioNode = null;
     this.audioWorkletReady = false;
+    this.audioInitPromise = null;
 
+    this.booting = false;
+    this.bootSeq = 0;
     this.userPaused = false;
     this.bgPaused = false;
     this.modalPaused = false;
@@ -532,17 +535,47 @@ class RustboyWebApp {
   }
 
   announce(text) {
+    if (typeof document.ariaNotify === "function") {
+      try {
+        document.ariaNotify(text);
+        return;
+      } catch {
+        // Fall back to the polite live region below.
+      }
+    }
     this.el.srStatus.textContent = text;
+  }
+
+  hideToast() {
+    const toast = this.el.toast;
+    if (typeof toast.hidePopover === "function") {
+      try {
+        if (toast.matches(":popover-open")) toast.hidePopover();
+      } catch {
+        // Ignore popover close errors when element is disconnected.
+      }
+    }
+    toast.hidden = true;
   }
 
   notify(text) {
     this.announce(text);
-    this.el.toast.textContent = text;
-    this.el.toast.hidden = false;
+    // Avoid surfacing background visual toasts while a modal dialog is open.
+    if (document.querySelector("dialog[open]")) {
+      return;
+    }
+    const toast = this.el.toast;
+    toast.textContent = text;
+    toast.hidden = false;
+    if (typeof toast.showPopover === "function") {
+      try {
+        if (!toast.matches(":popover-open")) toast.showPopover();
+      } catch {
+        // Fall back to standard fixed positioning if popover promotion fails.
+      }
+    }
     clearTimeout(this.toastTimer);
-    this.toastTimer = setTimeout(() => {
-      this.el.toast.hidden = true;
-    }, 2400);
+    this.toastTimer = setTimeout(() => this.hideToast(), 2400);
   }
 
   async init() {
@@ -588,42 +621,58 @@ class RustboyWebApp {
 
   async ensureAudioStarted() {
     if (!this.emu) return;
-    if (!this.audioCtx) {
-      try {
-        const Ctx = window.AudioContext || window.webkitAudioContext;
-        if (!Ctx) {
-          this.el.statAudio.textContent = "Unsupported";
-          return;
-        }
-        this.audioCtx = new Ctx({ latencyHint: "interactive" });
-        await this.audioCtx.audioWorklet.addModule("./audio-worklet.js");
-        this.audioNode = new AudioWorkletNode(this.audioCtx, "gba-audio-processor", {
-          numberOfInputs: 0,
-          numberOfOutputs: 1,
-          outputChannelCount: [2],
-        });
-        this.audioNode.port.onmessage = ({ data }) => {
-          if (data?.type === "recycle" && data.buffer && this.audioBufferPool.length < 8) {
-            this.audioBufferPool.push(data.buffer);
+    if (this.audioInitPromise) {
+      await this.audioInitPromise;
+    } else if (!this.audioCtx) {
+      this.audioInitPromise = (async () => {
+        let ctx = null;
+        try {
+          const Ctx = window.AudioContext || window.webkitAudioContext;
+          if (!Ctx) {
+            this.el.statAudio.textContent = "Unsupported";
+            return;
           }
-        };
-        this.audioNode.connect(this.audioCtx.destination);
-        this.audioNode.port.postMessage({
-          type: "config",
-          inputSampleRate: this.emu.sample_rate(),
-        });
-        this.audioNode.port.postMessage({ type: "speed", speed: this.prefs.speed });
-        this.audioNode.port.postMessage({ type: "mute", muted: this.prefs.muted });
-        this.audioNode.port.postMessage({ type: "volume", volume: this.prefs.volume / 100 });
-        this.audioWorkletReady = true;
-        this.audioCtx.addEventListener("statechange", () => this.updateAudioUi());
-      } catch (err) {
-        this.el.statAudio.textContent = "Audio Unavailable";
-        this.showError(
-          "AudioWorklet Unavailable",
-          `Running muted: ${err?.message || err}. Secure context (HTTPS or localhost) is required for WebAudio worklets.`,
-        );
-      }
+          ctx = new Ctx({ latencyHint: "interactive" });
+          await ctx.audioWorklet.addModule("./audio-worklet.js");
+          const node = new AudioWorkletNode(ctx, "gba-audio-processor", {
+            numberOfInputs: 0,
+            numberOfOutputs: 1,
+            outputChannelCount: [2],
+          });
+          node.port.onmessage = ({ data }) => {
+            if (data?.type === "recycle" && data.buffer && this.audioBufferPool.length < 8) {
+              this.audioBufferPool.push(data.buffer);
+            }
+          };
+          node.connect(ctx.destination);
+          node.port.postMessage({
+            type: "config",
+            inputSampleRate: this.emu.sample_rate(),
+          });
+          node.port.postMessage({ type: "speed", speed: this.prefs.speed });
+          node.port.postMessage({ type: "mute", muted: this.prefs.muted });
+          node.port.postMessage({ type: "volume", volume: this.prefs.volume / 100 });
+          this.audioCtx = ctx;
+          this.audioNode = node;
+          this.audioWorkletReady = true;
+          this.audioCtx.addEventListener("statechange", () => this.updateAudioUi());
+        } catch (err) {
+          this.audioWorkletReady = false;
+          this.audioNode = null;
+          this.audioCtx = null;
+          if (ctx) {
+            await ctx.close().catch(() => {});
+          }
+          this.el.statAudio.textContent = "Audio Unavailable";
+          this.showError(
+            "AudioWorklet Unavailable",
+            `Running muted: ${err?.message || err}. Secure context (HTTPS or localhost) is required for WebAudio worklets.`,
+          );
+        } finally {
+          this.audioInitPromise = null;
+        }
+      })();
+      await this.audioInitPromise;
     }
     if (this.audioCtx?.state === "suspended") {
       await this.audioCtx.resume().catch(() => {});
@@ -709,50 +758,77 @@ class RustboyWebApp {
     }
   }
 
+  syncHostRtc() {
+    if (!this.emu || typeof this.emu.set_rtc_datetime !== "function") return;
+    const now = new Date();
+    const year = Math.max(0, Math.min(99, now.getFullYear() - 2000));
+    const month = now.getMonth() + 1;
+    const day = now.getDate();
+    const dow = now.getDay();
+    const hour = now.getHours();
+    const minute = now.getMinutes();
+    const second = now.getSeconds();
+    this.emu.set_rtc_datetime(year, month, day, dow, hour, minute, second);
+  }
+
   async bootRomBytes(bytes, label) {
-    await this.flushSramIfDirty();
-    this.emu.load_rom(bytes);
-
-    // Hydrate battery save from IndexedDB if available
-    const key = this.emu.storage_key;
+    const seq = ++this.bootSeq;
+    this.booting = true;
     try {
-      const saved = await this.storage.loadSram(key);
-      if (saved && saved.length > 0) {
-        this.emu.import_sram(saved);
+      await this.flushSramIfDirty();
+      if (this.bootSeq !== seq) return;
+      this.emu.load_rom(bytes);
+      this.syncHostRtc();
+
+      // Hydrate battery save from IndexedDB before the rAF loop steps any frames.
+      const key = this.emu.storage_key;
+      try {
+        const saved = await this.storage.loadSram(key);
+        if (this.bootSeq !== seq) return;
+        if (saved && saved.length > 0) {
+          this.emu.import_sram(saved);
+        }
+      } catch (err) {
+        this.notify(`IndexedDB save read skipped: ${err?.message || err}`);
       }
-    } catch (err) {
-      this.notify(`IndexedDB save read skipped: ${err?.message || err}`);
+
+      this.userPaused = false;
+      this.bgPaused = false;
+      this.lastFrameTs = performance.now();
+      this.accMs = 0;
+
+      this.el.stateLoading.hidden = true;
+      this.el.stateEmpty.hidden = true;
+      this.el.stateRunning.hidden = false;
+      this.el.pausedScrim.hidden = true;
+
+      this.setDisabled(this.el.btnPause, false);
+      this.setDisabled(this.el.btnReset, false);
+      this.setDisabled(this.el.btnFastForward, false);
+      this.setDisabled(this.el.btnStates, false);
+
+      this.el.cartBadge.textContent = `${this.emu.title} · ${this.emu.game_code}`;
+      this.el.statCrc.textContent = this.emu.rom_crc32_hex;
+      this.el.statSave.textContent = `${this.emu.save_type} · Synced`;
+      this.updateBiosUi();
+      this.updatePowerState();
+      this.updateCanvasSize();
+
+      this.emu.run_frame();
+      this.presentFrame();
+      this.canvas.focus();
+
+      await this.ensureAudioStarted();
+      if (this.bootSeq !== seq) return;
+      this.audioNode?.port.postMessage({ type: "clear" });
+      this.notify(`Loaded ${this.emu.title || label}`);
+    } finally {
+      if (this.bootSeq === seq) {
+        this.booting = false;
+        this.lastFrameTs = performance.now();
+        this.accMs = 0;
+      }
     }
-
-    this.userPaused = false;
-    this.bgPaused = false;
-    this.lastFrameTs = performance.now();
-    this.accMs = 0;
-
-    this.el.stateLoading.hidden = true;
-    this.el.stateEmpty.hidden = true;
-    this.el.stateRunning.hidden = false;
-    this.el.pausedScrim.hidden = true;
-
-    this.setDisabled(this.el.btnPause, false);
-    this.setDisabled(this.el.btnReset, false);
-    this.setDisabled(this.el.btnFastForward, false);
-    this.setDisabled(this.el.btnStates, false);
-
-    this.el.cartBadge.textContent = `${this.emu.title} · ${this.emu.game_code}`;
-    this.el.statCrc.textContent = this.emu.rom_crc32_hex;
-    this.el.statSave.textContent = `${this.emu.save_type} · Synced`;
-    this.updateBiosUi();
-    this.updatePowerState();
-    this.updateCanvasSize();
-
-    this.emu.run_frame();
-    this.presentFrame();
-    this.canvas.focus();
-
-    await this.ensureAudioStarted();
-    this.audioNode?.port.postMessage({ type: "clear" });
-    this.notify(`Loaded ${this.emu.title || label}`);
   }
 
   async loadBiosFile(file) {
@@ -808,6 +884,7 @@ class RustboyWebApp {
     if (!this.emu?.rom_loaded) return;
     this.flushSramIfDirty();
     this.emu.reset();
+    this.syncHostRtc();
     this.audioNode?.port.postMessage({ type: "clear" });
     this.presentFrame();
     this.accMs = 0;
@@ -937,7 +1014,13 @@ class RustboyWebApp {
     this.lastFrameTs = performance.now();
     const tick = (now) => {
       this.rafId = requestAnimationFrame(tick);
-      if (!this.emu?.rom_loaded || this.userPaused || this.bgPaused || this.modalPaused) {
+      if (
+        this.booting ||
+        !this.emu?.rom_loaded ||
+        this.userPaused ||
+        this.bgPaused ||
+        this.modalPaused
+      ) {
         this.lastFrameTs = now;
         return;
       }
@@ -953,11 +1036,31 @@ class RustboyWebApp {
       this.emu.set_keys(mask);
 
       const maxSteps = Math.max(4, Math.ceil(speed * 2));
-      const dueSteps = Math.min(maxSteps, Math.floor(this.accMs / stepMs));
+      let dueSteps = Math.min(maxSteps, Math.floor(this.accMs / stepMs));
+      // On 60 Hz displays (~16.67 ms vs GBA's 16.74 ms), snap 1:1 with vsync so we don't
+      // drop a frame every ~3.6 s; the AudioWorklet's ±0.5% DRC absorbs the 0.45% delta.
+      let vsyncSnapped = false;
+      if (
+        dueSteps === 0 &&
+        Math.abs(speed - 1.0) < 0.01 &&
+        delta >= 14.5 &&
+        delta <= 18.5 &&
+        this.accMs >= stepMs * 0.92
+      ) {
+        dueSteps = 1;
+        vsyncSnapped = true;
+      }
+
       let stepped = 0;
       if (dueSteps > 0) {
-        stepped = this.emu.step_frames(dueSteps);
-        this.accMs -= stepped * stepMs;
+        if (typeof this.emu.step_frames === "function") {
+          stepped = this.emu.step_frames(dueSteps);
+        } else {
+          for (let i = 0; i < dueSteps; i++) {
+            if (this.emu.run_frame()) stepped += 1;
+          }
+        }
+        this.accMs = vsyncSnapped ? 0 : Math.max(0, this.accMs - stepped * stepMs);
         this.fpsFrames += stepped;
       }
       if (stepped === maxSteps && this.accMs > stepMs * 2) {

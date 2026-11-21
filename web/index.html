@@ -105,22 +105,22 @@
     </header>
 
     <main class="workspace">
-      <div id="error-banner" class="alert-banner" role="alert" hidden>
-        <div class="alert-body">
-          <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" aria-hidden="true">
-            <circle cx="12" cy="12" r="10"/>
-            <line x1="12" y1="8" x2="12" y2="12"/>
-            <line x1="12" y1="16" x2="12.01" y2="16"/>
-          </svg>
-          <div>
-            <strong id="error-title">Error</strong>
-            <p id="error-message"></p>
-          </div>
-        </div>
-        <button type="button" id="btn-dismiss-error" class="ctrl-btn">Dismiss</button>
-      </div>
-
       <section class="stage-shell" id="stage-shell" aria-label="Game Boy Advance console viewport">
+        <div id="error-banner" class="alert-banner" role="alert" hidden>
+          <div class="alert-body">
+            <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" aria-hidden="true">
+              <circle cx="12" cy="12" r="10"/>
+              <line x1="12" y1="8" x2="12" y2="12"/>
+              <line x1="12" y1="16" x2="12.01" y2="16"/>
+            </svg>
+            <div>
+              <strong id="error-title">Error</strong>
+              <p id="error-message"></p>
+            </div>
+          </div>
+          <button type="button" id="btn-dismiss-error" class="ctrl-btn">Dismiss</button>
+        </div>
+
         <div class="bezel-card" id="bezel-card">
           <div class="bezel-topbar">
             <div class="power-indicator" id="power-indicator" data-state="idle">
@@ -178,9 +178,9 @@
 
           <div class="bezel-quickstrip">
             <div class="quick-controls" role="group" aria-label="Quick display toggles">
-              <label class="inline-field">
+              <label class="inline-field" for="quick-color-profile">
                 <span>Profile</span>
-                <select id="quick-color-profile" aria-label="Color profile">
+                <select id="quick-color-profile">
                   <option value="1">AGB-001</option>
                   <option value="2">AGS-101</option>
                   <option value="3">AGS-001</option>
@@ -240,7 +240,7 @@
     </footer>
 
     <p id="sr-status" class="visually-hidden" role="status" aria-live="polite"></p>
-    <div id="toast" class="toast" hidden aria-hidden="true"></div>
+    <div id="toast" class="toast" popover="manual" hidden aria-hidden="true"></div>
 
     <!-- Save States Modal Dialog -->
     <dialog id="states-dialog" class="modal-dialog" closedby="any" aria-labelledby="states-dialog-title">
@@ -268,7 +268,7 @@
         <section class="settings-panel">
           <h3>Video &amp; Audio</h3>
           <div class="settings-grid">
-            <label class="field-row">
+            <label class="field-row" for="set-color-profile">
               <span>Color Profile</span>
               <select id="set-color-profile">
                 <option value="1">AGB-001 (Original TFT)</option>
@@ -277,7 +277,7 @@
                 <option value="0">Linear (Uncorrected RGB)</option>
               </select>
             </label>
-            <label class="field-row">
+            <label class="field-row" for="set-speed">
               <span>Emulation Speed</span>
               <select id="set-speed">
                 <option value="0.5">0.5× (Slow)</option>
@@ -286,23 +286,23 @@
                 <option value="4">4.0× (Fast Forward)</option>
               </select>
             </label>
-            <label class="field-row">
+            <label class="field-row" for="set-volume">
               <span>Master Volume (<span id="vol-readout" class="mono-num">100%</span>)</span>
               <input type="range" id="set-volume" min="0" max="100" value="100">
             </label>
-            <label class="toggle-row">
+            <label class="toggle-row" for="set-integer-scale">
               <span>Integer Pixel Scaling</span>
               <input type="checkbox" id="set-integer-scale" switch checked>
             </label>
-            <label class="toggle-row">
+            <label class="toggle-row" for="set-lcd-grid">
               <span>LCD Pixel Grid</span>
               <input type="checkbox" id="set-lcd-grid" switch>
             </label>
-            <label class="toggle-row">
+            <label class="toggle-row" for="set-lcd-ghosting">
               <span>LCD Frame Blending (Ghosting)</span>
               <input type="checkbox" id="set-lcd-ghosting" switch>
             </label>
-            <label class="toggle-row">
+            <label class="toggle-row" for="set-touch-controls">
               <span>Show Touch Gamepad</span>
               <input type="checkbox" id="set-touch-controls" switch>
             </label>
@@ -325,7 +325,7 @@
             <h3>Keyboard &amp; Gamepad</h3>
             <button type="button" id="btn-reset-keys" class="ctrl-btn">Reset Defaults</button>
           </div>
-          <label class="toggle-row">
+          <label class="toggle-row" for="set-swap-ab">
             <span>Swap Gamepad A / B (Nintendo Layout)</span>
             <input type="checkbox" id="set-swap-ab" switch>
           </label>

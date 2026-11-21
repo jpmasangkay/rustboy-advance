@@ -303,10 +303,11 @@ fn make_isolated_app() -> ManuallyDrop<RustboyApp> {
 
 fn load_synthetic_active_game(app: &mut RustboyApp) {
     let manifest_dir = Path::new(env!("CARGO_MANIFEST_DIR"));
-    let summon_night =
-        PathBuf::from(r"C:\Users\My Laptop\Downloads\Summon Night - Swordcraft Story (USA).gba");
+    let env_rom = std::env::var_os("GBA_SUMMON_NIGHT_ROM").map(PathBuf::from);
     let tonc_m7 = manifest_dir.join("../../test-roms/tonc/m7_ex.gba");
-    let (rom, title, code) = if let Ok(bytes) = std::fs::read(&summon_night) {
+    let (rom, title, code) = if let Some(ref p) = env_rom
+        && let Ok(bytes) = std::fs::read(p)
+    {
         (
             bytes,
             "Summon Night - Swordcraft Story".to_string(),

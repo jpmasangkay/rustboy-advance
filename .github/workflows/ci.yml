@@ -69,16 +69,7 @@ jobs:
           node --check web/input.js
           node --check web/audio-worklet.js
           node --check web/main.js
-
-      - name: Run workspace unit & harness tests
-        run: |
-          cargo test --workspace
-          cargo test -p gba-core --features jit
-
-      - name: Build release libretro core & desktop binary
-        run: |
-          cargo build --release -p gba-libretro
-          cargo build --release -p gba-testrunner
+          node --check web/test-rom.js
 
       - name: Fetch freely-redistributable test ROMs (Unix)
         if: runner.os != 'Windows'
@@ -89,6 +80,15 @@ jobs:
         if: runner.os == 'Windows'
         shell: pwsh
         run: ./scripts/fetch-test-roms.ps1
+
+      - name: Run workspace unit & harness tests
+        run: |
+          cargo test --workspace
+          cargo test -p gba-core --features jit
+
+      - name: Build release testrunner binary
+        run: |
+          cargo build --release -p gba-testrunner
 
       - name: Run GBA test ROM suite & generate TEST_RESULTS.md
         run: cargo run --release -p gba-testrunner -- --report TEST_RESULTS.md --preserve-diagnosis --fail-on-unexpected

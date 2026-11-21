@@ -2,7 +2,7 @@ use std::collections::VecDeque;
 use std::time::Instant;
 
 use egui::{self, Color32, CornerRadius, RichText, Stroke};
-use lz4_flex::block::{compress, decompress_into};
+use lz4_flex::block::{compress_into, decompress_into, get_maximum_output_size};
 
 use crate::app::{
     ACCENT_TEAL, ACCENT_TEAL_BG, BG_CARD, BG_PANEL, BORDER_HAIRLINE, GBA_FRAME_SECS, RustboyApp,
@@ -46,25 +46,48 @@ fn xor_buffers(a: &[u8], b: &[u8], out: &mut [u8]) {
 /// LZ4-compressed XOR delta between two consecutive serialized core states.
 #[derive(Clone, Debug)]
 pub struct XorDelta {
-    compressed_xor: Vec<u8>,
+    compressed_xor: Box<[u8]>,
     prev_len: usize,
     curr_len: usize,
 }
 
 impl XorDelta {
-    /// Encodes an XOR delta between `prev` and `curr`, reusing `scratch` to avoid heap churn.
-    pub fn encode_with_scratch(prev: &[u8], curr: &[u8], scratch: &mut Vec<u8>) -> Self {
+    /// Encodes an XOR delta between `prev` and `curr`, reusing `xor_scratch` and `compress_scratch`
+    /// so steady-state recording only allocates the exact compressed slice (no ~422 KB excess `Vec` capacity).
+    pub fn encode_with_scratches(
+        prev: &[u8],
+        curr: &[u8],
+        xor_scratch: &mut Vec<u8>,
+        compress_scratch: &mut Vec<u8>,
+    ) -> Self {
         let max_len = prev.len().max(curr.len());
-        if scratch.len() < max_len {
-            scratch.resize(max_len, 0);
+        if xor_scratch.len() < max_len {
+            xor_scratch.resize(max_len, 0);
         }
-        xor_buffers(prev, curr, &mut scratch[..max_len]);
-        let compressed_xor = compress(&scratch[..max_len]);
+        xor_buffers(prev, curr, &mut xor_scratch[..max_len]);
+
+        let max_compressed = get_maximum_output_size(max_len);
+        if compress_scratch.len() < max_compressed {
+            compress_scratch.resize(max_compressed, 0);
+        }
+        let written = compress_into(
+            &xor_scratch[..max_len],
+            &mut compress_scratch[..max_compressed],
+        )
+        .expect("lz4 compress_into buffer sized via get_maximum_output_size");
+        let compressed_xor = compress_scratch[..written].to_vec().into_boxed_slice();
         Self {
             compressed_xor,
             prev_len: prev.len(),
             curr_len: curr.len(),
         }
+    }
+
+    /// Encodes an XOR delta between `prev` and `curr`, reusing `scratch` to avoid heap churn.
+    #[cfg(test)]
+    pub fn encode_with_scratch(prev: &[u8], curr: &[u8], scratch: &mut Vec<u8>) -> Self {
+        let mut compress_scratch = Vec::new();
+        Self::encode_with_scratches(prev, curr, scratch, &mut compress_scratch)
     }
 
     /// Reconstructs `prev` into `buf` in place using a reusable `xor_scratch` buffer
@@ -139,6 +162,7 @@ pub struct RewindBuffer {
     total_bytes: usize,
     frames_since_keyframe: usize,
     xor_scratch: Vec<u8>,
+    compress_scratch: Vec<u8>,
     pub last_encode_us: f32,
     pub ema_encode_us: f32,
 }
@@ -152,6 +176,7 @@ impl RewindBuffer {
             total_bytes: 0,
             frames_since_keyframe: 0,
             xor_scratch: Vec::new(),
+            compress_scratch: Vec::new(),
             last_encode_us: 0.0,
             ema_encode_us: 0.0,
         }
@@ -166,6 +191,7 @@ impl RewindBuffer {
             total_bytes: 0,
             frames_since_keyframe: 0,
             xor_scratch: Vec::new(),
+            compress_scratch: Vec::new(),
             last_encode_us: 0.0,
             ema_encode_us: 0.0,
         }
@@ -233,7 +259,12 @@ impl RewindBuffer {
                 self.frames_since_keyframe = 0;
             }
             Some(prev) => {
-                let delta = XorDelta::encode_with_scratch(&prev, &state, &mut self.xor_scratch);
+                let delta = XorDelta::encode_with_scratches(
+                    &prev,
+                    &state,
+                    &mut self.xor_scratch,
+                    &mut self.compress_scratch,
+                );
                 self.frames_since_keyframe += 1;
 
                 let is_kf = self.frames_since_keyframe >= KEYFRAME_INTERVAL;
@@ -748,5 +779,16 @@ mod tests {
             "unexpectedly slow delta encode: {elapsed_ms:.2} ms"
         );
         assert!(rb.seconds_available(1) > 0.0);
+        // Boxed slice prevents lz4_flex::block::compress excess capacity leak (~422 KB per delta).
+        let stored_delta = rb
+            .entries
+            .back()
+            .and_then(|e| e.back_delta.as_ref())
+            .expect("delta stored");
+        assert!(
+            stored_delta.compressed_xor.len() < 8 * 1024,
+            "expected compact delta, got {} bytes",
+            stored_delta.compressed_xor.len()
+        );
     }
 }

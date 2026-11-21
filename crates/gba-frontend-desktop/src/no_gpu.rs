@@ -1098,8 +1098,30 @@ fn binding_matches_keycode(binding: &str, code: KeyCode) -> bool {
                 || b.eq_ignore_ascii_case("LShift")
                 || b.eq_ignore_ascii_case("RShift")
         }
+        KeyCode::ControlLeft | KeyCode::ControlRight => {
+            b.eq_ignore_ascii_case("Ctrl")
+                || b.eq_ignore_ascii_case("Control")
+                || b.eq_ignore_ascii_case("LCtrl")
+                || b.eq_ignore_ascii_case("RCtrl")
+        }
+        KeyCode::AltLeft | KeyCode::AltRight => {
+            b.eq_ignore_ascii_case("Alt")
+                || b.eq_ignore_ascii_case("LAlt")
+                || b.eq_ignore_ascii_case("RAlt")
+        }
         KeyCode::Tab => b.eq_ignore_ascii_case("Tab"),
         KeyCode::Escape => b.eq_ignore_ascii_case("Escape") || b.eq_ignore_ascii_case("Esc"),
+        KeyCode::Semicolon => b == ";" || b.eq_ignore_ascii_case("Semicolon"),
+        KeyCode::Comma => b == "," || b.eq_ignore_ascii_case("Comma"),
+        KeyCode::Period => b == "." || b.eq_ignore_ascii_case("Period"),
+        KeyCode::Slash => b == "/" || b.eq_ignore_ascii_case("Slash"),
+        KeyCode::BracketLeft => b == "[" || b.eq_ignore_ascii_case("LBracket"),
+        KeyCode::BracketRight => b == "]" || b.eq_ignore_ascii_case("RBracket"),
+        KeyCode::Minus => b == "-" || b.eq_ignore_ascii_case("Minus"),
+        KeyCode::Equal => b == "=" || b.eq_ignore_ascii_case("Equals"),
+        KeyCode::Backslash => b == "\\" || b.eq_ignore_ascii_case("Backslash"),
+        KeyCode::Quote => b == "'" || b.eq_ignore_ascii_case("Apostrophe"),
+        KeyCode::Backquote => b == "`" || b.eq_ignore_ascii_case("Grave"),
         KeyCode::KeyA => b.eq_ignore_ascii_case("A"),
         KeyCode::KeyB => b.eq_ignore_ascii_case("B"),
         KeyCode::KeyC => b.eq_ignore_ascii_case("C"),
@@ -1155,16 +1177,16 @@ fn compute_gba_keypad(pressed: &HashSet<KeyCode>, kb: &KeyBindings) -> u16 {
     if is_down(&kb.start) {
         mask &= !(1 << 3);
     }
-    if is_down(&kb.right) || pressed.contains(&KeyCode::ArrowRight) {
+    if is_down(&kb.right) {
         mask &= !(1 << 4);
     }
-    if is_down(&kb.left) || pressed.contains(&KeyCode::ArrowLeft) {
+    if is_down(&kb.left) {
         mask &= !(1 << 5);
     }
-    if is_down(&kb.up) || pressed.contains(&KeyCode::ArrowUp) {
+    if is_down(&kb.up) {
         mask &= !(1 << 6);
     }
-    if is_down(&kb.down) || pressed.contains(&KeyCode::ArrowDown) {
+    if is_down(&kb.down) {
         mask &= !(1 << 7);
     }
     if is_down(&kb.r) {
@@ -1172,6 +1194,13 @@ fn compute_gba_keypad(pressed: &HashSet<KeyCode>, kb: &KeyBindings) -> u16 {
     }
     if is_down(&kb.l) {
         mask &= !(1 << 9);
+    }
+    // Sanitize simultaneous opposing D-Pad directions (Left+Right or Up+Down) to match hardware pivot.
+    if (mask & ((1 << 4) | (1 << 5))) == 0 {
+        mask |= (1 << 4) | (1 << 5);
+    }
+    if (mask & ((1 << 6) | (1 << 7))) == 0 {
+        mask |= (1 << 6) | (1 << 7);
     }
     mask
 }
@@ -2819,5 +2848,32 @@ mod tests {
         gb.core.run_frame(&mut sink);
         assert!(sink.frame_dirty);
         assert_eq!(gb_core::GbHostFrontend::poll_keypad(&mut sink), 0x03FF);
+    }
+
+    #[test]
+    fn nogpu_keypad_respects_custom_bindings_and_rejects_opposing_dpad() {
+        let kb = KeyBindings {
+            up: "W".to_string(),
+            down: "S".to_string(),
+            left: "A".to_string(),
+            right: "D".to_string(),
+            a: "Semicolon".to_string(),
+            ..Default::default()
+        };
+
+        // Unbound ArrowRight must not trigger D-Pad Right when D-Pad is bound to WASD.
+        let mut pressed = HashSet::from([KeyCode::ArrowRight]);
+        assert_eq!(compute_gba_keypad(&pressed, &kb), 0x03FF);
+
+        // Custom punctuation binding ("Semicolon" -> A) and "D" -> Right must register.
+        pressed = HashSet::from([KeyCode::Semicolon, KeyCode::KeyD]);
+        assert_eq!(
+            compute_gba_keypad(&pressed, &kb),
+            0x03FF & !(1 << 0) & !(1 << 4)
+        );
+
+        // Opposing D-Pad directions (Left+Right and Up+Down) must cancel to neutral high bits.
+        pressed = HashSet::from([KeyCode::KeyA, KeyCode::KeyD, KeyCode::KeyW, KeyCode::KeyS]);
+        assert_eq!(compute_gba_keypad(&pressed, &kb), 0x03FF);
     }
 }

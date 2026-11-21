@@ -58,14 +58,15 @@ impl RustboyApp {
         }
 
         if ctx.input(|i| {
-            i.modifiers.ctrl && i.modifiers.shift && !i.modifiers.alt && i.key_pressed(Key::M)
+            let cmd = i.modifiers.ctrl || i.modifiers.mac_cmd;
+            cmd && i.modifiers.shift && !i.modifiers.alt && i.key_pressed(Key::M)
         }) {
             self.config.show_menu_bar = !self.config.show_menu_bar;
             self.config.save();
             self.notify(if self.config.show_menu_bar {
                 "Menu Bar Shown (Ctrl+Shift+M)"
             } else {
-                "Menu Bar Hidden — press Ctrl+Shift+M to restore"
+                "Menu Bar Hidden — press F10 or Ctrl+Shift+M to restore"
             });
         }
 
@@ -148,9 +149,7 @@ impl RustboyApp {
                     }
                 });
 
-            let menu_toggle =
-                (cmd && i.modifiers.shift && !i.modifiers.alt && i.key_pressed(Key::M))
-                    || (!i.modifiers.any() && i.key_pressed(Key::F10));
+            let menu_toggle = !i.modifiers.any() && i.key_pressed(Key::F10);
 
             (
                 rw_chord.is_some_and(|c| is_chord_held(i, c)),
@@ -477,5 +476,43 @@ mod tests {
         });
         assert!(app.show_pause_overlay);
         assert!(app.paused);
+    }
+
+    #[test]
+    fn test_ctrl_shift_m_toggles_menu_bar_once_not_twice() {
+        let mut app = ManuallyDrop::new(RustboyApp::new(
+            CliConfig::default(),
+            crate::config::AppConfig::default(),
+        ));
+        app.config.show_menu_bar = true;
+
+        let ctx = egui::Context::default();
+        let input = egui::RawInput {
+            modifiers: egui::Modifiers::CTRL | egui::Modifiers::SHIFT,
+            events: vec![egui::Event::Key {
+                key: Key::M,
+                physical_key: None,
+                pressed: true,
+                repeat: false,
+                modifiers: egui::Modifiers::CTRL | egui::Modifiers::SHIFT,
+            }],
+            ..Default::default()
+        };
+
+        let _ = ctx.run(input.clone(), |ctx| {
+            app.handle_global_shortcuts(ctx);
+        });
+        assert!(
+            !app.config.show_menu_bar,
+            "Ctrl+Shift+M must toggle menu bar off in one press"
+        );
+
+        let _ = ctx.run(input, |ctx| {
+            app.handle_global_shortcuts(ctx);
+        });
+        assert!(
+            app.config.show_menu_bar,
+            "second Ctrl+Shift+M must restore menu bar"
+        );
     }
 }

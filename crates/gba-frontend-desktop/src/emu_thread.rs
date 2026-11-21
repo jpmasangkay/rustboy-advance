@@ -30,6 +30,7 @@ pub const FRAME_PIXELS: usize = LCD_WIDTH * LCD_HEIGHT;
 /// callers on `&SharedTripleBuffer` can never alias a buffer slot or trigger UB.
 pub struct SharedTripleBuffer {
     buffers: [UnsafeCell<[u16; FRAME_PIXELS]>; 3],
+    writing: AtomicUsize,
     reading: AtomicUsize,
     latest_packed: AtomicUsize,
     read_lock: AtomicBool,
@@ -42,6 +43,13 @@ const DIRTY_BIT: usize = 0b100;
 unsafe impl Send for SharedTripleBuffer {}
 unsafe impl Sync for SharedTripleBuffer {}
 
+struct SpinLockGuard<'a>(&'a AtomicBool);
+impl Drop for SpinLockGuard<'_> {
+    fn drop(&mut self) {
+        self.0.store(false, Ordering::Release);
+    }
+}
+
 impl SharedTripleBuffer {
     pub fn new() -> Self {
         Self {
@@ -50,6 +58,7 @@ impl SharedTripleBuffer {
                 UnsafeCell::new([0; FRAME_PIXELS]),
                 UnsafeCell::new([0; FRAME_PIXELS]),
             ],
+            writing: AtomicUsize::new(0),
             reading: AtomicUsize::new(1),
             latest_packed: AtomicUsize::new(2), // slot 2, dirty = false
             read_lock: AtomicBool::new(false),
@@ -57,15 +66,9 @@ impl SharedTripleBuffer {
         }
     }
 
-    /// Selects the initial write slot for the producer.
-    pub fn next_write_slot(&self, _last_written: usize) -> usize {
-        0
-    }
-
-    /// Safe producer write helper: copies `frame` into `written_slot` and publishes it,
-    /// returning the recycled slot for the next frame.
-    pub fn write_and_publish(&self, written_slot: usize, frame: &[u16; FRAME_PIXELS]) -> usize {
-        let slot = written_slot % 3;
+    /// Safe producer write helper: copies `frame` into the privately-owned write slot and
+    /// atomically publishes it, recycling the previous unpublished slot for the next write.
+    pub fn write_and_publish(&self, frame: &[u16; FRAME_PIXELS]) {
         while self
             .write_lock
             .compare_exchange_weak(false, true, Ordering::Acquire, Ordering::Relaxed)
@@ -73,33 +76,16 @@ impl SharedTripleBuffer {
         {
             std::hint::spin_loop();
         }
-        // SAFETY: `write_lock` serializes producers, and the triple-buffer invariant guarantees
-        // `slot` is neither the consumer's `reading` slot nor the published `latest` slot.
+        let _guard = SpinLockGuard(&self.write_lock);
+        let slot = self.writing.load(Ordering::Relaxed);
+        debug_assert!(slot < 3);
+        // SAFETY: `write_lock` serializes all producers, and the triple-buffer invariant guarantees
+        // `self.writing` is disjoint from both `self.reading` and `self.latest_packed`.
         unsafe {
             (*self.buffers[slot].get()).copy_from_slice(frame);
         }
         let prev = self.latest_packed.swap(slot | DIRTY_BIT, Ordering::AcqRel);
-        self.write_lock.store(false, Ordering::Release);
-        prev & SLOT_MASK
-    }
-
-    /// Mutable reference to a designated write slot.
-    ///
-    /// # Safety
-    /// Only the single emulation worker thread may call this on its owned write slot
-    /// before calling `publish_frame`.
-    #[allow(clippy::mut_from_ref)]
-    pub unsafe fn write_buffer_mut(&self, slot: usize) -> &mut [u16; FRAME_PIXELS] {
-        debug_assert!(slot < 3);
-        unsafe { &mut *self.buffers[slot % 3].get() }
-    }
-
-    /// Marks the given slot as the latest published frame for the UI and returns
-    /// the new unread buffer slot allocated for the writer.
-    pub fn publish_frame(&self, written_slot: usize) -> usize {
-        let slot = written_slot % 3;
-        let prev = self.latest_packed.swap(slot | DIRTY_BIT, Ordering::AcqRel);
-        prev & SLOT_MASK
+        self.writing.store(prev & SLOT_MASK, Ordering::Release);
     }
 
     /// Checks if a new frame is pending for display.
@@ -119,13 +105,7 @@ impl SharedTripleBuffer {
         {
             std::hint::spin_loop();
         }
-        struct ReadGuard<'a>(&'a AtomicBool);
-        impl Drop for ReadGuard<'_> {
-            fn drop(&mut self) {
-                self.0.store(false, Ordering::Release);
-            }
-        }
-        let _guard = ReadGuard(&self.read_lock);
+        let _guard = SpinLockGuard(&self.read_lock);
 
         let cur = self.latest_packed.load(Ordering::Acquire);
         if (cur & DIRTY_BIT) == 0 {
@@ -382,7 +362,6 @@ impl DrcPacer {
 /// Internal frontend implementation for the worker thread.
 struct WorkerFrontend<'a> {
     triple_buffer: &'a SharedTripleBuffer,
-    write_slot: usize,
     keypad: &'a AtomicU16,
     audio: &'a mut AudioProducer,
     audio_scratch: Vec<i16>,
@@ -390,12 +369,7 @@ struct WorkerFrontend<'a> {
 
 impl<'a> HostFrontend for WorkerFrontend<'a> {
     fn present_frame(&mut self, fb: &[u16; FRAME_PIXELS]) {
-        // SAFETY: Only this thread writes to the allocated `write_slot`
-        unsafe {
-            let buf = self.triple_buffer.write_buffer_mut(self.write_slot);
-            buf.copy_from_slice(fb);
-        }
-        self.write_slot = self.triple_buffer.publish_frame(self.write_slot);
+        self.triple_buffer.write_and_publish(fb);
     }
 
     fn push_audio_samples(&mut self, samples: &[i16]) {
@@ -447,7 +421,6 @@ impl EmuThreadHandle {
                 let _mmcss_guard = crate::audio::win_mmcss::MmcssGuard::enter_games();
                 let capacity = audio.capacity();
                 let mut pacer = DrcPacer::new(capacity);
-                let mut write_slot = tb.next_write_slot(0);
                 let mut paused = false;
 
                 loop {
@@ -484,13 +457,11 @@ impl EmuThreadHandle {
                     {
                         let mut fe = WorkerFrontend {
                             triple_buffer: &tb,
-                            write_slot,
                             keypad: &kp,
                             audio: &mut audio,
                             audio_scratch: Vec::new(),
                         };
                         core.run_frame(&mut fe);
-                        write_slot = fe.write_slot;
                     }
 
                     // Dynamic rate control pacing
@@ -555,13 +526,10 @@ mod tests {
         // Initially dirty is false
         assert!(!tb.is_dirty());
 
-        // Producer writes to slot 0
-        let slot0 = tb.next_write_slot(2);
-        unsafe {
-            let b = tb.write_buffer_mut(slot0);
-            b[0] = 0x1234;
-        }
-        let next_write = tb.publish_frame(slot0);
+        // Producer writes frame via safe API
+        let mut frame = [0u16; FRAME_PIXELS];
+        frame[0] = 0x1234;
+        tb.write_and_publish(&frame);
 
         assert!(tb.is_dirty());
 
@@ -571,7 +539,10 @@ mod tests {
         assert!(!tb.is_dirty());
 
         // Next producer slot never collides with reader slot
-        assert_ne!(next_write, tb.reading.load(Ordering::Relaxed));
+        assert_ne!(
+            tb.writing.load(Ordering::Relaxed),
+            tb.reading.load(Ordering::Relaxed)
+        );
     }
 
     #[test]

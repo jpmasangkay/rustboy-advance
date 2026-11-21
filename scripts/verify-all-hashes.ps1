@@ -60,8 +60,8 @@ try {
             continue
         }
         $procArgs = @("--headless", "--verify-hashes", $c.Ref, "`"$($c.Rom)`"", "--frames", "$($c.Frames)")
-        if ($c.Replay) { $procArgs += @("--input-replay", $c.Replay) }
-        if ($c.Sav) { $procArgs += @("--sav", $c.Sav) }
+        if ($c.Replay -and (Test-Path $c.Replay)) { $procArgs += @("--input-replay", $c.Replay) }
+        if ($c.Sav -and (Test-Path $c.Sav)) { $procArgs += @("--sav", $c.Sav) }
         $proc = Start-Process -FilePath $exe -ArgumentList $procArgs -WindowStyle Hidden -PassThru -Wait -RedirectStandardOutput $tmpOut -RedirectStandardError $tmpErr
         $out = ((Get-Content $tmpOut -ErrorAction SilentlyContinue) + (Get-Content $tmpErr -ErrorAction SilentlyContinue)) -join "`n"
         if ($proc.ExitCode -ne 0) {
@@ -90,8 +90,13 @@ if ($total -gt 0 -and $verified -eq $total -and $skipped -eq 0) {
         Write-Warning "No ROMs were verified; failing instead of reporting false success. Pass -AllowSkipped to exit 0."
         exit 1
     }
-    if ($skipped -gt 0 -and $AllowSkipped) {
-        Write-Warning "Some ROMs were skipped; exiting 0 because -AllowSkipped was specified."
+    if ($skipped -gt 0) {
+        if ($AllowSkipped) {
+            Write-Warning "Some ROMs were skipped; exiting 0 because -AllowSkipped was specified."
+        } else {
+            Write-Warning "Some ROMs were skipped; failing instead of reporting false success. Pass -AllowSkipped to exit 0."
+            exit 1
+        }
     }
 }
 

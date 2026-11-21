@@ -59,7 +59,13 @@ fn read_git_commit() -> String {
     if dirty { format!("{hash}-dirty") } else { hash }
 }
 
-fn build_windows_icon_coff_obj(ico_bytes: &[u8]) -> Result<Vec<u8>, String> {
+fn build_windows_icon_coff_obj(ico_bytes: &[u8], target_arch: &str) -> Result<Vec<u8>, String> {
+    let (machine_id, reloc_type): (u16, u16) = match target_arch {
+        "x86_64" => (0x8664, 0x0003), // IMAGE_FILE_MACHINE_AMD64 + IMAGE_REL_AMD64_ADDR32NB
+        "aarch64" => (0xAA64, 0x0002), // IMAGE_FILE_MACHINE_ARM64 + IMAGE_REL_ARM64_ADDR32NB
+        "x86" => (0x014C, 0x0007),    // IMAGE_FILE_MACHINE_I386 + IMAGE_REL_I386_DIR32NB
+        other => return Err(format!("unsupported Windows COFF icon arch: {other}")),
+    };
     if ico_bytes.len() < 6 {
         return Err("icon.ico too small".to_string());
     }
@@ -192,7 +198,7 @@ fn build_windows_icon_coff_obj(ico_bytes: &[u8]) -> Result<Vec<u8>, String> {
     let mut obj = Vec::with_capacity(symtab_ptr + (num_symbols as usize) * 18 + 4);
 
     // COFF File Header
-    obj.extend_from_slice(&0x8664u16.to_le_bytes()); // Machine: IMAGE_FILE_MACHINE_AMD64
+    obj.extend_from_slice(&machine_id.to_le_bytes());
     obj.extend_from_slice(&1u16.to_le_bytes()); // NumberOfSections: 1
     obj.extend_from_slice(&0u32.to_le_bytes()); // TimeDateStamp
     obj.extend_from_slice(&(symtab_ptr as u32).to_le_bytes()); // PointerToSymbolTable
@@ -217,13 +223,12 @@ fn build_windows_icon_coff_obj(ico_bytes: &[u8]) -> Result<Vec<u8>, String> {
     obj.extend_from_slice(&rsrc);
 
     // Relocations (each 10 bytes: VirtualAddress: u32, SymbolTableIndex: u32, Type: u16)
-    const IMAGE_REL_AMD64_ADDR32NB: u16 = 0x0003;
     for i in 0..total_res {
         let va = (data_entries_off + i * 16) as u32;
         let sym_idx = (i as u32) + 1;
         obj.extend_from_slice(&va.to_le_bytes());
         obj.extend_from_slice(&sym_idx.to_le_bytes());
-        obj.extend_from_slice(&IMAGE_REL_AMD64_ADDR32NB.to_le_bytes());
+        obj.extend_from_slice(&reloc_type.to_le_bytes());
     }
 
     // Symbol Table (each 18 bytes)
@@ -249,7 +254,6 @@ fn build_windows_icon_coff_obj(ico_bytes: &[u8]) -> Result<Vec<u8>, String> {
 }
 
 fn main() {
-    println!("cargo:rerun-if-changed=src");
     println!("cargo:rerun-if-changed=build.rs");
     println!("cargo:rerun-if-changed=Cargo.toml");
     println!("cargo:rerun-if-changed=assets/icon.ico");
@@ -274,6 +278,7 @@ fn main() {
     // and embed the crab-GBA icon into the Windows .exe resource table.
     if std::env::var("CARGO_CFG_TARGET_OS").as_deref() == Ok("windows") {
         let target_env = std::env::var("CARGO_CFG_TARGET_ENV").unwrap_or_default();
+        let target_arch = std::env::var("CARGO_CFG_TARGET_ARCH").unwrap_or_default();
         if target_env == "msvc" {
             println!("cargo:rustc-link-arg=/STACK:16777216");
         } else {
@@ -281,7 +286,7 @@ fn main() {
         }
         let ico_path = Path::new("assets/icon.ico");
         if let Ok(ico_bytes) = std::fs::read(ico_path)
-            && let Ok(coff_obj) = build_windows_icon_coff_obj(&ico_bytes)
+            && let Ok(coff_obj) = build_windows_icon_coff_obj(&ico_bytes, &target_arch)
             && let Ok(out_dir) = std::env::var("OUT_DIR")
         {
             let obj_path = Path::new(&out_dir).join("rustboy_icon_res.obj");

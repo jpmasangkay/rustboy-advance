@@ -32,6 +32,8 @@ function openDb() {
     };
     req.onsuccess = () => resolve(req.result);
     req.onerror = () => reject(req.error ?? new Error("Failed to open IndexedDB."));
+    req.onblocked = () =>
+      reject(new Error("IndexedDB upgrade blocked by another open tab. Please close other tabs."));
   });
 }
 
@@ -48,10 +50,10 @@ function txRequest(db, storeName, mode, op) {
       }
     };
     req.onerror = () => reject(req.error ?? new Error("IndexedDB request failed."));
+    tx.onerror = () => reject(tx.error ?? new Error("IndexedDB transaction failed."));
+    tx.onabort = () => reject(tx.error ?? new Error("IndexedDB transaction aborted."));
     if (mode !== "readonly") {
       tx.oncomplete = () => resolve(result);
-      tx.onerror = () => reject(tx.error ?? new Error("IndexedDB transaction failed."));
-      tx.onabort = () => reject(tx.error ?? new Error("IndexedDB transaction aborted."));
     }
   });
 }
@@ -63,10 +65,21 @@ export class EmulatorStorage {
 
   async db() {
     if (!this.dbPromise) {
-      this.dbPromise = openDb().catch((err) => {
-        this.dbPromise = null;
-        throw err;
-      });
+      this.dbPromise = openDb()
+        .then((db) => {
+          db.onversionchange = () => {
+            db.close();
+            this.dbPromise = null;
+          };
+          db.onclose = () => {
+            this.dbPromise = null;
+          };
+          return db;
+        })
+        .catch((err) => {
+          this.dbPromise = null;
+          throw err;
+        });
     }
     return this.dbPromise;
   }

@@ -964,6 +964,39 @@ where
             println!("[gpu-guard] {reason}");
             return GpuGuardOutcome::UseNoGpu { reason };
         }
+    } else if peek_meta.is_none() && !config.blocked_gpu_adapters.is_empty() {
+        // When we deliberately skipped in-process wgpu peeking (e.g. prior hang/adapter failure
+        // cleared `verified_gpu_adapters`), still honor non-expired blocklist entries recorded by
+        // previous child probes instead of silently re-probing forever.
+        let mut expired_keys = Vec::new();
+        let mut active_block: Option<(String, BlockedGpuAdapterEntry)> = None;
+        for (key, entry) in &config.blocked_gpu_adapters {
+            if key == ADAPTER_ENUM_SENTINEL_KEY {
+                continue;
+            }
+            if is_blocked_entry_expired(entry, None, now_secs).is_some() {
+                expired_keys.push(key.clone());
+            } else if entry.consecutive_failures >= GPU_BLOCKLIST_FAILURE_THRESHOLD
+                && active_block.is_none()
+            {
+                active_block = Some((key.clone(), entry.clone()));
+            }
+        }
+        for k in expired_keys {
+            config.blocked_gpu_adapters.remove(&k);
+            config_dirty = true;
+        }
+        if let Some((key, entry)) = active_block {
+            if persist && config_dirty {
+                config.save();
+            }
+            let reason = format!(
+                "Skipped blocked GPU adapter `{}` ({} consecutive failures; latest `{}`: {}); pass --retry-gpu to retry",
+                key, entry.consecutive_failures, entry.failed_stage, entry.reason
+            );
+            println!("[gpu-guard] {reason}");
+            return GpuGuardOutcome::UseNoGpu { reason };
+        }
     }
 
     // Check prior active failures (if 1st failure occurred without hitting the 2-failure blocklist).
@@ -972,6 +1005,18 @@ where
         .and_then(|meta| config.blocked_gpu_adapters.get(&meta.block_key))
         .or_else(|| config.blocked_gpu_adapters.get(ADAPTER_ENUM_SENTINEL_KEY))
         .map(|e| e.consecutive_failures)
+        .or_else(|| {
+            if peek_meta.is_none() {
+                config
+                    .blocked_gpu_adapters
+                    .values()
+                    .filter(|e| is_blocked_entry_expired(e, None, now_secs).is_none())
+                    .map(|e| e.consecutive_failures)
+                    .max()
+            } else {
+                None
+            }
+        })
         .unwrap_or(0);
 
     // Verified cache lookup: only valid when adapter + driver match cleanly, no retry/fault flags,
@@ -1166,12 +1211,17 @@ pub fn ensure_gpu_startup_safe(cli: &CliConfig, config: &mut AppConfig) -> GpuGu
     // Only touch wgpu in-process before the isolated child probe when we already have a
     // verified-adapter cache entry (so a hostile driver crash stays isolated inside the child
     // on first run or when `--retry-gpu` is requested).
-    let peek_meta = if !cli.retry_gpu
-        && !config.verified_gpu_adapters.is_empty()
+    let can_peek_safely = !cli.retry_gpu
         && !config
             .blocked_gpu_adapters
             .contains_key(ADAPTER_ENUM_SENTINEL_KEY)
-    {
+        && (!config.verified_gpu_adapters.is_empty()
+            || (!config.blocked_gpu_adapters.is_empty()
+                && config
+                    .blocked_gpu_adapters
+                    .values()
+                    .all(|e| e.failed_stage != "adapter" && e.failed_stage != "hang")));
+    let peek_meta = if can_peek_safely {
         peek_primary_adapter_meta(cli.software_adapter)
     } else {
         None

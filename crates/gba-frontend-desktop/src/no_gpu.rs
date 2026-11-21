@@ -1849,7 +1849,8 @@ impl ApplicationHandler for NoGpuApp {
                 "{} [No-GPU: softbuffer] — {}",
                 self.title, self.rom_name
             ))
-            .with_inner_size(LogicalSize::new(self.size.0, self.size.1));
+            .with_inner_size(LogicalSize::new(self.size.0, self.size.1))
+            .with_window_icon(crate::icon::winit_window_icon());
         if self.fullscreen_on_start {
             attrs = attrs.with_fullscreen(Some(winit::window::Fullscreen::Borderless(None)));
         }

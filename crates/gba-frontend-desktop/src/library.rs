@@ -209,23 +209,36 @@ pub(crate) fn capture_first_frame_cover_fallback(
         crate::config::ColorProfileChoice::Agb001,
         &mut rgba_full,
     );
-    let (rgba, width, height) = if is_gb {
+    let (src_rgba, src_w, src_h) = if is_gb {
         (
             crate::gb_bridge::crop_gb_rgba_from_240x160(&rgba_full),
-            gb_core::LCD_WIDTH as u32,
-            gb_core::LCD_HEIGHT as u32,
+            gb_core::LCD_WIDTH,
+            gb_core::LCD_HEIGHT,
         )
     } else {
         (
             rgba_full,
-            gba_core::LCD_WIDTH as u32,
-            gba_core::LCD_HEIGHT as u32,
+            gba_core::LCD_WIDTH,
+            gba_core::LCD_HEIGHT,
         )
     };
 
-    if !force_fallback && is_uniform_rgba_frame(&rgba) {
+    if !force_fallback && is_uniform_rgba_frame(&src_rgba) {
         return Ok(None);
     }
+
+    // Center-crop the captured frame to a 1:1 square so fallback covers match square GBA/GB box art.
+    let side = src_w.min(src_h);
+    let x_off = (src_w - side) / 2;
+    let y_off = (src_h - side) / 2;
+    let mut rgba = Vec::with_capacity(side * side * 4);
+    for row in 0..side {
+        let src_start = ((y_off + row) * src_w + x_off) * 4;
+        let src_end = src_start + side * 4;
+        rgba.extend_from_slice(&src_rgba[src_start..src_end]);
+    }
+    let width = side as u32;
+    let height = side as u32;
 
     if let Some(parent) = dest.parent() {
         fs::create_dir_all(parent).map_err(|e| format!("Failed creating covers dir: {e}"))?;
@@ -591,20 +604,34 @@ impl RustboyApp {
                 .inner_margin(if centered { 22.0 } else { 14.0 })
                 .show(ui, |ui| {
                     ui.set_width((max_w - if centered { 44.0 } else { 28.0 }).max(240.0));
-                    ui.label(
-                        RichText::new("Welcome to Rustboy Advance")
-                            .size(if centered { 20.0 } else { 16.0 })
-                            .strong()
-                            .color(COLOR_TEXT),
-                    );
-                    ui.add_space(4.0);
-                    ui.label(
-                        RichText::new(
-                            "Set up your game folder and review controls before jumping in.",
-                        )
-                        .size(12.5)
-                        .color(COLOR_TEXT_SECONDARY),
-                    );
+                    let logo_id = app
+                        .app_logo_tex
+                        .get_or_insert_with(|| crate::icon::app_logo_texture(ui.ctx()))
+                        .id();
+                    let logo_sz = if centered { 52.0 } else { 40.0 };
+                    ui.horizontal(|ui| {
+                        ui.add(
+                            egui::Image::new((logo_id, egui::vec2(logo_sz, logo_sz)))
+                                .fit_to_exact_size(egui::vec2(logo_sz, logo_sz)),
+                        );
+                        ui.add_space(6.0);
+                        ui.vertical(|ui| {
+                            ui.label(
+                                RichText::new("Welcome to Rustboy Advance")
+                                    .size(if centered { 20.0 } else { 16.0 })
+                                    .strong()
+                                    .color(COLOR_TEXT),
+                            );
+                            ui.add_space(2.0);
+                            ui.label(
+                                RichText::new(
+                                    "Set up your game folder and review controls before jumping in.",
+                                )
+                                .size(12.5)
+                                .color(COLOR_TEXT_SECONDARY),
+                            );
+                        });
+                    });
                     ui.add_space(12.0);
 
                     // Step 1: Game folder
@@ -1920,8 +1947,8 @@ impl RustboyApp {
                             })
                             .show(ui, |ui| {
                                 let tile_w = 180.0_f32;
-                                let tile_h = 120.0_f32; // Native 3:2 GBA aspect ratio (240x160)
-                                let card_meta_h = 40.0_f32;
+                                let tile_h = 180.0_f32; // 1:1 square matching GBA/GB/GBC box art covers
+                                let card_meta_h = 24.0_f32;
                                 let spacing_x = 16.0_f32;
                                 let spacing_y = 20.0_f32;
                                 let avail_w = ui.available_width().max(tile_w);
@@ -2039,31 +2066,39 @@ impl RustboyApp {
                                                         COLOR_TILE,
                                                     );
 
-                                                    // Render cover image if loaded, aspect-fitted inside square tile
+                                                    // Render cover image if loaded, filling the 1:1 square tile with no empty margins
                                                     if let Some(tex) =
                                                         self.cover_textures.get(&entry.path)
                                                     {
                                                         let tex_w = tex.size()[0] as f32;
                                                         let tex_h = tex.size()[1] as f32;
                                                         if tex_w > 0.0 && tex_h > 0.0 {
-                                                            let scale = (tile_w / tex_w)
-                                                                .min(tile_h / tex_h);
-                                                            let draw_size = egui::vec2(
-                                                                tex_w * scale,
-                                                                tex_h * scale,
-                                                            );
-                                                            let draw_rect =
-                                                                egui::Rect::from_center_size(
-                                                                    tile_rect.center(),
-                                                                    draw_size,
-                                                                );
-                                                            ui.painter().image(
-                                                                tex.id(),
-                                                                draw_rect,
+                                                            let tex_aspect = tex_w / tex_h;
+                                                            let tile_aspect = tile_w / tile_h;
+                                                            let uv_rect = if (tex_aspect - tile_aspect).abs() <= 0.04 {
                                                                 egui::Rect::from_min_max(
                                                                     egui::pos2(0.0, 0.0),
                                                                     egui::pos2(1.0, 1.0),
-                                                                ),
+                                                                )
+                                                            } else if tex_aspect > tile_aspect {
+                                                                let u_span = tile_aspect / tex_aspect;
+                                                                let u0 = (1.0 - u_span) * 0.5;
+                                                                egui::Rect::from_min_max(
+                                                                    egui::pos2(u0, 0.0),
+                                                                    egui::pos2(u0 + u_span, 1.0),
+                                                                )
+                                                            } else {
+                                                                let v_span = tex_aspect / tile_aspect;
+                                                                let v0 = (1.0 - v_span) * 0.5;
+                                                                egui::Rect::from_min_max(
+                                                                    egui::pos2(0.0, v0),
+                                                                    egui::pos2(1.0, v0 + v_span),
+                                                                )
+                                                            };
+                                                            ui.painter().image(
+                                                                tex.id(),
+                                                                tile_rect,
+                                                                uv_rect,
                                                                 Color32::WHITE,
                                                             );
                                                         }
@@ -2084,7 +2119,7 @@ impl RustboyApp {
                                                     let tile_hovered = tile_resp.hovered();
                                                     tile_resp.on_hover_text(&entry.display_name);
 
-                                                    // 2. Metadata Directly Below Tile
+                                                    // 2. Title Directly Below Tile (no region or MB size clutter in Grid view)
                                                     ui.add_space(6.0);
 
                                                     // Title 12px white, single-line ellipsis + full title tooltip
@@ -2111,24 +2146,7 @@ impl RustboyApp {
                                                     }
                                                     title_resp.on_hover_text(&entry.display_name);
 
-                                                    ui.add_space(2.0);
-
-                                                    // "REGION · SIZE" ("Homebrew · SIZE" for unheadered, or "SIZE" when region unknown)
-                                                    let size_str =
-                                                        format_rom_size_mb(entry.size_mb);
-                                                    let region_lbl = library_region_label(entry);
-                                                    let meta_str = if region_lbl.is_empty() {
-                                                        size_str
-                                                    } else {
-                                                        format!("{region_lbl} · {size_str}")
-                                                    };
-                                                    ui.label(
-                                                        RichText::new(meta_str)
-                                                            .color(COLOR_TEXT_SECONDARY)
-                                                            .size(11.0),
-                                                    );
-
-                                                    // Subtle top-right Favorite star badge rendered in its own scoped rect so it never shifts title/metadata below the tile
+                                                    // Subtle top-right Favorite star badge rendered in its own scoped rect so it never shifts title below the tile
                                                     let is_fav =
                                                         self.favorites.contains(&entry.path);
                                                     let show_star = is_fav || tile_hovered;

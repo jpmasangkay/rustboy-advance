@@ -72,6 +72,14 @@ impl AsyncConfigWriter {
             st = self.cv.wait(st).unwrap_or_else(|e| e.into_inner());
         }
     }
+
+    fn cancel_and_wait(&self) {
+        let mut st = self.state.lock().unwrap_or_else(|e| e.into_inner());
+        st.pending = None;
+        while st.writing {
+            st = self.cv.wait(st).unwrap_or_else(|e| e.into_inner());
+        }
+    }
 }
 
 /// Atomically writes `data` to `path` by writing to a sibling temporary file,
@@ -1833,6 +1841,69 @@ impl AppConfig {
     pub fn record_verified_gpu_adapter(&mut self, key: String, entry: VerifiedGpuAdapterEntry) {
         self.verified_gpu_adapters.insert(key, entry);
     }
+
+    /// Cleanly removes all persistent emulator configuration, library cache, battery saves,
+    /// save states, box-art covers, screenshots, crash logs, and OS keyring credentials
+    /// inside `Self::app_data_dir()`.
+    pub fn uninstall_all_data() -> Result<Vec<PathBuf>, String> {
+        AsyncConfigWriter::global().cancel_and_wait();
+        Self::clear_ra_token();
+        Self::uninstall_data_at(&Self::app_data_dir(), is_portable_mode())
+    }
+
+    /// Removes all emulator-managed files and directories under `data_dir`.
+    /// When `portable_only_managed_items` is false and `data_dir` ends with `"RustboyAdvance"`,
+    /// removes `data_dir` entirely after clearing managed subdirectories.
+    pub fn uninstall_data_at(
+        data_dir: &Path,
+        portable_only_managed_items: bool,
+    ) -> Result<Vec<PathBuf>, String> {
+        let mut removed = Vec::new();
+        let managed_files = [
+            data_dir.join("config.json"),
+            data_dir.join("config.json.bak"),
+            data_dir.join("rustboy_library.cfg"),
+            data_dir.join("rustboy-advance-crash.log"),
+            data_dir.join("rustboy-advance-startup-error.log"),
+        ];
+        let managed_dirs = [
+            data_dir.join("saves"),
+            data_dir.join("states"),
+            data_dir.join("covers"),
+            data_dir.join("screenshots"),
+        ];
+
+        for file in &managed_files {
+            if file.is_file() {
+                fs::remove_file(file)
+                    .map_err(|e| format!("Failed removing {}: {e}", file.display()))?;
+                removed.push(file.clone());
+            }
+        }
+        for dir in &managed_dirs {
+            if dir.is_dir() {
+                fs::remove_dir_all(dir)
+                    .map_err(|e| format!("Failed removing directory {}: {e}", dir.display()))?;
+                removed.push(dir.clone());
+            }
+        }
+
+        if !portable_only_managed_items
+            && data_dir.is_dir()
+            && data_dir
+                .file_name()
+                .and_then(|n| n.to_str())
+                .is_some_and(|n| n.eq_ignore_ascii_case("RustboyAdvance"))
+        {
+            fs::remove_dir_all(data_dir)
+                .map_err(|e| format!("Failed removing {}: {e}", data_dir.display()))?;
+            if !removed.contains(&data_dir.to_path_buf()) {
+                removed.push(data_dir.to_path_buf());
+            }
+        }
+
+        Ok(removed)
+    }
 }
 
 #[cfg(test)]
@@ -2187,5 +2258,35 @@ mod tests {
         let parsed = AppConfig::from_json_str(&raw);
         assert_eq!(parsed.master_volume, 7);
         let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn uninstall_data_at_removes_all_managed_files_dirs_and_clears_ra_token() {
+        let dir = std::env::temp_dir()
+            .join(format!(
+                "rustboy_uninstall_test_{}_{}",
+                std::process::id(),
+                ATOMIC_TMP_COUNTER.fetch_add(1, Ordering::Relaxed)
+            ))
+            .join("RustboyAdvance");
+        fs::create_dir_all(dir.join("saves")).expect("create saves");
+        fs::create_dir_all(dir.join("states")).expect("create states");
+        fs::create_dir_all(dir.join("covers")).expect("create covers");
+        fs::create_dir_all(dir.join("screenshots")).expect("create screenshots");
+        fs::write(dir.join("config.json"), b"{}").expect("write config");
+        fs::write(dir.join("rustboy_library.cfg"), b"[]").expect("write library");
+        fs::write(dir.join("saves/test.sav"), b"SAVE").expect("write save");
+        fs::write(dir.join("states/test.slot1.state"), b"STATE").expect("write state");
+        fs::write(dir.join("covers/test.png"), b"PNG").expect("write cover");
+        fs::write(dir.join("screenshots/shot.png"), b"SHOT").expect("write screenshot");
+
+        AppConfig::store_ra_token("tok_uninstall_check");
+        assert_eq!(AppConfig::load_ra_token(), "tok_uninstall_check");
+        AppConfig::clear_ra_token();
+        let removed = AppConfig::uninstall_data_at(&dir, false).expect("uninstall data");
+        assert!(!removed.is_empty());
+        assert!(!dir.exists(), "RustboyAdvance data directory must be deleted");
+        assert!(AppConfig::load_ra_token().is_empty());
+        let _ = fs::remove_dir_all(dir.parent().unwrap());
     }
 }

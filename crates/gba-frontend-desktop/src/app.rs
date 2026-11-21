@@ -140,6 +140,7 @@ pub(crate) struct RustboyApp {
     pub(crate) sink: CoreSink,
     pub(crate) postproc: VideoPostProcessor,
     pub(crate) lcd_tex: Option<TextureHandle>,
+    pub(crate) app_logo_tex: Option<TextureHandle>,
     pub(crate) wgpu_shaders: Option<Arc<Mutex<WgpuShaderPipeline>>>,
     pub(crate) debugger: DebuggerWindows,
     pub(crate) gdb_stub: gba_debugger::GdbStub,
@@ -263,6 +264,8 @@ pub(crate) struct RustboyApp {
     pub(crate) cli_loop_replay: bool,
     pub(crate) cli_replay_frame: usize,
     pub(crate) show_settings: bool,
+    pub(crate) show_uninstall_confirm: bool,
+    pub(crate) uninstalled_skip_save: bool,
     pub(crate) show_perf_check: bool,
     pub(crate) perf_details_open: bool,
     pub(crate) perf_check: crate::settings_ui::PerfCheckState,
@@ -361,6 +364,7 @@ impl RustboyApp {
             sink,
             postproc: VideoPostProcessor::new(),
             lcd_tex: None,
+            app_logo_tex: None,
             wgpu_shaders: None,
             debugger: DebuggerWindows::default(),
             gdb_stub: gba_debugger::GdbStub::new(),
@@ -469,6 +473,8 @@ impl RustboyApp {
             cli_loop_replay,
             cli_replay_frame: 0,
             show_settings: false,
+            show_uninstall_confirm: false,
+            uninstalled_skip_save: false,
             show_perf_check: false,
             perf_details_open: false,
             perf_check: crate::settings_ui::PerfCheckState::Idle,
@@ -2229,6 +2235,7 @@ impl RustboyApp {
             && !self.show_pause_overlay
             && !self.show_state_manager
             && !self.show_settings
+            && !self.show_uninstall_confirm
             && !self.show_perf_check
             && !self.show_volume_popup
             && !self.link.show_window
@@ -2287,6 +2294,7 @@ impl RustboyApp {
         self.draw_link_window(ctx);
         self.draw_volume_popup(ctx);
         self.draw_settings_dialog(ctx);
+        self.draw_uninstall_confirm_dialog(ctx);
         self.draw_perf_check_dialog(ctx);
         self.draw_confirm_action_dialog(ctx);
         let hardcore = self.is_ra_hardcore_active();
@@ -2540,6 +2548,14 @@ impl RustboyApp {
         if let Some(ref mut logger) = self.perf_logger {
             logger.finish_and_print();
         }
+        if self.uninstalled_skip_save {
+            self.stop_all_captures(false);
+            self.ra.on_rom_closed();
+            self.lua.on_rom_changed("", "");
+            self.sink.audio.set_paused(true);
+            self.link.disconnect_all();
+            return;
+        }
         self.stop_all_captures(false);
         self.ra.on_rom_closed();
         self.lua.on_rom_changed("", "");
@@ -2557,6 +2573,35 @@ impl RustboyApp {
         self.config.display_filter = self.governor_user_target;
         self.config.save();
         AppConfig::flush_pending_saves();
+    }
+
+    /// Cleanly deletes all persistent application data, battery saves, states, covers, screenshots,
+    /// and credentials, then closes the emulator without recreating any config files on exit.
+    pub(crate) fn perform_clean_uninstall_and_exit(&mut self, ctx: &egui::Context) {
+        self.cancel_perf_check();
+        self.stop_all_captures(false);
+        self.ra.on_rom_closed();
+        self.lua.on_rom_changed("", "");
+        self.sink.audio.set_paused(true);
+        self.link.disconnect_all();
+        // Drop active cores without flushing dirty battery saves so uninstall doesn't write new files.
+        self.core = None;
+        self.gb = None;
+        self.join_pending_save_flush();
+        self.drain_battery_save_worker();
+        match AppConfig::uninstall_all_data() {
+            Ok(_) => {
+                self.uninstalled_skip_save = true;
+                self.show_uninstall_confirm = false;
+                self.show_settings = false;
+                self.quit_requested = true;
+                ctx.send_viewport_cmd(egui::ViewportCommand::Close);
+            }
+            Err(err) => {
+                self.show_uninstall_confirm = false;
+                self.notify_error(&format!("Uninstall failed: {err}"));
+            }
+        }
     }
 
     pub(crate) fn slot_exists_cached(&mut self, slot: usize) -> bool {
@@ -2884,6 +2929,9 @@ pub(crate) fn write_save_bytes_sync(path: &Path, data: &[u8]) -> std::io::Result
 
 impl Drop for RustboyApp {
     fn drop(&mut self) {
+        if self.uninstalled_skip_save {
+            return;
+        }
         self.flush_gb_battery_save_sync(true);
         self.flush_battery_save_sync();
         self.join_pending_save_flush();

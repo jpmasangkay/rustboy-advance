@@ -669,6 +669,10 @@ impl RustboyApp {
                 &mut self.debugger.mem_search.open,
             ),
             ("Settings", &mut self.show_settings),
+            (
+                "Uninstall Rustboy Advance Data",
+                &mut self.show_uninstall_confirm,
+            ),
             ("Performance Check", &mut self.show_perf_check),
         ]
     }
@@ -769,6 +773,7 @@ impl RustboyApp {
         let mut open_controls = false;
         let mut open_rewind = false;
         let mut open_folder = false;
+        let mut open_uninstall = false;
 
         egui::Window::new("Settings")
             .open(&mut open)
@@ -892,9 +897,26 @@ impl RustboyApp {
                             .color(COLOR_TEXT_SECONDARY),
                         );
                         ui.add_space(6.0);
-                        if ui.button("Open Config & Logs Folder").clicked() {
-                            open_folder = true;
-                        }
+                        ui.horizontal(|ui| {
+                            if ui.button("Open Config & Logs Folder").clicked() {
+                                open_folder = true;
+                            }
+                            if ui
+                                .add(
+                                    egui::Button::new(
+                                        egui::RichText::new("Uninstall / Delete All App Data...")
+                                            .color(egui::Color32::from_rgb(245, 120, 120)),
+                                    )
+                                    .stroke(STROKE_BORDER),
+                                )
+                                .on_hover_text(
+                                    "Cleanly delete all persistent config, saves, states, covers, screenshots, logs, and credentials",
+                                )
+                                .clicked()
+                            {
+                                open_uninstall = true;
+                            }
+                        });
                     });
             });
 
@@ -910,6 +932,80 @@ impl RustboyApp {
         }
         if open_folder {
             self.open_config_and_logs_folder();
+        }
+        if open_uninstall {
+            self.show_uninstall_confirm = true;
+        }
+    }
+
+    /// Modal dialog confirming clean deletion of all persistent application data and credentials.
+    pub(crate) fn draw_uninstall_confirm_dialog(&mut self, ctx: &egui::Context) {
+        if !self.show_uninstall_confirm {
+            return;
+        }
+
+        let mut open = self.show_uninstall_confirm;
+        let mut confirm_uninstall = false;
+        let mut cancel_clicked = false;
+        let data_dir = crate::config::AppConfig::app_data_dir();
+
+        egui::Window::new("Uninstall Rustboy Advance Data")
+            .open(&mut open)
+            .collapsible(false)
+            .resizable(false)
+            .anchor(egui::Align2::CENTER_CENTER, egui::Vec2::ZERO)
+            .fixed_size([460.0, 215.0])
+            .show(ctx, |ui| {
+                ui.label(
+                    egui::RichText::new("Delete all persistent emulator data and exit?")
+                        .strong()
+                        .size(14.5)
+                        .color(COLOR_TEXT),
+                );
+                ui.add_space(6.0);
+                ui.label(
+                    egui::RichText::new(format!(
+                        "This will permanently delete all Rustboy Advance configuration, library cache, \
+                         battery saves, save states, box-art covers, screenshots, logs, and OS keyring credentials in:\n{}",
+                        data_dir.display()
+                    ))
+                    .color(COLOR_TEXT_SECONDARY),
+                );
+                ui.add_space(6.0);
+                ui.label(
+                    egui::RichText::new(
+                        "Your ROM files in your game folders will NOT be touched.",
+                    )
+                    .small()
+                    .color(ACCENT_TEAL),
+                );
+                ui.add_space(12.0);
+                ui.horizontal(|ui| {
+                    if ui
+                        .add(
+                            egui::Button::new(
+                                egui::RichText::new("Uninstall All Data & Exit")
+                                    .strong()
+                                    .color(egui::Color32::from_rgb(255, 130, 130)),
+                            )
+                            .stroke(STROKE_BORDER),
+                        )
+                        .clicked()
+                    {
+                        confirm_uninstall = true;
+                    }
+                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        if ui.button("Cancel").clicked() {
+                            cancel_clicked = true;
+                        }
+                    });
+                });
+            });
+
+        if confirm_uninstall {
+            self.perform_clean_uninstall_and_exit(ctx);
+        } else if !open || cancel_clicked {
+            self.show_uninstall_confirm = false;
         }
     }
 

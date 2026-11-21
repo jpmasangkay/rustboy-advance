@@ -147,6 +147,8 @@ pub struct CliConfig {
     pub capture_frame: Option<u64>,
     pub verify_save_flush: Option<String>,
     pub verify_perf_check: Option<PathBuf>,
+    pub uninstall: bool,
+    pub yes: bool,
 }
 
 impl Default for CliConfig {
@@ -202,6 +204,8 @@ impl Default for CliConfig {
             capture_frame: None,
             verify_save_flush: None,
             verify_perf_check: None,
+            uninstall: false,
+            yes: false,
         }
     }
 }
@@ -394,6 +398,8 @@ impl CliConfig {
                     cfg.verify_perf_check = Some(PathBuf::from(v));
                     cfg.headless = true;
                 }
+                "--uninstall" => cfg.uninstall = true,
+                "--yes" | "-y" => cfg.yes = true,
                 "--dump-regs" => cfg.dump_regs = true,
                 "--fb-crc32" => cfg.fb_crc32 = true,
                 "--ascii" => cfg.dump_ascii_grid = true,
@@ -424,6 +430,7 @@ impl CliConfig {
                          \t--input-replay <path>    Replay deterministic button inputs and scene tags\n\
                          \t--filter <name>          Display filter (smooth-bilinear, sharp-1x, xbr-3x, lcd-matrix, soft-handheld, scale2x, crt-scanlines)\n\
                          \t--portable               Store config, saves, states, screenshots, and covers next to executable\n\
+                         \t--uninstall [--yes]      Cleanly delete all persistent emulator data, saves, states, covers, and credentials\n\
                          \t--version                Print version and exit\n\
                          \t--perf-dir <dir>         Output directory for benchmark artifacts (default: perf)\n\
                          \t--category <cat>         Legacy homebrew benchmark category: mode4-3d, mode5-bitmap, affine, sprites, dma-hdma, audio, or 'all'\n\

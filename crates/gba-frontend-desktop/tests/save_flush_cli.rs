@@ -139,3 +139,42 @@ fn cli_save_flush_all_quit_paths_and_positional_rom() {
         verify_cli_quit_mode(mode);
     }
 }
+
+#[test]
+fn cli_uninstall_cleanly_deletes_all_persistent_app_data() {
+    let ws = TempDirGuard::new("uninstall");
+    let app_data = ws.dir.join("RustboyAdvance");
+    fs::create_dir_all(app_data.join("saves")).expect("create saves");
+    fs::create_dir_all(app_data.join("states")).expect("create states");
+    fs::create_dir_all(app_data.join("covers")).expect("create covers");
+    fs::create_dir_all(app_data.join("screenshots")).expect("create screenshots");
+    fs::write(app_data.join("config.json"), b"{\"window_scale\":3}").expect("write config");
+    fs::write(app_data.join("rustboy_library.cfg"), b"[]").expect("write library");
+    fs::write(app_data.join("saves/game.sav"), b"SAVDATA").expect("write sav");
+    fs::write(app_data.join("states/game.slot1.state"), b"STATEDATA").expect("write state");
+    fs::write(app_data.join("covers/game.png"), b"COVER").expect("write cover");
+    fs::write(app_data.join("screenshots/shot.png"), b"SHOT").expect("write screenshot");
+
+    let exe = env!("CARGO_BIN_EXE_rustboy-advance");
+    let output = Command::new(exe)
+        .env("APPDATA", &ws.dir)
+        .env("XDG_CONFIG_HOME", &ws.dir)
+        .env("HOME", &ws.dir)
+        .arg("--uninstall")
+        .arg("--yes")
+        .output()
+        .expect("run rustboy-advance --uninstall --yes");
+
+    assert!(
+        output.status.success(),
+        "--uninstall exited with {}\nstdout: {}\nstderr: {}",
+        output.status,
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(
+        !app_data.exists(),
+        "expected {} to be completely removed by --uninstall",
+        app_data.display()
+    );
+}

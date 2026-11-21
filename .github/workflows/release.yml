@@ -119,6 +119,14 @@ jobs:
           cp "target/${{ matrix.target }}/release/${{ matrix.exe_name }}" "${{ matrix.artifact_name }}/"
           cp "target/${{ matrix.target }}/libretro/${{ matrix.libretro_name }}" "${{ matrix.artifact_name }}/"
           chmod +x "${{ matrix.artifact_name }}/${{ matrix.exe_name }}"
+          cat << 'EOF' > "${{ matrix.artifact_name }}/uninstall.sh"
+          #!/usr/bin/env sh
+          set -e
+          DIR="$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)"
+          "$DIR/rustboy-advance" --uninstall --yes
+          echo "To complete removal, delete this folder: $DIR"
+          EOF
+          chmod +x "${{ matrix.artifact_name }}/uninstall.sh"
           cp LICENSE README.md CHANGELOG.md THIRD-PARTY-NOTICES.md "${{ matrix.artifact_name }}/"
           cp docs/COMPATIBILITY.md docs/TEST_RESULTS.md "${{ matrix.artifact_name }}/docs/"
           tar -czf "dist/${{ matrix.artifact_name }}.tar.gz" "${{ matrix.artifact_name }}"
@@ -133,6 +141,13 @@ jobs:
           New-Item -ItemType Directory -Force -Path "dist", "$stage/docs" | Out-Null
           Copy-Item "target\${{ matrix.target }}\release\${{ matrix.exe_name }}" $stage
           Copy-Item "target\${{ matrix.target }}\libretro\${{ matrix.libretro_name }}" $stage
+          @(
+            '@echo off',
+            '"%~dp0rustboy-advance.exe" --uninstall --yes',
+            'echo.',
+            'echo All Rustboy Advance persistent app data, saves, states, covers, and credentials have been removed.',
+            'echo You may now delete this folder to complete uninstallation.'
+          ) | Out-File -Encoding ascii "$stage/uninstall.bat"
           Copy-Item LICENSE, README.md, CHANGELOG.md, THIRD-PARTY-NOTICES.md $stage
           Copy-Item docs/COMPATIBILITY.md, docs/TEST_RESULTS.md "$stage/docs"
           # Use bsdtar (`tar.exe -a`) instead of Compress-Archive so zip paths use '/' on Linux/macOS.

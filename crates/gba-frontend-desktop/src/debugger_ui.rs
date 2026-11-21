@@ -210,6 +210,7 @@ pub struct DebuggerWindows {
     pub draft_cheat_code: String,
     pub draft_cheat_format: CheatFormat,
     pub cheat_error: Option<String>,
+    about_logo_tex: Option<TextureHandle>,
 }
 
 impl Default for DebuggerWindows {
@@ -275,6 +276,7 @@ impl Default for DebuggerWindows {
             draft_cheat_code: String::new(),
             draft_cheat_format: CheatFormat::AutoRaw,
             cheat_error: None,
+            about_logo_tex: None,
         }
     }
 }
@@ -1861,18 +1863,33 @@ impl DebuggerWindows {
 
     fn draw_about_window(&mut self, ctx: &egui::Context) {
         let mut open = self.show_about;
+        let logo_id = self
+            .about_logo_tex
+            .get_or_insert_with(|| crate::icon::app_logo_texture(ctx))
+            .id();
         egui::Window::new("About Rustboy Advance")
             .open(&mut open)
             .anchor(Align2::CENTER_CENTER, Vec2::ZERO)
             .collapsible(false)
             .resizable(false)
-            .default_width(360.0)
+            .default_width(380.0)
             .show(ctx, |ui| {
-                ui.heading("Rustboy Advance");
-                ui.label(
-                    RichText::new("Version 0.1.0 — Cycle-Aware GBA Emulator & Hardware Debugger")
-                        .color(TEXT_MUTED),
-                );
+                ui.horizontal(|ui| {
+                    ui.add(
+                        egui::Image::new((logo_id, egui::vec2(56.0, 56.0)))
+                            .fit_to_exact_size(egui::vec2(56.0, 56.0)),
+                    );
+                    ui.add_space(6.0);
+                    ui.vertical(|ui| {
+                        ui.heading("Rustboy Advance");
+                        ui.label(
+                            RichText::new(
+                                "Version 0.1.0 — Cycle-Aware GBA Emulator & Hardware Debugger",
+                            )
+                            .color(TEXT_MUTED),
+                        );
+                    });
+                });
                 ui.separator();
                 ui.label("• CPU: ARM7TDMI (ARMv4T + Thumb, 3-stage pipeline, Prefetch)");
                 ui.label("• PPU: Modes 0–5, Windows, Blending, Scanline & Per-Dot Renderer");

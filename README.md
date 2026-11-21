@@ -112,6 +112,10 @@ To use **Portable Mode** (store everything beside the executable):
 
 Legacy `.sav` and `.slotN.state` files located directly beside a ROM continue to work as read fallbacks if no file exists yet in `saves/` / `states/`.
 
+To **cleanly uninstall** all persistent emulator data (`config.json`, `rustboy_library.cfg`, `saves/`, `states/`, `covers/`, `screenshots/`, logs, and the OS keyring `retroachievements_token` credential):
+- In the desktop app, open **Help -> Uninstall / Delete All App Data...** (or **Settings -> Advanced -> Uninstall / Delete All App Data...**), **or**
+- Run `rustboy-advance --uninstall --yes` (or `uninstall.bat` / `uninstall.sh` included in public release builds).
+
 ---
 
 ## Privacy & Outbound Network Requests
@@ -177,6 +181,9 @@ rustboy-advance
 
 # Launch directly into a ROM (or use portable mode)
 rustboy-advance "path/to/game.gba" --portable --bios "path/to/gba_bios.bin"
+
+# Cleanly delete all persistent emulator data, saves, states, covers, and credentials
+rustboy-advance --uninstall --yes
 
 # Headless deterministic test run with CRC32 & screenshot dump
 rustboy-advance "path/to/rom.gba" --headless --frames 120 --fb-crc32 --screenshot frame.ppm

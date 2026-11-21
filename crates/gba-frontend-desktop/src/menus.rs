@@ -1014,6 +1014,16 @@ impl RustboyApp {
             self.open_config_and_logs_folder();
             ui.close_menu();
         }
+        if ui
+            .button("Uninstall / Delete All App Data...")
+            .on_hover_text(
+                "Cleanly delete all persistent config, saves, states, covers, screenshots, and credentials",
+            )
+            .clicked()
+        {
+            self.show_uninstall_confirm = true;
+            ui.close_menu();
+        }
         ui.separator();
         if ui.button("About Rustboy Advance").clicked() {
             self.debugger.show_about = true;

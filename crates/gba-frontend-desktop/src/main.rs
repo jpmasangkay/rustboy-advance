@@ -72,6 +72,7 @@ fn is_cli_headless_invocation() -> bool {
                 | "--gpu-probe"
                 | "--dump-hashes"
                 | "--verify-hashes"
+                | "--uninstall"
         )
     })
 }
@@ -204,6 +205,26 @@ fn real_main() {
             std::process::exit(2);
         }
     };
+
+    if cli.uninstall {
+        let data_dir = AppConfig::app_data_dir();
+        match AppConfig::uninstall_all_data() {
+            Ok(removed) => {
+                println!(
+                    "Rustboy Advance: cleanly uninstalled persistent data from {}",
+                    data_dir.display()
+                );
+                for path in &removed {
+                    println!("  removed: {}", path.display());
+                }
+                return;
+            }
+            Err(err) => {
+                eprintln!("Rustboy Advance uninstall failed: {err}");
+                std::process::exit(1);
+            }
+        }
+    }
 
     if let Some(mode) = cli.verify_save_flush.clone() {
         let res = if mode.starts_with("nogpu-") {

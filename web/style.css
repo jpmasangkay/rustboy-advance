@@ -123,8 +123,8 @@
   code {
     font-family: var(--font-mono);
     font-size: 0.9em;
-    padding-inline: 0.35em;
-    padding-block: 0.1em;
+    padding-inline: 0.6em;
+    padding-block: 0.25em;
     border-radius: 4px;
     background-color: var(--bg-elevated);
     border: 1px solid var(--border-hairline);
@@ -189,11 +189,11 @@
 
   .tag-mono {
     font-family: var(--font-mono);
-    font-size: 0.72rem;
+    font-size: 0.8rem;
     letter-spacing: 0.05em;
     color: var(--text-secondary);
-    padding-inline: 0.45rem;
-    padding-block: 0.1rem;
+    padding-inline: 0.65rem;
+    padding-block: 0.3rem;
     border-radius: var(--radius-sm);
     background-color: var(--bg-elevated);
     border: 1px solid var(--border-hairline);
@@ -228,8 +228,8 @@
     gap: 0.4rem;
     min-block-size: max(var(--target-size), 30px);
     min-inline-size: var(--target-size);
-    padding-inline: 0.7rem;
-    padding-block: 0.32rem;
+    padding-inline: 0.85rem;
+    padding-block: 0.45rem;
     font-size: 0.85rem;
     font-weight: 500;
     color: var(--text-primary);
@@ -369,7 +369,7 @@
     display: flex;
     flex-direction: column;
     gap: 0.6rem;
-    padding: 0.75rem;
+    padding: 0.9rem;
     background-color: var(--bg-surface);
     border: 1px solid var(--border-hairline);
     border-radius: var(--radius-lg);
@@ -383,7 +383,7 @@
     align-items: center;
     justify-content: space-between;
     gap: 0.75rem;
-    padding-inline: 0.25rem;
+    padding-inline: 0.35rem;
   }
 
   .power-indicator {
@@ -391,7 +391,7 @@
     align-items: center;
     gap: 0.45rem;
     font-family: var(--font-mono);
-    font-size: 0.74rem;
+    font-size: 0.8rem;
     letter-spacing: 0.06em;
     color: var(--text-secondary);
   }
@@ -419,7 +419,7 @@
 
   .cart-badge {
     font-family: var(--font-mono);
-    font-size: 0.74rem;
+    font-size: 0.8rem;
     color: var(--text-secondary);
     overflow: hidden;
     text-overflow: ellipsis;
@@ -435,7 +435,7 @@
     flex: 1 1 auto;
     display: grid;
     place-items: center;
-    padding: 0.5rem;
+    padding: 0.75rem;
     background-color: var(--bg-screen);
     border: 1px solid var(--border-hairline);
     border-radius: var(--radius-md);
@@ -662,27 +662,27 @@
     display: inline-flex;
     align-items: center;
     gap: 0.4rem;
-    font-size: 0.78rem;
+    font-size: 0.82rem;
     color: var(--text-secondary);
   }
 
   .inline-field select,
   .field-row select {
     min-block-size: var(--target-size);
-    padding-inline: 0.5rem;
-    padding-block: 0.2rem;
+    padding-inline: 0.65rem;
+    padding-block: 0.35rem;
     background-color: var(--bg-elevated);
     border: 1px solid var(--border-hairline);
     border-radius: var(--radius-sm);
-    font-size: 0.8rem;
+    font-size: 0.82rem;
     color: var(--text-primary);
   }
 
   .chip-toggle {
     min-block-size: var(--target-size);
-    padding-inline: 0.6rem;
-    padding-block: 0.2rem;
-    font-size: 0.78rem;
+    padding-inline: 0.75rem;
+    padding-block: 0.35rem;
+    font-size: 0.82rem;
     font-weight: 500;
     color: var(--text-secondary);
     background-color: var(--bg-elevated);
@@ -706,7 +706,7 @@
 
   .quick-hint {
     font-family: var(--font-mono);
-    font-size: 0.72rem;
+    font-size: 0.8rem;
     color: var(--text-muted);
   }
 
@@ -778,10 +778,12 @@
   }
 
   .touch-pill {
-    min-inline-size: 66px;
-    min-block-size: 34px;
+    min-inline-size: 72px;
+    min-block-size: 36px;
+    padding-inline: 0.65rem;
+    padding-block: 0.35rem;
     border-radius: 999px;
-    font-size: 0.68rem;
+    font-size: 0.8rem;
     letter-spacing: 0.05em;
   }
 
@@ -801,7 +803,7 @@
     place-items: center;
     inline-size: 38px;
     block-size: 38px;
-    font-size: 0.72rem;
+    font-size: 0.8rem;
     color: var(--text-secondary);
     pointer-events: none;
   }
@@ -880,10 +882,10 @@
     gap: 0.4rem 1rem;
     padding-inline: max(1rem, env(safe-area-inset-left, 0px))
       max(1rem, env(safe-area-inset-right, 0px));
-    padding-block: 0.45rem max(0.45rem, env(safe-area-inset-bottom, 0px));
+    padding-block: 0.6rem max(0.6rem, env(safe-area-inset-bottom, 0px));
     background-color: var(--bg-surface);
     border-block-start: 1px solid var(--border-hairline);
-    font-size: 0.76rem;
+    font-size: 0.82rem;
     color: var(--text-secondary);
   }
 
@@ -975,7 +977,7 @@
     grid-template-columns: 78px 1fr auto;
     align-items: center;
     gap: 0.75rem;
-    padding: 0.55rem;
+    padding: 0.75rem;
     background-color: var(--bg-elevated);
     border: 1px solid var(--border-hairline);
     border-radius: var(--radius-sm);
@@ -991,7 +993,8 @@
     border-radius: 4px;
     display: grid;
     place-items: center;
-    font-size: 0.68rem;
+    padding: 0.5rem;
+    font-size: 0.8rem;
     color: var(--text-muted);
   }
 
@@ -1006,7 +1009,7 @@
 
   .slot-time {
     font-family: var(--font-mono);
-    font-size: 0.74rem;
+    font-size: 0.8rem;
     color: var(--text-secondary);
   }
 
@@ -1091,17 +1094,17 @@
     align-items: center;
     justify-content: space-between;
     gap: 0.5rem;
-    padding-inline: 0.6rem;
-    padding-block: 0.35rem;
+    padding-inline: 0.75rem;
+    padding-block: 0.55rem;
     background-color: var(--bg-surface);
     border: 1px solid var(--border-hairline);
     border-radius: var(--radius-sm);
-    font-size: 0.8rem;
+    font-size: 0.82rem;
   }
 
   .keybind-btn {
     font-family: var(--font-mono);
-    font-size: 0.76rem;
+    font-size: 0.82rem;
     min-inline-size: 78px;
   }
 

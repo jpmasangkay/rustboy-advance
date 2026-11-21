@@ -216,11 +216,7 @@ pub(crate) fn capture_first_frame_cover_fallback(
             gb_core::LCD_HEIGHT,
         )
     } else {
-        (
-            rgba_full,
-            gba_core::LCD_WIDTH,
-            gba_core::LCD_HEIGHT,
-        )
+        (rgba_full, gba_core::LCD_WIDTH, gba_core::LCD_HEIGHT)
     };
 
     if !force_fallback && is_uniform_rgba_frame(&src_rgba) {

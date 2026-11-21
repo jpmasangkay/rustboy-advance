@@ -2285,7 +2285,10 @@ mod tests {
         AppConfig::clear_ra_token();
         let removed = AppConfig::uninstall_data_at(&dir, false).expect("uninstall data");
         assert!(!removed.is_empty());
-        assert!(!dir.exists(), "RustboyAdvance data directory must be deleted");
+        assert!(
+            !dir.exists(),
+            "RustboyAdvance data directory must be deleted"
+        );
         assert!(AppConfig::load_ra_token().is_empty());
         let _ = fs::remove_dir_all(dir.parent().unwrap());
     }

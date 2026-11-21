@@ -533,19 +533,34 @@ impl RustboyApp {
 
         if self.link.split_view_active() {
             if let Some(local) = &mut self.link.local {
-                let tex_options = self.config.display_filter.texture_options();
-                let p2_img = local.p2_postproc.process_display_filter(
-                    &local.p2_framebuffer,
+                let filter_key = (
+                    self.config.display_filter,
                     color_correction,
                     lcd_ghosting,
-                    self.config.display_filter,
-                    false,
-                    self.config.lcd_grid_intensity,
+                    self.config.lcd_grid_intensity.to_bits(),
                 );
-                let p2_tex = local.p2_lcd_tex.get_or_insert_with(|| {
-                    ctx.load_texture("gba_p2_lcd", p2_img.clone(), tex_options)
-                });
-                p2_tex.set(p2_img.clone(), tex_options);
+                if local.p2_frame_dirty
+                    || local.p2_lcd_tex.is_none()
+                    || local.p2_last_filter_key != Some(filter_key)
+                {
+                    let tex_options = self.config.display_filter.texture_options();
+                    let p2_img = local.p2_postproc.process_display_filter(
+                        &local.p2_framebuffer,
+                        color_correction,
+                        lcd_ghosting,
+                        self.config.display_filter,
+                        false,
+                        self.config.lcd_grid_intensity,
+                    );
+                    if let Some(p2_tex) = &mut local.p2_lcd_tex {
+                        p2_tex.set(p2_img.clone(), tex_options);
+                    } else {
+                        local.p2_lcd_tex =
+                            Some(ctx.load_texture("gba_p2_lcd", p2_img.clone(), tex_options));
+                    }
+                    local.p2_frame_dirty = false;
+                    local.p2_last_filter_key = Some(filter_key);
+                }
             }
 
             let gap = 14.0;

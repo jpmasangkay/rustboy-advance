@@ -182,6 +182,8 @@ pub struct LocalLinkSession {
     pub p2_framebuffer: [u16; LCD_WIDTH * LCD_HEIGHT],
     pub(crate) p2_postproc: VideoPostProcessor,
     pub(crate) p2_lcd_tex: Option<egui::TextureHandle>,
+    pub(crate) p2_frame_dirty: bool,
+    pub(crate) p2_last_filter_key: Option<(crate::config::DisplayFilter, bool, bool, u32)>,
     pub p2_rom_title: String,
     pub p2_rom_code: String,
     pub p2_rom_path: Option<PathBuf>,
@@ -209,6 +211,8 @@ impl LocalLinkSession {
             p2_framebuffer: [0; LCD_WIDTH * LCD_HEIGHT],
             p2_postproc: VideoPostProcessor::new(),
             p2_lcd_tex: None,
+            p2_frame_dirty: true,
+            p2_last_filter_key: None,
             p2_rom_title,
             p2_rom_code,
             p2_rom_path,
@@ -300,6 +304,7 @@ impl LocalLinkSession {
 
         flush_core_to_frontend(p1, p1_fe);
         flush_core_framebuffer_only(&mut self.p2_core, &mut self.p2_framebuffer);
+        self.p2_frame_dirty = true;
     }
 
     fn resolve_pending(&mut self, p1: &mut GbaCore) {

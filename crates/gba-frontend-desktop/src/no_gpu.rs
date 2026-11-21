@@ -1320,16 +1320,14 @@ impl NoGpuApp {
         }
         let prep_t0 = Instant::now();
         let prep_qpc_t0 = crate::display_timing::qpc_now();
-        let green_swap = self
-            .core
-            .as_ref()
-            .is_some_and(|c| (c.bus.ppu.greenswap & 1) != 0);
+        // gba-core already applies hardware GREENSWAP during scanline rendering,
+        // so pass green_swap = false here to avoid double-swapping green channels.
         let img = self.postproc.process_display_filter(
             &self.sink.framebuffer,
             self.config.color_correction,
             self.config.lcd_ghosting,
             self.config.display_filter,
-            green_swap,
+            false,
             self.config.lcd_grid_intensity,
         );
         let linear = self.config.display_filter.texture_options() == egui::TextureOptions::LINEAR;
@@ -1943,6 +1941,8 @@ pub fn run_no_gpu_desktop(
         .build()
         .map_err(|e| format!("failed to build winit event loop for No-GPU presenter: {e}"))?;
 
+    let _emu_prio_guard =
+        (!cli.no_emu_priority).then(crate::audio::win_mmcss::MmcssGuard::enter_games);
     let mut app = NoGpuApp::new(
         title.to_string(),
         init_width.round().max(240.0) as u32,
@@ -1953,6 +1953,7 @@ pub fn run_no_gpu_desktop(
     event_loop
         .run_app(&mut app)
         .map_err(|e| format!("winit No-GPU event loop failed: {e}"))?;
+    AppConfig::flush_pending_saves();
     if let Some(err) = app.startup_err {
         return Err(err);
     }

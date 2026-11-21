@@ -217,7 +217,158 @@ pub(crate) mod win_mmcss {
     }
 }
 
-#[cfg(not(windows))]
+#[cfg(target_os = "macos")]
+pub(crate) mod win_mmcss {
+    use std::ffi::c_void;
+    use std::sync::OnceLock;
+
+    const QOS_CLASS_USER_INTERACTIVE: u32 = 0x21;
+    const THREAD_STANDARD_POLICY: u32 = 1;
+    const THREAD_TIME_CONSTRAINT_POLICY: u32 = 2;
+
+    #[repr(C)]
+    #[derive(Clone, Copy)]
+    struct MachTimebaseInfo {
+        numer: u32,
+        denom: u32,
+    }
+
+    #[repr(C)]
+    #[derive(Clone, Copy)]
+    struct ThreadStandardPolicy {
+        no_data: u32,
+    }
+
+    #[repr(C)]
+    #[derive(Clone, Copy)]
+    struct ThreadTimeConstraintPolicy {
+        period: u32,
+        computation: u32,
+        constraint: u32,
+        preemptible: i32,
+    }
+
+    unsafe extern "C" {
+        fn pthread_self() -> *mut c_void;
+        fn pthread_mach_thread_np(thread: *mut c_void) -> u32;
+        fn pthread_get_qos_class_np(
+            thread: *mut c_void,
+            qos_class: *mut u32,
+            relative_priority: *mut i32,
+        ) -> i32;
+        fn pthread_set_qos_class_self_np(qos_class: u32, relative_priority: i32) -> i32;
+        fn mach_timebase_info(info: *mut MachTimebaseInfo) -> i32;
+        fn thread_policy_set(
+            thread: u32,
+            flavor: u32,
+            policy_info: *const c_void,
+            count: u32,
+        ) -> i32;
+    }
+
+    fn ns_to_mach_ticks(ns: u64) -> u32 {
+        static TB: OnceLock<(u64, u64)> = OnceLock::new();
+        let (numer, denom) = *TB.get_or_init(|| {
+            let mut info = MachTimebaseInfo { numer: 1, denom: 1 };
+            // SAFETY: Valid stack pointer to MachTimebaseInfo; libSystem always provides this symbol.
+            if unsafe { mach_timebase_info(&mut info) } == 0 && info.numer > 0 && info.denom > 0 {
+                (info.numer as u64, info.denom as u64)
+            } else {
+                (1, 1)
+            }
+        });
+        ((ns as u128).saturating_mul(denom as u128) / (numer as u128)).min(u32::MAX as u128) as u32
+    }
+
+    pub struct MmcssGuard {
+        prev_qos: Option<(u32, i32)>,
+        time_constraint_active: bool,
+        elevated: bool,
+    }
+
+    impl MmcssGuard {
+        fn enter_rt(period_ns: u64, computation_ns: u64, constraint_ns: u64) -> Self {
+            // SAFETY: Standard libSystem pthread QoS + Mach time-constraint policy calls
+            // operating only on the calling thread (`pthread_mach_thread_np` does not retain a port ref).
+            unsafe {
+                let mut prev_class: u32 = 0;
+                let mut prev_prio: i32 = 0;
+                let got_prev =
+                    pthread_get_qos_class_np(pthread_self(), &mut prev_class, &mut prev_prio) == 0;
+                let qos_ok = pthread_set_qos_class_self_np(QOS_CLASS_USER_INTERACTIVE, 0) == 0;
+                let tc = ThreadTimeConstraintPolicy {
+                    period: ns_to_mach_ticks(period_ns),
+                    computation: ns_to_mach_ticks(computation_ns),
+                    constraint: ns_to_mach_ticks(constraint_ns),
+                    preemptible: 1,
+                };
+                let thread_port = pthread_mach_thread_np(pthread_self());
+                let tc_ok = thread_policy_set(
+                    thread_port,
+                    THREAD_TIME_CONSTRAINT_POLICY,
+                    (&raw const tc).cast::<c_void>(),
+                    (std::mem::size_of::<ThreadTimeConstraintPolicy>() / std::mem::size_of::<u32>())
+                        as u32,
+                ) == 0;
+                Self {
+                    prev_qos: (got_prev && qos_ok).then_some((prev_class, prev_prio)),
+                    time_constraint_active: tc_ok,
+                    elevated: qos_ok || tc_ok,
+                }
+            }
+        }
+
+        pub fn enter_pro_audio() -> Self {
+            Self::enter_rt(10_000_000, 2_000_000, 5_000_000)
+        }
+
+        pub fn enter_games() -> Self {
+            Self::enter_rt(16_742_706, 5_000_000, 15_000_000)
+        }
+
+        pub fn is_mmcss_active(&self) -> bool {
+            self.elevated
+        }
+    }
+
+    impl Drop for MmcssGuard {
+        fn drop(&mut self) {
+            if self.time_constraint_active {
+                let sp = ThreadStandardPolicy { no_data: 0 };
+                // SAFETY: Restores standard scheduling policy on the owning thread.
+                unsafe {
+                    let thread_port = pthread_mach_thread_np(pthread_self());
+                    let _ = thread_policy_set(
+                        thread_port,
+                        THREAD_STANDARD_POLICY,
+                        (&raw const sp).cast::<c_void>(),
+                        1,
+                    );
+                }
+                self.time_constraint_active = false;
+            }
+            if let Some((qos, rel)) = self.prev_qos.take() {
+                // SAFETY: Restores previous QoS class on the same thread.
+                unsafe {
+                    let _ = pthread_set_qos_class_self_np(qos, rel);
+                }
+            }
+        }
+    }
+
+    pub fn current_thread_priority() -> i32 {
+        let mut qos: u32 = 0;
+        let mut rel: i32 = 0;
+        // SAFETY: Standard libSystem query on calling thread.
+        if unsafe { pthread_get_qos_class_np(pthread_self(), &mut qos, &mut rel) } == 0 {
+            qos as i32
+        } else {
+            0
+        }
+    }
+}
+
+#[cfg(all(not(windows), not(target_os = "macos")))]
 pub(crate) mod win_mmcss {
     pub struct MmcssGuard;
     impl MmcssGuard {

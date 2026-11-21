@@ -337,6 +337,7 @@ impl SysBus {
     }
 
     pub fn rebuild_fastmem(&mut self) {
+        self.invalidate_code_page();
         self.fastmem_read.fill(None);
         self.fastmem_write.fill(None);
         let ewram_base = self.ewram.as_mut_ptr();

@@ -248,6 +248,57 @@ pub(crate) mod win_timer {
     }
 }
 
+#[cfg(target_os = "macos")]
+pub(crate) mod mac_timer {
+    use std::sync::OnceLock;
+    use std::time::Duration;
+
+    #[repr(C)]
+    #[derive(Clone, Copy)]
+    struct MachTimebaseInfo {
+        numer: u32,
+        denom: u32,
+    }
+
+    unsafe extern "C" {
+        fn mach_absolute_time() -> u64;
+        fn mach_timebase_info(info: *mut MachTimebaseInfo) -> i32;
+        fn mach_wait_until(deadline: u64) -> i32;
+    }
+
+    fn timebase() -> (u64, u64) {
+        static TB: OnceLock<(u64, u64)> = OnceLock::new();
+        *TB.get_or_init(|| {
+            let mut info = MachTimebaseInfo { numer: 1, denom: 1 };
+            // SAFETY: Valid stack pointer to MachTimebaseInfo; libSystem always provides mach_timebase_info.
+            if unsafe { mach_timebase_info(&mut info) } == 0 && info.numer > 0 && info.denom > 0 {
+                (info.numer as u64, info.denom as u64)
+            } else {
+                (1, 1)
+            }
+        })
+    }
+
+    /// Sleeps using macOS `mach_wait_until`, bypassing POSIX `nanosleep` timer coalescing
+    /// for sub-millisecond frame pacing on Apple Silicon and Intel Macs.
+    pub fn sleep_for(duration: Duration) {
+        let nanos = duration.as_nanos();
+        if nanos == 0 {
+            return;
+        }
+        let (numer, denom) = timebase();
+        let ticks = (nanos.saturating_mul(denom as u128) / (numer as u128)) as u64;
+        if ticks == 0 {
+            return;
+        }
+        // SAFETY: Standard Mach kernel trap sleeping until the computed absolute tick deadline.
+        unsafe {
+            let now = mach_absolute_time();
+            let _ = mach_wait_until(now.saturating_add(ticks));
+        }
+    }
+}
+
 /// Dynamic Rate Control (DRC) pacer for the emulation thread.
 pub struct DrcPacer {
     target: usize,
@@ -306,7 +357,9 @@ impl DrcPacer {
                 let sleep_dur = remaining - spin_tail;
                 #[cfg(windows)]
                 self.timer.sleep_for(sleep_dur);
-                #[cfg(not(windows))]
+                #[cfg(target_os = "macos")]
+                mac_timer::sleep_for(sleep_dur);
+                #[cfg(all(not(windows), not(target_os = "macos")))]
                 thread::sleep(sleep_dur);
             }
             while Instant::now() < target_instant {

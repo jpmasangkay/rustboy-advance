@@ -462,6 +462,7 @@ impl RustboyApp {
                 if (1..=5).contains(&slot) {
                     self.slot_thumbnails[slot - 1] = None;
                     self.slot_meta[slot - 1] = None;
+                    self.slot_exists_cache[slot - 1] = Some(true);
                 }
                 self.movie.record_state_bookmark(&path);
                 self.state_manager_error = None;
@@ -527,6 +528,7 @@ impl RustboyApp {
                         if (1..=5).contains(&slot) {
                             self.slot_thumbnails[slot - 1] = None;
                             self.slot_meta[slot - 1] = None;
+                            self.slot_exists_cache[slot - 1] = Some(true);
                         }
                         self.state_manager_error = None;
                         self.notify(&format!("Undo: Restored previous Save Slot {slot} file"));
@@ -1052,6 +1054,7 @@ impl RustboyApp {
             } else {
                 self.slot_thumbnails[s - 1] = None;
                 self.slot_meta[s - 1] = Some(SlotMetaEntry::Empty);
+                self.slot_exists_cache[s - 1] = Some(false);
                 self.state_manager_error = None;
                 self.notify(&format!("Deleted Slot {s}"));
             }

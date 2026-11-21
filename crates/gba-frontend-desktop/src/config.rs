@@ -3,8 +3,76 @@ use std::fs;
 use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Condvar, Mutex, OnceLock};
 
 static ATOMIC_TMP_COUNTER: AtomicU64 = AtomicU64::new(0);
+
+struct ConfigWriteState {
+    pending: Option<(PathBuf, Vec<u8>)>,
+    writing: bool,
+}
+
+struct AsyncConfigWriter {
+    state: Mutex<ConfigWriteState>,
+    cv: Condvar,
+}
+
+impl AsyncConfigWriter {
+    fn global() -> &'static Self {
+        static WRITER: OnceLock<AsyncConfigWriter> = OnceLock::new();
+        WRITER.get_or_init(|| {
+            let writer = AsyncConfigWriter {
+                state: Mutex::new(ConfigWriteState {
+                    pending: None,
+                    writing: false,
+                }),
+                cv: Condvar::new(),
+            };
+            let _ = std::thread::Builder::new()
+                .name("config-saver".to_string())
+                .spawn(|| {
+                    let w = AsyncConfigWriter::global();
+                    loop {
+                        let next = {
+                            let mut st = w.state.lock().unwrap_or_else(|e| e.into_inner());
+                            while st.pending.is_none() {
+                                st = w.cv.wait(st).unwrap_or_else(|e| e.into_inner());
+                            }
+                            st.writing = true;
+                            st.pending.take()
+                        };
+                        if let Some((path, data)) = next
+                            && let Err(e) = write_atomic(&path, &data)
+                        {
+                            log::warn!(
+                                "Failed to atomically save config to {}: {e}",
+                                path.display()
+                            );
+                        }
+                        let mut st = w.state.lock().unwrap_or_else(|e| e.into_inner());
+                        st.writing = false;
+                        if st.pending.is_none() {
+                            w.cv.notify_all();
+                        }
+                    }
+                });
+            writer
+        })
+    }
+
+    fn enqueue(&self, path: PathBuf, data: Vec<u8>) {
+        let mut st = self.state.lock().unwrap_or_else(|e| e.into_inner());
+        st.pending = Some((path, data));
+        self.cv.notify_all();
+    }
+
+    fn flush(&self) {
+        let mut st = self.state.lock().unwrap_or_else(|e| e.into_inner());
+        while st.pending.is_some() || st.writing {
+            st = self.cv.wait(st).unwrap_or_else(|e| e.into_inner());
+        }
+    }
+}
 
 /// Atomically writes `data` to `path` by writing to a sibling temporary file,
 /// flushing to disk with `sync_all`, and renaming into place.
@@ -1381,16 +1449,19 @@ impl AppConfig {
         Self::from_json_str(&raw)
     }
 
+    /// Enqueues an atomic config write on a dedicated background thread (coalescing rapid UI edits)
+    /// so clicking menus, toggling checkboxes, or dragging sliders never blocks gameplay on `fsync`.
     pub fn save(&self) {
         let path = Self::config_file_path();
-        if let Ok(json) = serde_json::to_string_pretty(self)
-            && let Err(e) = write_atomic(&path, json.as_bytes())
-        {
-            log::warn!(
-                "Failed to atomically save config to {}: {e}",
-                path.display()
-            );
+        if let Ok(json) = serde_json::to_string_pretty(self) {
+            AsyncConfigWriter::global().enqueue(path, json.into_bytes());
         }
+    }
+
+    /// Blocks until any queued background config write has finished syncing to disk.
+    /// Call during application shutdown so no final preference changes are lost.
+    pub fn flush_pending_saves() {
+        AsyncConfigWriter::global().flush();
     }
 
     pub fn push_recent(&mut self, path: &Path, title: String, code: String) {
@@ -1727,5 +1798,27 @@ mod tests {
         assert_eq!(cfg.clear_blocked_gpu_adapters(), 1);
         assert!(cfg.blocked_gpu_adapter(&key).is_none());
         assert!(cfg.verified_gpu_adapter(&key, "nvidia", "560.1").is_none());
+    }
+
+    #[test]
+    fn async_config_writer_coalesces_and_flushes_atomically() {
+        let dir = std::env::temp_dir().join(format!(
+            "rustboy_async_cfg_test_{}_{}",
+            std::process::id(),
+            ATOMIC_TMP_COUNTER.fetch_add(1, Ordering::Relaxed)
+        ));
+        let path = dir.join("config.json");
+        let writer = AsyncConfigWriter::global();
+        for i in 0..8u32 {
+            writer.enqueue(
+                path.clone(),
+                format!(r#"{{"master_volume":{i}}}"#).into_bytes(),
+            );
+        }
+        AppConfig::flush_pending_saves();
+        let raw = fs::read_to_string(&path).expect("flushed config file");
+        let parsed = AppConfig::from_json_str(&raw);
+        assert_eq!(parsed.master_volume, 7);
+        let _ = fs::remove_dir_all(&dir);
     }
 }

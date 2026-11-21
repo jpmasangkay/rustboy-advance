@@ -220,6 +220,7 @@ pub(crate) struct RustboyApp {
     pub(crate) confirm_delete_slot: Option<usize>,
     pub(crate) slot_thumbnails: [Option<TextureHandle>; 5],
     pub(crate) slot_meta: [Option<SlotMetaEntry>; 5],
+    pub(crate) slot_exists_cache: [Option<bool>; 5],
     pub(crate) state_manager_error: Option<String>,
     pub(crate) playtime_timer: Instant,
     pub(crate) rumble_in_progress: bool,
@@ -416,6 +417,7 @@ impl RustboyApp {
             confirm_delete_slot: None,
             slot_thumbnails: [None, None, None, None, None],
             slot_meta: [None, None, None, None, None],
+            slot_exists_cache: [None; 5],
             state_manager_error: None,
             playtime_timer: Instant::now(),
             rumble_in_progress: false,
@@ -765,6 +767,7 @@ impl RustboyApp {
         self.sink.audio.reset_underruns();
         self.slot_thumbnails = [None, None, None, None, None];
         self.slot_meta = [None, None, None, None, None];
+        self.slot_exists_cache = [None; 5];
         self.state_manager_error = None;
         self.playtime_timer = Instant::now();
 
@@ -815,6 +818,7 @@ impl RustboyApp {
         self.confirm_delete_slot = None;
         self.slot_thumbnails = [None, None, None, None, None];
         self.slot_meta = [None, None, None, None, None];
+        self.slot_exists_cache = [None; 5];
         self.state_manager_error = None;
         self.paused = false;
         self.sink.audio.set_paused(true);
@@ -1896,8 +1900,15 @@ impl RustboyApp {
         }
 
         if !self.paused {
+            if !turbo && paced_wake_at.is_none() && target_frame_time > 0.0 {
+                let rem = (target_frame_time - self.time_accumulator).max(0.0);
+                let wake_lead = 0.0015;
+                if rem > wake_lead {
+                    paced_wake_at = Some(Instant::now() + Duration::from_secs_f64(rem - wake_lead));
+                }
+            }
             match paced_wake_at.map(|wake_at| wake_at.saturating_duration_since(Instant::now())) {
-                Some(delay) if delay >= Duration::from_micros(500) => {
+                Some(delay) if delay >= Duration::from_micros(250) => {
                     // egui::Context::request_repaint_after subtracts predicted_dt (default 1/60s),
                     // which clamps delays <= 16.67ms to ZERO; compensate so the requested timer holds.
                     let pred = Duration::try_from_secs_f32(ctx.input(|i| i.predicted_dt))
@@ -2074,8 +2085,14 @@ impl RustboyApp {
             self.notify_warn("Hardcore Mode enabled — system hard-reset for verified session");
         }
 
-        // Present dockable/floating Debugger & Tool windows
-        let vram_rev = self.sink.frame_seq.wrapping_add(self.debug_step_seq);
+        // Present dockable/floating Debugger & Tool windows.
+        // Throttle heavy VRAM/BG/OAM debug texture re-decodes to ~15 Hz while running live
+        // (up to 1024x1024 RGBA for affine BG maps) while staying 1:1 exact when paused/stepping.
+        let vram_rev = if self.paused {
+            self.sink.frame_seq.wrapping_add(self.debug_step_seq)
+        } else {
+            (self.sink.frame_seq / 4).wrapping_add(self.debug_step_seq)
+        };
         let dbg_actions = self.debugger.show_all(
             ctx,
             self.core.as_mut(),
@@ -2292,6 +2309,24 @@ impl RustboyApp {
             .set_settled_filter(key, self.quality_governor.active_filter());
         self.config.display_filter = self.governor_user_target;
         self.config.save();
+        AppConfig::flush_pending_saves();
+    }
+
+    pub(crate) fn slot_exists_cached(&mut self, slot: usize) -> bool {
+        if !(1..=5).contains(&slot) {
+            return false;
+        }
+        let idx = slot - 1;
+        if let Some(cached) = self.slot_exists_cache[idx] {
+            return cached;
+        }
+        let exists = match &self.slot_meta[idx] {
+            Some(SlotMetaEntry::Empty) => false,
+            Some(SlotMetaEntry::Ready { .. } | SlotMetaEntry::Corrupt(_)) => true,
+            None => self.slot_path(slot).is_some_and(|p| p.exists()),
+        };
+        self.slot_exists_cache[idx] = Some(exists);
+        exists
     }
 
     pub(crate) fn sync_movie_after_rewind(&mut self, prev_rewind_len: usize) {

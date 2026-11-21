@@ -16,8 +16,10 @@ impl eframe::App for RustboyApp {
 }
 
 /// Queries supported presentation modes with the eframe (0.31) / egui-wgpu version in use.
-/// Prioritizes tear-free, stutter-free vsync modes (`AutoVsync` or `Fifo`) with a single-frame
-/// latency buffer so gameplay is smooth and locked to display refresh cadence.
+/// Prioritizes low-latency non-blocking presentation (`Mailbox` / `Immediate` / `AutoNoVsync`)
+/// because `RustboyApp` paces emulation frames in software (`pacing_deadline` + Audio DRC);
+/// blocking `Fifo` with `latency = 1` causes mid-frame mouse/menu UI repaints to steal VSync
+/// slots and halve gameplay smoothness during UI interaction.
 pub fn query_supported_present_mode(
     surface: &wgpu::Surface,
     adapter: &wgpu::Adapter,
@@ -29,18 +31,18 @@ pub fn query_supported_present_mode(
         caps.present_modes
     );
 
-    if caps.present_modes.contains(&wgpu::PresentMode::AutoVsync) {
-        log::info!("Surface supports AutoVsync -> choosing PresentMode::AutoVsync");
-        wgpu::PresentMode::AutoVsync
-    } else if caps.present_modes.contains(&wgpu::PresentMode::Fifo) {
-        log::info!("Surface supports Fifo -> choosing PresentMode::Fifo");
-        wgpu::PresentMode::Fifo
-    } else if caps.present_modes.contains(&wgpu::PresentMode::Mailbox) {
+    if caps.present_modes.contains(&wgpu::PresentMode::Mailbox) {
         log::info!("Surface supports Mailbox -> choosing PresentMode::Mailbox");
         wgpu::PresentMode::Mailbox
-    } else {
-        log::info!("Defaulting to PresentMode::AutoNoVsync");
+    } else if caps.present_modes.contains(&wgpu::PresentMode::Immediate) {
+        log::info!("Surface supports Immediate -> choosing PresentMode::Immediate");
+        wgpu::PresentMode::Immediate
+    } else if caps.present_modes.contains(&wgpu::PresentMode::AutoNoVsync) {
+        log::info!("Surface supports AutoNoVsync -> choosing PresentMode::AutoNoVsync");
         wgpu::PresentMode::AutoNoVsync
+    } else {
+        log::info!("Defaulting to PresentMode::Fifo");
+        wgpu::PresentMode::Fifo
     }
 }
 
@@ -81,6 +83,8 @@ pub fn run_desktop(
 
     let force_software = cli.software_adapter;
     let fullscreen = cli.fullscreen;
+    let _emu_prio_guard =
+        (!cli.no_emu_priority).then(crate::audio::win_mmcss::MmcssGuard::enter_games);
 
     // In eframe 0.31 with wgpu, adapter and surface capabilities are inspected
     // during adapter selection via `native_adapter_selector`.
@@ -129,8 +133,11 @@ pub fn run_desktop(
             .with_fullscreen(fullscreen)
             .with_resizable(true),
         wgpu_options: egui_wgpu::WgpuConfiguration {
-            present_mode: wgpu::PresentMode::AutoVsync,
-            desired_maximum_frame_latency: Some(1),
+            // Non-blocking presentation (`AutoNoVsync` -> Immediate/Mailbox/Fifo) + 2-frame
+            // swapchain keeps mouse/menu/debugger UI repaints from stealing VSync slots from
+            // `RustboyApp`'s software frame pacer (`pacing_deadline` + Audio DRC).
+            present_mode: wgpu::PresentMode::AutoNoVsync,
+            desired_maximum_frame_latency: Some(2),
             wgpu_setup: egui_wgpu::WgpuSetup::CreateNew(wgpu_setup),
             ..Default::default()
         },

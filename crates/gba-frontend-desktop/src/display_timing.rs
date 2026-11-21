@@ -36,7 +36,11 @@ pub fn resolve_sync_decision(
         let rate_str = effective
             .map(|hz| format!("{hz:.2} Hz"))
             .unwrap_or_else(|| "unknown Hz".to_string());
-        let mode_str = if forced { "60.0 Hz DRC lock" } else { "native 59.7275 Hz" };
+        let mode_str = if forced {
+            "60.0 Hz DRC lock"
+        } else {
+            "native 59.7275 Hz"
+        };
         return SyncRateDecision {
             effective_refresh_hz: effective,
             sync_60hz: forced,
@@ -219,7 +223,10 @@ mod win32 {
             if proc.is_null() {
                 None
             } else {
-                Some(std::mem::transmute::<*const core::ffi::c_void, DwmGetTimingFn>(proc))
+                Some(std::mem::transmute::<
+                    *const core::ffi::c_void,
+                    DwmGetTimingFn,
+                >(proc))
             }
         })
     }
@@ -392,7 +399,8 @@ impl DwmScanoutTracker {
         self.last_missed = Some(snap.c_frames_missed);
 
         if steady {
-            self.dwm_dropped_delta_total = self.dwm_dropped_delta_total.saturating_add(dropped_delta);
+            self.dwm_dropped_delta_total =
+                self.dwm_dropped_delta_total.saturating_add(dropped_delta);
             self.dwm_missed_delta_total = self.dwm_missed_delta_total.saturating_add(missed_delta);
         }
 
@@ -592,8 +600,8 @@ impl VblankPhaseLock {
         let start = self.target_present_start_qpc()?;
         let min_headroom = (self.qpc_freq as f64) * 0.0040; // >= 4.0 ms buffer for OS timer + prep
         let cap_headroom = (self.qpc_freq as f64) * 0.0115; // <= 11.5 ms so we still WaitUntil idle
-        let lead = (self.ema_prep_qpc + (self.qpc_freq as f64) * 0.0025)
-            .clamp(min_headroom, cap_headroom);
+        let lead =
+            (self.ema_prep_qpc + (self.qpc_freq as f64) * 0.0025).clamp(min_headroom, cap_headroom);
         Some(start.saturating_sub(lead.round() as u64))
     }
 
@@ -664,12 +672,18 @@ impl VblankPhaseLock {
 
         // Track only the BitBlt/present submission latency so present completes at target_phase.
         let dur_ticks = present_end_qpc.saturating_sub(present_start_qpc) as f64;
-        let max_present_lead = (p as f64) * if self.vblanks_per_frame == 1 { 0.45 } else { 0.55 };
-        self.ema_present_qpc = (self.ema_present_qpc * 0.90 + dur_ticks * 0.10).min(max_present_lead);
+        let max_present_lead = (p as f64)
+            * if self.vblanks_per_frame == 1 {
+                0.45
+            } else {
+                0.55
+            };
+        self.ema_present_qpc =
+            (self.ema_present_qpc * 0.90 + dur_ticks * 0.10).min(max_present_lead);
 
         // Actual phase error of present completion within its DWM refresh interval [-0.5, +0.5).
-        let end_mod = ((present_end_qpc as i128 - snap.qpc_vblank as i128)
-            .rem_euclid(p as i128)) as f64
+        let end_mod = ((present_end_qpc as i128 - snap.qpc_vblank as i128).rem_euclid(p as i128))
+            as f64
             / (p as f64);
         let end_err_norm = end_mod - self.target_phase;
         self.ema_phase_err_norm = self.ema_phase_err_norm * 0.92 + end_err_norm * 0.08;
@@ -768,9 +782,15 @@ mod tests {
     #[test]
     fn windows_display_timing_queries_succeed_unelevated() {
         let hz = detect_display_refresh_hz();
-        assert!(hz.is_some(), "expected detected display refresh Hz on Windows");
+        assert!(
+            hz.is_some(),
+            "expected detected display refresh Hz on Windows"
+        );
         let dwm = query_dwm_timing();
-        assert!(dwm.is_some(), "DwmGetCompositionTimingInfo must succeed with 292-byte pack(1) struct");
+        assert!(
+            dwm.is_some(),
+            "DwmGetCompositionTimingInfo must succeed with 292-byte pack(1) struct"
+        );
     }
 
     #[test]
@@ -884,4 +904,3 @@ mod tests {
         );
     }
 }
-

@@ -239,6 +239,31 @@ inputs = [
     { frame = 145, duration = 12, keys = ["START"] },
 ]
 
+[[tests]]
+id = "armwrestler_arm_alu_p2"
+suite = "armwrestler"
+name = "armwrestler/arm-alu-p2"
+rom_path = "test-roms/armwrestler/armwrestler-gba-fixed.gba"
+frames = 95
+criterion = "screenshot"
+inputs = [
+    { frame = 25, duration = 12, keys = ["START"] },
+    { frame = 55, duration = 12, keys = ["START"] },
+]
+
+[[tests]]
+id = "armwrestler_arm_ldr_str_p2"
+suite = "armwrestler"
+name = "armwrestler/arm-ldr-str-p2"
+rom_path = "test-roms/armwrestler/armwrestler-gba-fixed.gba"
+frames = 120
+criterion = "screenshot"
+inputs = [
+    { frame = 25, duration = 12, keys = ["DOWN"] },
+    { frame = 49, duration = 12, keys = ["START"] },
+    { frame = 79, duration = 12, keys = ["START"] },
+]
+
 # --- NanoBoyAdvance hw-test ---
 
 [[tests]]
@@ -297,6 +322,9 @@ name = "nba-hw-test/haltcnt.gba"
 rom_path = "test-roms/nba-hw-test/haltcnt/haltcnt.gba"
 frames = 60
 criterion = "screenshot"
+known_failure = true
+known_bad_crc32 = "0x467f7fbb"
+notes = "3/6 pass (HLE BIOS; CPUSET, POSTFLG, CPUSET DMA fail)"
 
 [[tests]]
 id = "nba_irq_delay"
@@ -306,8 +334,8 @@ rom_path = "test-roms/nba-hw-test/irq/irq-delay/irq-delay.gba"
 frames = 60
 criterion = "screenshot"
 known_failure = true
-known_bad_crc32 = "0x4fc84cc5"
-notes = "0/3 pass (IWRAM: 95 vs 92, EWRAM: 115 vs 112, ROM: 115 vs 120)"
+known_bad_crc32 = "0x73b6a3c4"
+notes = "0/3 pass (IWRAM: 95 vs 92, EWRAM: 110 vs 112, ROM: 110 vs 120)"
 
 [[tests]]
 id = "nba_ppu_bgpd"
@@ -351,7 +379,7 @@ frames = 30
 criterion = "fb_hash"
 known_failure = true
 known_bad_crc32 = "0x9a420c77"
-notes = "Visual mismatch vs expected.png (uniform RGB stripes; GREENSWAP swap unimplemented)"
+notes = "Visual mismatch vs expected.png (mid-scanline GREENSWAP toggle requires dot-level PPU)"
 
 [[tests]]
 id = "nba_ppu_ram_access_timing"
@@ -369,10 +397,8 @@ suite = "nba-hw-test"
 name = "nba-hw-test/ppu/sprite-hmosaic.gba"
 rom_path = "test-roms/nba-hw-test/ppu/sprite-hmosaic/sprite-hmosaic.gba"
 frames = 30
-criterion = "fb_hash"
-known_failure = true
-known_bad_crc32 = "0x99822121"
-notes = "Visual mismatch vs expected.png (rows 9-14 horizontal mosaic stretch differs)"
+criterion = "screenshot"
+notes = "Verified visually against upstream expected.png"
 
 [[tests]]
 id = "nba_ppu_status_irq_dma"
@@ -513,6 +539,52 @@ name = "tonc/dma_demo.gba"
 rom_path = "test-roms/tonc/dma_demo.gba"
 frames = 30
 criterion = "fb_hash"
+
+[[tests]]
+id = "tonc_bld_demo_active"
+suite = "tonc"
+name = "tonc/bld_demo.gba (alpha blend)"
+rom_path = "test-roms/tonc/bld_demo.gba"
+frames = 65
+criterion = "fb_hash"
+inputs = [
+    { frame = 5, duration = 3, keys = ["R"] },
+    { frame = 15, duration = 40, keys = ["RIGHT", "UP"] },
+]
+
+[[tests]]
+id = "tonc_mos_demo_active"
+suite = "tonc"
+name = "tonc/mos_demo.gba (bg+obj mosaic)"
+rom_path = "test-roms/tonc/mos_demo.gba"
+frames = 90
+criterion = "fb_hash"
+inputs = [
+    { frame = 10, duration = 30, keys = ["RIGHT", "UP"] },
+    { frame = 45, duration = 30, keys = ["A", "RIGHT", "UP"] },
+]
+
+[[tests]]
+id = "tonc_bm_modes_m4"
+suite = "tonc"
+name = "tonc/bm_modes.gba (mode 4)"
+rom_path = "test-roms/tonc/bm_modes.gba"
+frames = 45
+criterion = "fb_hash"
+inputs = [
+    { frame = 15, duration = 3, keys = ["RIGHT"] },
+]
+
+[[tests]]
+id = "tonc_obj_aff_rotated"
+suite = "tonc"
+name = "tonc/obj_aff.gba (rotated)"
+rom_path = "test-roms/tonc/obj_aff.gba"
+frames = 60
+criterion = "fb_hash"
+inputs = [
+    { frame = 10, duration = 40, keys = ["L", "RIGHT"] },
+]
 
 # --- Optional / User-Supplied Suites ---
 

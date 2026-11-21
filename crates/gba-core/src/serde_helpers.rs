@@ -85,8 +85,7 @@ pub mod box_u16s {
         {
             // SAFETY: `u16` has no padding and every bit pattern is valid; on little-endian
             // targets its in-memory representation is identical to packed LE bytes.
-            let bytes =
-                unsafe { core::slice::from_raw_parts(val.as_ptr().cast::<u8>(), N * 2) };
+            let bytes = unsafe { core::slice::from_raw_parts(val.as_ptr().cast::<u8>(), N * 2) };
             serializer.serialize_bytes(bytes)
         }
         #[cfg(not(target_endian = "little"))]
@@ -116,8 +115,8 @@ pub mod box_u16s {
                     return Err(E::invalid_length(v.len(), &self));
                 }
                 let mut out = alloc_boxed_array::<u16, N>(0);
-                for (dst, chunk) in out.iter_mut().zip(v.chunks_exact(2)) {
-                    *dst = u16::from_le_bytes([chunk[0], chunk[1]]);
+                for (dst, chunk) in out.iter_mut().zip(v.as_chunks::<2>().0) {
+                    *dst = u16::from_le_bytes(*chunk);
                 }
                 Ok(out)
             }

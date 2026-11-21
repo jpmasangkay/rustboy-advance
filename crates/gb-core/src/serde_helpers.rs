@@ -105,8 +105,8 @@ pub mod box_u16s {
                     return Err(E::invalid_length(v.len(), &self));
                 }
                 let mut vec = Vec::with_capacity(N);
-                for chunk in v.chunks_exact(2) {
-                    vec.push(u16::from_le_bytes([chunk[0], chunk[1]]));
+                for chunk in v.as_chunks::<2>().0 {
+                    vec.push(u16::from_le_bytes(*chunk));
                 }
                 vec.into_boxed_slice()
                     .try_into()

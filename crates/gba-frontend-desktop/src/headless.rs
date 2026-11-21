@@ -315,8 +315,12 @@ impl CliConfig {
                 "--sync-60hz" => cfg.sync_60hz = Some(true),
                 "--no-sync-60hz" => cfg.sync_60hz = Some(false),
                 "--simulate-refresh-hz" => {
-                    let v = args.next().ok_or("missing value for --simulate-refresh-hz")?;
-                    let hz: f64 = v.parse().map_err(|_| "invalid --simulate-refresh-hz value")?;
+                    let v = args
+                        .next()
+                        .ok_or("missing value for --simulate-refresh-hz")?;
+                    let hz: f64 = v
+                        .parse()
+                        .map_err(|_| "invalid --simulate-refresh-hz value")?;
                     if !hz.is_finite() || hz <= 1.0 {
                         return Err("--simulate-refresh-hz must be > 1.0".to_string());
                     }
@@ -332,8 +336,12 @@ impl CliConfig {
                     cfg.probe_fail_stage = Some(crate::gpu_probe::ProbeFailStage::parse(&v)?);
                 }
                 "--gpu-probe-timeout-ms" => {
-                    let v = args.next().ok_or("missing value for --gpu-probe-timeout-ms")?;
-                    let ms: u64 = v.parse().map_err(|_| "invalid --gpu-probe-timeout-ms number")?;
+                    let v = args
+                        .next()
+                        .ok_or("missing value for --gpu-probe-timeout-ms")?;
+                    let ms: u64 = v
+                        .parse()
+                        .map_err(|_| "invalid --gpu-probe-timeout-ms number")?;
                     cfg.gpu_probe_timeout_ms = Some(ms.max(200));
                 }
                 "--capture-png" => {

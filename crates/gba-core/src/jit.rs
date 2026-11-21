@@ -405,8 +405,7 @@ mod cranelift_backend {
                         total_cyc_val = builder.ins().iadd(total_cyc_val, step_cyc);
 
                         if !is_last {
-                            let exit_flag =
-                                builder.ins().band_imm_s(raw_ret, JIT_EXIT_BIT as i64);
+                            let exit_flag = builder.ins().band_imm_s(raw_ret, JIT_EXIT_BIT as i64);
                             let should_exit =
                                 builder.ins().icmp_imm_s(IntCC::NotEqual, exit_flag, 0);
                             let cont_block = builder.create_block();
@@ -484,9 +483,7 @@ mod cranelift_backend {
         let store_gpr =
             |builder: &mut cranelift_frontend::FunctionBuilder, reg: usize, val: Value| {
                 let offset = (reg * 4) as i32;
-                builder
-                    .ins()
-                    .store(trusted_flags, val, cpu_val, offset);
+                builder.ins().store(trusted_flags, val, cpu_val, offset);
             };
 
         let advance_pc = |builder: &mut cranelift_frontend::FunctionBuilder, delta: i64| {
@@ -495,9 +492,7 @@ mod cranelift_backend {
                 .ins()
                 .load(types::I32, trusted_flags, cpu_val, offset);
             let new_pc = builder.ins().iadd_imm_s(old_pc, delta);
-            builder
-                .ins()
-                .store(trusted_flags, new_pc, cpu_val, offset);
+            builder.ins().store(trusted_flags, new_pc, cpu_val, offset);
         };
 
         if is_thumb {

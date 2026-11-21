@@ -308,19 +308,8 @@ mod win32_gdi {
             return Err("CreateCompatibleBitmap failed".to_string());
         }
         let old = unsafe { SelectObject(mem_dc, hbmp) };
-        let blt_ok = unsafe {
-            BitBlt(
-                mem_dc,
-                0,
-                0,
-                dst_w as i32,
-                dst_h as i32,
-                hdc,
-                0,
-                0,
-                SRCCOPY,
-            )
-        };
+        let blt_ok =
+            unsafe { BitBlt(mem_dc, 0, 0, dst_w as i32, dst_h as i32, hdc, 0, 0, SRCCOPY) };
         if blt_ok == 0 {
             unsafe {
                 SelectObject(mem_dc, old);
@@ -348,6 +337,10 @@ mod win32_gdi {
             bmi_colors: [0],
         };
         let mut rgba = vec![0u8; dst_w * dst_h * 4];
+        // Win32 GetDIBits requires the bitmap NOT to be selected into a DC.
+        unsafe {
+            SelectObject(mem_dc, old);
+        }
         let lines = unsafe {
             GetDIBits(
                 mem_dc,
@@ -360,7 +353,6 @@ mod win32_gdi {
             )
         };
         unsafe {
-            SelectObject(mem_dc, old);
             DeleteObject(hbmp);
             DeleteDC(mem_dc);
             ReleaseDC(hwnd, hdc);
@@ -453,6 +445,7 @@ impl NoGpuCpuPresenter {
         &self.scratch_xrgb
     }
 
+    #[allow(clippy::too_many_arguments)]
     pub fn blit_rgba_to_slice(
         &mut self,
         src: &[egui::Color32],
@@ -565,8 +558,8 @@ impl NoGpuCpuPresenter {
             Self::fill_letterbox_borders(dst, dst_w, dst_h, off_x, off_y, draw_w, draw_h);
         }
 
-        // Exact nearest / integer upscaling with vertical row reuse (memcpy repeated source rows).
-        if !linear || (draw_w.is_multiple_of(src_w) && draw_h.is_multiple_of(src_h)) {
+        // Exact nearest upscaling with vertical row reuse (memcpy repeated source rows).
+        if !linear {
             if *cached_dims != (src_w, src_h, draw_w, draw_h) {
                 x_map.resize(draw_w, 0);
                 for (dx, slot) in x_map.iter_mut().enumerate() {
@@ -595,7 +588,7 @@ impl NoGpuCpuPresenter {
             return;
         }
 
-        // Non-integer bilinear path: separable horizontal LUT + cached source-row pairs + SWAR vertical blend.
+        // Bilinear path: pixel-center sampling with separable horizontal LUT + cached source-row pairs + SWAR vertical blend.
         if *cached_bilinear_dims != (src_w, draw_w) || x_bilinear_lut.len() != draw_w {
             x_bilinear_lut.resize(
                 draw_w,
@@ -606,11 +599,13 @@ impl NoGpuCpuPresenter {
                     iwx: 256,
                 },
             );
+            let scale_x = src_w as f64 / draw_w.max(1) as f64;
+            let max_x = src_w.saturating_sub(1) as f64;
             for (dx, tap) in x_bilinear_lut.iter_mut().enumerate() {
-                let fx = ((dx as u64 * src_w as u64) << 16) / draw_w.max(1) as u64;
-                let x0 = ((fx >> 16) as usize).min(src_w - 1);
+                let src_x = ((dx as f64 + 0.5) * scale_x - 0.5).clamp(0.0, max_x);
+                let x0 = src_x.floor() as usize;
                 let x1 = (x0 + 1).min(src_w - 1);
-                let wx = ((fx & 0xFFFF) >> 8) as u16;
+                let wx = (((src_x - x0 as f64) * 256.0).round() as u16).min(256);
                 *tap = BilinearXTap {
                     x0: x0 as u16,
                     x1: x1 as u16,
@@ -629,12 +624,14 @@ impl NoGpuCpuPresenter {
         let taps = &x_bilinear_lut[..draw_w];
         let mut cached_y0 = usize::MAX;
         let mut cached_y1 = usize::MAX;
+        let scale_y = src_h as f64 / draw_h.max(1) as f64;
+        let max_y = src_h.saturating_sub(1) as f64;
 
         for dy in 0..draw_h {
-            let fy = ((dy as u64 * src_h as u64) << 16) / draw_h.max(1) as u64;
-            let y0 = ((fy >> 16) as usize).min(src_h - 1);
+            let src_y = ((dy as f64 + 0.5) * scale_y - 0.5).clamp(0.0, max_y);
+            let y0 = src_y.floor() as usize;
             let y1 = (y0 + 1).min(src_h - 1);
-            let wy = ((fy & 0xFFFF) >> 8) as u32;
+            let wy = (((src_y - y0 as f64) * 256.0).round() as u32).min(256);
             let iwy = 256 - wy;
 
             if y0 != cached_y0 {
@@ -698,7 +695,13 @@ impl NoGpuCpuPresenter {
         let pattern = crate::filters::test_filter_pattern_fb();
         let mut costs = Vec::with_capacity(DisplayFilter::ALL.len());
         for &filter in &DisplayFilter::ALL {
-            postproc.prewarm(color_correction, lcd_ghosting, filter, false, grid_intensity);
+            postproc.prewarm(
+                color_correction,
+                lcd_ghosting,
+                filter,
+                false,
+                grid_intensity,
+            );
             let linear = filter.texture_options() == egui::TextureOptions::LINEAR;
             for _ in 0..2 {
                 let img = postproc.process_display_filter(
@@ -709,7 +712,14 @@ impl NoGpuCpuPresenter {
                     false,
                     grid_intensity,
                 );
-                self.present_rgba_to_xrgb(&img.pixels, img.size[0], img.size[1], dst_w, dst_h, linear);
+                self.present_rgba_to_xrgb(
+                    &img.pixels,
+                    img.size[0],
+                    img.size[1],
+                    dst_w,
+                    dst_h,
+                    linear,
+                );
             }
             let mut samples = [0.0f64; 3];
             for slot in &mut samples {
@@ -745,7 +755,7 @@ impl NoGpuCpuPresenter {
     }
 
     /// Presents `img` capped at most `720x480` via Win32 `StretchDIBits` (`None` on non-Windows).
-    #[allow(unused_variables)]
+    #[allow(unused_variables, clippy::too_many_arguments)]
     pub fn present_capped_os_stretch(
         &mut self,
         window: &Window,
@@ -777,6 +787,7 @@ impl NoGpuCpuPresenter {
         }
     }
 
+    #[allow(clippy::too_many_arguments)]
     pub fn measure_capped_filter_costs(
         &mut self,
         postproc: &mut VideoPostProcessor,
@@ -790,7 +801,13 @@ impl NoGpuCpuPresenter {
         let pattern = crate::filters::test_filter_pattern_fb();
         let mut costs = Vec::with_capacity(DisplayFilter::ALL.len());
         for &filter in &DisplayFilter::ALL {
-            postproc.prewarm(color_correction, lcd_ghosting, filter, false, grid_intensity);
+            postproc.prewarm(
+                color_correction,
+                lcd_ghosting,
+                filter,
+                false,
+                grid_intensity,
+            );
             let linear = filter.texture_options() == egui::TextureOptions::LINEAR;
             for _ in 0..2 {
                 let img = postproc.process_display_filter(
@@ -996,11 +1013,14 @@ struct NoGpuApp {
     postproc: VideoPostProcessor,
     blitter: NoGpuCpuPresenter,
     governor: QualityGovernor,
+    user_target_filter: DisplayFilter,
     profile_key: String,
     pressed_keys: HashSet<KeyCode>,
     paused: bool,
     next_frame_due: Instant,
     last_title_update: Instant,
+    last_save_flush: Instant,
+    pending_resize_recalib: Option<Instant>,
     frames_in_window: u32,
     last_core_ms: f64,
     last_present_ms: f64,
@@ -1029,13 +1049,7 @@ struct NoGpuApp {
 }
 
 impl NoGpuApp {
-    fn new(
-        title: String,
-        init_w: u32,
-        init_h: u32,
-        cli: CliConfig,
-        reason: &str,
-    ) -> Self {
+    fn new(title: String, init_w: u32, init_h: u32, cli: CliConfig, reason: &str) -> Self {
         let mut config = AppConfig::load();
         if let Some(f) = cli.filter {
             config.display_filter = f;
@@ -1051,6 +1065,7 @@ impl NoGpuApp {
 
         let audio = AudioOutput::start();
         audio.set_muted(config.muted);
+        audio.set_master_volume(config.master_volume);
         let audio_cap = audio.capacity();
         let sync_decision =
             crate::display_timing::resolve_sync_decision(cli.sync_60hz, cli.simulate_refresh_hz);
@@ -1061,8 +1076,7 @@ impl NoGpuApp {
         if sync_60hz {
             drc_pacer.set_base_fps(60.0);
         }
-        let phase_lock =
-            crate::display_timing::VblankPhaseLock::new(sync_60hz, display_refresh_hz);
+        let phase_lock = crate::display_timing::VblankPhaseLock::new(sync_60hz, display_refresh_hz);
         if phase_lock.is_enabled() {
             audio.set_rate_offset_ppm(phase_lock.audio_rate_offset_ppm());
         }
@@ -1111,13 +1125,16 @@ impl NoGpuApp {
             init_h as usize,
             None,
         );
+        let user_target_filter = config.display_filter;
         let mut governor = QualityGovernor::with_measured_costs(
-            config.display_filter,
+            user_target_filter,
             config.auto_quality_governor,
             costs,
         );
         governor.set_resolution_cap_support(
-            init_w as usize > GOVERNOR_MAX_CAP_WIDTH || init_h as usize > GOVERNOR_MAX_CAP_HEIGHT,
+            cfg!(target_os = "windows")
+                && (init_w as usize > GOVERNOR_MAX_CAP_WIDTH
+                    || init_h as usize > GOVERNOR_MAX_CAP_HEIGHT),
             Some(capped_costs),
         );
         let profile_key = AppConfig::governor_profile_key(
@@ -1143,9 +1160,10 @@ impl NoGpuApp {
         let mut sav_path = cli.sav_path.clone();
         let mut rom_name = String::from("No ROM loaded (press Ctrl+O or drop .gba)");
         if let Some(path) = &cli.rom_path {
-            match fs::read(path) {
-                Ok(rom) => {
-                    let mut c = GbaCore::new(bios_bytes.as_deref(), rom);
+            match crate::rom_loader::load_rom_bytes(path) {
+                Ok(mut loaded) => {
+                    let _ = crate::rom_loader::apply_auto_patch_if_present(path, &mut loaded.bytes);
+                    let mut c = GbaCore::new(bios_bytes.as_deref(), loaded.bytes);
                     let inferred_sav = sav_path
                         .take()
                         .unwrap_or_else(|| path.with_extension("sav"));
@@ -1155,10 +1173,11 @@ impl NoGpuApp {
                         c.bus.cart.load_save_data(&bytes);
                     }
                     sav_path = Some(inferred_sav);
-                    rom_name = path
-                        .file_name()
-                        .map(|n| n.to_string_lossy().into_owned())
-                        .unwrap_or_else(|| "ROM".to_string());
+                    rom_name = loaded.inner_name.unwrap_or_else(|| {
+                        path.file_name()
+                            .map(|n| n.to_string_lossy().into_owned())
+                            .unwrap_or_else(|| "ROM".to_string())
+                    });
                     core = Some(c);
                 }
                 Err(e) => {
@@ -1200,11 +1219,14 @@ impl NoGpuApp {
             postproc,
             blitter,
             governor,
+            user_target_filter,
             profile_key,
             pressed_keys: HashSet::new(),
             paused: false,
             next_frame_due: Instant::now(),
             last_title_update: Instant::now(),
+            last_save_flush: Instant::now(),
+            pending_resize_recalib: None,
             frames_in_window: 0,
             last_core_ms: 0.0,
             last_present_ms: 0.0,
@@ -1234,10 +1256,11 @@ impl NoGpuApp {
 
     fn load_rom(&mut self, path: &Path) {
         self.flush_save();
-        let Ok(rom) = fs::read(path) else {
+        let Ok(mut loaded) = crate::rom_loader::load_rom_bytes(path) else {
             return;
         };
-        let mut core = GbaCore::new(self.bios_bytes.as_deref(), rom);
+        let _ = crate::rom_loader::apply_auto_patch_if_present(path, &mut loaded.bytes);
+        let mut core = GbaCore::new(self.bios_bytes.as_deref(), loaded.bytes);
         let sav = path.with_extension("sav");
         if sav.exists()
             && let Ok(bytes) = fs::read(&sav)
@@ -1246,14 +1269,26 @@ impl NoGpuApp {
         }
         self.core = Some(core);
         self.sav_path = Some(sav);
-        self.rom_name = path
-            .file_name()
-            .map(|n| n.to_string_lossy().into_owned())
-            .unwrap_or_else(|| "ROM".to_string());
+        self.rom_name = loaded.inner_name.unwrap_or_else(|| {
+            path.file_name()
+                .map(|n| n.to_string_lossy().into_owned())
+                .unwrap_or_else(|| "ROM".to_string())
+        });
         self.paused = false;
+        self.sink.audio.set_paused(false);
         self.next_frame_due = Instant::now();
         self.phase_lock.reset_schedule();
         self.sink.frame_dirty = true;
+    }
+
+    fn save_config_preserving_target(&mut self) {
+        let active_filter = self.config.display_filter;
+        self.config.display_filter = self.user_target_filter;
+        self.config.shader_preset = self.user_target_filter.default_shader_preset();
+        self.config
+            .set_settled_filter(self.profile_key.clone(), self.governor.active_filter());
+        self.config.save();
+        self.config.display_filter = active_filter;
     }
 
     fn flush_save(&mut self) {
@@ -1261,7 +1296,7 @@ impl NoGpuApp {
             && core.bus.cart.save_dirty
         {
             let data = core.bus.cart.export_save_data();
-            if fs::write(sav, &data).is_ok() {
+            if crate::config::write_atomic(sav, data).is_ok() {
                 core.bus.cart.save_dirty = false;
             }
         }
@@ -1402,7 +1437,37 @@ impl NoGpuApp {
                         self.total_emu_frames,
                         self.config.display_filter.label(),
                         self.governor.is_resolution_capped(),
-                        if use_capped_os_stretch { "StretchDIBits" } else { "softbuffer" }
+                        if use_capped_os_stretch {
+                            "StretchDIBits"
+                        } else {
+                            "softbuffer"
+                        }
+                    ),
+                    Err(e) => eprintln!("[capture] Screenshot capture failed: {e}"),
+                }
+            }
+            #[cfg(not(target_os = "windows"))]
+            {
+                if let Some(parent) = cap_path.parent()
+                    && !parent.as_os_str().is_empty()
+                {
+                    let _ = fs::create_dir_all(parent);
+                }
+                match image::save_buffer_with_format(
+                    cap_path,
+                    img.as_raw(),
+                    img.size[0] as u32,
+                    img.size[1] as u32,
+                    image::ColorType::Rgba8,
+                    image::ImageFormat::Png,
+                ) {
+                    Ok(()) => println!(
+                        "[capture] Saved {}x{} screenshot -> {} (frame={}, filter={})",
+                        img.size[0],
+                        img.size[1],
+                        cap_path.display(),
+                        self.total_emu_frames,
+                        self.config.display_filter.label(),
                     ),
                     Err(e) => eprintln!("[capture] Screenshot capture failed: {e}"),
                 }
@@ -1448,7 +1513,10 @@ impl ApplicationHandler for NoGpuApp {
             return;
         }
         let mut attrs = Window::default_attributes()
-            .with_title(format!("{} [No-GPU: softbuffer] — {}", self.title, self.rom_name))
+            .with_title(format!(
+                "{} [No-GPU: softbuffer] — {}",
+                self.title, self.rom_name
+            ))
             .with_inner_size(LogicalSize::new(self.size.0, self.size.1));
         if self.fullscreen_on_start {
             attrs = attrs.with_fullscreen(Some(winit::window::Fullscreen::Borderless(None)));
@@ -1496,7 +1564,7 @@ impl ApplicationHandler for NoGpuApp {
             self.config.lcd_grid_intensity,
             self.size.0 as usize,
             self.size.1 as usize,
-            Some(&window),
+            None,
         );
         let costs = self.blitter.measure_filter_costs(
             &mut self.postproc,
@@ -1508,8 +1576,9 @@ impl ApplicationHandler for NoGpuApp {
         );
         self.governor.set_measured_costs(costs);
         self.governor.set_resolution_cap_support(
-            self.size.0 as usize > GOVERNOR_MAX_CAP_WIDTH
-                || self.size.1 as usize > GOVERNOR_MAX_CAP_HEIGHT,
+            cfg!(target_os = "windows")
+                && (self.size.0 as usize > GOVERNOR_MAX_CAP_WIDTH
+                    || self.size.1 as usize > GOVERNOR_MAX_CAP_HEIGHT),
             Some(capped_costs),
         );
         self.window = Some(window);
@@ -1532,10 +1601,12 @@ impl ApplicationHandler for NoGpuApp {
                 if let Some(ref mut logger) = self.perf_logger {
                     logger.finish_and_print();
                 }
-                self.config
-                    .set_settled_filter(self.profile_key.clone(), self.governor.active_filter());
-                self.config.save();
+                self.save_config_preserving_target();
                 event_loop.exit();
+            }
+            WindowEvent::Focused(false) => {
+                self.pressed_keys.clear();
+                self.sink.keypad = 0x03FF;
             }
             WindowEvent::Resized(new_size) => {
                 self.size = (new_size.width.max(1), new_size.height.max(1));
@@ -1553,29 +1624,8 @@ impl ApplicationHandler for NoGpuApp {
                     self.size.1,
                     self.config.window_scale,
                 );
-                let costs = self.blitter.measure_filter_costs(
-                    &mut self.postproc,
-                    self.config.color_correction,
-                    self.config.lcd_ghosting,
-                    self.config.lcd_grid_intensity,
-                    self.size.0 as usize,
-                    self.size.1 as usize,
-                );
-                let capped_costs = self.blitter.measure_capped_filter_costs(
-                    &mut self.postproc,
-                    self.config.color_correction,
-                    self.config.lcd_ghosting,
-                    self.config.lcd_grid_intensity,
-                    self.size.0 as usize,
-                    self.size.1 as usize,
-                    self.window.as_deref(),
-                );
-                self.governor.set_measured_costs(costs);
-                self.governor.set_resolution_cap_support(
-                    self.size.0 as usize > GOVERNOR_MAX_CAP_WIDTH
-                        || self.size.1 as usize > GOVERNOR_MAX_CAP_HEIGHT,
-                    Some(capped_costs),
-                );
+                // Debounce filter cost recalibration so live window drag stays responsive.
+                self.pending_resize_recalib = Some(Instant::now() + Duration::from_millis(350));
                 self.phase_lock.reset_schedule();
                 self.sink.frame_dirty = true;
                 if let Some(w) = &self.window {
@@ -1590,38 +1640,46 @@ impl ApplicationHandler for NoGpuApp {
                     if event.state == ElementState::Pressed {
                         self.pressed_keys.insert(code);
                         if !event.repeat {
+                            let mod_down = self.pressed_keys.contains(&KeyCode::ControlLeft)
+                                || self.pressed_keys.contains(&KeyCode::ControlRight)
+                                || self.pressed_keys.contains(&KeyCode::SuperLeft)
+                                || self.pressed_keys.contains(&KeyCode::SuperRight);
                             match code {
-                                KeyCode::KeyP => self.paused = !self.paused,
+                                KeyCode::KeyP | KeyCode::Escape => {
+                                    self.paused = !self.paused;
+                                    self.sink.audio.set_paused(self.paused);
+                                    if !self.paused {
+                                        self.next_frame_due = Instant::now();
+                                        self.phase_lock.reset_schedule();
+                                    }
+                                }
                                 KeyCode::KeyF => {
                                     let next = self.config.display_filter.next();
+                                    self.user_target_filter = next;
                                     self.config.display_filter = next;
                                     self.config.shader_preset = next.default_shader_preset();
                                     self.governor.set_user_target(next);
-                                    self.config.save();
+                                    self.save_config_preserving_target();
                                     self.sink.frame_dirty = true;
                                 }
-                                KeyCode::KeyO
-                                    if self.pressed_keys.contains(&KeyCode::ControlLeft)
-                                        || self.pressed_keys.contains(&KeyCode::ControlRight) =>
-                                {
+                                KeyCode::KeyO if mod_down => {
                                     if let Some(path) = rfd::FileDialog::new()
                                         .set_title("Open GBA ROM")
-                                        .add_filter("GBA ROMs", &["gba", "agb", "bin"])
+                                        .add_filter(
+                                            "GBA ROMs & Archives",
+                                            &["gba", "agb", "bin", "zip", "7z"],
+                                        )
                                         .pick_file()
                                     {
                                         self.load_rom(&path);
                                     }
                                 }
-                                KeyCode::Escape => {
+                                KeyCode::KeyQ if mod_down => {
                                     self.flush_save();
                                     if let Some(ref mut logger) = self.perf_logger {
                                         logger.finish_and_print();
                                     }
-                                    self.config.set_settled_filter(
-                                        self.profile_key.clone(),
-                                        self.governor.active_filter(),
-                                    );
-                                    self.config.save();
+                                    self.save_config_preserving_target();
                                     event_loop.exit();
                                 }
                                 _ => {}
@@ -1630,7 +1688,8 @@ impl ApplicationHandler for NoGpuApp {
                     } else {
                         self.pressed_keys.remove(&code);
                     }
-                    self.sink.keypad = compute_gba_keypad(&self.pressed_keys, &self.config.keybindings);
+                    self.sink.keypad =
+                        compute_gba_keypad(&self.pressed_keys, &self.config.keybindings);
                 }
             }
             WindowEvent::RedrawRequested => {
@@ -1664,6 +1723,43 @@ impl ApplicationHandler for NoGpuApp {
     }
 
     fn about_to_wait(&mut self, event_loop: &ActiveEventLoop) {
+        self.sink.audio.poll_recover_stream();
+
+        if let Some(due) = self.pending_resize_recalib
+            && Instant::now() >= due
+        {
+            self.pending_resize_recalib = None;
+            let costs = self.blitter.measure_filter_costs(
+                &mut self.postproc,
+                self.config.color_correction,
+                self.config.lcd_ghosting,
+                self.config.lcd_grid_intensity,
+                self.size.0 as usize,
+                self.size.1 as usize,
+            );
+            let capped_costs = self.blitter.measure_capped_filter_costs(
+                &mut self.postproc,
+                self.config.color_correction,
+                self.config.lcd_ghosting,
+                self.config.lcd_grid_intensity,
+                self.size.0 as usize,
+                self.size.1 as usize,
+                None,
+            );
+            self.governor.set_measured_costs(costs);
+            self.governor.set_resolution_cap_support(
+                cfg!(target_os = "windows")
+                    && (self.size.0 as usize > GOVERNOR_MAX_CAP_WIDTH
+                        || self.size.1 as usize > GOVERNOR_MAX_CAP_HEIGHT),
+                Some(capped_costs),
+            );
+        }
+
+        if self.last_save_flush.elapsed() >= Duration::from_secs(3) {
+            self.flush_save();
+            self.last_save_flush = Instant::now();
+        }
+
         if self.capture_done && self.perf_seconds.is_none() {
             self.flush_save();
             event_loop.exit();
@@ -1742,9 +1838,7 @@ impl ApplicationHandler for NoGpuApp {
                 if let Some(tr) = self.governor.record_frame(work_ms) {
                     self.config.display_filter = tr.to;
                     self.config.shader_preset = tr.to.default_shader_preset();
-                    self.config
-                        .set_settled_filter(self.profile_key.clone(), tr.to);
-                    self.config.save();
+                    self.save_config_preserving_target();
                     self.sink.frame_dirty = true;
                     println!(
                         "[governor] No-GPU {:?}: {} -> {} | capped_720x480={} (rolling_p95={:.2} ms)",
@@ -1951,9 +2045,7 @@ pub fn bench_softbuffer_sizes(
                 core.run_frame(&mut core_sink);
             }
 
-            let mut sizes = vec![
-                ("720x480 (3x GBA baseline)".to_string(), 720u32, 480u32),
-            ];
+            let mut sizes = vec![("720x480 (3x GBA baseline)".to_string(), 720u32, 480u32)];
             if self.include_scaled_slowdowns {
                 sizes.push(("1280x720 (720p)".to_string(), 1280, 720));
                 sizes.push(("1920x1080 (1080p)".to_string(), 1920, 1080));
@@ -1993,126 +2085,126 @@ pub fn bench_softbuffer_sizes(
                 }
             }
 
-            let run_variant = |variant: SizePresentVariant,
-                               res_label: &str,
-                               w: u32,
-                               h: u32,
-                               surf: &mut softbuffer::Surface<Arc<Window>, Arc<Window>>,
-                               core: &mut GbaCore,
-                               core_sink: &mut NullSink,
-                               postproc: &mut VideoPostProcessor,
-                               blitter: &mut NoGpuCpuPresenter,
-                               results: &mut Vec<SoftbufferSizeBenchRow>| {
-                for &(slug, filter, cc) in &[
-                    ("none", DisplayFilter::Sharp1x, false),
-                    ("myboy-smooth", DisplayFilter::MyBoySmooth, false),
-                ] {
-                    postproc.prewarm(cc, false, filter, false, 0.08);
-                    let linear = filter.texture_options() == egui::TextureOptions::LINEAR;
-                    let mut present_once = |core_fb: &[u16; LCD_WIDTH * LCD_HEIGHT]| {
-                        let img = postproc.process_display_filter(
-                            core_fb, cc, false, filter, false, 0.08,
-                        );
-                        match variant {
-                            SizePresentVariant::SoftbufferUncapped => {
-                                if let Ok(mut buf) = surf.buffer_mut() {
-                                    blitter.blit_rgba_to_slice(
+            let run_variant =
+                |variant: SizePresentVariant,
+                 res_label: &str,
+                 w: u32,
+                 h: u32,
+                 surf: &mut softbuffer::Surface<Arc<Window>, Arc<Window>>,
+                 core: &mut GbaCore,
+                 core_sink: &mut NullSink,
+                 postproc: &mut VideoPostProcessor,
+                 blitter: &mut NoGpuCpuPresenter,
+                 results: &mut Vec<SoftbufferSizeBenchRow>| {
+                    for &(slug, filter, cc) in &[
+                        ("none", DisplayFilter::Sharp1x, false),
+                        ("myboy-smooth", DisplayFilter::MyBoySmooth, false),
+                    ] {
+                        postproc.prewarm(cc, false, filter, false, 0.08);
+                        let linear = filter.texture_options() == egui::TextureOptions::LINEAR;
+                        let mut present_once = |core_fb: &[u16; LCD_WIDTH * LCD_HEIGHT]| {
+                            let img = postproc
+                                .process_display_filter(core_fb, cc, false, filter, false, 0.08);
+                            match variant {
+                                SizePresentVariant::SoftbufferUncapped => {
+                                    if let Ok(mut buf) = surf.buffer_mut() {
+                                        blitter.blit_rgba_to_slice(
+                                            &img.pixels,
+                                            img.size[0],
+                                            img.size[1],
+                                            &mut buf,
+                                            w as usize,
+                                            h as usize,
+                                            linear,
+                                        );
+                                        let _ = buf.present();
+                                    }
+                                }
+                                #[cfg(target_os = "windows")]
+                                SizePresentVariant::StretchDibitsColorOnColor => {
+                                    let _ = blitter.present_capped_os_stretch(
+                                        &win,
                                         &img.pixels,
                                         img.size[0],
                                         img.size[1],
-                                        &mut buf,
                                         w as usize,
                                         h as usize,
-                                        linear,
+                                        false,
                                     );
-                                    let _ = buf.present();
+                                }
+                                #[cfg(target_os = "windows")]
+                                SizePresentVariant::StretchDibitsHalftone => {
+                                    let _ = blitter.present_capped_os_stretch(
+                                        &win,
+                                        &img.pixels,
+                                        img.size[0],
+                                        img.size[1],
+                                        w as usize,
+                                        h as usize,
+                                        true,
+                                    );
                                 }
                             }
-                            #[cfg(target_os = "windows")]
-                            SizePresentVariant::StretchDibitsColorOnColor => {
-                                let _ = blitter.present_capped_os_stretch(
-                                    &win,
-                                    &img.pixels,
-                                    img.size[0],
-                                    img.size[1],
-                                    w as usize,
-                                    h as usize,
-                                    false,
-                                );
-                            }
-                            #[cfg(target_os = "windows")]
-                            SizePresentVariant::StretchDibitsHalftone => {
-                                let _ = blitter.present_capped_os_stretch(
-                                    &win,
-                                    &img.pixels,
-                                    img.size[0],
-                                    img.size[1],
-                                    w as usize,
-                                    h as usize,
-                                    true,
-                                );
-                            }
-                        }
-                    };
-                    for _ in 0..8 {
-                        core.run_frame(core_sink);
-                        present_once(&core_sink.0);
-                    }
-
-                    for &slowdown in slowdowns {
-                        let mut present_samples = Vec::with_capacity(self.frames);
-                        let mut total_samples = Vec::with_capacity(self.frames);
-                        let mut over_budget = 0usize;
-                        for _ in 0..self.frames {
-                            let t_frame = Instant::now();
+                        };
+                        for _ in 0..8 {
                             core.run_frame(core_sink);
-                            let t_pres = Instant::now();
                             present_once(&core_sink.0);
-                            let pres_ms = t_pres.elapsed().as_secs_f64() * 1000.0;
-                            let raw_dur = t_frame.elapsed();
-                            if slowdown > 1 {
-                                let target = raw_dur.mul_f64(slowdown as f64);
-                                while t_frame.elapsed() < target {
-                                    std::hint::spin_loop();
-                                }
-                            }
-                            let total_ms = t_frame.elapsed().as_secs_f64() * 1000.0;
-                            if total_ms > 1000.0 / (16_777_216.0 / 280_896.0) {
-                                over_budget += 1;
-                            }
-                            present_samples.push(pres_ms * slowdown as f64);
-                            total_samples.push(total_ms);
                         }
-                        present_samples.sort_by(f64::total_cmp);
-                        total_samples.sort_by(f64::total_cmp);
-                        let n = self.frames.max(1);
-                        let pres_avg = present_samples.iter().sum::<f64>() / n as f64;
-                        let pres_p95 = present_samples[((n - 1) * 95) / 100];
-                        let tot_avg = total_samples.iter().sum::<f64>() / n as f64;
-                        let tot_p95 = total_samples[((n - 1) * 95) / 100];
-                        let tot_p99 = total_samples[((n - 1) * 99) / 100];
-                        let tot_worst = *total_samples.last().unwrap_or(&0.0);
-                        let over_pct = (over_budget as f64 / n as f64) * 100.0;
-                        results.push(SoftbufferSizeBenchRow {
-                            present_mode: variant.label().to_string(),
-                            resolution_label: res_label.to_string(),
-                            width: w,
-                            height: h,
-                            filter: slug.to_string(),
-                            slowdown_x: slowdown,
-                            frames: self.frames,
-                            present_only_avg_ms: pres_avg,
-                            present_only_p95_ms: pres_p95,
-                            total_work_avg_ms: tot_avg,
-                            total_work_p95_ms: tot_p95,
-                            total_work_p99_ms: tot_p99,
-                            total_work_worst_ms: tot_worst,
-                            over_budget_pct: over_pct,
-                            fits_budget: over_pct < 0.50,
-                        });
+
+                        for &slowdown in slowdowns {
+                            let mut present_samples = Vec::with_capacity(self.frames);
+                            let mut total_samples = Vec::with_capacity(self.frames);
+                            let mut over_budget = 0usize;
+                            for _ in 0..self.frames {
+                                let t_frame = Instant::now();
+                                core.run_frame(core_sink);
+                                let t_pres = Instant::now();
+                                present_once(&core_sink.0);
+                                let pres_ms = t_pres.elapsed().as_secs_f64() * 1000.0;
+                                let raw_dur = t_frame.elapsed();
+                                if slowdown > 1 {
+                                    let target = raw_dur.mul_f64(slowdown as f64);
+                                    while t_frame.elapsed() < target {
+                                        std::hint::spin_loop();
+                                    }
+                                }
+                                let total_ms = t_frame.elapsed().as_secs_f64() * 1000.0;
+                                if total_ms > 1000.0 / (16_777_216.0 / 280_896.0) {
+                                    over_budget += 1;
+                                }
+                                present_samples.push(pres_ms * slowdown as f64);
+                                total_samples.push(total_ms);
+                            }
+                            present_samples.sort_by(f64::total_cmp);
+                            total_samples.sort_by(f64::total_cmp);
+                            let n = self.frames.max(1);
+                            let pres_avg = present_samples.iter().sum::<f64>() / n as f64;
+                            let pres_p95 = present_samples[((n - 1) * 95) / 100];
+                            let tot_avg = total_samples.iter().sum::<f64>() / n as f64;
+                            let tot_p95 = total_samples[((n - 1) * 95) / 100];
+                            let tot_p99 = total_samples[((n - 1) * 99) / 100];
+                            let tot_worst = *total_samples.last().unwrap_or(&0.0);
+                            let over_pct = (over_budget as f64 / n as f64) * 100.0;
+                            results.push(SoftbufferSizeBenchRow {
+                                present_mode: variant.label().to_string(),
+                                resolution_label: res_label.to_string(),
+                                width: w,
+                                height: h,
+                                filter: slug.to_string(),
+                                slowdown_x: slowdown,
+                                frames: self.frames,
+                                present_only_avg_ms: pres_avg,
+                                present_only_p95_ms: pres_p95,
+                                total_work_avg_ms: tot_avg,
+                                total_work_p95_ms: tot_p95,
+                                total_work_p99_ms: tot_p99,
+                                total_work_worst_ms: tot_worst,
+                                over_budget_pct: over_pct,
+                                fits_budget: over_pct < 0.50,
+                            });
+                        }
                     }
-                }
-            };
+                };
 
             for (res_label, w, h) in sizes {
                 let _ = surf.resize(
@@ -2262,11 +2354,8 @@ mod tests {
                 cost_ms: c.cost_ms * capped_scale,
             })
             .collect();
-        let mut gov = QualityGovernor::with_measured_costs(
-            DisplayFilter::MyBoySmooth,
-            true,
-            scaled_uncapped,
-        );
+        let mut gov =
+            QualityGovernor::with_measured_costs(DisplayFilter::MyBoySmooth, true, scaled_uncapped);
         gov.set_resolution_cap_support(true, Some(scaled_capped));
 
         let cap_tr = (0..(GOVERNOR_WINDOW_FRAMES + GOVERNOR_DOWN_SUSTAIN_FRAMES))

@@ -1576,7 +1576,10 @@ impl GbaCore {
 
         self.bus.ewram.copy_from_slice(&payload.bus.ewram[..]);
         self.bus.iwram.copy_from_slice(&payload.bus.iwram[..]);
-        self.bus.cart.sram.copy_from_slice(&payload.bus.cart.sram[..]);
+        self.bus
+            .cart
+            .sram
+            .copy_from_slice(&payload.bus.cart.sram[..]);
         self.bus.ppu.pram.copy_from_slice(&payload.bus.ppu.pram[..]);
         self.bus.ppu.vram.copy_from_slice(&payload.bus.ppu.vram[..]);
         self.bus.ppu.oam.copy_from_slice(&payload.bus.ppu.oam[..]);

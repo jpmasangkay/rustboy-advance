@@ -1,5 +1,6 @@
 use std::io::{BufRead, BufReader, Write};
 use std::process::{Command, Stdio};
+#[cfg(target_os = "windows")]
 use std::sync::atomic::{AtomicBool, AtomicIsize, AtomicUsize, Ordering};
 use std::sync::{Arc, mpsc};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
@@ -283,11 +284,11 @@ pub fn run_gpu_probe_child(cli: &CliConfig) -> Result<(), String> {
             let view = frame
                 .texture
                 .create_view(&wgpu::TextureViewDescriptor::default());
-            let mut encoder =
-                self.device
-                    .create_command_encoder(&wgpu::CommandEncoderDescriptor {
-                        label: Some("rba_gpu_probe_first_frame"),
-                    });
+            let mut encoder = self
+                .device
+                .create_command_encoder(&wgpu::CommandEncoderDescriptor {
+                    label: Some("rba_gpu_probe_first_frame"),
+                });
             {
                 let _pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
                     label: Some("rba_gpu_probe_clear"),
@@ -528,8 +529,8 @@ fn run_probe_subprocess(
 
 #[cfg(target_os = "windows")]
 mod checking_splash {
-    use std::thread::JoinHandle;
     use super::*;
+    use std::thread::JoinHandle;
 
     const WM_DESTROY: u32 = 0x0002;
     const WM_PAINT: u32 = 0x000F;
@@ -993,7 +994,11 @@ where
             );
             return GpuGuardOutcome::AllowGpu;
         }
-        if config.verified_gpu_adapters.remove(&meta.block_key).is_some() {
+        if config
+            .verified_gpu_adapters
+            .remove(&meta.block_key)
+            .is_some()
+        {
             config_dirty = true;
             println!(
                 "[gpu-guard] Cached GPU probe invalidated for `{}` (driver changed to `{}` / `{}`); re-probing",
@@ -1179,17 +1184,11 @@ pub fn ensure_gpu_startup_safe(cli: &CliConfig, config: &mut AppConfig) -> GpuGu
             };
         }
     };
-    let outcome = evaluate_guard_with_runner_at(
-        cli,
-        config,
-        true,
-        utc_epoch_secs(),
-        peek_meta,
-        |timeout| {
+    let outcome =
+        evaluate_guard_with_runner_at(cli, config, true, utc_epoch_secs(), peek_meta, |timeout| {
             let _splash = checking_splash::SplashGuard::spawn();
             run_probe_subprocess(&exe, cli.software_adapter, cli.probe_fail_stage, timeout)
-        },
-    );
+        });
     let total_ms = guard_start.elapsed().as_secs_f64() * 1000.0;
     println!("[gpu-guard] Startup GPU guard completed in {total_ms:.1} ms");
     outcome
@@ -1257,7 +1256,10 @@ mod tests {
                     fail_result(&meta, stage, timed_out)
                 },
             );
-            assert_eq!(t1, Some(Duration::from_millis(DEFAULT_GPU_PROBE_TIMEOUT_MS)));
+            assert_eq!(
+                t1,
+                Some(Duration::from_millis(DEFAULT_GPU_PROBE_TIMEOUT_MS))
+            );
             assert!(matches!(outcome1, GpuGuardOutcome::UseNoGpu { .. }));
             let recorded1 = config
                 .blocked_gpu_adapters
@@ -1311,8 +1313,10 @@ mod tests {
             assert!(matches!(outcome3, GpuGuardOutcome::UseNoGpu { .. }));
 
             // Launch 4 with --retry-gpu clears blocklist, probes again, and caches success.
-            let mut retry_cli = CliConfig::default();
-            retry_cli.retry_gpu = true;
+            let retry_cli = CliConfig {
+                retry_gpu: true,
+                ..Default::default()
+            };
             let mut probed_after_retry = false;
             let outcome4 = evaluate_guard_with_runner_at(
                 &retry_cli,
@@ -1353,7 +1357,10 @@ mod tests {
             |_| fail_result(&meta, "hang", true),
         );
         assert!(matches!(o1, GpuGuardOutcome::UseNoGpu { .. }));
-        assert_eq!(config.blocked_gpu_adapters[&meta.block_key].consecutive_failures, 1);
+        assert_eq!(
+            config.blocked_gpu_adapters[&meta.block_key].consecutive_failures,
+            1
+        );
 
         // Second launch retries with 20s timeout and succeeds -> resets failure state and caches verified adapter.
         let mut retry_timeout = None;
@@ -1368,7 +1375,10 @@ mod tests {
                 ok_result(&meta)
             },
         );
-        assert_eq!(retry_timeout, Some(Duration::from_millis(RETRY_GPU_PROBE_TIMEOUT_MS)));
+        assert_eq!(
+            retry_timeout,
+            Some(Duration::from_millis(RETRY_GPU_PROBE_TIMEOUT_MS))
+        );
         assert_eq!(o2, GpuGuardOutcome::AllowGpu);
         assert!(config.blocked_gpu_adapters.is_empty());
         assert!(
@@ -1396,7 +1406,10 @@ mod tests {
                 |_| fail_result(&meta, "hang", true),
             );
         }
-        assert_eq!(config.blocked_gpu_adapters[&meta.block_key].consecutive_failures, 2);
+        assert_eq!(
+            config.blocked_gpu_adapters[&meta.block_key].consecutive_failures,
+            2
+        );
 
         // At +29 days with same driver: still blocked (probe skipped).
         let mut probed_day29 = false;
@@ -1430,7 +1443,10 @@ mod tests {
             },
         );
         assert!(probed_day30);
-        assert_eq!(t_day30, Some(Duration::from_millis(DEFAULT_GPU_PROBE_TIMEOUT_MS)));
+        assert_eq!(
+            t_day30,
+            Some(Duration::from_millis(DEFAULT_GPU_PROBE_TIMEOUT_MS))
+        );
         assert_eq!(o_day30, GpuGuardOutcome::AllowGpu);
 
         // Next warm launch with same driver skips child probe via verified cache.
@@ -1464,7 +1480,10 @@ mod tests {
                 ok_result(&updated_meta)
             },
         );
-        assert!(probed_new_driver, "driver change must invalidate verified cache");
+        assert!(
+            probed_new_driver,
+            "driver change must invalidate verified cache"
+        );
         assert_eq!(o_drv, GpuGuardOutcome::AllowGpu);
 
         // Block with old driver -> driver change also immediately expires blocklist.
@@ -1490,7 +1509,10 @@ mod tests {
                 ok_result(&updated_meta)
             },
         );
-        assert!(probed_after_drv_update, "driver change must expire blocklist");
+        assert!(
+            probed_after_drv_update,
+            "driver change must expire blocklist"
+        );
         assert_eq!(o_unblocked, GpuGuardOutcome::AllowGpu);
     }
 }

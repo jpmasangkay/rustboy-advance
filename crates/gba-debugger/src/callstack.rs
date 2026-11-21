@@ -139,7 +139,7 @@ pub fn is_return_instruction(core: &GbaCore, pc: u32, thumb: bool, cpsr: u32) ->
         }
         // GCC/ARMv4T Thumb interworking epilogue: `pop {..., r0-r3}; bx r0-r3`
         if (op & 0xFF87) == 0x4700 {
-            let reg = ((op >> 3) & 0xF) as u16;
+            let reg = (op >> 3) & 0xF;
             if reg <= 3 {
                 let prev = core.peek16(pc.wrapping_sub(2));
                 if (prev & 0xFF00) == 0xBC00 && (prev & (1 << reg)) != 0 {

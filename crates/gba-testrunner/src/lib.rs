@@ -1,3 +1,5 @@
+pub mod stress_roms;
+
 use std::collections::HashSet;
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -122,11 +124,21 @@ pub struct TestResult {
     pub criterion: Criterion,
     pub outcome: TestOutcome,
     pub known_failure: bool,
+    /// `true` when a `known_failure` test's CRC32 diverged from `known_bad_crc32` (unexpected
+    /// regression or unacknowledged fix requiring manifest/golden update).
+    pub known_bad_drift: bool,
     pub frames_executed: usize,
     pub avg_frame_ms: f64,
     pub fb_hash: Option<u64>,
     pub fb_crc32: Option<u32>,
     pub notes: String,
+}
+
+impl TestResult {
+    /// Returns `true` when this result should fail `--fail-on-unexpected` / `cargo test`.
+    pub const fn is_unexpected_failure(&self) -> bool {
+        matches!(self.outcome, TestOutcome::Fail) && (!self.known_failure || self.known_bad_drift)
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -433,6 +445,7 @@ pub fn run_single_test(
             criterion: entry.criterion,
             outcome: TestOutcome::SkipMissingRom,
             known_failure: entry.known_failure,
+            known_bad_drift: false,
             frames_executed: 0,
             avg_frame_ms: 0.0,
             fb_hash: None,
@@ -456,6 +469,7 @@ pub fn run_single_test(
                 criterion: entry.criterion,
                 outcome: TestOutcome::Fail,
                 known_failure: entry.known_failure,
+                known_bad_drift: false,
                 frames_executed: 0,
                 avg_frame_ms: 0.0,
                 fb_hash: None,
@@ -476,6 +490,7 @@ pub fn run_single_test(
                 criterion: entry.criterion,
                 outcome: TestOutcome::Fail,
                 known_failure: entry.known_failure,
+                known_bad_drift: false,
                 frames_executed: 0,
                 avg_frame_ms: 0.0,
                 fb_hash: None,
@@ -542,7 +557,7 @@ pub fn run_single_test(
         crc32: fb_crc32,
     };
 
-    let (outcome, notes) = evaluate_entry(
+    let (outcome, known_bad_drift, notes) = evaluate_entry(
         entry,
         &core,
         &observed,
@@ -566,6 +581,7 @@ pub fn run_single_test(
         criterion: entry.criterion,
         outcome,
         known_failure: entry.known_failure,
+        known_bad_drift,
         frames_executed,
         avg_frame_ms,
         fb_hash: Some(fb_hash),
@@ -591,7 +607,7 @@ fn evaluate_entry(
     settled_in_loop: bool,
     frames_executed: usize,
     opts: &RunOptions,
-) -> (TestOutcome, String) {
+) -> (TestOutcome, bool, String) {
     let fb = observed.fb;
     let fb_hash = observed.hash;
     let fb_crc32 = observed.crc32;
@@ -605,6 +621,7 @@ fn evaluate_entry(
             if !settled_in_loop {
                 return (
                     TestOutcome::Fail,
+                    false,
                     format!(
                         "did not reach idle loop within {frames_executed} frames (PC=0x{pc:08X}, r{reg_idx}={reg_val})"
                     ),
@@ -613,6 +630,7 @@ fn evaluate_entry(
             if reg_val != entry.expected_reg_value {
                 return (
                     TestOutcome::Fail,
+                    false,
                     format!(
                         "failed test #{reg_val} (r{reg_idx}={reg_val}, expected {}, PC=0x{pc:08X})",
                         entry.expected_reg_value
@@ -622,6 +640,7 @@ fn evaluate_entry(
             if distinct < 2 {
                 return (
                     TestOutcome::Fail,
+                    false,
                     format!(
                         "PC settled at 0x{pc:08X} with r{reg_idx}={reg_val}, but screen is blank (possible early hang)"
                     ),
@@ -629,6 +648,7 @@ fn evaluate_entry(
             }
             (
                 TestOutcome::Pass,
+                false,
                 format!("r{reg_idx}={reg_val} at idle PC=0x{pc:08X} ({frames_executed}f)"),
             )
         }
@@ -636,10 +656,11 @@ fn evaluate_entry(
             let hash_path = opts.golden_dir.join(format!("{}.hash", entry.id));
             if opts.record && !entry.known_failure && !entry.interactive {
                 if let Err(e) = write_golden_hash(&hash_path, fb_hash) {
-                    return (TestOutcome::Fail, e);
+                    return (TestOutcome::Fail, false, e);
                 }
                 return (
                     TestOutcome::Pass,
+                    false,
                     format!("recorded hash 0x{fb_hash:016x} (crc32=0x{fb_crc32:08x})"),
                 );
             }
@@ -659,14 +680,17 @@ fn evaluate_entry(
             match u64::from_str_radix(trimmed, 16) {
                 Ok(expected) if expected == fb_hash => (
                     TestOutcome::Pass,
+                    false,
                     format!("hash 0x{fb_hash:016x} (crc32=0x{fb_crc32:08x})"),
                 ),
                 Ok(expected) => (
                     TestOutcome::Fail,
+                    false,
                     format!("hash mismatch: got 0x{fb_hash:016x}, expected 0x{expected:016x}"),
                 ),
                 Err(e) => (
                     TestOutcome::Fail,
+                    false,
                     format!("invalid golden hash in {}: {e}", hash_path.display()),
                 ),
             }
@@ -675,10 +699,11 @@ fn evaluate_entry(
             let png_path = opts.golden_dir.join(format!("{}.png", entry.id));
             if opts.record && !entry.known_failure && !entry.interactive {
                 if let Err(e) = save_fb_png(&png_path, fb) {
-                    return (TestOutcome::Fail, e);
+                    return (TestOutcome::Fail, false, e);
                 }
                 return (
                     TestOutcome::Pass,
+                    false,
                     format!("recorded golden PNG (crc32=0x{fb_crc32:08x})"),
                 );
             }
@@ -688,6 +713,7 @@ fn evaluate_entry(
             match compare_fb_with_png(fb, &png_path) {
                 Ok((0, _)) => (
                     TestOutcome::Pass,
+                    false,
                     format!("pixel-exact match (crc32=0x{fb_crc32:08x})"),
                 ),
                 Ok((diffs, first)) => {
@@ -701,10 +727,11 @@ fn evaluate_entry(
                     };
                     (
                         TestOutcome::Fail,
+                        false,
                         format!("{diffs} pixels differ vs golden PNG;{detail}"),
                     )
                 }
-                Err(e) => (TestOutcome::Fail, e),
+                Err(e) => (TestOutcome::Fail, false, e),
             }
         }
     }
@@ -716,7 +743,7 @@ fn evaluate_missing_golden(
     fb_crc32: u32,
     kind_desc: &str,
     missing_path: &Path,
-) -> (TestOutcome, String) {
+) -> (TestOutcome, bool, String) {
     if entry.known_failure {
         let base_note = if entry.notes.is_empty() {
             "known failure (no passing golden recorded)"
@@ -728,16 +755,19 @@ fn evaluate_missing_golden(
             return match u32::from_str_radix(trimmed, 16) {
                 Ok(exp_bad) if exp_bad == fb_crc32 => (
                     TestOutcome::Fail,
+                    false,
                     format!("{base_note} (crc32=0x{fb_crc32:08x})"),
                 ),
                 Ok(exp_bad) => (
                     TestOutcome::Fail,
+                    true,
                     format!(
                         "output changed from known-bad baseline 0x{exp_bad:08x} to 0x{fb_crc32:08x} ({base_note})"
                     ),
                 ),
                 Err(_) => (
                     TestOutcome::Fail,
+                    true,
                     format!(
                         "invalid known_bad_crc32 `{bad_hex}` (observed crc32=0x{fb_crc32:08x})"
                     ),
@@ -746,6 +776,7 @@ fn evaluate_missing_golden(
         }
         return (
             TestOutcome::Fail,
+            false,
             format!("{base_note} (crc32=0x{fb_crc32:08x})"),
         );
     }
@@ -762,6 +793,7 @@ fn evaluate_missing_golden(
         .unwrap_or_else(|| missing_path.display().to_string());
     (
         TestOutcome::SkipMissingGolden,
+        false,
         format!(
             "missing {kind_desc} `{rel_golden}` (observed 0x{fb_hash:016x}, crc32=0x{fb_crc32:08x}){suffix}"
         ),
@@ -913,10 +945,18 @@ mod tests {
             notes: "expected subtest failure".to_string(),
         };
         let missing = std::env::temp_dir().join("__nonexistent_golden__.png");
-        let (outcome, notes) = evaluate_missing_golden(&entry, hash, crc, "golden PNG", &missing);
+        let (outcome, drift, notes) =
+            evaluate_missing_golden(&entry, hash, crc, "golden PNG", &missing);
         assert_eq!(outcome, TestOutcome::Fail);
+        assert!(!drift);
         assert!(notes.contains("expected subtest failure"));
         assert!(notes.contains(&format!("0x{crc:08x}")));
+
+        let (outcome2, drift2, notes2) =
+            evaluate_missing_golden(&entry, hash, crc ^ 1, "golden PNG", &missing);
+        assert_eq!(outcome2, TestOutcome::Fail);
+        assert!(drift2, "divergent CRC32 must flag known_bad_drift");
+        assert!(notes2.contains("output changed from known-bad baseline"));
     }
 
     #[test]

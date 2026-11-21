@@ -16,10 +16,7 @@ pub(crate) fn write_atomic(path: &Path, data: &[u8]) -> std::io::Result<()> {
     }
     let pid = std::process::id();
     let seq = ATOMIC_TMP_COUNTER.fetch_add(1, Ordering::Relaxed);
-    let file_name = path
-        .file_name()
-        .and_then(|n| n.to_str())
-        .unwrap_or("file");
+    let file_name = path.file_name().and_then(|n| n.to_str()).unwrap_or("file");
     let tmp_path = path.with_file_name(format!(".{file_name}.{pid}.{seq}.tmp"));
 
     let write_res = (|| -> std::io::Result<()> {
@@ -1389,7 +1386,10 @@ impl AppConfig {
         if let Ok(json) = serde_json::to_string_pretty(self)
             && let Err(e) = write_atomic(&path, json.as_bytes())
         {
-            log::warn!("Failed to atomically save config to {}: {e}", path.display());
+            log::warn!(
+                "Failed to atomically save config to {}: {e}",
+                path.display()
+            );
         }
     }
 
@@ -1673,7 +1673,10 @@ mod tests {
         cfg.set_settled_filter(k2.clone(), DisplayFilter::Sharp1x);
         let raw = serde_json::to_string(&cfg).expect("serialize config");
         let back = AppConfig::from_json_str(&raw);
-        assert_eq!(back.settled_filter_for(&k1), Some(DisplayFilter::MyBoySmooth));
+        assert_eq!(
+            back.settled_filter_for(&k1),
+            Some(DisplayFilter::MyBoySmooth)
+        );
         assert_eq!(back.settled_filter_for(&k2), Some(DisplayFilter::Sharp1x));
         assert_eq!(back.settled_filter_for(&k3), None);
     }

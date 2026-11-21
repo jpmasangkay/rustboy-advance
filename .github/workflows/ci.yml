@@ -47,34 +47,50 @@ jobs:
         uses: Swatinem/rust-cache@v2
 
       - name: Check formatting
-        run: |
-          # Note: Workspace-wide `cargo fmt --check` currently fails on pre-existing
-          # crates on main (e.g., gba-core), so it is skipped here until formatted.
-          # Enforce strict formatting on the test runner crate:
-          cargo fmt -p gba-testrunner -- --check
+        run: cargo fmt --all -- --check
 
       - name: Run Clippy
-        run: |
-          # Existing crates on main emit clippy warnings, so run workspace clippy
-          # without -D warnings, and enforce -D warnings on gba-testrunner:
-          cargo clippy --workspace --all-targets
-          cargo clippy -p gba-testrunner --all-targets --no-deps -- -D warnings
+        run: cargo clippy --workspace --all-targets -- -D warnings
 
-      - name: Run workspace unit & harness tests (dev profile)
-        run: cargo test --workspace
+      - name: Check no_std core builds
+        run: |
+          cargo check -p gba-core --no-default-features
+          cargo check -p gb-core --no-default-features
+          cargo check -p gba-debugger --no-default-features
+
+      - name: Check fuzz targets compile
+        run: cargo check --manifest-path fuzz/Cargo.toml
+
+      - name: Check web frontend JavaScript syntax
+        run: |
+          node --check web/server.js
+          node --check web/storage.js
+          node --check web/input.js
+          node --check web/audio-worklet.js
+          node --check web/main.js
+
+      - name: Run workspace unit & harness tests
+        run: |
+          cargo test --workspace
+          cargo test -p gba-core --features jit
+
+      - name: Build release libretro core & desktop binary
+        run: |
+          cargo build --release -p gba-libretro
+          cargo build --release -p gba-testrunner
 
       - name: Fetch freely-redistributable test ROMs (Unix)
         if: runner.os != 'Windows'
         shell: bash
-        run: ./scripts/fetch-test-roms.sh --roms-only
+        run: ./scripts/fetch-test-roms.sh
 
       - name: Fetch freely-redistributable test ROMs (Windows)
         if: runner.os == 'Windows'
         shell: pwsh
-        run: ./scripts/fetch-test-roms.ps1 -RomsOnly
+        run: ./scripts/fetch-test-roms.ps1
 
       - name: Run GBA test ROM suite & generate TEST_RESULTS.md
-        run: cargo run -p gba-testrunner -- --report TEST_RESULTS.md --fail-on-unexpected
+        run: cargo run --release -p gba-testrunner -- --report TEST_RESULTS.md --fail-on-unexpected
 
       - name: Upload TEST_RESULTS.md and test_output artifacts
         if: always()

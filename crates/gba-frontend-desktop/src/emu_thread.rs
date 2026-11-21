@@ -78,9 +78,7 @@ impl SharedTripleBuffer {
         unsafe {
             (*self.buffers[slot].get()).copy_from_slice(frame);
         }
-        let prev = self
-            .latest_packed
-            .swap(slot | DIRTY_BIT, Ordering::AcqRel);
+        let prev = self.latest_packed.swap(slot | DIRTY_BIT, Ordering::AcqRel);
         self.write_lock.store(false, Ordering::Release);
         prev & SLOT_MASK
     }
@@ -100,9 +98,7 @@ impl SharedTripleBuffer {
     /// the new unread buffer slot allocated for the writer.
     pub fn publish_frame(&self, written_slot: usize) -> usize {
         let slot = written_slot % 3;
-        let prev = self
-            .latest_packed
-            .swap(slot | DIRTY_BIT, Ordering::AcqRel);
+        let prev = self.latest_packed.swap(slot | DIRTY_BIT, Ordering::AcqRel);
         prev & SLOT_MASK
     }
 

@@ -14,16 +14,17 @@ use gba_core::{
 
 use crate::ffi::{
     RETRO_DEVICE_ID_JOYPAD_A, RETRO_DEVICE_ID_JOYPAD_B, RETRO_DEVICE_ID_JOYPAD_DOWN,
-    RETRO_DEVICE_ID_JOYPAD_L, RETRO_DEVICE_ID_JOYPAD_LEFT, RETRO_DEVICE_ID_JOYPAD_R,
-    RETRO_DEVICE_ID_JOYPAD_RIGHT, RETRO_DEVICE_ID_JOYPAD_SELECT, RETRO_DEVICE_ID_JOYPAD_START,
-    RETRO_DEVICE_ID_JOYPAD_UP, RETRO_DEVICE_JOYPAD, RETRO_DEVICE_NONE,
-    RETRO_ENVIRONMENT_GET_LOG_INTERFACE, RETRO_ENVIRONMENT_GET_RUMBLE_INTERFACE,
-    RETRO_ENVIRONMENT_GET_SYSTEM_DIRECTORY, RETRO_ENVIRONMENT_GET_VARIABLE_UPDATE,
-    RETRO_ENVIRONMENT_SET_CONTROLLER_INFO, RETRO_ENVIRONMENT_SET_INPUT_DESCRIPTORS,
-    RETRO_ENVIRONMENT_SET_MEMORY_MAPS, RETRO_ENVIRONMENT_SET_PIXEL_FORMAT,
-    RETRO_ENVIRONMENT_SET_SUPPORT_ACHIEVEMENTS, RETRO_ENVIRONMENT_SET_SUPPORT_NO_GAME,
-    RETRO_ENVIRONMENT_SET_VARIABLES, RETRO_LOG_INFO, RETRO_LOG_WARN, RETRO_MEMDESC_CONST,
-    RETRO_MEMDESC_SAVE_RAM, RETRO_MEMDESC_SYSTEM_RAM, RETRO_MEMORY_MASK, RETRO_MEMORY_SAVE_RAM,
+    RETRO_DEVICE_ID_JOYPAD_L, RETRO_DEVICE_ID_JOYPAD_LEFT, RETRO_DEVICE_ID_JOYPAD_MASK,
+    RETRO_DEVICE_ID_JOYPAD_R, RETRO_DEVICE_ID_JOYPAD_RIGHT, RETRO_DEVICE_ID_JOYPAD_SELECT,
+    RETRO_DEVICE_ID_JOYPAD_START, RETRO_DEVICE_ID_JOYPAD_UP, RETRO_DEVICE_JOYPAD,
+    RETRO_DEVICE_NONE, RETRO_ENVIRONMENT_GET_INPUT_BITMASKS, RETRO_ENVIRONMENT_GET_LOG_INTERFACE,
+    RETRO_ENVIRONMENT_GET_RUMBLE_INTERFACE, RETRO_ENVIRONMENT_GET_SYSTEM_DIRECTORY,
+    RETRO_ENVIRONMENT_GET_VARIABLE_UPDATE, RETRO_ENVIRONMENT_SET_CONTROLLER_INFO,
+    RETRO_ENVIRONMENT_SET_INPUT_DESCRIPTORS, RETRO_ENVIRONMENT_SET_MEMORY_MAPS,
+    RETRO_ENVIRONMENT_SET_PIXEL_FORMAT, RETRO_ENVIRONMENT_SET_SUPPORT_ACHIEVEMENTS,
+    RETRO_ENVIRONMENT_SET_SUPPORT_NO_GAME, RETRO_ENVIRONMENT_SET_VARIABLES, RETRO_LOG_INFO,
+    RETRO_LOG_WARN, RETRO_MEMDESC_CONST, RETRO_MEMDESC_SAVE_RAM, RETRO_MEMDESC_SYSTEM_RAM,
+    RETRO_MEMDESC_VIDEO_RAM, RETRO_MEMORY_MASK, RETRO_MEMORY_RTC, RETRO_MEMORY_SAVE_RAM,
     RETRO_MEMORY_SYSTEM_RAM, RETRO_PIXEL_FORMAT_0RGB1555, RETRO_PIXEL_FORMAT_RGB565,
     RETRO_RUMBLE_STRONG, RETRO_RUMBLE_WEAK, retro_audio_sample_batch_t, retro_audio_sample_t,
     retro_environment_t, retro_game_info, retro_input_poll_t, retro_input_state_t,
@@ -36,15 +37,17 @@ use crate::options::{
 use crate::video::{OutputPixelFormat, convert_framebuffer, convert_pixels};
 
 const STATE_MAGIC: [u8; 4] = *b"RBLS";
-const STATE_VERSION: u32 = 1;
+const STATE_VERSION: u32 = 2;
 const STATE_HEADER_SIZE: usize = 16;
-const STATE_MARGIN_BYTES: usize = 256 * 1024;
-const STATE_MIN_BOUND_BYTES: usize = 1024 * 1024;
+const STATE_MARGIN_BYTES: usize = 64 * 1024;
+const GB_RTC_BUF_SIZE: usize = 48;
 
 const BIOS_SIZE: usize = 0x4000;
 const EWRAM_SIZE: usize = 0x40000;
 const IWRAM_SIZE: usize = 0x8000;
 const SRAM_MAX_SIZE: usize = 0x20000;
+const GB_VRAM_SIZE: usize = 0x4000;
+const GB_OAM_SIZE: usize = 0xA0;
 
 static STATE: Mutex<LibretroState> = Mutex::new(LibretroState::new());
 
@@ -96,7 +99,9 @@ impl ActiveCore {
 
     fn save_state_bytes(&self) -> Result<Vec<u8>, ()> {
         match self {
-            Self::Gba(core) => core.save_state().map_err(|_| ()),
+            // Uncompressed postcard payload enables optimal XOR-delta rewind compression
+            // in RetroArch and avoids per-frame LZ4 overhead.
+            Self::Gba(core) => core.save_state_raw().map_err(|_| ()),
             Self::Gb(core) => core.save_state().map_err(|_| ()),
         }
     }
@@ -107,6 +112,60 @@ impl ActiveCore {
             Self::Gb(core) => core.is_rumble_active(),
         }
     }
+
+    fn init_rtc_from_host(&mut self) {
+        let (year, month, day, dow, hour, min, sec, unix) = utc_now_civil();
+        match self {
+            Self::Gba(core) => {
+                if core.bus.cart.effective_rtc() {
+                    core.bus
+                        .cart
+                        .rtc
+                        .set_datetime(year, month, day, dow, hour, min, sec);
+                }
+            }
+            Self::Gb(core) => {
+                if core.bus.cart.has_rtc() {
+                    core.bus.cart.rtc.timestamp = unix;
+                }
+            }
+        }
+    }
+}
+
+/// Computes current UTC civil date/time plus Unix timestamp without external crates.
+fn utc_now_civil() -> (u8, u8, u8, u8, u8, u8, u8, u64) {
+    let unix = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs();
+    let days = (unix / 86_400) as i64;
+    let secs_of_day = unix % 86_400;
+    let hour = (secs_of_day / 3600) as u8;
+    let min = ((secs_of_day % 3600) / 60) as u8;
+    let sec = (secs_of_day % 60) as u8;
+    // 1970-01-01 was Thursday (dow=4 in 0=Sun..6=Sat).
+    let dow = (days + 4).rem_euclid(7) as u8;
+    // Howard Hinnant civil-from-days algorithm (UTC).
+    let z = days + 719_468;
+    let era = z.div_euclid(146_097);
+    let doe = z.rem_euclid(146_097) as u64;
+    let yoe = (doe - doe / 1460 + doe / 36_524 - doe / 146_096) / 365;
+    let y = (yoe as i64) + era * 400;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let day = (doy - (153 * mp + 2) / 5 + 1) as u8;
+    let month = (if mp < 10 { mp + 3 } else { mp - 9 }) as u8;
+    let year_full = if month <= 2 { y + 1 } else { y };
+    let year = year_full.rem_euclid(100) as u8;
+    (year, month, day, dow, hour, min, sec, unix)
+}
+
+fn current_unix_secs() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs()
 }
 
 struct LoadedCore {
@@ -118,7 +177,47 @@ struct LoadedCore {
     spare_audio_buf: Vec<i16>,
     serialize_bound: usize,
     last_rumble_active: bool,
-    memory_descriptors: Box<[retro_memory_descriptor; 4]>,
+    memory_descriptors: Box<[retro_memory_descriptor]>,
+    /// Pinned 48-byte MBC3 RTC buffer exposed via `RETRO_MEMORY_RTC`.
+    rtc_buf: Box<[u8; GB_RTC_BUF_SIZE]>,
+    rtc_last_synced: [u8; GB_RTC_BUF_SIZE],
+}
+
+impl LoadedCore {
+    fn sync_rtc_to_buf(&mut self) {
+        if let ActiveCore::Gb(ref mut gb) = self.core
+            && gb.bus.cart.has_rtc()
+        {
+            gb.bus.cart.rtc.timestamp = current_unix_secs();
+            let mut tmp = Vec::with_capacity(GB_RTC_BUF_SIZE);
+            gb.bus.cart.rtc.append_48_byte_trailer(&mut tmp);
+            if tmp.len() == GB_RTC_BUF_SIZE {
+                self.rtc_buf.copy_from_slice(&tmp);
+                self.rtc_last_synced.copy_from_slice(&tmp);
+            }
+        }
+    }
+
+    fn ingest_host_rtc_if_modified(&mut self) {
+        if let ActiveCore::Gb(ref mut gb) = self.core
+            && gb.bus.cart.has_rtc()
+            && *self.rtc_buf != self.rtc_last_synced
+        {
+            gb.bus.cart.rtc.load_trailer(&*self.rtc_buf);
+            let now = current_unix_secs();
+            if gb.bus.cart.rtc.timestamp > 0 && now > gb.bus.cart.rtc.timestamp {
+                let elapsed = now - gb.bus.cart.rtc.timestamp;
+                gb.bus.cart.rtc.advance_seconds(elapsed);
+            }
+            gb.bus.cart.rtc.timestamp = now;
+            let mut tmp = Vec::with_capacity(GB_RTC_BUF_SIZE);
+            gb.bus.cart.rtc.append_48_byte_trailer(&mut tmp);
+            if tmp.len() == GB_RTC_BUF_SIZE {
+                self.rtc_buf.copy_from_slice(&tmp);
+                self.rtc_last_synced.copy_from_slice(&tmp);
+            }
+        }
+    }
 }
 
 pub fn active_geometry() -> (usize, usize, f32) {
@@ -132,6 +231,7 @@ pub fn active_geometry() -> (usize, usize, f32) {
 struct LibretroState {
     callbacks: LibretroCallbacks,
     port0_device: c_uint,
+    input_bitmasks: bool,
     loaded: Option<LoadedCore>,
 }
 
@@ -149,6 +249,7 @@ impl LibretroState {
                 log: None,
             },
             port0_device: RETRO_DEVICE_JOYPAD,
+            input_bitmasks: false,
             loaded: None,
         }
     }
@@ -195,20 +296,11 @@ fn save_ram_size_for_cart(core: &GbaCore) -> usize {
     }
 }
 
-fn build_memory_descriptors(core: &mut GbaCore) -> [retro_memory_descriptor; 4] {
+fn build_memory_descriptors(core: &mut GbaCore) -> Vec<retro_memory_descriptor> {
     let save_len = save_ram_size_for_cart(core);
-    let empty_desc = retro_memory_descriptor {
-        flags: 0,
-        ptr: ptr::null_mut(),
-        offset: 0,
-        start: 0,
-        select: 0,
-        disconnect: 0,
-        len: 0,
-        addrspace: ptr::null(),
-    };
+    let mut descs = Vec::with_capacity(4);
 
-    let ewram_desc = retro_memory_descriptor {
+    descs.push(retro_memory_descriptor {
         flags: RETRO_MEMDESC_SYSTEM_RAM,
         ptr: core.bus.ewram.as_mut_ptr().cast(),
         offset: 0,
@@ -217,9 +309,9 @@ fn build_memory_descriptors(core: &mut GbaCore) -> [retro_memory_descriptor; 4] 
         disconnect: 0x00FC_0000,
         len: EWRAM_SIZE,
         addrspace: ptr::null(),
-    };
+    });
 
-    let iwram_desc = retro_memory_descriptor {
+    descs.push(retro_memory_descriptor {
         flags: RETRO_MEMDESC_SYSTEM_RAM,
         ptr: core.bus.iwram.as_mut_ptr().cast(),
         offset: 0,
@@ -228,21 +320,23 @@ fn build_memory_descriptors(core: &mut GbaCore) -> [retro_memory_descriptor; 4] 
         disconnect: 0x00FF_8000,
         len: IWRAM_SIZE,
         addrspace: ptr::null(),
-    };
+    });
 
-    let rom_desc = retro_memory_descriptor {
-        flags: RETRO_MEMDESC_CONST,
-        ptr: core.bus.cart.rom.as_mut_ptr().cast(),
-        offset: 0,
-        start: 0x0800_0000,
-        select: 0xFE00_0000,
-        disconnect: 0,
-        len: core.bus.cart.rom.len(),
-        addrspace: ptr::null(),
-    };
+    if !core.bus.cart.rom.is_empty() {
+        descs.push(retro_memory_descriptor {
+            flags: RETRO_MEMDESC_CONST,
+            ptr: core.bus.cart.rom.as_mut_ptr().cast(),
+            offset: 0,
+            start: 0x0800_0000,
+            select: 0xFE00_0000,
+            disconnect: 0,
+            len: core.bus.cart.rom.len(),
+            addrspace: ptr::null(),
+        });
+    }
 
-    let sram_desc = if save_len > 0 {
-        retro_memory_descriptor {
+    if save_len > 0 {
+        descs.push(retro_memory_descriptor {
             flags: RETRO_MEMDESC_SAVE_RAM,
             ptr: core.bus.cart.sram.as_mut_ptr().cast(),
             offset: 0,
@@ -251,50 +345,44 @@ fn build_memory_descriptors(core: &mut GbaCore) -> [retro_memory_descriptor; 4] 
             disconnect: 0,
             len: save_len,
             addrspace: ptr::null(),
-        }
-    } else {
-        empty_desc
-    };
+        });
+    }
 
-    [ewram_desc, iwram_desc, rom_desc, sram_desc]
+    descs
 }
 
-fn build_gb_memory_descriptors(core: &mut GbCore) -> [retro_memory_descriptor; 4] {
-    let empty_desc = retro_memory_descriptor {
-        flags: 0,
-        ptr: ptr::null_mut(),
-        offset: 0,
-        start: 0,
-        select: 0,
-        disconnect: 0,
-        len: 0,
-        addrspace: ptr::null(),
-    };
+fn build_gb_memory_descriptors(core: &mut GbCore) -> Vec<retro_memory_descriptor> {
+    let mut descs = Vec::with_capacity(8);
 
-    let wram_desc = retro_memory_descriptor {
-        flags: RETRO_MEMDESC_SYSTEM_RAM,
-        ptr: core.bus.wram.as_mut_ptr().cast(),
+    // ROM banks 0..1 (0x0000..=0x7FFF)
+    if !core.bus.cart.rom.is_empty() {
+        descs.push(retro_memory_descriptor {
+            flags: RETRO_MEMDESC_CONST,
+            ptr: core.bus.cart.rom.as_mut_ptr().cast(),
+            offset: 0,
+            start: 0x0000,
+            select: 0xFFFF_8000,
+            disconnect: 0,
+            len: core.bus.cart.rom.len().min(0x8000),
+            addrspace: ptr::null(),
+        });
+    }
+
+    // VRAM bank 0 (0x8000..=0x9FFF)
+    descs.push(retro_memory_descriptor {
+        flags: RETRO_MEMDESC_VIDEO_RAM,
+        ptr: core.bus.ppu.vram.as_mut_ptr().cast(),
         offset: 0,
-        start: 0xC000,
+        start: 0x8000,
         select: 0xFFFF_E000,
         disconnect: 0,
         len: 0x2000,
         addrspace: ptr::null(),
-    };
+    });
 
-    let rom_desc = retro_memory_descriptor {
-        flags: RETRO_MEMDESC_CONST,
-        ptr: core.bus.cart.rom.as_mut_ptr().cast(),
-        offset: 0,
-        start: 0x0000,
-        select: 0xFFFF_8000,
-        disconnect: 0,
-        len: core.bus.cart.rom.len().min(0x8000),
-        addrspace: ptr::null(),
-    };
-
-    let sram_desc = if !core.bus.cart.ram.is_empty() {
-        retro_memory_descriptor {
+    // External cartridge RAM (0xA000..=0xBFFF)
+    if !core.bus.cart.ram.is_empty() {
+        descs.push(retro_memory_descriptor {
             flags: RETRO_MEMDESC_SAVE_RAM,
             ptr: core.bus.cart.ram.as_mut_ptr().cast(),
             offset: 0,
@@ -303,23 +391,136 @@ fn build_gb_memory_descriptors(core: &mut GbCore) -> [retro_memory_descriptor; 4
             disconnect: 0,
             len: core.bus.cart.ram.len().min(0x2000),
             addrspace: ptr::null(),
-        }
-    } else {
-        empty_desc
-    };
+        });
+    }
 
-    [wram_desc, rom_desc, sram_desc, empty_desc]
+    // WRAM Bank 0 (0xC000..=0xCFFF)
+    descs.push(retro_memory_descriptor {
+        flags: RETRO_MEMDESC_SYSTEM_RAM,
+        ptr: core.bus.wram.as_mut_ptr().cast(),
+        offset: 0,
+        start: 0xC000,
+        select: 0xFFFF_F000,
+        disconnect: 0,
+        len: 0x1000,
+        addrspace: ptr::null(),
+    });
+
+    // WRAM Bank 1 (0xD000..=0xDFFF)
+    descs.push(retro_memory_descriptor {
+        flags: RETRO_MEMDESC_SYSTEM_RAM,
+        ptr: core.bus.wram.as_mut_ptr().cast(),
+        offset: 0x1000,
+        start: 0xD000,
+        select: 0xFFFF_F000,
+        disconnect: 0,
+        len: 0x1000,
+        addrspace: ptr::null(),
+    });
+
+    // OAM (0xFE00..=0xFE9F)
+    descs.push(retro_memory_descriptor {
+        flags: RETRO_MEMDESC_VIDEO_RAM,
+        ptr: core.bus.ppu.oam.as_mut_ptr().cast(),
+        offset: 0,
+        start: 0xFE00,
+        select: 0xFFFF_FF00,
+        disconnect: 0,
+        len: GB_OAM_SIZE,
+        addrspace: ptr::null(),
+    });
+
+    // HRAM (0xFF80..=0xFFFE) — inline inside Box<GbCore>, address stable across reset/unserialize
+    descs.push(retro_memory_descriptor {
+        flags: RETRO_MEMDESC_SYSTEM_RAM,
+        ptr: core.bus.hram.as_mut_ptr().cast(),
+        offset: 0,
+        start: 0xFF80,
+        select: 0xFFFF_FF80,
+        disconnect: 0,
+        len: core.bus.hram.len(),
+        addrspace: ptr::null(),
+    });
+
+    // CGB extra WRAM Banks 2..7 mapped at 0x0001_0000 per rcheevos/libretro GBC convention
+    if core.is_cgb() {
+        descs.push(retro_memory_descriptor {
+            flags: RETRO_MEMDESC_SYSTEM_RAM,
+            ptr: core.bus.wram.as_mut_ptr().cast(),
+            offset: 0x2000,
+            start: 0x0001_0000,
+            select: 0xFFFF_0000,
+            disconnect: 0,
+            len: 0x6000,
+            addrspace: ptr::null(),
+        });
+    }
+
+    descs
 }
 
-fn build_active_memory_descriptors(
-    core: &mut ActiveCore,
-) -> ([retro_memory_descriptor; 4], c_uint) {
-    let descs = match core {
-        ActiveCore::Gba(gba) => build_memory_descriptors(gba),
-        ActiveCore::Gb(gb) => build_gb_memory_descriptors(gb),
-    };
-    let count = descs.iter().take_while(|d| d.len > 0).count() as c_uint;
-    (descs, count)
+fn build_active_memory_descriptors(core: &mut ActiveCore) -> Box<[retro_memory_descriptor]> {
+    match core {
+        ActiveCore::Gba(gba) => build_memory_descriptors(gba).into_boxed_slice(),
+        ActiveCore::Gb(gb) => build_gb_memory_descriptors(gb).into_boxed_slice(),
+    }
+}
+
+/// Unwind-safe RAII guard that keeps `GbCore`'s exposed heap buffers (`wram`, `vram`, `oam`,
+/// and `cart.ram`) pinned at their original addresses even if `op` returns `Err` or panics.
+struct GbBufferPinGuard<'a> {
+    core: &'a mut GbCore,
+    orig_wram: Box<[u8; GB_WRAM_SIZE]>,
+    orig_vram: Box<[u8; GB_VRAM_SIZE]>,
+    orig_oam: Box<[u8; GB_OAM_SIZE]>,
+    orig_ram: Vec<u8>,
+}
+
+impl<'a> GbBufferPinGuard<'a> {
+    fn new(core: &'a mut GbCore, copy_ram_in: bool) -> Self {
+        let mut orig_wram = alloc_boxed_u8_zeroed::<GB_WRAM_SIZE>();
+        let mut orig_vram = alloc_boxed_u8_zeroed::<GB_VRAM_SIZE>();
+        let mut orig_oam = alloc_boxed_u8_zeroed::<GB_OAM_SIZE>();
+        let orig_ram = core::mem::take(&mut core.bus.cart.ram);
+        let orig_ram_len = orig_ram.len();
+
+        core::mem::swap(&mut core.bus.wram, &mut orig_wram);
+        core::mem::swap(&mut core.bus.ppu.vram, &mut orig_vram);
+        core::mem::swap(&mut core.bus.ppu.oam, &mut orig_oam);
+        core.bus.cart.ram = if copy_ram_in {
+            orig_ram.clone()
+        } else {
+            vec![0u8; orig_ram_len]
+        };
+
+        Self {
+            core,
+            orig_wram,
+            orig_vram,
+            orig_oam,
+            orig_ram,
+        }
+    }
+
+    fn commit(&mut self) {
+        self.orig_wram.copy_from_slice(&*self.core.bus.wram);
+        self.orig_vram.copy_from_slice(&*self.core.bus.ppu.vram);
+        self.orig_oam.copy_from_slice(&*self.core.bus.ppu.oam);
+        if self.orig_ram.len() == self.core.bus.cart.ram.len() {
+            self.orig_ram.copy_from_slice(&self.core.bus.cart.ram);
+        } else {
+            self.orig_ram = self.core.bus.cart.ram.clone();
+        }
+    }
+}
+
+impl Drop for GbBufferPinGuard<'_> {
+    fn drop(&mut self) {
+        core::mem::swap(&mut self.core.bus.wram, &mut self.orig_wram);
+        core::mem::swap(&mut self.core.bus.ppu.vram, &mut self.orig_vram);
+        core::mem::swap(&mut self.core.bus.ppu.oam, &mut self.orig_oam);
+        self.core.bus.cart.ram = core::mem::take(&mut self.orig_ram);
+    }
 }
 
 fn preserve_gb_memory_buffers<E>(
@@ -327,31 +528,59 @@ fn preserve_gb_memory_buffers<E>(
     copy_ram_in: bool,
     op: impl FnOnce(&mut GbCore) -> Result<(), E>,
 ) -> Result<(), E> {
-    let mut orig_wram = alloc_boxed_u8_zeroed::<GB_WRAM_SIZE>();
-    let mut orig_ram = core::mem::take(&mut core.bus.cart.ram);
-    let orig_ram_len = orig_ram.len();
-
-    core::mem::swap(&mut core.bus.wram, &mut orig_wram);
-    if copy_ram_in {
-        core.bus.cart.ram = orig_ram.clone();
-    } else {
-        core.bus.cart.ram = vec![0u8; orig_ram_len];
-    }
-
-    let result = op(core);
-
+    let mut guard = GbBufferPinGuard::new(core, copy_ram_in);
+    let result = op(guard.core);
     if result.is_ok() {
-        orig_wram.copy_from_slice(&*core.bus.wram);
-        if orig_ram.len() == core.bus.cart.ram.len() {
-            orig_ram.copy_from_slice(&core.bus.cart.ram);
-        } else {
-            orig_ram = core.bus.cart.ram.clone();
+        guard.commit();
+    }
+    result
+}
+
+/// Unwind-safe RAII guard that keeps `GbaCore`'s exposed heap buffers (`ewram`, `iwram`, and
+/// `cart.sram`) pinned at their original addresses even if `op` returns `Err` or panics.
+struct GbaBufferPinGuard<'a> {
+    core: &'a mut GbaCore,
+    orig_ewram: Box<[u8; EWRAM_SIZE]>,
+    orig_iwram: Box<[u8; IWRAM_SIZE]>,
+    orig_sram: Box<[u8; SRAM_MAX_SIZE]>,
+}
+
+impl<'a> GbaBufferPinGuard<'a> {
+    fn new(core: &'a mut GbaCore, copy_sram_in: bool) -> Self {
+        let mut orig_ewram = alloc_boxed_u8_zeroed::<EWRAM_SIZE>();
+        let mut orig_iwram = alloc_boxed_u8_zeroed::<IWRAM_SIZE>();
+        let mut orig_sram = alloc_boxed_u8_zeroed::<SRAM_MAX_SIZE>();
+
+        core::mem::swap(&mut core.bus.ewram, &mut orig_ewram);
+        core::mem::swap(&mut core.bus.iwram, &mut orig_iwram);
+        core::mem::swap(&mut core.bus.cart.sram, &mut orig_sram);
+
+        if copy_sram_in {
+            core.bus.cart.sram.copy_from_slice(&*orig_sram);
+        }
+
+        Self {
+            core,
+            orig_ewram,
+            orig_iwram,
+            orig_sram,
         }
     }
 
-    core::mem::swap(&mut core.bus.wram, &mut orig_wram);
-    core.bus.cart.ram = orig_ram;
-    result
+    fn commit(&mut self) {
+        self.orig_ewram.copy_from_slice(&*self.core.bus.ewram);
+        self.orig_iwram.copy_from_slice(&*self.core.bus.iwram);
+        self.orig_sram.copy_from_slice(&*self.core.bus.cart.sram);
+    }
+}
+
+impl Drop for GbaBufferPinGuard<'_> {
+    fn drop(&mut self) {
+        core::mem::swap(&mut self.core.bus.ewram, &mut self.orig_ewram);
+        core::mem::swap(&mut self.core.bus.iwram, &mut self.orig_iwram);
+        core::mem::swap(&mut self.core.bus.cart.sram, &mut self.orig_sram);
+        self.core.bus.rebuild_fastmem();
+    }
 }
 
 /// Runs `op(core)` while keeping the heap allocations of `ewram`, `iwram`, and
@@ -361,31 +590,11 @@ fn preserve_memory_buffers<E>(
     copy_sram_in: bool,
     op: impl FnOnce(&mut GbaCore) -> Result<(), E>,
 ) -> Result<(), E> {
-    let mut orig_ewram = alloc_boxed_u8_zeroed::<EWRAM_SIZE>();
-    let mut orig_iwram = alloc_boxed_u8_zeroed::<IWRAM_SIZE>();
-    let mut orig_sram = alloc_boxed_u8_zeroed::<SRAM_MAX_SIZE>();
-
-    core::mem::swap(&mut core.bus.ewram, &mut orig_ewram);
-    core::mem::swap(&mut core.bus.iwram, &mut orig_iwram);
-    core::mem::swap(&mut core.bus.cart.sram, &mut orig_sram);
-
-    if copy_sram_in {
-        core.bus.cart.sram.copy_from_slice(&*orig_sram);
-    }
-
-    let result = op(core);
-
+    let mut guard = GbaBufferPinGuard::new(core, copy_sram_in);
+    let result = op(guard.core);
     if result.is_ok() {
-        orig_ewram.copy_from_slice(&*core.bus.ewram);
-        orig_iwram.copy_from_slice(&*core.bus.iwram);
-        orig_sram.copy_from_slice(&*core.bus.cart.sram);
+        guard.commit();
     }
-
-    core::mem::swap(&mut core.bus.ewram, &mut orig_ewram);
-    core::mem::swap(&mut core.bus.iwram, &mut orig_iwram);
-    core::mem::swap(&mut core.bus.cart.sram, &mut orig_sram);
-
-    core.bus.rebuild_fastmem();
     result
 }
 
@@ -580,6 +789,7 @@ fn poll_port0_keypad(
     input_poll: retro_input_poll_t,
     input_state: retro_input_state_t,
     port0_device: c_uint,
+    input_bitmasks: bool,
 ) -> u16 {
     if let Some(poll) = input_poll {
         unsafe { poll() };
@@ -605,10 +815,20 @@ fn poll_port0_keypad(
     ];
 
     let mut pressed = 0u16;
-    for &(retro_id, gba_mask) in &BUTTON_MAP {
-        let val = unsafe { state_cb(0, RETRO_DEVICE_JOYPAD, 0, retro_id) };
-        if val != 0 {
-            pressed |= gba_mask;
+    if input_bitmasks {
+        let mask =
+            unsafe { state_cb(0, RETRO_DEVICE_JOYPAD, 0, RETRO_DEVICE_ID_JOYPAD_MASK) } as u16;
+        for &(retro_id, gba_mask) in &BUTTON_MAP {
+            if (mask & (1u16 << retro_id)) != 0 {
+                pressed |= gba_mask;
+            }
+        }
+    } else {
+        for &(retro_id, gba_mask) in &BUTTON_MAP {
+            let val = unsafe { state_cb(0, RETRO_DEVICE_JOYPAD, 0, retro_id) };
+            if val != 0 {
+                pressed |= gba_mask;
+            }
         }
     }
     encode_keyinput(pressed)
@@ -672,6 +892,7 @@ pub fn set_controller_port_device(port: c_uint, device: c_uint) {
 pub fn init() {
     let environ_cb = lock_state().callbacks.environ;
     let mut log_cb: retro_log_printf_t = None;
+    let mut input_bitmasks = false;
     if let Some(env) = environ_cb {
         let mut log_iface = retro_log_callback { log: None };
         if unsafe {
@@ -682,8 +903,11 @@ pub fn init() {
         } {
             log_cb = log_iface.log;
         }
+        input_bitmasks = unsafe { env(RETRO_ENVIRONMENT_GET_INPUT_BITMASKS, ptr::null_mut()) };
     }
-    lock_state().callbacks.log = log_cb;
+    let mut state = lock_state();
+    state.callbacks.log = log_cb;
+    state.input_bitmasks = input_bitmasks;
 }
 
 pub fn deinit() {
@@ -739,7 +963,9 @@ pub unsafe fn load_game(game: *const retro_game_info) -> bool {
     let rumble_cb = query_rumble_interface(environ_cb);
     let options = read_core_options(environ_cb);
     core.apply_options(options);
+    core.init_rtc_from_host();
 
+    let mut input_bitmasks = false;
     if let Some(env) = environ_cb {
         unsafe {
             env(
@@ -751,17 +977,17 @@ pub unsafe fn load_game(game: *const retro_game_info) -> bool {
                 RETRO_ENVIRONMENT_SET_SUPPORT_ACHIEVEMENTS,
                 (&raw mut achievements).cast(),
             );
+            input_bitmasks = env(RETRO_ENVIRONMENT_GET_INPUT_BITMASKS, ptr::null_mut());
         }
     }
 
     let measured_state = core.save_state_bytes().map(|b| b.len()).unwrap_or(0);
-    let serialize_bound =
-        (measured_state + STATE_HEADER_SIZE + STATE_MARGIN_BYTES).max(STATE_MIN_BOUND_BYTES);
+    let serialize_bound = measured_state + STATE_HEADER_SIZE + STATE_MARGIN_BYTES;
 
-    let (descriptors, num_descriptors) = build_active_memory_descriptors(&mut core);
-    let descriptors = Box::new(descriptors);
+    let descriptors = build_active_memory_descriptors(&mut core);
+    let num_descriptors = descriptors.len() as c_uint;
 
-    let loaded = LoadedCore {
+    let mut loaded = LoadedCore {
         core,
         pixel_format,
         options,
@@ -771,7 +997,10 @@ pub unsafe fn load_game(game: *const retro_game_info) -> bool {
         serialize_bound,
         last_rumble_active: false,
         memory_descriptors: descriptors,
+        rtc_buf: alloc_boxed_u8_zeroed::<GB_RTC_BUF_SIZE>(),
+        rtc_last_synced: [0u8; GB_RTC_BUF_SIZE],
     };
+    loaded.sync_rtc_to_buf();
 
     let mut map = retro_memory_map {
         descriptors: loaded.memory_descriptors.as_ptr(),
@@ -782,6 +1011,7 @@ pub unsafe fn load_game(game: *const retro_game_info) -> bool {
     {
         let mut state = lock_state();
         state.callbacks.rumble = rumble_cb;
+        state.input_bitmasks = input_bitmasks;
         state.loaded = Some(loaded);
     }
 
@@ -836,13 +1066,20 @@ pub fn reset() {
             }
         }
         loaded.core.apply_options(options);
+        loaded.core.init_rtc_from_host();
+        loaded.sync_rtc_to_buf();
     }
 }
 
 pub fn run() {
-    let (callbacks, port0_device, has_loaded) = {
+    let (callbacks, port0_device, input_bitmasks, has_loaded) = {
         let state = lock_state();
-        (state.callbacks, state.port0_device, state.loaded.is_some())
+        (
+            state.callbacks,
+            state.port0_device,
+            state.input_bitmasks,
+            state.loaded.is_some(),
+        )
     };
     if !has_loaded {
         return;
@@ -868,13 +1105,20 @@ pub fn run() {
     };
 
     // Poll keypad before acquiring the core mutex so frontend input callbacks never deadlock.
-    let keyinput = poll_port0_keypad(callbacks.input_poll, callbacks.input_state, port0_device);
+    let keyinput = poll_port0_keypad(
+        callbacks.input_poll,
+        callbacks.input_state,
+        port0_device,
+        input_bitmasks,
+    );
 
     let (out_frame, out_audio, pixel_format, width, height, rumble_change, refresh_map) = {
         let mut state = lock_state();
         let Some(ref mut loaded) = state.loaded else {
             return;
         };
+
+        loaded.ingest_host_rtc_if_modified();
 
         let mut refresh_map = false;
         if let Some(opts) = updated_options {
@@ -933,6 +1177,8 @@ pub fn run() {
             }
         }
 
+        loaded.sync_rtc_to_buf();
+
         let mut out_audio = core::mem::take(&mut loaded.spare_audio_buf);
         out_audio.clear();
         core::mem::swap(&mut loaded.audio_buf, &mut out_audio);
@@ -947,8 +1193,9 @@ pub fn run() {
 
         let mut map_descriptors = None;
         if refresh_map {
-            let (descs, num_descs) = build_active_memory_descriptors(&mut loaded.core);
-            *loaded.memory_descriptors = descs;
+            let descs = build_active_memory_descriptors(&mut loaded.core);
+            let num_descs = descs.len() as c_uint;
+            loaded.memory_descriptors = descs;
             map_descriptors = Some((loaded.memory_descriptors.as_ptr(), num_descs));
         }
 
@@ -990,8 +1237,15 @@ pub fn run() {
         let frames = out_audio.len() / 2;
         if frames > 0 {
             if let Some(batch_cb) = callbacks.audio_sample_batch {
-                unsafe {
-                    batch_cb(out_audio.as_ptr(), frames);
+                let mut consumed = 0usize;
+                while consumed < frames {
+                    let n = unsafe {
+                        batch_cb(out_audio.as_ptr().add(consumed * 2), frames - consumed)
+                    };
+                    if n == 0 {
+                        break;
+                    }
+                    consumed = consumed.saturating_add(n).min(frames);
                 }
             } else if let Some(sample_cb) = callbacks.audio_sample {
                 let (pairs, _) = out_audio.as_chunks::<2>();
@@ -1098,14 +1352,15 @@ pub unsafe fn unserialize(data: *const c_void, size: usize) -> bool {
 
     let ok = match loaded.core {
         ActiveCore::Gba(ref mut gba) => {
-            preserve_memory_buffers(gba, false, |c| c.load_state(payload)).is_ok()
+            preserve_memory_buffers(gba, true, |c| c.load_state_raw(payload)).is_ok()
         }
         ActiveCore::Gb(ref mut gb) => {
-            preserve_gb_memory_buffers(gb, false, |c| c.load_state(payload)).is_ok()
+            preserve_gb_memory_buffers(gb, true, |c| c.load_state(payload)).is_ok()
         }
     };
     if ok {
         loaded.core.apply_options(loaded.options);
+        loaded.sync_rtc_to_buf();
     }
     ok
 }
@@ -1126,10 +1381,17 @@ pub fn get_memory_data(id: c_uint) -> *mut c_void {
         }
         (ActiveCore::Gb(gb), RETRO_MEMORY_SYSTEM_RAM) => gb.bus.wram.as_mut_ptr().cast(),
         (ActiveCore::Gb(gb), RETRO_MEMORY_SAVE_RAM) => {
-            if gb.bus.cart.ram.is_empty() {
+            if !gb.has_battery() || gb.bus.cart.ram.is_empty() {
                 ptr::null_mut()
             } else {
                 gb.bus.cart.ram.as_mut_ptr().cast()
+            }
+        }
+        (ActiveCore::Gb(gb), RETRO_MEMORY_RTC) => {
+            if gb.bus.cart.has_rtc() {
+                loaded.rtc_buf.as_mut_ptr().cast()
+            } else {
+                ptr::null_mut()
             }
         }
         _ => ptr::null_mut(),
@@ -1145,7 +1407,14 @@ pub fn get_memory_size(id: c_uint) -> usize {
         (ActiveCore::Gba(_), RETRO_MEMORY_SYSTEM_RAM) => EWRAM_SIZE,
         (ActiveCore::Gba(gba), RETRO_MEMORY_SAVE_RAM) => save_ram_size_for_cart(gba),
         (ActiveCore::Gb(_), RETRO_MEMORY_SYSTEM_RAM) => GB_WRAM_SIZE,
-        (ActiveCore::Gb(gb), RETRO_MEMORY_SAVE_RAM) => gb.bus.cart.ram.len(),
+        (ActiveCore::Gb(gb), RETRO_MEMORY_SAVE_RAM) => {
+            if gb.has_battery() {
+                gb.bus.cart.ram.len()
+            } else {
+                0
+            }
+        }
+        (ActiveCore::Gb(gb), RETRO_MEMORY_RTC) if gb.bus.cart.has_rtc() => GB_RTC_BUF_SIZE,
         _ => 0,
     }
 }

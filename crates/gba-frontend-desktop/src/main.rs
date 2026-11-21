@@ -87,7 +87,12 @@ impl log::Log for DesktopLogger {
 
     fn log(&self, record: &log::Record) {
         if self.enabled(record.metadata()) {
-            eprintln!("[{}] {}: {}", record.level(), record.target(), record.args());
+            eprintln!(
+                "[{}] {}: {}",
+                record.level(),
+                record.target(),
+                record.args()
+            );
         }
     }
 
@@ -225,8 +230,11 @@ fn real_main() {
     }
 
     let cli_fallback = cli.clone();
-    if let Err(err) = app_host::run_desktop("Rustboy Advance", init_w, init_h, cli, initial_config) {
-        log::warn!("wgpu desktop initialization unavailable ({err}); falling back to no-GPU presenter");
+    if let Err(err) = app_host::run_desktop("Rustboy Advance", init_w, init_h, cli, initial_config)
+    {
+        log::warn!(
+            "wgpu desktop initialization unavailable ({err}); falling back to no-GPU presenter"
+        );
         println!("[backend] Selected: {no_gpu_label} — reason: wgpu fallback ({err})");
         if let Err(no_gpu_err) =
             no_gpu::run_no_gpu_desktop("Rustboy Advance", init_w, init_h, cli_fallback, &err)

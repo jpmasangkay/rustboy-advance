@@ -115,9 +115,9 @@ pub fn format_registers(core: &GbaCore) -> String {
     use core::fmt::Write;
     let cpu = &core.cpu;
     let mut out = String::with_capacity(256);
-    for r in 0..16 {
+    for (r, &val) in cpu.gpr.iter().enumerate() {
         let sep = if r % 4 == 3 { '\n' } else { ' ' };
-        let _ = write!(&mut out, "R{:02}={:08X}{}", r, cpu.gpr[r], sep);
+        let _ = write!(&mut out, "R{:02}={:08X}{}", r, val, sep);
     }
     let _ = writeln!(
         &mut out,

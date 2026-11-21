@@ -49,10 +49,7 @@ fn is_hotkey_just_pressed(i: &egui::InputState, chord: Option<&HotkeyChord>) -> 
 
 impl RustboyApp {
     pub(crate) fn handle_global_shortcuts(&mut self, ctx: &egui::Context) {
-        if ctx.wants_keyboard_input()
-            || self.debugger.awaiting_rebind.is_some()
-            || self.awaiting_input_bind.is_some()
-        {
+        if ctx.wants_keyboard_input() || self.awaiting_input_bind.is_some() {
             self.tab_fast_forward = false;
             self.rewinding = false;
             return;
@@ -144,8 +141,9 @@ impl RustboyApp {
                     }
                 });
 
-            let menu_toggle = (cmd && i.modifiers.shift && !i.modifiers.alt && i.key_pressed(Key::M))
-                || (!i.modifiers.any() && i.key_pressed(Key::F10));
+            let menu_toggle =
+                (cmd && i.modifiers.shift && !i.modifiers.alt && i.key_pressed(Key::M))
+                    || (!i.modifiers.any() && i.key_pressed(Key::F10));
 
             (
                 rw_chord.is_some_and(|c| is_chord_held(i, c)),
@@ -249,7 +247,9 @@ impl RustboyApp {
         }
         if state_mgr_trig {
             if hardcore {
-                self.notify_warn("Save State Manager is disabled in RetroAchievements Hardcore Mode");
+                self.notify_warn(
+                    "Save State Manager is disabled in RetroAchievements Hardcore Mode",
+                );
             } else {
                 self.show_state_manager = !self.show_state_manager;
             }

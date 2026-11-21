@@ -697,9 +697,7 @@ impl Ppu {
                 obj_drawn[x] = true;
 
                 let obj_wins = if is_cgb {
-                    (self.lcdc & 0x01) == 0
-                        || bg_color_idx[x] == 0
-                        || (!bg_prio[x] && !bg_over_obj)
+                    (self.lcdc & 0x01) == 0 || bg_color_idx[x] == 0 || (!bg_prio[x] && !bg_over_obj)
                 } else {
                     !bg_over_obj || bg_color_idx[x] == 0
                 };

@@ -123,8 +123,20 @@ foreach ($f in $NbaFiles) {
 
 Write-Host "==> Fetching Tonc prebuilt demos (tonc-bin.zip)"
 $ToncDir = Join-Path $OutRoot "tonc"
-$ToncMarker = Join-Path $ToncDir "win_demo.gba"
-if ((-not (Test-Path $ToncMarker)) -or $Force) {
+$ToncRequired = @(
+    "bm_modes.gba", "mos_demo.gba", "win_demo.gba", "bld_demo.gba",
+    "obj_aff.gba", "obj_demo.gba", "m7_demo.gba", "prio_demo.gba",
+    "tte_demo.gba", "irq_demo.gba", "tmr_demo.gba", "dma_demo.gba"
+)
+$ToncMissing = $false
+foreach ($rom in $ToncRequired) {
+    $p = Join-Path $ToncDir $rom
+    if (-not (Test-Path $p) -or (Get-Item $p).Length -eq 0) {
+        $ToncMissing = $true
+        break
+    }
+}
+if ($ToncMissing -or $Force) {
     if (-not (Test-Path $ToncDir)) {
         New-Item -ItemType Directory -Path $ToncDir -Force | Out-Null
     }
@@ -145,7 +157,31 @@ if ((-not (Test-Path $ToncMarker)) -or $Force) {
     }
     Remove-Item $ToncZip -Force -ErrorAction SilentlyContinue
 } else {
-    Write-Host "  [cached] $ToncDir"
+    Write-Host "  [cached] $ToncDir (all $($ToncRequired.Count) manifest ROMs present)"
+}
+
+$ChecksumFile = Join-Path $PSScriptRoot "test-roms.sha256"
+if (Test-Path $ChecksumFile) {
+    Write-Host "==> Verifying SHA-256 checksums ($ChecksumFile)"
+    $verified = 0
+    foreach ($line in Get-Content $ChecksumFile) {
+        $trimmed = $line.Trim()
+        if (-not $trimmed -or $trimmed.StartsWith("#")) { continue }
+        $parts = $trimmed -split "\s+", 2
+        $expected = $parts[0].ToLowerInvariant()
+        $relPath = $parts[1].Trim()
+        if ($RomsOnly -and $relPath.EndsWith(".png")) { continue }
+        $target = Join-Path $OutRoot $relPath
+        if (-not (Test-Path $target)) {
+            throw "Missing expected file: $target"
+        }
+        $actual = (Get-FileHash -Algorithm SHA256 -Path $target).Hash.ToLowerInvariant()
+        if ($actual -ne $expected) {
+            throw "SHA-256 mismatch for $relPath (expected $expected, got $actual)"
+        }
+        $verified++
+    }
+    Write-Host "  Verified $verified files against SHA-256 manifest."
 }
 
 Write-Host ""

@@ -212,10 +212,7 @@ impl BlipBuf {
     #[inline]
     pub fn max_chunk_cycles(&self) -> u64 {
         let used = (self.offset >> 32) as usize;
-        let safe_samples = self
-            .buf_l
-            .len()
-            .saturating_sub(KERNEL_WIDTH + 4 + used) as u64;
+        let safe_samples = self.buf_l.len().saturating_sub(KERNEL_WIDTH + 4 + used) as u64;
         ((safe_samples << 32) / self.factor.max(1)).max(1)
     }
 
@@ -267,10 +264,8 @@ impl BlipBuf {
                 prev_l = cur_l;
                 prev_r = cur_r;
             }
-            bl[KERNEL_WIDTH - 1] =
-                bl[KERNEL_WIDTH - 1].wrapping_add((delta_l << Q_SHIFT) - prev_l);
-            br[KERNEL_WIDTH - 1] =
-                br[KERNEL_WIDTH - 1].wrapping_add((delta_r << Q_SHIFT) - prev_r);
+            bl[KERNEL_WIDTH - 1] = bl[KERNEL_WIDTH - 1].wrapping_add((delta_l << Q_SHIFT) - prev_l);
+            br[KERNEL_WIDTH - 1] = br[KERNEL_WIDTH - 1].wrapping_add((delta_r << Q_SHIFT) - prev_r);
         } else if delta_l != 0 {
             let bl = &mut self.buf_l[idx..idx + KERNEL_WIDTH];
             let dl = delta_l as i64;
@@ -281,8 +276,7 @@ impl BlipBuf {
                 bl[k] = bl[k].wrapping_add(cur_l - prev_l);
                 prev_l = cur_l;
             }
-            bl[KERNEL_WIDTH - 1] =
-                bl[KERNEL_WIDTH - 1].wrapping_add((delta_l << Q_SHIFT) - prev_l);
+            bl[KERNEL_WIDTH - 1] = bl[KERNEL_WIDTH - 1].wrapping_add((delta_l << Q_SHIFT) - prev_l);
         } else {
             let br = &mut self.buf_r[idx..idx + KERNEL_WIDTH];
             let dr = delta_r as i64;
@@ -293,8 +287,7 @@ impl BlipBuf {
                 br[k] = br[k].wrapping_add(cur_r - prev_r);
                 prev_r = cur_r;
             }
-            br[KERNEL_WIDTH - 1] =
-                br[KERNEL_WIDTH - 1].wrapping_add((delta_r << Q_SHIFT) - prev_r);
+            br[KERNEL_WIDTH - 1] = br[KERNEL_WIDTH - 1].wrapping_add((delta_r << Q_SHIFT) - prev_r);
         }
     }
 

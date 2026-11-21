@@ -1947,9 +1947,7 @@ fn thumb_push_pop<const CFG: u8>(cpu: &mut Arm7tdmi, bus: &mut SysBus, instr: u1
                         if (rlist & (1 << r)) != 0 {
                             let off = (cur_addr & 0x3FFC) as usize;
                             let v = unsafe {
-                                u32::from_le(
-                                    (ptr.as_ptr().add(off) as *const u32).read_unaligned(),
-                                )
+                                u32::from_le((ptr.as_ptr().add(off) as *const u32).read_unaligned())
                             };
                             cpu.gpr[r] = v;
                             cur_addr = cur_addr.wrapping_add(4);
@@ -2113,9 +2111,7 @@ fn thumb_ldm_stm<const LOAD: bool>(cpu: &mut Arm7tdmi, bus: &mut SysBus, instr: 
                         if (rlist & (1 << r)) != 0 {
                             let off = (cur_addr & 0x3FFC) as usize;
                             let v = unsafe {
-                                u32::from_le(
-                                    (ptr.as_ptr().add(off) as *const u32).read_unaligned(),
-                                )
+                                u32::from_le((ptr.as_ptr().add(off) as *const u32).read_unaligned())
                             };
                             cpu.gpr[r] = v;
                             cur_addr = cur_addr.wrapping_add(4);

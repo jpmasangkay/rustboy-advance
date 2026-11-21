@@ -31,8 +31,8 @@ impl RomEmitter {
         hdr[0xBD] = 0u8.wrapping_sub(sum.wrapping_add(0x19));
 
         let mut words = Vec::with_capacity(4096);
-        for chunk in hdr.chunks_exact(4) {
-            words.push(u32::from_le_bytes(chunk.try_into().unwrap()));
+        for chunk in hdr.as_chunks::<4>().0 {
+            words.push(u32::from_le_bytes(*chunk));
         }
         Self {
             words,
@@ -136,7 +136,7 @@ impl RomEmitter {
     }
 
     fn add_blob(&mut self, mut bytes: Vec<u8>) -> usize {
-        while bytes.len() % 4 != 0 {
+        while !bytes.len().is_multiple_of(4) {
             bytes.push(0);
         }
         let id = self.blobs.len();
@@ -167,8 +167,8 @@ impl RomEmitter {
             self.words[insn_idx] = 0xE59F_0000 | ((rd as u32) << 12) | (off & 0xFFF);
         }
         let mut blob_ptr_words = vec![0usize; self.blobs.len()];
-        for b_idx in 0..self.blobs.len() {
-            blob_ptr_words[b_idx] = self.words.len();
+        for slot in &mut blob_ptr_words {
+            *slot = self.words.len();
             self.words.push(0);
         }
         let _ = pool_start;
@@ -181,8 +181,8 @@ impl RomEmitter {
         for (b_idx, (_, bytes)) in self.blobs.iter().enumerate() {
             let rom_addr = 0x0800_0000u32 + (self.words.len() as u32) * 4;
             self.words[blob_ptr_words[b_idx]] = rom_addr;
-            for chunk in bytes.chunks_exact(4) {
-                self.words.push(u32::from_le_bytes(chunk.try_into().unwrap()));
+            for chunk in bytes.as_chunks::<4>().0 {
+                self.words.push(u32::from_le_bytes(*chunk));
             }
         }
         let mut out = Vec::with_capacity(self.words.len() * 4);
@@ -232,11 +232,8 @@ fn build_mode0_64x64_map(seed: u16) -> Vec<u8> {
     for screen in 0..4u16 {
         for ty in 0..32u16 {
             for tx in 0..32u16 {
-                let tile = (tx.wrapping_mul(3)
-                    ^ ty.wrapping_mul(5)
-                    ^ screen.wrapping_mul(7)
-                    ^ seed)
-                    & 63;
+                let tile =
+                    (tx.wrapping_mul(3) ^ ty.wrapping_mul(5) ^ screen.wrapping_mul(7) ^ seed) & 63;
                 let pal = ((tx + ty + seed) & 15) << 12;
                 let entry = pal | tile;
                 out.extend_from_slice(&entry.to_le_bytes());
@@ -410,6 +407,9 @@ mod tests {
             "expected rich multi-color Mode 0 scene, found {} colors",
             distinct_colors.len()
         );
-        assert_ne!(f10, f30, "expected scrolling animation between frame 10 and 30");
+        assert_ne!(
+            f10, f30,
+            "expected scrolling animation between frame 10 and 30"
+        );
     }
 }

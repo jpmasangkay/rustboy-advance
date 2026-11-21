@@ -266,6 +266,7 @@ impl RewindBuffer {
     }
 
     /// Pops and returns the most recent snapshot, reconstructing the preceding state in memory.
+    #[allow(dead_code)]
     pub fn pop_back(&mut self) -> Option<Vec<u8>> {
         let head = self.head_raw.take()?;
         let entry = self.entries.pop_back()?;
@@ -308,13 +309,11 @@ impl RewindBuffer {
         let count = steps.max(1);
         let mut head = self.head_raw.take()?;
         let mut remaining = count;
-        let mut popped_any = false;
 
         while remaining > 0 {
             let Some(entry) = self.entries.pop_back() else {
                 break;
             };
-            popped_any = true;
             self.total_bytes = self
                 .total_bytes
                 .saturating_sub(entry.compressed_bytes() + head.len());
@@ -363,13 +362,8 @@ impl RewindBuffer {
             self.total_bytes += head.len();
         }
 
-        if popped_any {
-            self.head_raw = Some(head);
-            None
-        } else {
-            self.head_raw = Some(head);
-            None
-        }
+        self.head_raw = Some(head);
+        None
     }
 
     fn evict_to_budget(&mut self) {

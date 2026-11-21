@@ -856,8 +856,8 @@ pub fn decode_io_reg(addr: u32, val: u32) -> Option<IoRegDesc> {
             name: "GREENSWP",
             category: "LCD",
             access: io_reg_access_width(addr).0,
-        width: io_reg_access_width(addr).1,
-        raw_value: val,
+            width: io_reg_access_width(addr).1,
+            raw_value: val,
             summary: format!("Green Swap: {}", on_off(bit(val, 0))),
             fields: vec![IoField {
                 name: "Green Swap",
@@ -874,8 +874,8 @@ pub fn decode_io_reg(addr: u32, val: u32) -> Option<IoRegDesc> {
                 name: "VCOUNT",
                 category: "LCD",
                 access: io_reg_access_width(addr).0,
-        width: io_reg_access_width(addr).1,
-        raw_value: val,
+                width: io_reg_access_width(addr).1,
+                raw_value: val,
                 summary: format!(
                     "Scanline {line} ({})",
                     if line >= 160 { "VBlank" } else { "Visible" }
@@ -908,8 +908,8 @@ pub fn decode_io_reg(addr: u32, val: u32) -> Option<IoRegDesc> {
                 name,
                 category: "LCD",
                 access: io_reg_access_width(addr).0,
-        width: io_reg_access_width(addr).1,
-        raw_value: val,
+                width: io_reg_access_width(addr).1,
+                raw_value: val,
                 summary: format!("Offset = {ofs}"),
                 fields: vec![IoField {
                     name: if is_v { "Y Offset" } else { "X Offset" },
@@ -939,7 +939,10 @@ pub fn decode_io_reg(addr: u32, val: u32) -> Option<IoRegDesc> {
                 let abs = s.unsigned_abs();
                 let int_p = abs >> 8;
                 let frac_p = ((abs & 0xFF) as u32 * 1000) / 256;
-                format!("{sign}{int_p}.{frac_p:03} (8.8 fixed, 0x{:04X})", val as u16)
+                format!(
+                    "{sign}{int_p}.{frac_p:03} (8.8 fixed, 0x{:04X})",
+                    val as u16
+                )
             } else {
                 format!("0x{:04X} (28-bit fixed-point half)", val as u16)
             };
@@ -974,8 +977,8 @@ pub fn decode_io_reg(addr: u32, val: u32) -> Option<IoRegDesc> {
                 name,
                 category: "LCD",
                 access: io_reg_access_width(addr).0,
-        width: io_reg_access_width(addr).1,
-        raw_value: val,
+                width: io_reg_access_width(addr).1,
+                raw_value: val,
                 summary: format!("X: {x1}..{x2}"),
                 fields: vec![
                     IoField {
@@ -1006,8 +1009,8 @@ pub fn decode_io_reg(addr: u32, val: u32) -> Option<IoRegDesc> {
                 name,
                 category: "LCD",
                 access: io_reg_access_width(addr).0,
-        width: io_reg_access_width(addr).1,
-        raw_value: val,
+                width: io_reg_access_width(addr).1,
+                raw_value: val,
                 summary: format!("Y: {y1}..{y2}"),
                 fields: vec![
                     IoField {
@@ -1033,8 +1036,8 @@ pub fn decode_io_reg(addr: u32, val: u32) -> Option<IoRegDesc> {
                 name: "WININ",
                 category: "LCD",
                 access: io_reg_access_width(addr).0,
-        width: io_reg_access_width(addr).1,
-        raw_value: val,
+                width: io_reg_access_width(addr).1,
+                raw_value: val,
                 summary: format!("WIN0=[{w0}] WIN1=[{w1}]"),
                 fields: vec![
                     IoField {
@@ -1060,8 +1063,8 @@ pub fn decode_io_reg(addr: u32, val: u32) -> Option<IoRegDesc> {
                 name: "WINOUT",
                 category: "LCD",
                 access: io_reg_access_width(addr).0,
-        width: io_reg_access_width(addr).1,
-        raw_value: val,
+                width: io_reg_access_width(addr).1,
+                raw_value: val,
                 summary: format!("OUT=[{out}] OBJWIN=[{objw}]"),
                 fields: vec![
                     IoField {
@@ -1084,8 +1087,8 @@ pub fn decode_io_reg(addr: u32, val: u32) -> Option<IoRegDesc> {
             name: "MOSAIC",
             category: "LCD",
             access: io_reg_access_width(addr).0,
-        width: io_reg_access_width(addr).1,
-        raw_value: val,
+            width: io_reg_access_width(addr).1,
+            raw_value: val,
             summary: format!(
                 "BG={}x{} OBJ={}x{}",
                 bits(val, 0, 4) + 1,
@@ -1129,8 +1132,8 @@ pub fn decode_io_reg(addr: u32, val: u32) -> Option<IoRegDesc> {
                 name: "BLDALPHA",
                 category: "LCD",
                 access: io_reg_access_width(addr).0,
-        width: io_reg_access_width(addr).1,
-        raw_value: val,
+                width: io_reg_access_width(addr).1,
+                raw_value: val,
                 summary: format!("EVA={eva}/16 EVB={evb}/16"),
                 fields: vec![
                     IoField {
@@ -1155,8 +1158,8 @@ pub fn decode_io_reg(addr: u32, val: u32) -> Option<IoRegDesc> {
                 name: "BLDY",
                 category: "LCD",
                 access: io_reg_access_width(addr).0,
-        width: io_reg_access_width(addr).1,
-        raw_value: val,
+                width: io_reg_access_width(addr).1,
+                raw_value: val,
                 summary: format!("EVY={evy}/16"),
                 fields: vec![IoField {
                     name: "EVY Coefficient",
@@ -1171,8 +1174,8 @@ pub fn decode_io_reg(addr: u32, val: u32) -> Option<IoRegDesc> {
             name: "SOUND1CNT_L",
             category: "Sound",
             access: io_reg_access_width(addr).0,
-        width: io_reg_access_width(addr).1,
-        raw_value: val,
+            width: io_reg_access_width(addr).1,
+            raw_value: val,
             summary: format!(
                 "SweepTime={} {} Shift={}",
                 bits(val, 4, 3),
@@ -1270,8 +1273,8 @@ pub fn decode_io_reg(addr: u32, val: u32) -> Option<IoRegDesc> {
                 name,
                 category: "Sound",
                 access: io_reg_access_width(addr).0,
-        width: io_reg_access_width(addr).1,
-        raw_value: val,
+                width: io_reg_access_width(addr).1,
+                raw_value: val,
                 summary: format!("Freq={} Timed={}", bits(val, 0, 11), on_off(bit(val, 14))),
                 fields: vec![
                     IoField {
@@ -1300,8 +1303,8 @@ pub fn decode_io_reg(addr: u32, val: u32) -> Option<IoRegDesc> {
             name: "SOUND3CNT_L",
             category: "Sound",
             access: io_reg_access_width(addr).0,
-        width: io_reg_access_width(addr).1,
-        raw_value: val,
+            width: io_reg_access_width(addr).1,
+            raw_value: val,
             summary: format!(
                 "Ch3={} BankMode={}",
                 on_off(bit(val, 7)),
@@ -1460,8 +1463,8 @@ pub fn decode_io_reg(addr: u32, val: u32) -> Option<IoRegDesc> {
             name: "SOUNDCNT_L",
             category: "Sound",
             access: io_reg_access_width(addr).0,
-        width: io_reg_access_width(addr).1,
-        raw_value: val,
+            width: io_reg_access_width(addr).1,
+            raw_value: val,
             summary: format!(
                 "DMG Vol R={}/L={} R_En=0x{:X} L_En=0x{:X}",
                 bits(val, 0, 3),
@@ -1502,8 +1505,8 @@ pub fn decode_io_reg(addr: u32, val: u32) -> Option<IoRegDesc> {
             name: "SOUNDCNT_X",
             category: "Sound",
             access: io_reg_access_width(addr).0,
-        width: io_reg_access_width(addr).1,
-        raw_value: val,
+            width: io_reg_access_width(addr).1,
+            raw_value: val,
             summary: format!(
                 "Master={} Active Ch=0b{:04b}",
                 on_off(bit(val, 7)),
@@ -1537,8 +1540,8 @@ pub fn decode_io_reg(addr: u32, val: u32) -> Option<IoRegDesc> {
                 name: "SOUNDBIAS",
                 category: "Sound",
                 access: io_reg_access_width(addr).0,
-        width: io_reg_access_width(addr).1,
-        raw_value: val,
+                width: io_reg_access_width(addr).1,
+                raw_value: val,
                 summary: format!("Bias=0x{bias:03X} {rate}"),
                 fields: vec![
                     IoField {
@@ -1573,8 +1576,8 @@ pub fn decode_io_reg(addr: u32, val: u32) -> Option<IoRegDesc> {
                 name,
                 category: "Sound",
                 access: io_reg_access_width(addr).0,
-        width: io_reg_access_width(addr).1,
-        raw_value: val,
+                width: io_reg_access_width(addr).1,
+                raw_value: val,
                 summary: format!("Wave samples 0x{:04X}", val & 0xFFFF),
                 fields: vec![IoField {
                     name: "4-bit Samples",
@@ -1596,8 +1599,8 @@ pub fn decode_io_reg(addr: u32, val: u32) -> Option<IoRegDesc> {
                 name,
                 category: "Sound",
                 access: io_reg_access_width(addr).0,
-        width: io_reg_access_width(addr).1,
-        raw_value: val,
+                width: io_reg_access_width(addr).1,
+                raw_value: val,
                 summary: format!("Direct Sound FIFO data 0x{val:08X}"),
                 fields: vec![],
             })
@@ -1620,8 +1623,8 @@ pub fn decode_io_reg(addr: u32, val: u32) -> Option<IoRegDesc> {
                         name,
                         category: "DMA",
                         access: io_reg_access_width(addr).0,
-        width: io_reg_access_width(addr).1,
-        raw_value: val,
+                        width: io_reg_access_width(addr).1,
+                        raw_value: val,
                         summary: format!("Source 0x{val:04X}"),
                         fields: vec![],
                     })
@@ -1639,8 +1642,8 @@ pub fn decode_io_reg(addr: u32, val: u32) -> Option<IoRegDesc> {
                         name,
                         category: "DMA",
                         access: io_reg_access_width(addr).0,
-        width: io_reg_access_width(addr).1,
-        raw_value: val,
+                        width: io_reg_access_width(addr).1,
+                        raw_value: val,
                         summary: format!("Destination 0x{val:04X}"),
                         fields: vec![],
                     })
@@ -1692,8 +1695,8 @@ pub fn decode_io_reg(addr: u32, val: u32) -> Option<IoRegDesc> {
                     name,
                     category: "Timer",
                     access: io_reg_access_width(addr).0,
-        width: io_reg_access_width(addr).1,
-        raw_value: val,
+                    width: io_reg_access_width(addr).1,
+                    raw_value: val,
                     summary: format!("Counter/Reload = 0x{:04X} ({})", val & 0xFFFF, val & 0xFFFF),
                     fields: vec![IoField {
                         name: "Value",
@@ -1718,8 +1721,8 @@ pub fn decode_io_reg(addr: u32, val: u32) -> Option<IoRegDesc> {
                 name,
                 category: "Serial",
                 access: io_reg_access_width(addr).0,
-        width: io_reg_access_width(addr).1,
-        raw_value: val,
+                width: io_reg_access_width(addr).1,
+                raw_value: val,
                 summary: format!("0x{:04X}", val & 0xFFFF),
                 fields: vec![],
             })
@@ -1771,7 +1774,11 @@ pub fn decode_io_reg(addr: u32, val: u32) -> Option<IoRegDesc> {
                         name: "SI Terminal (Role)",
                         bit_range: "2",
                         value: bits(val, 2, 1),
-                        meaning: String::from(if bit(val, 2) { "Child/Slave" } else { "Parent/Master" }),
+                        meaning: String::from(if bit(val, 2) {
+                            "Child/Slave"
+                        } else {
+                            "Parent/Master"
+                        }),
                     });
                     fields.push(IoField {
                         name: "Multiplayer ID",
@@ -1805,8 +1812,8 @@ pub fn decode_io_reg(addr: u32, val: u32) -> Option<IoRegDesc> {
             name: "SIOMLT_SEND",
             category: "Serial",
             access: io_reg_access_width(addr).0,
-        width: io_reg_access_width(addr).1,
-        raw_value: val,
+            width: io_reg_access_width(addr).1,
+            raw_value: val,
             summary: format!("Send Data = 0x{:04X}", val & 0xFFFF),
             fields: vec![],
         }),
@@ -1819,8 +1826,8 @@ pub fn decode_io_reg(addr: u32, val: u32) -> Option<IoRegDesc> {
                 name: "KEYINPUT",
                 category: "Keypad",
                 access: io_reg_access_width(addr).0,
-        width: io_reg_access_width(addr).1,
-        raw_value: val,
+                width: io_reg_access_width(addr).1,
+                raw_value: val,
                 summary: format!("Pressed: {pressed}"),
                 fields: vec![IoField {
                     name: "Pressed Buttons (active-low)",
@@ -1837,8 +1844,8 @@ pub fn decode_io_reg(addr: u32, val: u32) -> Option<IoRegDesc> {
                 name: "KEYCNT",
                 category: "Keypad",
                 access: io_reg_access_width(addr).0,
-        width: io_reg_access_width(addr).1,
-        raw_value: val,
+                width: io_reg_access_width(addr).1,
+                raw_value: val,
                 summary: format!(
                     "IRQ={} ({}) Keys=[{keys}]",
                     on_off(bit(val, 14)),
@@ -1875,8 +1882,8 @@ pub fn decode_io_reg(addr: u32, val: u32) -> Option<IoRegDesc> {
             name: "RCNT",
             category: "Serial",
             access: io_reg_access_width(addr).0,
-        width: io_reg_access_width(addr).1,
-        raw_value: val,
+            width: io_reg_access_width(addr).1,
+            raw_value: val,
             summary: format!(
                 "Mode bits=0b{:02b} Raw=0x{:04X}",
                 bits(val, 14, 2),
@@ -1907,8 +1914,8 @@ pub fn decode_io_reg(addr: u32, val: u32) -> Option<IoRegDesc> {
                 name,
                 category: "Serial",
                 access: io_reg_access_width(addr).0,
-        width: io_reg_access_width(addr).1,
-        raw_value: val,
+                width: io_reg_access_width(addr).1,
+                raw_value: val,
                 summary: format!("0x{:04X}", val & 0xFFFF),
                 fields: vec![],
             })
@@ -1920,8 +1927,8 @@ pub fn decode_io_reg(addr: u32, val: u32) -> Option<IoRegDesc> {
                 name: "IE",
                 category: "System",
                 access: io_reg_access_width(addr).0,
-        width: io_reg_access_width(addr).1,
-        raw_value: val,
+                width: io_reg_access_width(addr).1,
+                raw_value: val,
                 summary: format!("Enabled: {flags}"),
                 fields: vec![IoField {
                     name: "Interrupt Mask",
@@ -1938,8 +1945,8 @@ pub fn decode_io_reg(addr: u32, val: u32) -> Option<IoRegDesc> {
                 name: "IF",
                 category: "System",
                 access: io_reg_access_width(addr).0,
-        width: io_reg_access_width(addr).1,
-        raw_value: val,
+                width: io_reg_access_width(addr).1,
+                raw_value: val,
                 summary: format!("Pending: {flags}"),
                 fields: vec![IoField {
                     name: "IRQ Request Flags",
@@ -1955,8 +1962,8 @@ pub fn decode_io_reg(addr: u32, val: u32) -> Option<IoRegDesc> {
             name: "IME",
             category: "System",
             access: io_reg_access_width(addr).0,
-        width: io_reg_access_width(addr).1,
-        raw_value: val,
+            width: io_reg_access_width(addr).1,
+            raw_value: val,
             summary: format!("Master IRQ Enable: {}", on_off(bit(val, 0))),
             fields: vec![IoField {
                 name: "Master Enable",
@@ -1970,8 +1977,8 @@ pub fn decode_io_reg(addr: u32, val: u32) -> Option<IoRegDesc> {
             name: "POSTFLG",
             category: "System",
             access: io_reg_access_width(addr).0,
-        width: io_reg_access_width(addr).1,
-        raw_value: val,
+            width: io_reg_access_width(addr).1,
+            raw_value: val,
             summary: format!("Post-boot Flag = {}", bits(val, 0, 1)),
             fields: vec![IoField {
                 name: "Boot Flag",
@@ -1989,8 +1996,8 @@ pub fn decode_io_reg(addr: u32, val: u32) -> Option<IoRegDesc> {
             name: "HALTCNT",
             category: "System",
             access: io_reg_access_width(addr).0,
-        width: io_reg_access_width(addr).1,
-        raw_value: val,
+            width: io_reg_access_width(addr).1,
+            raw_value: val,
             summary: String::from(if bit(val, 7) {
                 "Stop Mode"
             } else {

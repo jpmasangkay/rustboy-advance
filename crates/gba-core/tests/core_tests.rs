@@ -1348,7 +1348,10 @@ fn test_timer_overhead_and_subsystem_breakdown() {
     println!("Average cost per measurement: {ns_per_call:.2} ns");
     let calls_per_frame = 160 + 228 + 50; // PPU (160) + APU (228) + DMA (~50)
     let frame_overhead_us = (calls_per_frame as f64 * ns_per_call) / 1000.0;
-    println!("Estimated timer overhead per frame ({calls_per_frame} calls): {frame_overhead_us:.3} us ({:.4} ms)", frame_overhead_us / 1000.0);
+    println!(
+        "Estimated timer overhead per frame ({calls_per_frame} calls): {frame_overhead_us:.3} us ({:.4} ms)",
+        frame_overhead_us / 1000.0
+    );
 
     let env_rom = std::env::var("GBA_BENCHMARK_ROM").ok();
     let rom_path = env_rom.as_deref().unwrap_or("roms/benchmark.gba");
@@ -1358,7 +1361,9 @@ fn test_timer_overhead_and_subsystem_breakdown() {
         impl gba_core::HostFrontend for DummyFe {
             fn present_frame(&mut self, _fb: &[u16; 240 * 160]) {}
             fn push_audio_samples(&mut self, _samples: &[i16]) {}
-            fn poll_keypad(&mut self) -> u16 { 0x03FF }
+            fn poll_keypad(&mut self) -> u16 {
+                0x03FF
+            }
         }
         let mut fe = DummyFe;
         // Warmup 60 frames
@@ -1397,13 +1402,34 @@ fn test_timer_overhead_and_subsystem_breakdown() {
         let other_ms = uninst_per_frame_ms - (ppu_ms + apu_ms + dma_ms);
 
         println!("\n=== EMPIRICAL COMPARISON (120 frames of benchmark ROM) ===");
-        println!("Pass 1 (Uninstrumented run_frame):     {uninst_per_frame_ms:.4} ms/frame ({:.1} FPS)", 1000.0 / uninst_per_frame_ms);
-        println!("Pass 2 (Instrumented run_frame_bench): {bench_per_frame_ms:.4} ms/frame ({:.1} FPS)", 1000.0 / bench_per_frame_ms);
-        println!("Empirical Instrumentation Overhead:    {empirical_timer_overhead_ms:.4} ms/frame ({:.2}%)", (empirical_timer_overhead_ms / uninst_per_frame_ms) * 100.0);
-        println!("  PPU Time:                            {ppu_ms:.4} ms ({:.1}%)", (ppu_ms / uninst_per_frame_ms) * 100.0);
-        println!("  APU Time:                            {apu_ms:.4} ms ({:.1}%)", (apu_ms / uninst_per_frame_ms) * 100.0);
-        println!("  DMA Time:                            {dma_ms:.4} ms ({:.1}%)", (dma_ms / uninst_per_frame_ms) * 100.0);
-        println!("  CPU + Bus Remaining:                 {other_ms:.4} ms ({:.1}%)", (other_ms / uninst_per_frame_ms) * 100.0);
+        println!(
+            "Pass 1 (Uninstrumented run_frame):     {uninst_per_frame_ms:.4} ms/frame ({:.1} FPS)",
+            1000.0 / uninst_per_frame_ms
+        );
+        println!(
+            "Pass 2 (Instrumented run_frame_bench): {bench_per_frame_ms:.4} ms/frame ({:.1} FPS)",
+            1000.0 / bench_per_frame_ms
+        );
+        println!(
+            "Empirical Instrumentation Overhead:    {empirical_timer_overhead_ms:.4} ms/frame ({:.2}%)",
+            (empirical_timer_overhead_ms / uninst_per_frame_ms) * 100.0
+        );
+        println!(
+            "  PPU Time:                            {ppu_ms:.4} ms ({:.1}%)",
+            (ppu_ms / uninst_per_frame_ms) * 100.0
+        );
+        println!(
+            "  APU Time:                            {apu_ms:.4} ms ({:.1}%)",
+            (apu_ms / uninst_per_frame_ms) * 100.0
+        );
+        println!(
+            "  DMA Time:                            {dma_ms:.4} ms ({:.1}%)",
+            (dma_ms / uninst_per_frame_ms) * 100.0
+        );
+        println!(
+            "  CPU + Bus Remaining:                 {other_ms:.4} ms ({:.1}%)",
+            (other_ms / uninst_per_frame_ms) * 100.0
+        );
 
         // Measure instruction profile
         let mut total_insts = 0u64;
@@ -1417,8 +1443,13 @@ fn test_timer_overhead_and_subsystem_breakdown() {
             total_stores += prof.mem_write_cycles;
             total_branches += prof.branch_flush_cycles;
         }
-        println!("  Profile counts / frame: insts={}, loads={}, stores={}, branches={}",
-            total_insts / 120, total_loads / 120, total_stores / 120, total_branches / 120);
+        println!(
+            "  Profile counts / frame: insts={}, loads={}, stores={}, branches={}",
+            total_insts / 120,
+            total_loads / 120,
+            total_stores / 120,
+            total_branches / 120
+        );
     }
 }
 
@@ -1616,8 +1647,7 @@ fn test_dma_writing_into_cached_code_page() {
         .write_32(0x0400_00D4, 0x0200_1000, AccessType::NonSequential); // DMA3SAD
     core.bus
         .write_32(0x0400_00D8, 0x0300_8010, AccessType::NonSequential); // DMA3DAD (alias!)
-    core.bus
-        .write_16(0x0400_00DC, 1, AccessType::NonSequential); // DMA3CNT_L = 1 word
+    core.bus.write_16(0x0400_00DC, 1, AccessType::NonSequential); // DMA3CNT_L = 1 word
     core.bus
         .write_16(0x0400_00DE, 0x8400, AccessType::NonSequential); // Enable | 32-bit | Immediate
     flush_immediate_dma(&mut core);
@@ -1699,14 +1729,20 @@ fn test_eeprom_reads_through_fast_path_including_32mb_autodetect() {
         let dummy = core
             .bus
             .read_16(0x0DFF_FF00, AccessType::NonSequential, 0x0800_0000, false);
-        assert_eq!(dummy, 0, "EEPROM dummy bit {d} should be 0 (got {dummy:#x})");
+        assert_eq!(
+            dummy, 0,
+            "EEPROM dummy bit {d} should be 0 (got {dummy:#x})"
+        );
     }
     let mut read_back = 0u64;
     for i in 0..64 {
         let bit = core
             .bus
             .read_16(0x0DFF_FF00, AccessType::NonSequential, 0x0800_0000, false);
-        assert!(bit <= 1, "EEPROM read bypassed into ROM bytes ({bit:#x}) at bit {i}");
+        assert!(
+            bit <= 1,
+            "EEPROM read bypassed into ROM bytes ({bit:#x}) at bit {i}"
+        );
         read_back = (read_back << 1) | ((bit & 1) as u64);
     }
     assert_eq!(read_back, payload);
@@ -1769,7 +1805,8 @@ fn test_savestate_runahead_sram_isolation_and_clone_safety() {
     let mut cloned_bus = core.bus.clone();
     cloned_bus.write_32(0x0200_0000, 0xCAFE_BABE, AccessType::NonSequential);
     assert_eq!(
-        core.bus.read_32(0x0200_0000, AccessType::NonSequential, 0x0800_0000),
+        core.bus
+            .read_32(0x0200_0000, AccessType::NonSequential, 0x0800_0000),
         0,
         "writing to cloned SysBus must not alias original EWRAM"
     );

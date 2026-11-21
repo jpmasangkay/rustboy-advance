@@ -32,13 +32,21 @@ function Get-Sum {
     return [double](($Values | Measure-Object -Sum).Sum)
 }
 
+function Resolve-RomPath {
+    param([string[]]$Candidates)
+    foreach ($p in $Candidates) {
+        if ($p -and (Test-Path $p)) { return $p }
+    }
+    return $Candidates[0]
+}
+
 $romSpecs = @(
-    @{ Name="m7_ex.gba"; Path="roms\homebrew\m7_ex.gba"; Replay="perf\replays\tonc_m7_ex.txt"; Frames=600 },
-    @{ Name="win_demo.gba"; Path="roms\homebrew\win_demo.gba"; Replay="perf\replays\tonc_win_demo.txt"; Frames=600 },
-    @{ Name="bld_demo.gba"; Path="roms\homebrew\bld_demo.gba"; Replay="perf\replays\tonc_bld_demo.txt"; Frames=600 },
-    @{ Name="mos_demo.gba"; Path="roms\homebrew\mos_demo.gba"; Replay="perf\replays\tonc_mos_demo.txt"; Frames=600 },
-    @{ Name="oacombo.gba"; Path="roms\homebrew\oacombo.gba"; Replay="perf\replays\tonc_oacombo.txt"; Frames=600 },
-    @{ Name="bm_modes.gba"; Path="roms\homebrew\bm_modes.gba"; Replay="perf\replays\tonc_bm_modes.txt"; Frames=600 },
+    @{ Name="m7_ex.gba"; Path=(Resolve-RomPath @("test-roms\tonc\m7_ex.gba", "roms\homebrew\m7_ex.gba")); Replay="perf\replays\tonc_m7_ex.txt"; Frames=600 },
+    @{ Name="win_demo.gba"; Path=(Resolve-RomPath @("test-roms\tonc\win_demo.gba", "roms\homebrew\win_demo.gba")); Replay="perf\replays\tonc_win_demo.txt"; Frames=600 },
+    @{ Name="bld_demo.gba"; Path=(Resolve-RomPath @("test-roms\tonc\bld_demo.gba", "roms\homebrew\bld_demo.gba")); Replay="perf\replays\tonc_bld_demo.txt"; Frames=600 },
+    @{ Name="mos_demo.gba"; Path=(Resolve-RomPath @("test-roms\tonc\mos_demo.gba", "roms\homebrew\mos_demo.gba")); Replay="perf\replays\tonc_mos_demo.txt"; Frames=600 },
+    @{ Name="oacombo.gba"; Path=(Resolve-RomPath @("test-roms\tonc\oacombo.gba", "roms\homebrew\oacombo.gba")); Replay="perf\replays\tonc_oacombo.txt"; Frames=600 },
+    @{ Name="bm_modes.gba"; Path=(Resolve-RomPath @("test-roms\tonc\bm_modes.gba", "roms\homebrew\bm_modes.gba")); Replay="perf\replays\tonc_bm_modes.txt"; Frames=600 },
     @{ Name="stress_aff_objwin.gba"; Path="roms\homebrew\stress_aff_objwin.gba"; Replay=$null; Frames=600 },
     @{ Name="stress_mode0_4bg_128spr.gba"; Path="roms\homebrew\stress_mode0_4bg_128spr.gba"; Replay=$null; Frames=600 },
     @{ Name="stress_bitmap_345.gba"; Path="roms\homebrew\stress_bitmap_345.gba"; Replay="perf\replays\stress_bitmap_345.txt"; Frames=600 }
@@ -47,6 +55,10 @@ $romSpecs = @(
 Write-Host "=== Step 1: Realtime N=1 baseline across all 9 Phase 3C ROMs ($FramesPerRom frames each) ==="
 $rtRows = @()
 foreach ($s in $romSpecs) {
+    if (-not (Test-Path $s.Path)) {
+        Write-Warning "Skipping $($s.Name): ROM not found at $($s.Path)"
+        continue
+    }
     $args = @("--bench-realtime", $s.Path, "--frames", $s.Frames, "--slowdown", "1")
     if ($s.Replay) { $args += @("--input-replay", $s.Replay) }
     $out = & $exe @args
@@ -74,7 +86,7 @@ $rtRows | ConvertTo-Json -Depth 4 | Set-Content "perf/phase3c_realtime.json"
 
 Write-Host "`n=== Step 2: 5-run --slowdown N sweep on worst Phase 3C ROMs (bld_demo.gba & stress_mode0_4bg_128spr.gba) ==="
 $sweepTargets = @(
-    @{ Name="bld_demo.gba"; Path="roms\homebrew\bld_demo.gba"; Replay="perf\replays\tonc_bld_demo.txt"; Frames=720 },
+    @{ Name="bld_demo.gba"; Path=(Resolve-RomPath @("test-roms\tonc\bld_demo.gba", "roms\homebrew\bld_demo.gba")); Replay="perf\replays\tonc_bld_demo.txt"; Frames=720 },
     @{ Name="stress_mode0_4bg_128spr.gba"; Path="roms\homebrew\stress_mode0_4bg_128spr.gba"; Replay=$null; Frames=720 }
 )
 $slowdowns = @(1, 5, 10, 20, 30, 50)

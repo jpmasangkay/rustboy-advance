@@ -381,9 +381,7 @@ impl RustboyApp {
         let mut raw_turbo_a = false;
         let mut raw_turbo_b = false;
 
-        let allow_kbd = !ctx.wants_keyboard_input()
-            && self.debugger.awaiting_rebind.is_none()
-            && self.awaiting_input_bind.is_none();
+        let allow_kbd = !ctx.wants_keyboard_input() && self.awaiting_input_bind.is_none();
 
         if allow_kbd {
             ctx.input(|i| {

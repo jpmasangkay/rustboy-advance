@@ -3,20 +3,22 @@ use core::ptr;
 use std::sync::Mutex;
 
 use gba_core::{KEY_A, KEY_UP, LCD_HEIGHT, LCD_WIDTH, SAMPLE_RATE_HZ};
-use gba_libretro::ffi::{
-    RETRO_API_VERSION, RETRO_DEVICE_ID_JOYPAD_A, RETRO_DEVICE_ID_JOYPAD_UP, RETRO_DEVICE_JOYPAD,
-    RETRO_DEVICE_NONE, RETRO_ENVIRONMENT_GET_LOG_INTERFACE, RETRO_ENVIRONMENT_GET_RUMBLE_INTERFACE,
-    RETRO_ENVIRONMENT_GET_SYSTEM_DIRECTORY, RETRO_ENVIRONMENT_GET_VARIABLE,
-    RETRO_ENVIRONMENT_GET_VARIABLE_UPDATE, RETRO_ENVIRONMENT_SET_CONTROLLER_INFO,
-    RETRO_ENVIRONMENT_SET_INPUT_DESCRIPTORS, RETRO_ENVIRONMENT_SET_MEMORY_MAPS,
-    RETRO_ENVIRONMENT_SET_PIXEL_FORMAT, RETRO_ENVIRONMENT_SET_SUPPORT_ACHIEVEMENTS,
-    RETRO_ENVIRONMENT_SET_SUPPORT_NO_GAME, RETRO_ENVIRONMENT_SET_VARIABLES, RETRO_MEMORY_SAVE_RAM,
+use rustboy_advance_libretro::ffi::{
+    RETRO_API_VERSION, RETRO_DEVICE_ID_JOYPAD_A, RETRO_DEVICE_ID_JOYPAD_MASK,
+    RETRO_DEVICE_ID_JOYPAD_UP, RETRO_DEVICE_JOYPAD, RETRO_DEVICE_NONE,
+    RETRO_ENVIRONMENT_GET_INPUT_BITMASKS, RETRO_ENVIRONMENT_GET_LOG_INTERFACE,
+    RETRO_ENVIRONMENT_GET_RUMBLE_INTERFACE, RETRO_ENVIRONMENT_GET_SYSTEM_DIRECTORY,
+    RETRO_ENVIRONMENT_GET_VARIABLE, RETRO_ENVIRONMENT_GET_VARIABLE_UPDATE,
+    RETRO_ENVIRONMENT_SET_CONTROLLER_INFO, RETRO_ENVIRONMENT_SET_INPUT_DESCRIPTORS,
+    RETRO_ENVIRONMENT_SET_MEMORY_MAPS, RETRO_ENVIRONMENT_SET_PIXEL_FORMAT,
+    RETRO_ENVIRONMENT_SET_SUPPORT_ACHIEVEMENTS, RETRO_ENVIRONMENT_SET_SUPPORT_NO_GAME,
+    RETRO_ENVIRONMENT_SET_VARIABLES, RETRO_MEMORY_RTC, RETRO_MEMORY_SAVE_RAM,
     RETRO_MEMORY_SYSTEM_RAM, RETRO_PIXEL_FORMAT_0RGB1555, RETRO_PIXEL_FORMAT_RGB565,
     RETRO_REGION_NTSC, RETRO_RUMBLE_STRONG, retro_game_info, retro_log_callback, retro_log_level,
     retro_memory_map, retro_pixel_format, retro_rumble_effect, retro_rumble_interface,
     retro_system_av_info, retro_system_info, retro_variable,
 };
-use gba_libretro::{
+use rustboy_advance_libretro::{
     retro_api_version, retro_cheat_reset, retro_cheat_set, retro_deinit, retro_get_memory_data,
     retro_get_memory_size, retro_get_region, retro_get_system_av_info, retro_get_system_info,
     retro_init, retro_load_game, retro_load_game_special, retro_reset, retro_run, retro_serialize,
@@ -30,6 +32,10 @@ static MOCK: Mutex<MockFrontend> = Mutex::new(MockFrontend::new());
 
 struct MockFrontend {
     allow_rgb565: bool,
+    support_input_bitmasks: bool,
+    max_audio_batch_chunk: Option<usize>,
+    audio_batch_calls: usize,
+    input_state_calls: usize,
     vars_set: bool,
     input_descriptors_set: bool,
     achievements_supported: bool,
@@ -57,6 +63,10 @@ impl MockFrontend {
     const fn new() -> Self {
         Self {
             allow_rgb565: true,
+            support_input_bitmasks: false,
+            max_audio_batch_chunk: None,
+            audio_batch_calls: 0,
+            input_state_calls: 0,
             vars_set: false,
             input_descriptors_set: false,
             achievements_supported: false,
@@ -223,6 +233,7 @@ unsafe extern "C" fn mock_environ(cmd: c_uint, data: *mut c_void) -> bool {
             mock.achievements_supported = unsafe { *data.cast::<bool>() };
             true
         }
+        RETRO_ENVIRONMENT_GET_INPUT_BITMASKS => mock.support_input_bitmasks,
         _ => false,
     }
 }
@@ -250,8 +261,13 @@ unsafe extern "C" fn mock_audio_sample(_left: i16, _right: i16) {
 }
 
 unsafe extern "C" fn mock_audio_sample_batch(_data: *const i16, frames: usize) -> usize {
-    lock_mock().audio_frames_received += frames;
-    frames
+    let mut mock = lock_mock();
+    mock.audio_batch_calls += 1;
+    let take = mock
+        .max_audio_batch_chunk
+        .map_or(frames, |cap| frames.min(cap));
+    mock.audio_frames_received += take;
+    take
 }
 
 unsafe extern "C" fn mock_input_poll() {
@@ -267,7 +283,18 @@ unsafe extern "C" fn mock_input_state(
     if port != 0 || device != RETRO_DEVICE_JOYPAD {
         return 0;
     }
-    let mock = lock_mock();
+    let mut mock = lock_mock();
+    mock.input_state_calls += 1;
+    if id == RETRO_DEVICE_ID_JOYPAD_MASK {
+        let mut mask = 0u16;
+        if mock.pressed_a {
+            mask |= 1 << RETRO_DEVICE_ID_JOYPAD_A;
+        }
+        if mock.pressed_up {
+            mask |= 1 << RETRO_DEVICE_ID_JOYPAD_UP;
+        }
+        return mask as i16;
+    }
     match id {
         RETRO_DEVICE_ID_JOYPAD_A if mock.pressed_a => 1,
         RETRO_DEVICE_ID_JOYPAD_UP if mock.pressed_up => 1,
@@ -357,14 +384,14 @@ fn system_and_av_info_and_null_safety() {
     assert!(!sys.block_extract);
 
     let mut av = retro_system_av_info {
-        geometry: gba_libretro::ffi::retro_game_geometry {
+        geometry: rustboy_advance_libretro::ffi::retro_game_geometry {
             base_width: 0,
             base_height: 0,
             max_width: 0,
             max_height: 0,
             aspect_ratio: 0.0,
         },
-        timing: gba_libretro::ffi::retro_system_timing {
+        timing: rustboy_advance_libretro::ffi::retro_system_timing {
             fps: 0.0,
             sample_rate: 0.0,
         },
@@ -452,26 +479,33 @@ fn run_frames_rgb565_audio_memory_and_serialize_roundtrip() {
     assert!(!save_ptr.is_null());
     assert!(save_size > 0);
 
-    // Serialize roundtrip verifies EWRAM state restoration and pointer stability.
+    // Serialize roundtrip verifies EWRAM + SRAM state restoration and pointer stability.
     let state_size = retro_serialize_size();
     assert!(state_size >= 600_000);
+    unsafe {
+        *save_ptr.cast::<u8>().add(0x10) = 0x5C;
+    }
     let mut state_buf = vec![0u8; state_size];
     assert!(unsafe { retro_serialize(state_buf.as_mut_ptr().cast(), state_buf.len()) });
     assert_eq!(&state_buf[0..4], b"RBLS");
 
     unsafe {
         *sys_ptr.cast::<u8>().add(0x123) = 0xA5;
+        *save_ptr.cast::<u8>().add(0x10) = 0x99;
     }
     retro_run();
     assert_eq!(unsafe { *sys_ptr.cast::<u8>().add(0x123) }, 0xA5);
 
     assert!(unsafe { retro_unserialize(state_buf.as_ptr().cast(), state_buf.len()) });
     assert_eq!(retro_get_memory_data(RETRO_MEMORY_SYSTEM_RAM), sys_ptr);
+    assert_eq!(retro_get_memory_data(RETRO_MEMORY_SAVE_RAM), save_ptr);
     assert_eq!(unsafe { *sys_ptr.cast::<u8>().add(0x123) }, 0x00);
+    assert_eq!(unsafe { *save_ptr.cast::<u8>().add(0x10) }, 0x5C);
 
     // Corrupted magic must fail gracefully without clobbering memory.
     state_buf[0] = b'X';
     assert!(!unsafe { retro_unserialize(state_buf.as_ptr().cast(), state_buf.len()) });
+    assert_eq!(unsafe { *save_ptr.cast::<u8>().add(0x10) }, 0x5C);
 
     // Reset keeps memory pointer valid and runs cleanly.
     retro_reset();
@@ -800,14 +834,14 @@ fn dual_core_dispatches_gb_rom_and_serializes_cleanly() {
     assert!(unsafe { retro_load_game(&raw const game) });
 
     let mut av = retro_system_av_info {
-        geometry: gba_libretro::ffi::retro_game_geometry {
+        geometry: rustboy_advance_libretro::ffi::retro_game_geometry {
             base_width: 0,
             base_height: 0,
             max_width: 0,
             max_height: 0,
             aspect_ratio: 0.0,
         },
-        timing: gba_libretro::ffi::retro_system_timing {
+        timing: rustboy_advance_libretro::ffi::retro_system_timing {
             fps: 0.0,
             sample_rate: 0.0,
         },
@@ -858,4 +892,143 @@ fn dual_core_dispatches_gb_rom_and_serializes_cleanly() {
     retro_reset();
     assert_eq!(retro_get_memory_data(RETRO_MEMORY_SYSTEM_RAM), wram_ptr);
     retro_run();
+}
+
+#[test]
+fn input_bitmasks_and_partial_audio_batch_loop() {
+    let (_guard, _teardown) = TestGuard::acquire();
+    {
+        let mut mock = lock_mock();
+        mock.support_input_bitmasks = true;
+        mock.max_audio_batch_chunk = Some(128);
+        mock.pressed_a = true;
+        mock.pressed_up = true;
+    }
+
+    let rom = rom_from_words(&[
+        0xE3A0_0301, // MOV R0, #0x04000000
+        0xE280_0C01, // ADD R0, R0, #0x100
+        0xE280_0030, // ADD R0, R0, #0x30  -> 0x0400_0130 (KEYINPUT)
+        0xE3A0_1402, // MOV R1, #0x02000000 (EWRAM)
+        0xE1D0_20B0, // LDRH R2, [R0]
+        0xE1C1_20B0, // STRH R2, [R1]
+        0xEAFF_FFFC, // B -16
+    ]);
+    let game = retro_game_info {
+        path: ptr::null(),
+        data: rom.as_ptr().cast(),
+        size: rom.len(),
+        meta: ptr::null(),
+    };
+    assert!(unsafe { retro_load_game(&raw const game) });
+
+    retro_run();
+
+    let ewram = retro_get_memory_data(RETRO_MEMORY_SYSTEM_RAM) as *const u16;
+    assert!(!ewram.is_null());
+    let key_val = unsafe { *ewram } & 0x03FF;
+    assert_eq!(key_val, !(KEY_A | KEY_UP) & 0x03FF);
+
+    let mock = lock_mock();
+    // With GET_INPUT_BITMASKS enabled, polling should invoke input_state exactly once per frame.
+    assert_eq!(mock.input_state_calls, 1);
+    // Partial batch consumption (cap=128) must loop across multiple calls until all frames drain.
+    assert!(mock.audio_batch_calls >= 5);
+    assert!(mock.audio_frames_received >= 700);
+}
+
+#[test]
+fn gb_memory_descriptors_non_battery_ram_and_mbc3_rtc() {
+    let (_guard, _teardown) = TestGuard::acquire();
+
+    // 1. Non-battery MBC1+RAM ROM (0x02): SAVE_RAM must not be exposed to RetroArch.
+    let mut no_batt = synthetic_gb_rom();
+    no_batt[0x0147] = 0x02; // MBC1+RAM (no battery)
+    let mut chk = 0u8;
+    for &b in &no_batt[0x0134..=0x014C] {
+        chk = chk.wrapping_sub(b).wrapping_sub(1);
+    }
+    no_batt[0x014D] = chk;
+    let game_nb = retro_game_info {
+        path: ptr::null(),
+        data: no_batt.as_ptr().cast(),
+        size: no_batt.len(),
+        meta: ptr::null(),
+    };
+    assert!(unsafe { retro_load_game(&raw const game_nb) });
+    assert_eq!(retro_get_memory_size(RETRO_MEMORY_SAVE_RAM), 0);
+    assert!(retro_get_memory_data(RETRO_MEMORY_SAVE_RAM).is_null());
+    assert_eq!(retro_get_memory_size(RETRO_MEMORY_RTC), 0);
+    retro_unload_game();
+
+    // 2. CGB + MBC3+TIMER+RAM+BATT (0x10): exposes HRAM, VRAM, OAM, CGB WRAM banks, and 48B RTC.
+    let mut cgb_rtc = synthetic_gb_rom();
+    cgb_rtc[0x0143] = 0x80; // CGB compatible
+    cgb_rtc[0x0147] = 0x10; // MBC3+TIMER+RAM+BATTERY
+    let mut chk2 = 0u8;
+    for &b in &cgb_rtc[0x0134..=0x014C] {
+        chk2 = chk2.wrapping_sub(b).wrapping_sub(1);
+    }
+    cgb_rtc[0x014D] = chk2;
+    let game_rtc = retro_game_info {
+        path: ptr::null(),
+        data: cgb_rtc.as_ptr().cast(),
+        size: cgb_rtc.len(),
+        meta: ptr::null(),
+    };
+    assert!(unsafe { retro_load_game(&raw const game_rtc) });
+
+    {
+        let mock = lock_mock();
+        assert!(
+            mock.memory_maps
+                .iter()
+                .any(|&(start, len, _)| start == 0x8000 && len == 0x2000),
+            "expected VRAM descriptor"
+        );
+        assert!(
+            mock.memory_maps
+                .iter()
+                .any(|&(start, len, _)| start == 0xFE00 && len == 0xA0),
+            "expected OAM descriptor"
+        );
+        assert!(
+            mock.memory_maps
+                .iter()
+                .any(|&(start, len, _)| start == 0xFF80 && len == 0x7F),
+            "expected HRAM descriptor"
+        );
+        assert!(
+            mock.memory_maps
+                .iter()
+                .any(|&(start, len, _)| start == 0x0001_0000 && len == 0x6000),
+            "expected CGB WRAM banks 2..7 descriptor"
+        );
+    }
+
+    assert_eq!(retro_get_memory_size(RETRO_MEMORY_SAVE_RAM), 0x2000);
+    assert_eq!(retro_get_memory_size(RETRO_MEMORY_RTC), 48);
+    let rtc_ptr = retro_get_memory_data(RETRO_MEMORY_RTC);
+    assert!(!rtc_ptr.is_null());
+
+    // Simulate RetroArch loading a persisted .rtc blob with hour=12, min=34, sec=56.
+    let mut trailer = [0u8; 48];
+    trailer[0..4].copy_from_slice(&56u32.to_le_bytes());
+    trailer[4..8].copy_from_slice(&34u32.to_le_bytes());
+    trailer[8..12].copy_from_slice(&12u32.to_le_bytes());
+    let now_secs = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs();
+    trailer[40..48].copy_from_slice(&now_secs.to_le_bytes());
+    unsafe {
+        ptr::copy_nonoverlapping(trailer.as_ptr(), rtc_ptr.cast::<u8>(), 48);
+    }
+
+    retro_run();
+    let readback = unsafe { core::slice::from_raw_parts(rtc_ptr.cast::<u8>(), 48) };
+    let rb_min = u32::from_le_bytes(readback[4..8].try_into().unwrap());
+    let rb_hour = u32::from_le_bytes(readback[8..12].try_into().unwrap());
+    assert_eq!(rb_hour, 12);
+    assert_eq!(rb_min, 34);
 }

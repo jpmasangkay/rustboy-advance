@@ -211,7 +211,10 @@ fn decode_cover_bytes(bytes: &[u8]) -> Option<egui::ColorImage> {
     ))
 }
 
-pub(crate) fn spawn_cover_loader_worker() -> (mpsc::Sender<RomLibraryEntry>, mpsc::Receiver<CoverLoadResult>) {
+pub(crate) fn spawn_cover_loader_worker() -> (
+    mpsc::Sender<RomLibraryEntry>,
+    mpsc::Receiver<CoverLoadResult>,
+) {
     let (req_tx, req_rx) = mpsc::channel::<RomLibraryEntry>();
     let (res_tx, res_rx) = mpsc::channel::<CoverLoadResult>();
 
@@ -220,7 +223,9 @@ pub(crate) fn spawn_cover_loader_worker() -> (mpsc::Sender<RomLibraryEntry>, mps
         .spawn(move || {
             while let Ok(entry) = req_rx.recv() {
                 let decoded = if let Some(cover_path) = find_cover_image(&entry) {
-                    fs::read(&cover_path).ok().and_then(|b| decode_cover_bytes(&b))
+                    fs::read(&cover_path)
+                        .ok()
+                        .and_then(|b| decode_cover_bytes(&b))
                 } else {
                     download_and_cache_cover(&entry).and_then(|b| decode_cover_bytes(&b))
                 };
@@ -294,7 +299,13 @@ fn download_and_cache_cover(entry: &RomLibraryEntry) -> Option<Vec<u8>> {
         let appdata_covers = crate::config::AppConfig::app_data_dir().join("covers");
         let safe_name: String = display_name
             .chars()
-            .map(|c| if matches!(c, '/' | '\\' | ':' | '*' | '?' | '"' | '<' | '>' | '|') { '_' } else { c })
+            .map(|c| {
+                if matches!(c, '/' | '\\' | ':' | '*' | '?' | '"' | '<' | '>' | '|') {
+                    '_'
+                } else {
+                    c
+                }
+            })
             .collect();
         let target = appdata_covers.join(format!("{safe_name}.png"));
         let _ = crate::config::write_atomic(&target, &bytes);

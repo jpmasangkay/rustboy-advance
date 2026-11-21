@@ -277,7 +277,15 @@ pub const GAME_DB: &[GameDbEntry] = &[
     GameDbEntry::with_flags("KYGP", SaveType::Eeprom8K, false, false, true, false, false),
     GameDbEntry::with_flags("KYGJ", SaveType::Eeprom8K, false, false, true, false, false),
     // Koro Koro Puzzle Happy Panechu! (Tilt)
-    GameDbEntry::with_flags("KHPJ", SaveType::Eeprom512B, false, false, true, false, false),
+    GameDbEntry::with_flags(
+        "KHPJ",
+        SaveType::Eeprom512B,
+        false,
+        false,
+        true,
+        false,
+        false,
+    ),
     // WarioWare: Twisted! (Gyro + Rumble)
     GameDbEntry::with_flags("RZWE", SaveType::Sram32K, false, false, false, true, true),
     GameDbEntry::with_flags("RZWJ", SaveType::Sram32K, false, false, false, true, true),
@@ -286,7 +294,15 @@ pub const GAME_DB: &[GameDbEntry] = &[
     GameDbEntry::with_flags("V49P", SaveType::Sram32K, false, false, false, false, true),
     GameDbEntry::with_flags("V49J", SaveType::Sram32K, false, false, false, false, true),
     // Sennen Kazoku (Flash 128K + RTC)
-    GameDbEntry::with_flags("BKAJ", SaveType::Flash128K, true, false, false, false, false),
+    GameDbEntry::with_flags(
+        "BKAJ",
+        SaveType::Flash128K,
+        true,
+        false,
+        false,
+        false,
+        false,
+    ),
     // Golden Sun & Golden Sun: The Lost Age
     GameDbEntry::basic("AGSE", SaveType::Flash64K),
     GameDbEntry::basic("AGSP", SaveType::Flash64K),

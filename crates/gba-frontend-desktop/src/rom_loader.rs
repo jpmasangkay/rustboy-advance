@@ -225,9 +225,7 @@ pub(crate) fn apply_ips(rom: &mut Vec<u8>, patch: &[u8]) -> Result<(), String> {
         // Only treat `b"EOF"` as the terminator when it is actually at the end of the patch
         // (or followed solely by the optional 3-byte truncation length), so a valid record at
         // offset 0x454F46 (`"EOF"`) in the middle of a patch is not misinterpreted as EOF.
-        if &patch[pos..pos + 3] == b"EOF"
-            && (pos + 3 == patch.len() || pos + 6 == patch.len())
-        {
+        if &patch[pos..pos + 3] == b"EOF" && (pos + 3 == patch.len() || pos + 6 == patch.len()) {
             if pos + 6 == patch.len() {
                 let trunc_len = ((patch[pos + 3] as usize) << 16)
                     | ((patch[pos + 4] as usize) << 8)
@@ -596,7 +594,11 @@ pub(crate) fn apply_auto_patch_if_present(
     Ok(None)
 }
 
-fn read_bounded_rom<R: Read>(reader: R, hint_len: usize, source_desc: &str) -> Result<Vec<u8>, String> {
+fn read_bounded_rom<R: Read>(
+    reader: R,
+    hint_len: usize,
+    source_desc: &str,
+) -> Result<Vec<u8>, String> {
     let mut bytes = Vec::with_capacity(hint_len.min(MAX_ROM_BYTES));
     reader
         .take(MAX_ROM_BYTES as u64 + 1)

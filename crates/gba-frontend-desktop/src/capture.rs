@@ -32,13 +32,6 @@ impl GifFpsMode {
         }
     }
 
-    pub(crate) const fn delay_cs(self) -> u16 {
-        match self {
-            Self::Fps60 => 2,
-            Self::Fps30 => 3,
-        }
-    }
-
     pub(crate) const fn label(self) -> &'static str {
         match self {
             Self::Fps60 => "60 FPS (Every Frame)",
@@ -187,6 +180,7 @@ impl<W: Write> GifRecorder<W> {
         self.frames_written
     }
 
+    #[allow(dead_code)]
     pub(crate) fn push_rgba_frame(&mut self, rgba: &[u8]) -> Result<bool, String> {
         let expected = self.width * self.height * 4;
         if rgba.len() != expected {
@@ -289,8 +283,8 @@ impl<W: Write> GifRecorder<W> {
             gif::Frame::from_palette_pixels(
                 self.width as u16,
                 self.height as u16,
-                &self.exact_indices,
-                &self.exact_palette,
+                self.exact_indices.clone(),
+                self.exact_palette.clone(),
                 None,
             )
         } else {
@@ -378,11 +372,6 @@ impl<W: Write + Seek> WavRecorder<W> {
             samples_written: 0,
             byte_buf: Vec::with_capacity(4096),
         })
-    }
-
-    pub(crate) fn duration_secs(&self) -> f64 {
-        let stereo_frames = self.samples_written / 2;
-        (stereo_frames as f64) / f64::from(self.sample_rate.max(1))
     }
 
     pub(crate) fn push_samples(&mut self, samples: &[i16]) -> Result<(), String> {
@@ -719,9 +708,7 @@ impl CaptureController {
         match gif.tx.try_send(msg) {
             Ok(()) | Err(mpsc::TrySendError::Full(_)) => Ok(()),
             Err(mpsc::TrySendError::Disconnected(_)) => {
-                if let Err(e) = self.stop_gif() {
-                    return Err(e);
-                }
+                self.stop_gif()?;
                 Err("GIF worker disconnected".into())
             }
         }
@@ -737,9 +724,7 @@ impl CaptureController {
         match wav.tx.try_send(WavWorkerMsg::Samples(samples.to_vec())) {
             Ok(()) | Err(mpsc::TrySendError::Full(_)) => Ok(()),
             Err(mpsc::TrySendError::Disconnected(_)) => {
-                if let Err(e) = self.stop_wav() {
-                    return Err(e);
-                }
+                self.stop_wav()?;
                 Err("WAV worker disconnected".into())
             }
         }
@@ -791,7 +776,11 @@ mod tests {
         let mut decoded_count = 0usize;
         let mut total_delay_60 = 0u32;
         while let Some(frame) = reader.read_next_frame().unwrap() {
-            assert!((1..=2).contains(&frame.delay), "unexpected 60fps delay {}", frame.delay);
+            assert!(
+                (1..=2).contains(&frame.delay),
+                "unexpected 60fps delay {}",
+                frame.delay
+            );
             total_delay_60 += u32::from(frame.delay);
             assert_eq!(frame.width, LCD_WIDTH as u16);
             assert_eq!(frame.height, LCD_HEIGHT as u16);
@@ -826,7 +815,11 @@ mod tests {
         let mut count30 = 0usize;
         let mut total_delay_30 = 0u32;
         while let Some(frame) = dec30.read_next_frame().unwrap() {
-            assert!((3..=4).contains(&frame.delay), "unexpected 30fps delay {}", frame.delay);
+            assert!(
+                (3..=4).contains(&frame.delay),
+                "unexpected 30fps delay {}",
+                frame.delay
+            );
             total_delay_30 += u32::from(frame.delay);
             count30 += 1;
         }

@@ -935,8 +935,9 @@ impl Apu {
                 self.tick_frame_sequencer();
                 self.commit_mix(seq_cycle);
             }
-            self.next_frame_seq_cycle =
-                self.next_frame_seq_cycle.saturating_add(crate::APU_FRAME_SEQ_INTERVAL);
+            self.next_frame_seq_cycle = self
+                .next_frame_seq_cycle
+                .saturating_add(crate::APU_FRAME_SEQ_INTERVAL);
         }
         self.sync_chunks(target_cycle);
     }

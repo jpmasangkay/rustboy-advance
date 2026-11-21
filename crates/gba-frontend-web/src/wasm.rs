@@ -39,9 +39,9 @@ impl Emulator {
     }
 
     /// Loads a GBA ROM image (`Uint8Array`) and initializes the core.
-    pub fn load_rom(&mut self, bytes: &[u8]) -> Result<(), JsValue> {
+    pub fn load_rom(&mut self, bytes: Vec<u8>) -> Result<(), JsValue> {
         self.inner
-            .load_rom(bytes)
+            .load_rom_owned(bytes)
             .map_err(|e| JsValue::from_str(&e))
     }
 
@@ -60,6 +60,12 @@ impl Emulator {
     /// Executes one full GBA frame (280,896 cycles). Returns `false` if no ROM is loaded.
     pub fn run_frame(&mut self) -> bool {
         self.inner.run_frame()
+    }
+
+    /// Executes `count` full GBA frames, deferring RGBA conversion until the last frame
+    /// when fast-forwarding without LCD ghosting.
+    pub fn step_frames(&mut self, count: u32) -> u32 {
+        self.inner.step_frames(count)
     }
 
     /// Hard-resets the console while preserving ROM, BIOS, and cartridge SRAM.

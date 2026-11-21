@@ -1,7 +1,7 @@
 # Software Information
-display_name = "Nintendo - Game Boy Advance (Rustboy Advance)"
+display_name = "Nintendo - Game Boy / Color / Advance (Rustboy Advance)"
 authors = "Rustboy Advance Contributors"
-supported_extensions = "gba|agb|bin"
+supported_extensions = "gba|agb|gb|gbc|bin"
 corename = "Rustboy Advance"
 categories = "Emulator"
 license = "MPL-2.0"
@@ -10,11 +10,11 @@ display_version = "0.1.0"
 
 # Hardware Information
 manufacturer = "Nintendo"
-systemname = "Nintendo - Game Boy Advance"
+systemname = "Nintendo - Game Boy / Color / Advance"
 systemid = "game_boy_advance"
 
 # Libretro Features
-database = "Nintendo - Game Boy Advance|Nintendo - Game Boy Advance (e-Reader)"
+database = "Nintendo - Game Boy Advance|Nintendo - Game Boy Advance (e-Reader)|Nintendo - Game Boy|Nintendo - Game Boy Color"
 supports_no_game = "false"
 savestate = "true"
 savestate_features = "serialized"
@@ -28,4 +28,4 @@ firmware_count = 1
 firmware0_desc = "gba_bios.bin (Game Boy Advance BIOS)"
 firmware0_path = "gba_bios.bin"
 firmware0_opt = "true"
-notes = "(!) gba_bios.bin (md5): a860e8c0b6d573d191e4ec7db1b1e4f6|(!) Falls back to built-in HLE BIOS when gba_bios.bin is absent."
+notes = "(!) Supports GBA (.gba/.agb) and Game Boy / Game Boy Color (.gb/.gbc) ROMs.|(!) gba_bios.bin (md5): a860e8c0b6d573d191e4ec7db1b1e4f6|(!) Falls back to built-in HLE BIOS when gba_bios.bin is absent."

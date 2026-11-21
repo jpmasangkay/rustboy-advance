@@ -378,9 +378,7 @@ impl GdbSession {
                     .watchpoints
                     .iter()
                     .find(|w| {
-                        matches_dir(w.kind)
-                            && w.start <= addr.saturating_add(3)
-                            && *addr <= w.end
+                        matches_dir(w.kind) && w.start <= addr.saturating_add(3) && *addr <= w.end
                     })
                     .map(|w| match w.kind {
                         WatchpointKind::Read => "rwatch",
@@ -591,7 +589,9 @@ impl GdbSession {
     fn handle_vcont(&mut self, rest: &str) -> PacketOutcome {
         let first_action = rest.split(';').next().unwrap_or("");
         let cmd = first_action.split(':').next().unwrap_or("");
-        if cmd == "c" || (cmd.starts_with('C') && cmd.len() == 3 && parse_hex_u32(&cmd[1..]).is_some()) {
+        if cmd == "c"
+            || (cmd.starts_with('C') && cmd.len() == 3 && parse_hex_u32(&cmd[1..]).is_some())
+        {
             self.run_state = RunState::Running;
             PacketOutcome {
                 reply: None,
@@ -616,8 +616,8 @@ impl GdbSession {
         if self.target_xml_read {
             // 17 registers described in ARM7TDMI_TARGET_XML: r0..r14, exec_pc, cpsr.
             let mut out = String::with_capacity(17 * 8);
-            for i in 0..15 {
-                encode_u32_le_hex(core.cpu.gpr[i], &mut out);
+            for &reg in core.cpu.gpr.iter().take(15) {
+                encode_u32_le_hex(reg, &mut out);
             }
             encode_u32_le_hex(core.cpu.current_exec_pc(), &mut out);
             encode_u32_le_hex(core.cpu.cpsr, &mut out);
@@ -625,8 +625,8 @@ impl GdbSession {
         } else {
             // Legacy 26-register ARM FPA layout (16*4 + 8*12 + 4 + 4 = 168 bytes).
             let mut out = String::with_capacity(168 * 2);
-            for i in 0..15 {
-                encode_u32_le_hex(core.cpu.gpr[i], &mut out);
+            for &reg in core.cpu.gpr.iter().take(15) {
+                encode_u32_le_hex(reg, &mut out);
             }
             encode_u32_le_hex(core.cpu.current_exec_pc(), &mut out);
             // 8 x 96-bit FPA registers (f0..f7) + 32-bit fps = 100 zero bytes (200 hex chars)
@@ -660,8 +660,8 @@ impl GdbSession {
         };
         let new_cpsr = read_u32(cpsr_off);
         core.cpu.set_cpsr(new_cpsr);
-        for i in 0..15 {
-            core.cpu.gpr[i] = read_u32(i * 4);
+        for (i, slot) in core.cpu.gpr.iter_mut().enumerate().take(15) {
+            *slot = read_u32(i * 4);
         }
         let new_pc = read_u32(15 * 4);
         core.cpu.flush_pipeline(&mut core.bus, new_pc);
@@ -752,7 +752,7 @@ impl GdbSession {
         if len > 0 {
             let end_addr = addr.saturating_add((len - 1) as u32);
             // Reject writes to read-only BIOS or unmapped high address space.
-            if addr < 0x0000_4000 || addr >= 0x1000_0000 || end_addr >= 0x1000_0000 {
+            if !(0x0000_4000..0x1000_0000).contains(&addr) || end_addr >= 0x1000_0000 {
                 return String::from("E0E");
             }
         }

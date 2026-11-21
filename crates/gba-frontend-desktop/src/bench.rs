@@ -17,7 +17,8 @@ use crate::emu_thread::DrcPacer;
 use crate::filters::{QualityGovernor, VideoPostProcessor};
 use crate::headless::CliConfig;
 use crate::no_gpu::{
-    NoGpuCpuPresenter, SoftbufferSizeBenchRow, bench_real_softbuffer_present, bench_softbuffer_sizes,
+    NoGpuCpuPresenter, SoftbufferSizeBenchRow, bench_real_softbuffer_present,
+    bench_softbuffer_sizes,
 };
 use crate::shaders::{
     BenchWgpuContext, EnumeratedAdapterInfo, StartupBackendDecision, choose_desktop_backend,
@@ -368,7 +369,9 @@ fn measure_calibrate_ms() -> (f64, u64) {
     let mut state: u64 = 0x9E37_79B9_7F4A_7C15;
     let mut acc: u64 = 0x517C_C1B7_2722_0A95;
     for i in 0..80_000_000u64 {
-        state = state.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407 ^ i);
+        state = state
+            .wrapping_mul(6364136223846793005)
+            .wrapping_add(1442695040888963407 ^ i);
         acc = acc.wrapping_add(state.rotate_left(17) ^ (state >> 23));
     }
     black_box(acc);
@@ -558,6 +561,7 @@ pub struct BenchReportJson {
 
 struct BenchFrontend<'a> {
     replay: &'a InputReplay,
+    loop_replay: bool,
     frame_idx: usize,
     filter: DisplayFilter,
     color_correction: bool,
@@ -574,11 +578,21 @@ struct BenchFrontend<'a> {
 }
 
 impl<'a> BenchFrontend<'a> {
-    fn new(replay: &'a InputReplay, filter: DisplayFilter) -> Self {
+    fn new(
+        replay: &'a InputReplay,
+        loop_replay: bool,
+        filter: DisplayFilter,
+        color_correction_override: bool,
+    ) -> Self {
         let cfg = AppConfig::default();
+        let color_correction = if color_correction_override {
+            true
+        } else {
+            cfg.color_correction
+        };
         let mut postproc = VideoPostProcessor::new();
         postproc.prewarm(
-            cfg.color_correction,
+            color_correction,
             cfg.lcd_ghosting,
             filter,
             false,
@@ -586,15 +600,19 @@ impl<'a> BenchFrontend<'a> {
         );
         Self {
             replay,
+            loop_replay,
             frame_idx: 0,
             filter,
-            color_correction: cfg.color_correction,
+            color_correction,
             color_profile: cfg.color_profile,
             frame_blending: cfg.frame_blending,
             lcd_ghosting: cfg.lcd_ghosting,
             lcd_grid_intensity: cfg.lcd_grid_intensity,
             postproc,
-            prev_fb: vec![0u16; LCD_WIDTH * LCD_HEIGHT].into_boxed_slice().try_into().unwrap(),
+            prev_fb: vec![0u16; LCD_WIDTH * LCD_HEIGHT]
+                .into_boxed_slice()
+                .try_into()
+                .unwrap(),
             has_prev: false,
             last_present_dur: Duration::ZERO,
             frames_presented: 0,
@@ -607,18 +625,12 @@ impl<'a> HostFrontend for BenchFrontend<'a> {
     fn present_frame(&mut self, fb: &[u16; LCD_WIDTH * LCD_HEIGHT]) {
         let t0 = Instant::now();
         let prev = self.has_prev.then_some(self.prev_fb.as_ref());
-        self.postproc.sync_rgba_for_capture(
+        let img = self.postproc.process_display_filter_with_options(
             fb,
             prev,
-            self.frame_idx as u64,
             self.color_correction,
             self.color_profile,
             self.frame_blending,
-            self.lcd_ghosting,
-        );
-        let img = self.postproc.process_display_filter(
-            fb,
-            self.color_correction,
             self.lcd_ghosting,
             self.filter,
             false,
@@ -637,12 +649,16 @@ impl<'a> HostFrontend for BenchFrontend<'a> {
     }
 
     fn poll_keypad(&mut self) -> u16 {
-        self.replay.keyinput_at(self.frame_idx)
+        let eff = self
+            .replay
+            .effective_frame(self.frame_idx, self.loop_replay);
+        self.replay.keyinput_at(eff)
     }
 }
 
 struct SubAttrFrontend<'a> {
     replay: &'a InputReplay,
+    loop_replay: bool,
     frame_idx: usize,
     frames_presented: usize,
 }
@@ -658,7 +674,10 @@ impl<'a> HostFrontend for SubAttrFrontend<'a> {
     }
 
     fn poll_keypad(&mut self) -> u16 {
-        self.replay.keyinput_at(self.frame_idx)
+        let eff = self
+            .replay
+            .effective_frame(self.frame_idx, self.loop_replay);
+        self.replay.keyinput_at(eff)
     }
 }
 
@@ -694,8 +713,8 @@ fn load_rom_and_bios(cfg: &CliConfig) -> Result<LoadedRomInputs, String> {
         .rom_path
         .as_ref()
         .ok_or("a ROM path is required for `--bench` / `--bench-realtime`")?;
-    let rom = fs::read(rom_path)
-        .map_err(|e| format!("failed to read ROM {}: {e}", rom_path.display()))?;
+    let mut loaded = crate::rom_loader::load_rom_bytes(rom_path)?;
+    let _ = crate::rom_loader::apply_auto_patch_if_present(rom_path, &mut loaded.bytes);
     let bios = match &cfg.bios_path {
         Some(p) => {
             Some(fs::read(p).map_err(|e| format!("failed to read BIOS {}: {e}", p.display()))?)
@@ -708,12 +727,14 @@ fn load_rom_and_bios(cfg: &CliConfig) -> Result<LoadedRomInputs, String> {
         }
         _ => None,
     };
-    let rom_name = rom_path
-        .file_name()
-        .map(|n| n.to_string_lossy().to_string())
-        .unwrap_or_else(|| "unknown.gba".to_string());
+    let rom_name = loaded.inner_name.unwrap_or_else(|| {
+        rom_path
+            .file_name()
+            .map(|n| n.to_string_lossy().to_string())
+            .unwrap_or_else(|| "unknown.gba".to_string())
+    });
     Ok(LoadedRomInputs {
-        rom,
+        rom: loaded.bytes,
         bios,
         sav,
         rom_name,
@@ -738,17 +759,39 @@ fn get_or_create_bucket<'a>(
     buckets.last_mut().expect("just pushed")
 }
 
-/// Checks workspace Cargo.toml for release optimization settings.
+/// Checks workspace Cargo.toml `[profile.release]` section for release optimization settings.
 pub fn verify_release_profile_settings() -> (bool, String) {
     let candidates = [Path::new("Cargo.toml"), Path::new("../../Cargo.toml")];
     for p in candidates {
         if let Ok(text) = fs::read_to_string(p) {
-            let has_opt3 = text.contains("opt-level = 3");
-            let has_lto = text.contains("lto = \"fat\"") || text.contains("lto = true");
-            let has_cgu1 = text.contains("codegen-units = 1");
+            let mut in_release = false;
+            let mut has_opt3 = false;
+            let mut has_lto = false;
+            let mut has_cgu1 = false;
+            for raw_line in text.lines() {
+                let line = raw_line.split('#').next().unwrap_or("").trim();
+                if line.is_empty() {
+                    continue;
+                }
+                if line.starts_with('[') && line.ends_with(']') {
+                    in_release = line == "[profile.release]";
+                    continue;
+                }
+                if !in_release {
+                    continue;
+                }
+                let compact: String = line.chars().filter(|c| !c.is_whitespace()).collect();
+                if compact == "opt-level=3" {
+                    has_opt3 = true;
+                } else if compact == "lto=\"fat\"" || compact == "lto=true" {
+                    has_lto = true;
+                } else if compact == "codegen-units=1" {
+                    has_cgu1 = true;
+                }
+            }
             let ok = has_opt3 && has_lto && has_cgu1;
             let detail = format!(
-                "Cargo.toml ({}): opt-level=3 ({has_opt3}), lto=fat ({has_lto}), codegen-units=1 ({has_cgu1})",
+                "Cargo.toml ({}) [profile.release]: opt-level=3 ({has_opt3}), lto=fat ({has_lto}), codegen-units=1 ({has_cgu1})",
                 p.display()
             );
             return (ok, detail);
@@ -772,6 +815,7 @@ pub fn run_bench(cfg: &CliConfig) -> Result<(), String> {
         .filter
         .unwrap_or_else(|| AppConfig::default().display_filter);
     let frames = cfg.frames.max(1);
+    let warmup_frames = cfg.warmup_frames;
     let ts = format_utc_timestamp();
 
     fs::create_dir_all(&cfg.perf_dir)
@@ -782,7 +826,17 @@ pub fn run_bench(cfg: &CliConfig) -> Result<(), String> {
     if let Some(bytes) = &sav {
         core1.bus.cart.load_save_data(bytes);
     }
-    let mut front1 = BenchFrontend::new(&replay, filter);
+    let mut front1 = BenchFrontend::new(
+        &replay,
+        cfg.loop_replay,
+        filter,
+        cfg.filter_color_correction,
+    );
+
+    for w in 0..warmup_frames {
+        front1.frame_idx = w;
+        core1.run_frame(&mut front1);
+    }
 
     let mut all_total_ms = Vec::with_capacity(frames);
     let mut all_emu_ms = Vec::with_capacity(frames);
@@ -794,7 +848,8 @@ pub fn run_bench(cfg: &CliConfig) -> Result<(), String> {
         .collect();
 
     for frame_idx in 0..frames {
-        front1.frame_idx = frame_idx;
+        let abs_frame = warmup_frames + frame_idx;
+        front1.frame_idx = abs_frame;
         front1.last_present_dur = Duration::ZERO;
         let t0 = Instant::now();
         core1.run_frame(&mut front1);
@@ -808,7 +863,8 @@ pub fn run_bench(cfg: &CliConfig) -> Result<(), String> {
         all_emu_ms.push(emu_ms);
         all_present_ms.push(present_ms);
 
-        let scene_name = replay.scene_at(frame_idx);
+        let eff = replay.effective_frame(abs_frame, cfg.loop_replay);
+        let scene_name = replay.scene_at(eff);
         let bucket = get_or_create_bucket(&mut scene_buckets, scene_name);
         bucket.total_ms.push(total_ms);
         bucket.emu_ms.push(emu_ms);
@@ -822,16 +878,23 @@ pub fn run_bench(cfg: &CliConfig) -> Result<(), String> {
     }
     let mut front2 = SubAttrFrontend {
         replay: &replay,
+        loop_replay: cfg.loop_replay,
         frame_idx: 0,
         frames_presented: 0,
     };
+    for w in 0..warmup_frames {
+        front2.frame_idx = w;
+        core2.run_frame(&mut front2);
+    }
     let mut total_accum = SubsystemAccum::default();
 
     for frame_idx in 0..frames {
-        front2.frame_idx = frame_idx;
+        let abs_frame = warmup_frames + frame_idx;
+        front2.frame_idx = abs_frame;
         let (timing, profile) = core2.run_frame_bench(&mut front2);
         total_accum.add_timing(&timing, &profile);
-        let scene_name = replay.scene_at(frame_idx);
+        let eff = replay.effective_frame(abs_frame, cfg.loop_replay);
+        let scene_name = replay.scene_at(eff);
         let bucket = get_or_create_bucket(&mut scene_buckets, scene_name);
         bucket.accum.add_timing(&timing, &profile);
     }
@@ -1124,7 +1187,10 @@ impl<'a> RealtimeFrontend<'a> {
             postproc,
             software_wgpu,
             no_gpu_blitter,
-            prev_fb: vec![0u16; LCD_WIDTH * LCD_HEIGHT].into_boxed_slice().try_into().unwrap(),
+            prev_fb: vec![0u16; LCD_WIDTH * LCD_HEIGHT]
+                .into_boxed_slice()
+                .try_into()
+                .unwrap(),
             has_prev: false,
             audio,
             last_present_dur: Duration::ZERO,
@@ -1166,28 +1232,25 @@ impl<'a> HostFrontend for RealtimeFrontend<'a> {
         let t0 = Instant::now();
         if let Some(ref mut ctx) = self.software_wgpu {
             if ctx.is_cpu_adapter() {
-                if self.frame_blending {
-                    let prev = self.has_prev.then_some(self.prev_fb.as_ref());
-                    self.postproc.sync_rgba_for_capture(
-                        fb,
-                        prev,
-                        self.frame_idx as u64,
-                        self.color_correction,
-                        self.color_profile,
-                        self.frame_blending,
-                        self.lcd_ghosting,
-                    );
-                }
-                let img = self.postproc.process_display_filter(
+                let prev = self.has_prev.then_some(self.prev_fb.as_ref());
+                let img = self.postproc.process_display_filter_with_options(
                     fb,
+                    prev,
                     self.color_correction,
+                    self.color_profile,
+                    self.frame_blending,
                     self.lcd_ghosting,
                     self.filter,
                     false,
                     self.lcd_grid_intensity,
                 );
                 let linear = self.filter.texture_options() == egui::TextureOptions::LINEAR;
-                ctx.present_plain_rgba_sync(img.as_raw(), img.size[0] as u32, img.size[1] as u32, linear);
+                ctx.present_plain_rgba_sync(
+                    img.as_raw(),
+                    img.size[0] as u32,
+                    img.size[1] as u32,
+                    linear,
+                );
             } else {
                 let preset = bench_shader_preset_for_filter(self.filter);
                 let color_profile_id = if self.color_correction { 1 } else { 0 };
@@ -1201,25 +1264,23 @@ impl<'a> HostFrontend for RealtimeFrontend<'a> {
                     );
                     self.last_gpu_submit_dur += Duration::from_secs_f64(submit_ms / 1000.0);
                 } else {
-                    ctx.present_frame_sync(fb, &self.prev_fb, self.has_prev, preset, color_profile_id);
+                    ctx.present_frame_sync(
+                        fb,
+                        &self.prev_fb,
+                        self.has_prev,
+                        preset,
+                        color_profile_id,
+                    );
                 }
             }
         } else {
-            if self.frame_blending {
-                let prev = self.has_prev.then_some(self.prev_fb.as_ref());
-                self.postproc.sync_rgba_for_capture(
-                    fb,
-                    prev,
-                    self.frame_idx as u64,
-                    self.color_correction,
-                    self.color_profile,
-                    self.frame_blending,
-                    self.lcd_ghosting,
-                );
-            }
-            let img = self.postproc.process_display_filter(
+            let prev = self.has_prev.then_some(self.prev_fb.as_ref());
+            let img = self.postproc.process_display_filter_with_options(
                 fb,
+                prev,
                 self.color_correction,
+                self.color_profile,
+                self.frame_blending,
                 self.lcd_ghosting,
                 self.filter,
                 false,
@@ -1252,7 +1313,9 @@ impl<'a> HostFrontend for RealtimeFrontend<'a> {
     }
 
     fn poll_keypad(&mut self) -> u16 {
-        let eff = self.replay.effective_frame(self.frame_idx, self.loop_replay);
+        let eff = self
+            .replay
+            .effective_frame(self.frame_idx, self.loop_replay);
         self.replay.keyinput_at(eff)
     }
 }
@@ -1380,7 +1443,9 @@ pub fn run_bench_realtime(cfg: &CliConfig) -> Result<(), String> {
             }
             fn push_audio_samples(&mut self, _samples: &[i16]) {}
             fn poll_keypad(&mut self) -> u16 {
-                let eff = self.replay.effective_frame(self.frame_idx, self.loop_replay);
+                let eff = self
+                    .replay
+                    .effective_frame(self.frame_idx, self.loop_replay);
                 self.replay.keyinput_at(eff)
             }
         }
@@ -1408,8 +1473,10 @@ pub fn run_bench_realtime(cfg: &CliConfig) -> Result<(), String> {
                 ctx.present_plain_rgba_sync(&blank_rgba, w, h, true);
             }
         } else {
-            let blank: Box<[u16; LCD_WIDTH * LCD_HEIGHT]> =
-                vec![0u16; LCD_WIDTH * LCD_HEIGHT].into_boxed_slice().try_into().unwrap();
+            let blank: Box<[u16; LCD_WIDTH * LCD_HEIGHT]> = vec![0u16; LCD_WIDTH * LCD_HEIGHT]
+                .into_boxed_slice()
+                .try_into()
+                .unwrap();
             for &preset in &[
                 ShaderPreset::Nearest,
                 ShaderPreset::SharpBilinear,
@@ -1425,7 +1492,10 @@ pub fn run_bench_realtime(cfg: &CliConfig) -> Result<(), String> {
         None
     };
     let mut no_gpu_blitter = if cfg.no_gpu {
-        Some(crate::no_gpu::NoGpuCpuPresenter::new(LCD_WIDTH * 3, LCD_HEIGHT * 3))
+        Some(crate::no_gpu::NoGpuCpuPresenter::new(
+            LCD_WIDTH * 3,
+            LCD_HEIGHT * 3,
+        ))
     } else {
         None
     };
@@ -1596,8 +1666,7 @@ pub fn run_bench_realtime(cfg: &CliConfig) -> Result<(), String> {
         if !missed_deadline
             && now_after_work <= next_ideal_deadline
             && after_pace > next_ideal_deadline
-            && after_pace.saturating_duration_since(next_ideal_deadline)
-                <= Duration::from_millis(2)
+            && after_pace.saturating_duration_since(next_ideal_deadline) <= Duration::from_millis(2)
         {
             // Keep open-loop deadline tracking aligned to sub-ms DAC clock drift when pacing cleanly.
             next_ideal_deadline = after_pace;
@@ -1852,11 +1921,19 @@ pub fn run_bench_realtime(cfg: &CliConfig) -> Result<(), String> {
     }
     println!(
         "  Work (all):         avg={:.3} ms | p50={:.3} ms | p95={:.3} ms | p99={:.3} ms | worst={:.3} ms",
-        work_summary.avg_ms, work_summary.p50_ms, work_summary.p95_ms, work_summary.p99_ms, work_summary.worst_ms,
+        work_summary.avg_ms,
+        work_summary.p50_ms,
+        work_summary.p95_ms,
+        work_summary.p99_ms,
+        work_summary.worst_ms,
     );
     println!(
         "  Work (post-warmup): avg={:.3} ms | p50={:.3} ms | p95={:.3} ms | p99={:.3} ms | worst={:.3} ms",
-        work_post_warmup.avg_ms, work_post_warmup.p50_ms, work_post_warmup.p95_ms, work_post_warmup.p99_ms, work_post_warmup.worst_ms,
+        work_post_warmup.avg_ms,
+        work_post_warmup.p50_ms,
+        work_post_warmup.p95_ms,
+        work_post_warmup.p99_ms,
+        work_post_warmup.worst_ms,
     );
     println!(
         "  Present-Interval:   avg={:.3} ms | p50={:.3} ms | p95={:.3} ms | p99={:.3} ms | max={:.3} ms | jitter(>2ms off 16.74ms)={cadence_jitter_frames}",
@@ -1985,7 +2062,9 @@ fn print_sw_profile(label: &str, ctx: &mut BenchWgpuContext, frames: usize) {
     let p = ctx.profile_swiftshader_none(frames);
     println!(
         "{label} ({}x{}) micro-profile ({} frames avg ms):",
-        ctx.width, ctx.height, frames.max(20)
+        ctx.width,
+        ctx.height,
+        frames.max(20)
     );
     println!(
         "  Adapter: {} ({} / {})",
@@ -2086,7 +2165,7 @@ pub fn run_bench_filters(cfg: &CliConfig) -> Result<(), String> {
         rom_name,
     } = load_rom_and_bios(cfg)?;
     let replay = load_replay(cfg)?;
-    let frames = cfg.frames.min(600).max(120);
+    let frames = cfg.frames.clamp(120, 600);
     let ts = format_utc_timestamp();
 
     fs::create_dir_all(&cfg.perf_dir)
@@ -2131,11 +2210,17 @@ pub fn run_bench_filters(cfg: &CliConfig) -> Result<(), String> {
     let normal_ctx = BenchWgpuContext::init(false, LCD_WIDTH as u32 * 3, LCD_HEIGHT as u32 * 3);
 
     let normal_name = match &normal_ctx {
-        Ok(c) => format!("{} ({} / {})", c.adapter_name, c.adapter_backend, c.adapter_device_type),
+        Ok(c) => format!(
+            "{} ({} / {})",
+            c.adapter_name, c.adapter_backend, c.adapter_device_type
+        ),
         Err(e) => format!("Unavailable ({e})"),
     };
     let fallback_name = match &software_ctx {
-        Ok(c) => format!("{} ({} / {})", c.adapter_name, c.adapter_backend, c.adapter_device_type),
+        Ok(c) => format!(
+            "{} ({} / {})",
+            c.adapter_name, c.adapter_backend, c.adapter_device_type
+        ),
         Err(e) => format!("Unavailable ({e})"),
     };
 
@@ -2152,7 +2237,12 @@ pub fn run_bench_filters(cfg: &CliConfig) -> Result<(), String> {
     let mut all_rows: Vec<FilterBenchRow> = Vec::new();
 
     if let Ok(mut ctx) = normal_ctx {
-        all_rows.extend(bench_filter_rows_wgpu(&mut ctx, &captured_frames, "normal-gpu", true));
+        all_rows.extend(bench_filter_rows_wgpu(
+            &mut ctx,
+            &captured_frames,
+            "normal-gpu",
+            true,
+        ));
     }
 
     match software_ctx {
@@ -2179,7 +2269,11 @@ pub fn run_bench_filters(cfg: &CliConfig) -> Result<(), String> {
     }
 
     // Condition 4: CPU pure-software fallback rasterizer + no-GPU XRGB8 blitter
-    all_rows.extend(bench_filter_rows_cpu(&captured_frames, "cpu-software", true));
+    all_rows.extend(bench_filter_rows_cpu(
+        &captured_frames,
+        "cpu-software",
+        true,
+    ));
     all_rows.extend(bench_filter_rows_no_gpu(
         &captured_frames,
         "no-gpu-xrgb8",
@@ -2209,7 +2303,10 @@ pub fn run_bench_filters(cfg: &CliConfig) -> Result<(), String> {
     fs::write(&json_path, json_body)
         .map_err(|e| format!("failed to write {}: {e}", json_path.display()))?;
 
-    println!("\nFilters benchmark complete! JSON written to: {}", json_path.display());
+    println!(
+        "\nFilters benchmark complete! JSON written to: {}",
+        json_path.display()
+    );
     Ok(())
 }
 
@@ -2243,9 +2340,9 @@ fn bench_filter_rows_wgpu(
             postproc.prewarm(def.cpu_color_correction, false, def.cpu_filter, false, 0.08);
             let linear = def.cpu_filter.texture_options() == egui::TextureOptions::LINEAR;
 
-            for i in 0..5.min(captured_frames.len()) {
+            for fb in captured_frames.iter().take(5) {
                 let img = postproc.process_display_filter(
-                    &captured_frames[i],
+                    fb,
                     def.cpu_color_correction,
                     false,
                     def.cpu_filter,
@@ -2313,8 +2410,7 @@ fn bench_filter_rows_wgpu(
         }
     } else {
         for def in &BENCH_FILTERS {
-            for i in 0..5.min(captured_frames.len()) {
-                let fb = &captured_frames[i];
+            for fb in captured_frames.iter().take(5) {
                 ctx.pipeline.stage_frames(fb, fb, false);
                 ctx.pipeline.flush_uploads();
                 let mut enc = ctx
@@ -2406,9 +2502,9 @@ fn bench_filter_rows_cpu(
 
     for def in &BENCH_FILTERS {
         postproc.prewarm(def.cpu_color_correction, false, def.cpu_filter, false, 0.08);
-        for i in 0..5.min(captured_frames.len()) {
+        for fb in captured_frames.iter().take(5) {
             let img = postproc.process_display_filter(
-                &captured_frames[i],
+                fb,
                 def.cpu_color_correction,
                 false,
                 def.cpu_filter,
@@ -2764,7 +2860,118 @@ fn collect_host_system_info() -> HostSystemInfo {
         }
     }
 
-    #[cfg(not(target_os = "windows"))]
+    #[cfg(target_os = "macos")]
+    {
+        let sysctl_str = |key: &str| -> Option<String> {
+            std::process::Command::new("sysctl")
+                .args(["-n", key])
+                .output()
+                .ok()
+                .filter(|o| o.status.success())
+                .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())
+                .filter(|s| !s.is_empty())
+        };
+        let cpu_model = sysctl_str("machdep.cpu.brand_string")
+            .unwrap_or_else(|| std::env::consts::ARCH.to_string());
+        let physical_cores = sysctl_str("hw.physicalcpu")
+            .and_then(|s| s.parse::<usize>().ok())
+            .filter(|&c| c > 0)
+            .unwrap_or(logical_threads);
+        let total_ram_mb = sysctl_str("hw.memsize")
+            .and_then(|s| s.parse::<u64>().ok())
+            .map(|b| b / (1024 * 1024))
+            .unwrap_or(0);
+        let prod = std::process::Command::new("sw_vers")
+            .arg("-productName")
+            .output()
+            .ok()
+            .filter(|o| o.status.success())
+            .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())
+            .unwrap_or_else(|| "macOS".to_string());
+        let ver = std::process::Command::new("sw_vers")
+            .arg("-productVersion")
+            .output()
+            .ok()
+            .filter(|o| o.status.success())
+            .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())
+            .unwrap_or_default();
+        let os_version = if ver.is_empty() {
+            prod
+        } else {
+            format!("{prod} {ver}")
+        };
+        HostSystemInfo {
+            cpu_model,
+            physical_cores,
+            logical_threads,
+            total_ram_mb,
+            os_version,
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    {
+        let mut cpu_model = std::env::consts::ARCH.to_string();
+        let mut core_pairs = std::collections::HashSet::<(String, String)>::new();
+        if let Ok(cpuinfo) = fs::read_to_string("/proc/cpuinfo") {
+            let mut cur_phys = String::new();
+            let mut cur_core = String::new();
+            for line in cpuinfo.lines() {
+                if let Some((k, v)) = line.split_once(':') {
+                    let key = k.trim();
+                    let val = v.trim();
+                    if key == "model name" && cpu_model == std::env::consts::ARCH {
+                        cpu_model = val.to_string();
+                    } else if key == "physical id" {
+                        cur_phys = val.to_string();
+                    } else if key == "core id" {
+                        cur_core = val.to_string();
+                    }
+                } else if !cur_core.is_empty() {
+                    core_pairs.insert((cur_phys.clone(), cur_core.clone()));
+                    cur_phys.clear();
+                    cur_core.clear();
+                }
+            }
+            if !cur_core.is_empty() {
+                core_pairs.insert((cur_phys, cur_core));
+            }
+        }
+        let physical_cores = if !core_pairs.is_empty() {
+            core_pairs.len()
+        } else {
+            logical_threads
+        };
+        let total_ram_mb = fs::read_to_string("/proc/meminfo")
+            .ok()
+            .and_then(|s| {
+                s.lines()
+                    .find(|l| l.starts_with("MemTotal:"))
+                    .and_then(|l| l.split_whitespace().nth(1))
+                    .and_then(|kb| kb.parse::<u64>().ok())
+                    .map(|kb| kb / 1024)
+            })
+            .unwrap_or(0);
+        let os_version = fs::read_to_string("/etc/os-release")
+            .ok()
+            .and_then(|s| {
+                s.lines().find(|l| l.starts_with("PRETTY_NAME=")).map(|l| {
+                    l.trim_start_matches("PRETTY_NAME=")
+                        .trim_matches('"')
+                        .to_string()
+                })
+            })
+            .unwrap_or_else(|| "Linux".to_string());
+        HostSystemInfo {
+            cpu_model,
+            physical_cores,
+            logical_threads,
+            total_ram_mb,
+            os_version,
+        }
+    }
+
+    #[cfg(not(any(target_os = "windows", target_os = "macos", target_os = "linux")))]
     {
         HostSystemInfo {
             cpu_model: std::env::consts::ARCH.to_string(),
@@ -2792,9 +2999,9 @@ fn bench_filter_rows_no_gpu(
     for def in &BENCH_FILTERS {
         postproc.prewarm(def.cpu_color_correction, false, def.cpu_filter, false, 0.08);
         let linear = def.cpu_filter.texture_options() == egui::TextureOptions::LINEAR;
-        for i in 0..5.min(captured_frames.len()) {
+        for fb in captured_frames.iter().take(5) {
             let img = postproc.process_display_filter(
-                &captured_frames[i],
+                fb,
                 def.cpu_color_correction,
                 false,
                 def.cpu_filter,
@@ -2884,9 +3091,8 @@ fn recommend_selftest_filter(
     rows: &[FilterBenchRow],
 ) -> (String, String) {
     let half_budget = FRAME_BUDGET_MS * 0.50;
-    let cost_for = |slug: &str| -> Option<f64> {
-        rows.iter().find(|r| r.filter == slug).map(|r| r.avg_ms)
-    };
+    let cost_for =
+        |slug: &str| -> Option<f64> { rows.iter().find(|r| r.filter == slug).map(|r| r.avg_ms) };
     let cheapest_row = rows.iter().min_by(|a, b| a.avg_ms.total_cmp(&b.avg_ms));
     let cheapest_slug = cheapest_row
         .map(|r| r.filter.clone())
@@ -2978,6 +3184,7 @@ struct SelftestPacedMetrics {
     cadence_jitter_frames: usize,
 }
 
+#[allow(clippy::too_many_arguments)]
 fn run_selftest_paced_window<'a>(
     core: &mut GbaCore,
     frontend: &mut RealtimeFrontend<'a>,
@@ -3253,8 +3460,13 @@ pub fn run_selftest(cfg: &CliConfig) -> Result<(), String> {
         Vec::new()
     };
 
-    let (prelim_slug, _) =
-        recommend_selftest_filter(is_cpu_adapter, wgpu_probe.is_ok(), cfg.no_gpu, 1.0, &filter_timings);
+    let (prelim_slug, _) = recommend_selftest_filter(
+        is_cpu_adapter,
+        wgpu_probe.is_ok(),
+        cfg.no_gpu,
+        1.0,
+        &filter_timings,
+    );
     let prelim_def = find_bench_filter_def(&prelim_slug);
 
     // 4. 600 headless unthrottled frames
@@ -3355,9 +3567,15 @@ pub fn run_selftest(cfg: &CliConfig) -> Result<(), String> {
         } else {
             None
         },
-        prev_fb: vec![0u16; LCD_WIDTH * LCD_HEIGHT].into_boxed_slice().try_into().unwrap(),
+        prev_fb: vec![0u16; LCD_WIDTH * LCD_HEIGHT]
+            .into_boxed_slice()
+            .try_into()
+            .unwrap(),
         has_prev: false,
-        last_fb: vec![0u16; LCD_WIDTH * LCD_HEIGHT].into_boxed_slice().try_into().unwrap(),
+        last_fb: vec![0u16; LCD_WIDTH * LCD_HEIGHT]
+            .into_boxed_slice()
+            .try_into()
+            .unwrap(),
         last_present_ms: 0.0,
     };
     let mut headless_core = Box::new(GbaCore::new(None, rom.clone()));
@@ -3456,8 +3674,14 @@ pub fn run_selftest(cfg: &CliConfig) -> Result<(), String> {
             n,
             &mut sweep_frame_idx,
         );
-        let smooth_passed = pt.over_budget_pct < 0.50 && pt.audio_underruns == 0;
-        let zero_over_budget = pt.dropped_work == 0 && pt.audio_underruns == 0;
+        let smooth_passed = pt.over_budget_pct < 0.50
+            && pt.audio_underruns == 0
+            && pt.over_2x_work == 0
+            && pt.over_2x_interval == 0;
+        let zero_over_budget = pt.dropped_work == 0
+            && pt.audio_underruns == 0
+            && pt.over_2x_work == 0
+            && pt.over_2x_interval == 0;
         if smooth_passed {
             measured_smooth_ceiling_x = n;
         }
@@ -3641,7 +3865,10 @@ pub fn run_selftest(cfg: &CliConfig) -> Result<(), String> {
         host_info.os_version
     );
     println!("  Embedded ROM:      {rom_name}");
-    println!("  Enumerated GPUs:   {} adapter(s) visible to wgpu", available_adapters.len());
+    println!(
+        "  Enumerated GPUs:   {} adapter(s) visible to wgpu",
+        available_adapters.len()
+    );
     for (i, ad) in available_adapters.iter().enumerate() {
         let drv = if ad.driver_info.is_empty() {
             ad.driver.as_str()
@@ -3715,6 +3942,9 @@ pub fn run_selftest(cfg: &CliConfig) -> Result<(), String> {
     }
     println!("  JSON:              {}", json_path.display());
 
+    if !passed {
+        return Err(format!("selftest FAILED: {}", fail_reasons.join("; ")));
+    }
     Ok(())
 }
 
@@ -3743,9 +3973,14 @@ struct HashCollectorFrontend<'a> {
 }
 
 impl<'a> HashCollectorFrontend<'a> {
-    fn new(replay: &'a InputReplay, filter: DisplayFilter) -> Self {
+    fn new(
+        replay: &'a InputReplay,
+        loop_replay: bool,
+        filter: DisplayFilter,
+        color_correction_override: bool,
+    ) -> Self {
         Self {
-            inner: BenchFrontend::new(replay, filter),
+            inner: BenchFrontend::new(replay, loop_replay, filter, color_correction_override),
             frame_idx: 0,
             cur_core_video_hash: 0,
             cur_presented_video_hash: 0,
@@ -3764,7 +3999,11 @@ impl<'a> HashCollectorFrontend<'a> {
 
     fn take_frame_hashes(&mut self) -> (u32, u32, u32) {
         let a_hash = std::mem::take(&mut self.cur_audio_hasher).finalize();
-        (self.cur_core_video_hash, self.cur_presented_video_hash, a_hash)
+        (
+            self.cur_core_video_hash,
+            self.cur_presented_video_hash,
+            a_hash,
+        )
     }
 }
 
@@ -3778,18 +4017,12 @@ impl<'a> HostFrontend for HashCollectorFrontend<'a> {
         self.cur_core_video_hash = core_h.finalize();
 
         let prev = self.inner.has_prev.then_some(self.inner.prev_fb.as_ref());
-        self.inner.postproc.sync_rgba_for_capture(
+        let img = self.inner.postproc.process_display_filter_with_options(
             fb,
             prev,
-            self.frame_idx as u64,
             self.inner.color_correction,
             self.inner.color_profile,
             self.inner.frame_blending,
-            self.inner.lcd_ghosting,
-        );
-        let img = self.inner.postproc.process_display_filter(
-            fb,
-            self.inner.color_correction,
             self.inner.lcd_ghosting,
             self.inner.filter,
             false,
@@ -3818,7 +4051,11 @@ impl<'a> HostFrontend for HashCollectorFrontend<'a> {
     }
 
     fn poll_keypad(&mut self) -> u16 {
-        self.inner.replay.keyinput_at(self.frame_idx)
+        let eff = self
+            .inner
+            .replay
+            .effective_frame(self.frame_idx, self.inner.loop_replay);
+        self.inner.replay.keyinput_at(eff)
     }
 }
 
@@ -3834,19 +4071,33 @@ pub fn run_hash_pass(cfg: &CliConfig) -> Result<(), String> {
         .filter
         .unwrap_or_else(|| AppConfig::default().display_filter);
     let frames = cfg.frames.max(1);
+    let warmup_frames = cfg.warmup_frames;
 
     let mut core = Box::new(GbaCore::new(bios.as_deref(), rom));
     if let Some(bytes) = &sav {
         core.bus.cart.load_save_data(bytes);
     }
 
-    let mut fe = HashCollectorFrontend::new(&replay, filter);
+    let mut fe = HashCollectorFrontend::new(
+        &replay,
+        cfg.loop_replay,
+        filter,
+        cfg.filter_color_correction,
+    );
+    for w in 0..warmup_frames {
+        fe.reset_frame(w);
+        core.run_frame(&mut fe);
+    }
+    fe.overall_core_video = crc32fast::Hasher::new();
+    fe.overall_presented_video = crc32fast::Hasher::new();
+    fe.overall_audio = crc32fast::Hasher::new();
+
     let mut core_video_hashes = Vec::with_capacity(frames);
     let mut presented_video_hashes = Vec::with_capacity(frames);
     let mut audio_hashes = Vec::with_capacity(frames);
 
     for frame_idx in 0..frames {
-        fe.reset_frame(frame_idx);
+        fe.reset_frame(warmup_frames + frame_idx);
         core.run_frame(&mut fe);
         let (cv, pv, ah) = fe.take_frame_hashes();
         core_video_hashes.push(cv);
@@ -3867,11 +4118,11 @@ pub fn run_hash_pass(cfg: &CliConfig) -> Result<(), String> {
     };
 
     if let Some(out_path) = &cfg.dump_hashes {
-        if let Some(parent) = out_path.parent() {
-            if !parent.as_os_str().is_empty() {
-                fs::create_dir_all(parent)
-                    .map_err(|e| format!("failed to create dir {}: {e}", parent.display()))?;
-            }
+        if let Some(parent) = out_path.parent()
+            && !parent.as_os_str().is_empty()
+        {
+            fs::create_dir_all(parent)
+                .map_err(|e| format!("failed to create dir {}: {e}", parent.display()))?;
         }
         let body = serde_json::to_string(&archive)
             .map_err(|e| format!("failed to serialize hash archive: {e}"))?;
@@ -3892,10 +4143,18 @@ pub fn run_hash_pass(cfg: &CliConfig) -> Result<(), String> {
             .map_err(|e| format!("failed to read {}: {e}", ref_path.display()))?;
         let expected: FrameHashesArchive = serde_json::from_str(&raw)
             .map_err(|e| format!("failed to parse {}: {e}", ref_path.display()))?;
-        if expected.frames != archive.frames {
+        if expected.frames != archive.frames
+            || expected.core_video_hashes.len() != frames
+            || expected.presented_video_hashes.len() != frames
+            || expected.audio_hashes.len() != frames
+        {
             return Err(format!(
-                "hash frame count mismatch: expected {}, got {}",
-                expected.frames, archive.frames
+                "hash frame count/array length mismatch: expected frames={} (core={}, pres={}, audio={}), got {}",
+                expected.frames,
+                expected.core_video_hashes.len(),
+                expected.presented_video_hashes.len(),
+                expected.audio_hashes.len(),
+                archive.frames
             ));
         }
         for i in 0..frames {
@@ -3943,8 +4202,15 @@ fn build_time_utc() -> String {
         .to_string()
 }
 
-/// FIPS 180-4 SHA-256 over an arbitrary byte slice (pure Rust, zero external crates).
-pub fn sha256_bytes(data: &[u8]) -> [u8; 32] {
+/// Streaming FIPS 180-4 SHA-256 hasher (pure Rust, zero external crates).
+struct Sha256Hasher {
+    h: [u32; 8],
+    buf: [u8; 64],
+    buf_len: usize,
+    total_bytes: u64,
+}
+
+impl Sha256Hasher {
     const K: [u32; 64] = [
         0x428a2f98, 0x71374491, 0xb5c0fbcf, 0xe9b5dba5, 0x3956c25b, 0x59f111f1, 0x923f82a4,
         0xab1c5ed5, 0xd807aa98, 0x12835b01, 0x243185be, 0x550c7dc3, 0x72be5d74, 0x80deb1fe,
@@ -3957,23 +4223,23 @@ pub fn sha256_bytes(data: &[u8]) -> [u8; 32] {
         0x748f82ee, 0x78a5636f, 0x84c87814, 0x8cc70208, 0x90befffa, 0xa4506ceb, 0xbef9a3f7,
         0xc67178f2,
     ];
-    let mut h: [u32; 8] = [
-        0x6a09e667, 0xbb67ae85, 0x3c6ef372, 0xa54ff53a, 0x510e527f, 0x9b05688c, 0x1f83d9ab,
-        0x5be0cd19,
-    ];
-    let bit_len = (data.len() as u64).wrapping_mul(8);
-    let mut msg = Vec::with_capacity(data.len() + 72);
-    msg.extend_from_slice(data);
-    msg.push(0x80);
-    while (msg.len() % 64) != 56 {
-        msg.push(0);
-    }
-    msg.extend_from_slice(&bit_len.to_be_bytes());
 
-    let mut w = [0u32; 64];
-    for chunk in msg.chunks_exact(64) {
-        for (i, word) in chunk.chunks_exact(4).enumerate() {
-            w[i] = u32::from_be_bytes([word[0], word[1], word[2], word[3]]);
+    fn new() -> Self {
+        Self {
+            h: [
+                0x6a09e667, 0xbb67ae85, 0x3c6ef372, 0xa54ff53a, 0x510e527f, 0x9b05688c, 0x1f83d9ab,
+                0x5be0cd19,
+            ],
+            buf: [0u8; 64],
+            buf_len: 0,
+            total_bytes: 0,
+        }
+    }
+
+    fn compress(h: &mut [u32; 8], chunk: &[u8; 64]) {
+        let mut w = [0u32; 64];
+        for (i, word) in chunk.as_chunks::<4>().0.iter().enumerate() {
+            w[i] = u32::from_be_bytes(*word);
         }
         for i in 16..64 {
             let s0 = w[i - 15].rotate_right(7) ^ w[i - 15].rotate_right(18) ^ (w[i - 15] >> 3);
@@ -3983,15 +4249,15 @@ pub fn sha256_bytes(data: &[u8]) -> [u8; 32] {
                 .wrapping_add(w[i - 7])
                 .wrapping_add(s1);
         }
-        let [mut a, mut b, mut c, mut d, mut e, mut f, mut g, mut hh] = h;
-        for i in 0..64 {
+        let [mut a, mut b, mut c, mut d, mut e, mut f, mut g, mut hh] = *h;
+        for (k_i, &w_i) in Self::K.iter().zip(w.iter()) {
             let s1 = e.rotate_right(6) ^ e.rotate_right(11) ^ e.rotate_right(25);
             let ch = (e & f) ^ ((!e) & g);
             let temp1 = hh
                 .wrapping_add(s1)
                 .wrapping_add(ch)
-                .wrapping_add(K[i])
-                .wrapping_add(w[i]);
+                .wrapping_add(*k_i)
+                .wrapping_add(w_i);
             let s0 = a.rotate_right(2) ^ a.rotate_right(13) ^ a.rotate_right(22);
             let maj = (a & b) ^ (a & c) ^ (b & c);
             let temp2 = s0.wrapping_add(maj);
@@ -4010,21 +4276,78 @@ pub fn sha256_bytes(data: &[u8]) -> [u8; 32] {
         }
     }
 
-    let mut out = [0u8; 32];
-    for (i, word) in h.iter().enumerate() {
-        out[i * 4..i * 4 + 4].copy_from_slice(&word.to_be_bytes());
+    fn update(&mut self, mut data: &[u8]) {
+        self.total_bytes = self.total_bytes.wrapping_add(data.len() as u64);
+        if self.buf_len > 0 {
+            let take = (64 - self.buf_len).min(data.len());
+            self.buf[self.buf_len..self.buf_len + take].copy_from_slice(&data[..take]);
+            self.buf_len += take;
+            data = &data[take..];
+            if self.buf_len == 64 {
+                let block = self.buf;
+                Self::compress(&mut self.h, &block);
+                self.buf_len = 0;
+            }
+        }
+        let (blocks, rem) = data.as_chunks::<64>();
+        for block in blocks {
+            Self::compress(&mut self.h, block);
+        }
+        if !rem.is_empty() {
+            self.buf[..rem.len()].copy_from_slice(rem);
+            self.buf_len = rem.len();
+        }
     }
-    out
+
+    fn finalize(mut self) -> [u8; 32] {
+        let bit_len = self.total_bytes.wrapping_mul(8);
+        self.buf[self.buf_len] = 0x80;
+        self.buf_len += 1;
+        if self.buf_len > 56 {
+            self.buf[self.buf_len..64].fill(0);
+            let block = self.buf;
+            Self::compress(&mut self.h, &block);
+            self.buf_len = 0;
+        }
+        self.buf[self.buf_len..56].fill(0);
+        self.buf[56..64].copy_from_slice(&bit_len.to_be_bytes());
+        let block = self.buf;
+        Self::compress(&mut self.h, &block);
+
+        let mut out = [0u8; 32];
+        for (i, word) in self.h.iter().enumerate() {
+            out[i * 4..i * 4 + 4].copy_from_slice(&word.to_be_bytes());
+        }
+        out
+    }
+}
+
+/// FIPS 180-4 SHA-256 over an arbitrary byte slice (pure Rust, zero external crates).
+#[allow(dead_code)]
+pub fn sha256_bytes(data: &[u8]) -> [u8; 32] {
+    let mut hasher = Sha256Hasher::new();
+    hasher.update(data);
+    hasher.finalize()
 }
 
 fn current_exe_sha256() -> String {
+    use std::io::Read as _;
     let Ok(exe) = std::env::current_exe() else {
         return "unknown".to_string();
     };
-    let Ok(bytes) = fs::read(&exe) else {
+    let Ok(mut file) = File::open(&exe) else {
         return "unknown".to_string();
     };
-    let digest = sha256_bytes(&bytes);
+    let mut hasher = Sha256Hasher::new();
+    let mut buf = [0u8; 64 * 1024];
+    loop {
+        match file.read(&mut buf) {
+            Ok(0) => break,
+            Ok(n) => hasher.update(&buf[..n]),
+            Err(_) => return "unknown".to_string(),
+        }
+    }
+    let digest = hasher.finalize();
     let mut hex = String::with_capacity(64);
     for b in digest {
         use std::fmt::Write as _;
@@ -4496,7 +4819,9 @@ pub fn run_bench_softbuffer(cfg: &CliConfig) -> Result<(), String> {
         .map_err(|e| format!("failed to create perf dir {}: {e}", cfg.perf_dir.display()))?;
 
     let rows = bench_softbuffer_sizes(frames, true)?;
-    println!("=== NO-GPU SOFTBUFFER REAL-WINDOW SIZE SWEEP ({frames} frames/condition, budget {FRAME_BUDGET_MS:.2} ms) ===");
+    println!(
+        "=== NO-GPU SOFTBUFFER REAL-WINDOW SIZE SWEEP ({frames} frames/condition, budget {FRAME_BUDGET_MS:.2} ms) ==="
+    );
     for r in &rows {
         let verdict = if r.fits_budget { "FIT" } else { "EXCEEDS" };
         println!(
@@ -4577,9 +4902,7 @@ pulse 100..120 10 2 A
 
     #[test]
     fn sha256_matches_nist_vectors() {
-        let to_hex = |d: [u8; 32]| -> String {
-            d.iter().map(|b| format!("{b:02x}")).collect()
-        };
+        let to_hex = |d: [u8; 32]| -> String { d.iter().map(|b| format!("{b:02x}")).collect() };
         assert_eq!(
             to_hex(sha256_bytes(b"")),
             "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"

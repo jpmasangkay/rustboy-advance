@@ -48,26 +48,10 @@ pub enum CheatAction {
     NoOp,
 }
 
-impl CheatAction {
-    pub fn targets_rom(&self) -> bool {
-        let addr = match *self {
-            Self::Write8 { addr, .. }
-            | Self::Write16 { addr, .. }
-            | Self::Write32 { addr, .. }
-            | Self::Add16 { addr, .. }
-            | Self::Or16 { addr, .. }
-            | Self::And16 { addr, .. } => addr,
-            Self::IfEqual16 { .. } | Self::IfNotEqual16 { .. } | Self::NoOp => return false,
-        };
-        matches!((addr >> 24) & 0xFF, 0x08..=0x0D)
-    }
-}
-
 /// Pre-decoded cheat action list so per-frame execution never re-parses hex or re-runs TEA.
 #[derive(Clone, Debug)]
 pub struct CompiledCheat {
     pub actions: Vec<CheatAction>,
-    pub patches_rom: bool,
 }
 
 const AR_V1_SEEDS: [u32; 4] = [0x09F4_FBBD, 0x9681_884A, 0x3520_27E9, 0xF3DE_E5A7];
@@ -338,11 +322,7 @@ pub fn compile_cheats(cheats: &[CheatEntry]) -> Vec<CompiledCheat> {
             continue;
         }
         if let Ok(actions) = decode_cheat_lines(&entry.code, entry.format) {
-            let patches_rom = actions.iter().any(CheatAction::targets_rom);
-            compiled.push(CompiledCheat {
-                actions,
-                patches_rom,
-            });
+            compiled.push(CompiledCheat { actions });
         }
     }
     compiled

@@ -130,11 +130,20 @@ mod tests {
         assert!(emu.load_rom(&[]).is_err());
         assert!(emu.load_rom(&[1, 2, 3]).is_err());
         assert!(emu.load_rom(b"PK\x03\x04zipdata").is_err());
+        assert!(emu.load_rom(b"7z\xBC\xAF\x27\x1C7zdata").is_err());
+        assert!(emu.load_rom(b"Rar!\x1A\x07rardata").is_err());
+        assert!(emu.load_rom(&[0x1F, 0x8B, 0x08, 0x00]).is_err());
         assert!(emu.load_rom(b"\x89PNG\r\n\x1a\n1234").is_err());
         assert!(emu.load_rom(b"\x7FELF1234").is_err());
         assert!(emu.load_rom(b"%PDF-1.7").is_err());
 
+        // Reject Game Boy / Game Boy Color ROMs cleanly.
+        let mut fake_gb = vec![0u8; 0x8000];
+        fake_gb[0x104..0x10C].copy_from_slice(&[0xCE, 0xED, 0x66, 0x66, 0xCC, 0x0D, 0x00, 0x0B]);
+        assert!(emu.load_rom(&fake_gb).is_err());
+
         assert!(emu.load_bios(&[0u8; 1024]).is_err());
+        assert!(emu.load_bios(&[0u8; BIOS_BYTES]).is_err());
         assert!(!emu.bios_loaded());
     }
 
@@ -212,11 +221,37 @@ mod tests {
         emu.set_speed(f32::NAN);
         assert_eq!(emu.speed(), 0.25);
 
-        let bios = vec![0u8; BIOS_BYTES];
-        emu.load_bios(&bios).expect("16 KiB BIOS accepted");
+        let mut bios = vec![0u8; BIOS_BYTES];
+        bios[0..4].copy_from_slice(&0xEA00_0006u32.to_le_bytes());
+        emu.load_bios(&bios)
+            .expect("16 KiB valid ARM BIOS accepted");
         assert!(emu.bios_loaded());
         emu.clear_bios();
         assert!(!emu.bios_loaded());
+
+        // Fast-forward multi-frame stepping renders the final frame cleanly.
+        assert_eq!(emu.step_frames(3), 3);
+        assert_eq!(&emu.framebuffer()[0..4], &[255, 0, 0, 255]);
+    }
+
+    #[test]
+    fn import_sram_infers_save_type_and_ghosting_seeds_current_frame() {
+        let rom = make_mode3_test_rom("NOSAVETAG", "NST1", None);
+        let mut emu = WebEmulator::new();
+        emu.load_rom(&rom).expect("ROM loads");
+        assert_eq!(emu.save_type_name(), "None");
+        let sram = vec![0x42u8; 32_768];
+        emu.import_sram(&sram).expect("import infers SRAM 32 KiB");
+        assert_eq!(emu.save_type_name(), "SRAM 32 KiB");
+        assert_eq!(emu.export_sram()[0], 0x42);
+
+        // Enabling ghosting mid-game seeds prev_rgba from current frame (no black flash).
+        emu.run_frame();
+        emu.run_frame();
+        assert_eq!(&emu.framebuffer()[0..4], &[255, 0, 0, 255]);
+        emu.set_lcd_ghosting(true);
+        emu.run_frame();
+        assert_eq!(emu.framebuffer()[0], 255);
     }
 
     #[test]

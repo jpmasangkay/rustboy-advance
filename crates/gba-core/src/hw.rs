@@ -1585,18 +1585,15 @@ impl SysBus {
                     let orig_x = self.read_32(src, AccessType::Sequential, 0) as i32;
                     let orig_y =
                         self.read_32(src.wrapping_add(4), AccessType::Sequential, 0) as i32;
-                    let disp_x =
-                        self.read_16(src.wrapping_add(8), AccessType::Sequential, 0, false) as i16
-                            as i32;
+                    let disp_x = self.read_16(src.wrapping_add(8), AccessType::Sequential, 0, false)
+                        as i16 as i32;
                     let disp_y =
                         self.read_16(src.wrapping_add(10), AccessType::Sequential, 0, false) as i16
                             as i32;
-                    let sx =
-                        self.read_16(src.wrapping_add(12), AccessType::Sequential, 0, false) as i16
-                            as i32;
-                    let sy =
-                        self.read_16(src.wrapping_add(14), AccessType::Sequential, 0, false) as i16
-                            as i32;
+                    let sx = self.read_16(src.wrapping_add(12), AccessType::Sequential, 0, false)
+                        as i16 as i32;
+                    let sy = self.read_16(src.wrapping_add(14), AccessType::Sequential, 0, false)
+                        as i16 as i32;
                     let alpha =
                         self.read_16(src.wrapping_add(16), AccessType::Sequential, 0, false);
                     src = src.wrapping_add(20);
@@ -1635,9 +1632,8 @@ impl SysBus {
                 let stride = cpu.gpr[3];
                 for _ in 0..count {
                     let sx = self.read_16(src, AccessType::Sequential, 0, false) as i16 as i32;
-                    let sy =
-                        self.read_16(src.wrapping_add(2), AccessType::Sequential, 0, false) as i16
-                            as i32;
+                    let sy = self.read_16(src.wrapping_add(2), AccessType::Sequential, 0, false)
+                        as i16 as i32;
                     let alpha = self.read_16(src.wrapping_add(4), AccessType::Sequential, 0, false);
                     src = src.wrapping_add(8);
 
@@ -1906,7 +1902,7 @@ impl SysBus {
         let decomp_len = ((header >> 8) as usize).min(0x10_0000);
         let tree_base = src.wrapping_add(4);
         let tree_size = ((self.read_8(tree_base, AccessType::Sequential, 0, false) as u32) + 1) * 2;
-        if tree_size < 2 || tree_size > 512 {
+        if !(2..=512).contains(&tree_size) {
             return;
         }
         let mut data_ptr = tree_base.wrapping_add(tree_size);
@@ -1931,8 +1927,12 @@ impl SysBus {
                     return;
                 }
                 let bit = (word >> shift) & 1;
-                let node_val =
-                    self.read_8(tree_base.wrapping_add(node_off), AccessType::Sequential, 0, false);
+                let node_val = self.read_8(
+                    tree_base.wrapping_add(node_off),
+                    AccessType::Sequential,
+                    0,
+                    false,
+                );
                 let is_leaf = if bit == 0 {
                     (node_val & 0x80) != 0
                 } else {

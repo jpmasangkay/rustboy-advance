@@ -1036,46 +1036,45 @@ impl Cartridge {
 
     pub fn write_rom_16(&mut self, addr: u32, val: u16) {
         let gpio_off = addr & 0x01FF_FFFE;
-        if (0x0000_00C4..=0x0000_00C8).contains(&gpio_off) {
-            if self.gpio_enabled()
-                && self.rtc.write(addr, val, self.effective_rtc())
-                && gpio_off == 0x0000_00C4
-            {
-                if self.solar_enabled && (self.rtc.data & 0x04) == 0 {
-                    let rst = (self.rtc.data & 0x02) != 0;
-                    let clk = (self.rtc.data & 0x01) != 0;
-                    if rst {
-                        self.solar_counter = 0;
+        if (0x0000_00C4..=0x0000_00C8).contains(&gpio_off)
+            && self.gpio_enabled()
+            && self.rtc.write(addr, val, self.effective_rtc())
+            && gpio_off == 0x0000_00C4
+        {
+            if self.solar_enabled && (self.rtc.data & 0x04) == 0 {
+                let rst = (self.rtc.data & 0x02) != 0;
+                let clk = (self.rtc.data & 0x01) != 0;
+                if rst {
+                    self.solar_counter = 0;
+                    self.rtc.data &= !0x08;
+                } else if !self.solar_prev_clk && clk {
+                    self.solar_counter = self.solar_counter.saturating_add(1);
+                    let threshold = 255u8.saturating_sub(self.solar_lux).max(1);
+                    if self.solar_counter >= threshold {
+                        self.rtc.data |= 0x08;
+                    } else {
                         self.rtc.data &= !0x08;
-                    } else if !self.solar_prev_clk && clk {
-                        self.solar_counter = self.solar_counter.saturating_add(1);
-                        let threshold = 255u8.saturating_sub(self.solar_lux).max(1);
-                        if self.solar_counter >= threshold {
-                            self.rtc.data |= 0x08;
-                        } else {
-                            self.rtc.data &= !0x08;
-                        }
                     }
-                    self.solar_prev_clk = clk;
                 }
-                if self.rumble_enabled && (self.rtc.dir & 0x08) != 0 {
-                    self.rumble_active = (self.rtc.data & 0x08) != 0;
-                }
-                if self.gyro_enabled {
-                    // WarioWare: Twisted! GPIO pinout: Bit 0 = RES/sample_start, Bit 1 = CLK, Bit 2 = DATA_OUT
-                    let sample_start = (self.rtc.data & 0x01) != 0;
-                    let clk = (self.rtc.data & 0x02) != 0;
-                    if sample_start {
-                        self.gyro_shift = (self.gyro_val & 0x0FFF) << 4;
-                    } else if self.gyro_prev_clk && !clk {
-                        let bit = (self.gyro_shift >> 15) & 1;
-                        if (self.rtc.dir & 0x04) == 0 {
-                            self.rtc.data = (self.rtc.data & !0x04) | (bit << 2);
-                        }
-                        self.gyro_shift <<= 1;
+                self.solar_prev_clk = clk;
+            }
+            if self.rumble_enabled && (self.rtc.dir & 0x08) != 0 {
+                self.rumble_active = (self.rtc.data & 0x08) != 0;
+            }
+            if self.gyro_enabled {
+                // WarioWare: Twisted! GPIO pinout: Bit 0 = RES/sample_start, Bit 1 = CLK, Bit 2 = DATA_OUT
+                let sample_start = (self.rtc.data & 0x01) != 0;
+                let clk = (self.rtc.data & 0x02) != 0;
+                if sample_start {
+                    self.gyro_shift = (self.gyro_val & 0x0FFF) << 4;
+                } else if self.gyro_prev_clk && !clk {
+                    let bit = (self.gyro_shift >> 15) & 1;
+                    if (self.rtc.dir & 0x04) == 0 {
+                        self.rtc.data = (self.rtc.data & !0x04) | (bit << 2);
                     }
-                    self.gyro_prev_clk = clk;
+                    self.gyro_shift <<= 1;
                 }
+                self.gyro_prev_clk = clk;
             }
         }
     }

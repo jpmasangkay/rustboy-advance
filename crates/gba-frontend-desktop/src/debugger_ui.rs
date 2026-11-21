@@ -1655,8 +1655,9 @@ impl DebuggerWindows {
                 {
                     changed = true;
                 }
-                let lux_resp = ui
-                    .add(egui::Slider::new(&mut core.bus.cart.solar_lux, 0..=255).text("Solar Lux"));
+                let lux_resp = ui.add(
+                    egui::Slider::new(&mut core.bus.cart.solar_lux, 0..=255).text("Solar Lux"),
+                );
                 if lux_resp.drag_stopped() || lux_resp.lost_focus() {
                     changed = true;
                 }

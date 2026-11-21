@@ -9,7 +9,7 @@ use core::ffi::{c_char, c_uint, c_void};
 use core::ptr;
 use std::panic::{AssertUnwindSafe, catch_unwind};
 
-use gba_core::{GbaCore, HostFrontend, LCD_HEIGHT, LCD_WIDTH, SAMPLE_RATE_HZ};
+use gba_core::SAMPLE_RATE_HZ;
 
 use crate::ffi::{
     RETRO_API_VERSION, RETRO_REGION_NTSC, retro_audio_sample_batch_t, retro_audio_sample_t,
@@ -19,54 +19,8 @@ use crate::ffi::{
 };
 
 const LIBRARY_VERSION_Z: &str = concat!(env!("CARGO_PKG_VERSION"), "\0");
-const GBA_FPS: f64 = 59.7275;
-
-pub struct LibretroAdapter {
-    pub xrgb1555: [u16; LCD_WIDTH * LCD_HEIGHT],
-    pub audio: Vec<i16>,
-    pub keyinput: u16,
-}
-
-impl LibretroAdapter {
-    pub fn new() -> Self {
-        Self {
-            xrgb1555: [0x7FFF; LCD_WIDTH * LCD_HEIGHT],
-            audio: Vec::with_capacity(2048),
-            keyinput: 0x03FF,
-        }
-    }
-
-    pub fn run_frame(&mut self, core: &mut GbaCore) {
-        self.audio.clear();
-        core.run_frame(self);
-    }
-}
-
-impl Default for LibretroAdapter {
-    fn default() -> Self {
-        Self::new()
-    }
-}
-
-impl HostFrontend for LibretroAdapter {
-    fn present_frame(&mut self, fb: &[u16; LCD_WIDTH * LCD_HEIGHT]) {
-        for (dst, &px) in self.xrgb1555.iter_mut().zip(fb.iter()) {
-            // Convert BGR555 -> RGB555 (0RRR RRGG GGGB BBBB)
-            let r = px & 0x1F;
-            let g = (px >> 5) & 0x1F;
-            let b = (px >> 10) & 0x1F;
-            *dst = (r << 10) | (g << 5) | b;
-        }
-    }
-
-    fn push_audio_samples(&mut self, samples: &[i16]) {
-        self.audio.extend_from_slice(samples);
-    }
-
-    fn poll_keypad(&mut self) -> u16 {
-        self.keyinput
-    }
-}
+/// Exact GBA/GB hardware frame rate: `16_777_216 / 280_896 == 4_194_304 / 70_224` (~59.72750057 Hz).
+const HARDWARE_FPS: f64 = 16_777_216.0 / 280_896.0;
 
 fn ffi_guard<T>(default: T, f: impl FnOnce() -> T) -> T {
     catch_unwind(AssertUnwindSafe(f)).unwrap_or(default)
@@ -126,7 +80,7 @@ pub unsafe extern "C" fn retro_get_system_av_info(info: *mut retro_system_av_inf
                     aspect_ratio,
                 },
                 timing: retro_system_timing {
-                    fps: GBA_FPS,
+                    fps: HARDWARE_FPS,
                     sample_rate: SAMPLE_RATE_HZ as f64,
                 },
             };

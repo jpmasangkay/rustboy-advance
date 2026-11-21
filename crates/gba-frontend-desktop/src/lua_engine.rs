@@ -1555,6 +1555,7 @@ mod tests {
         );
         assert_eq!(engine.apply_joypad_override(0), 0);
 
+        engine.clear_log();
         engine.script_source = r#"print("hello", 42)"#.to_string();
         engine
             .start_script(Some(&mut core), "LUATESTROM", "ALTE", 0, 0, false)

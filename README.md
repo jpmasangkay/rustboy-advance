@@ -12,7 +12,6 @@
 [![wgpu](https://img.shields.io/badge/wgpu-24.0-4E8EE9?style=flat-square)](https://wgpu.rs)
 [![License: MPL-2.0](https://img.shields.io/badge/License-MPL--2.0-yellow.svg?style=flat-square)](LICENSE)
 
-- **Source Repository:** <https://github.com/jpmasangkay/rustboy-advance>
 - **Release Tag:** `v0.1.0`
 - **Test Results:** [`TEST_RESULTS.md`](TEST_RESULTS.md) / [`docs/TEST_RESULTS.md`](docs/TEST_RESULTS.md)
 - **Compatibility Database:** [`docs/COMPATIBILITY.md`](docs/COMPATIBILITY.md)

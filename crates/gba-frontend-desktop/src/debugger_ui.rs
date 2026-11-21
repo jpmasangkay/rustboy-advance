@@ -32,10 +32,11 @@ pub enum MemoryRegion {
     Vram,
     Oam,
     Rom,
+    Sram,
 }
 
 impl MemoryRegion {
-    pub const ALL: [MemoryRegion; 8] = [
+    pub const ALL: [MemoryRegion; 9] = [
         Self::Bios,
         Self::Ewram,
         Self::Iwram,
@@ -44,6 +45,7 @@ impl MemoryRegion {
         Self::Vram,
         Self::Oam,
         Self::Rom,
+        Self::Sram,
     ];
 
     pub const fn label(self) -> &'static str {
@@ -56,6 +58,7 @@ impl MemoryRegion {
             Self::Vram => "0x06 VRAM (96 KB)",
             Self::Oam => "0x07 OAM (1 KB)",
             Self::Rom => "0x08 ROM",
+            Self::Sram => "0x0E SRAM / Flash (64 KB)",
         }
     }
 
@@ -69,6 +72,7 @@ impl MemoryRegion {
             Self::Vram => 0x0600_0000,
             Self::Oam => 0x0700_0000,
             Self::Rom => 0x0800_0000,
+            Self::Sram => 0x0E00_0000,
         }
     }
 
@@ -82,6 +86,7 @@ impl MemoryRegion {
             Self::Vram => 0x1_8000,
             Self::Oam => 0x400,
             Self::Rom => rom_len.clamp(0x100, 0x0200_0000),
+            Self::Sram => 0x1_0000,
         }
     }
 }
@@ -120,6 +125,8 @@ pub enum DebugAction {
     StepFrame,
     HardReset,
     ConfigChanged,
+    CheatsChanged,
+    AudioChannelMaskChanged(u8),
     AddCheat(CheatEntry),
     GdbStart(u16),
     GdbStop,
@@ -185,15 +192,18 @@ pub struct DebuggerWindows {
     pub tile_zoom: f32,
     pub selected_tile: Option<usize>,
     tile_tex: Option<TextureHandle>,
+    tile_cache_key: Option<(u64, usize, bool, usize, bool)>,
 
     // BG Map Viewer state
     pub bg_layer: usize,
     bg_tex: Option<TextureHandle>,
+    bg_cache_key: Option<(u64, usize, bool)>,
 
     // OAM Sprite Viewer state
     pub selected_sprite: usize,
     pub hide_disabled_sprites: bool,
     sprite_tex: Option<TextureHandle>,
+    sprite_cache_key: Option<(u64, usize, bool)>,
 
     // Cheat manager draft form
     pub draft_cheat_name: String,
@@ -253,11 +263,14 @@ impl Default for DebuggerWindows {
             tile_zoom: 2.0,
             selected_tile: None,
             tile_tex: None,
+            tile_cache_key: None,
             bg_layer: 0,
             bg_tex: None,
+            bg_cache_key: None,
             selected_sprite: 0,
             hide_disabled_sprites: true,
             sprite_tex: None,
+            sprite_cache_key: None,
             draft_cheat_name: String::new(),
             draft_cheat_code: String::new(),
             draft_cheat_format: CheatFormat::AutoRaw,
@@ -296,27 +309,30 @@ fn checkerboard_color(x: usize, y: usize) -> Color32 {
 }
 
 impl DebuggerWindows {
+    #[allow(clippy::too_many_arguments)] // Combines host emulation flags with active cheat table
     pub fn show_all(
         &mut self,
         ctx: &egui::Context,
         core: Option<&mut GbaCore>,
         paused: bool,
         color_correction: bool,
+        vram_rev: u64,
+        hardcore: bool,
         cheats: &mut Vec<CheatEntry>,
-    ) -> DebugAction {
-        let mut action = DebugAction::None;
+    ) -> Vec<DebugAction> {
+        let mut actions = Vec::new();
 
         if self.show_about {
             self.draw_about_window(ctx);
         }
-        if self.show_cheats && self.draw_cheats_window(ctx, cheats) {
-            action = DebugAction::ConfigChanged;
+        if self.show_cheats && self.draw_cheats_window(ctx, cheats, hardcore) {
+            actions.push(DebugAction::CheatsChanged);
         }
 
         if self.mem_search.open {
-            match self.mem_search.show(ctx, core.as_deref()) {
+            match self.mem_search.show(ctx, core.as_deref(), hardcore) {
                 MemSearchAction::AddCheat(entry) => {
-                    action = DebugAction::AddCheat(entry);
+                    actions.push(DebugAction::AddCheat(entry));
                 }
                 MemSearchAction::JumpHex(addr) => {
                     self.jump_hex_to(addr);
@@ -327,7 +343,7 @@ impl DebuggerWindows {
         if self.show_gdb {
             let gdb_act = self.draw_gdb_window(ctx);
             if !matches!(gdb_act, DebugAction::None) {
-                action = gdb_act;
+                actions.push(gdb_act);
             }
         }
         if self.show_io_regs {
@@ -336,17 +352,17 @@ impl DebuggerWindows {
 
         let Some(core) = core else {
             // Even without a ROM, keep debugger toggles clean without panicking.
-            return action;
+            return actions;
         };
 
         if self.show_overrides && self.draw_overrides_window(ctx, core) {
-            action = DebugAction::ConfigChanged;
+            actions.push(DebugAction::ConfigChanged);
         }
 
         if self.show_cpu {
             let cpu_act = self.draw_cpu_window(ctx, core, paused);
             if !matches!(cpu_act, DebugAction::None) {
-                action = cpu_act;
+                actions.push(cpu_act);
             }
         }
         if self.show_hex {
@@ -356,19 +372,21 @@ impl DebuggerWindows {
             self.draw_palette_window(ctx, core, color_correction);
         }
         if self.show_vram {
-            self.draw_vram_window(ctx, core, color_correction);
+            self.draw_vram_window(ctx, core, color_correction, vram_rev);
         }
         if self.show_bg {
-            self.draw_bg_window(ctx, core, color_correction);
+            self.draw_bg_window(ctx, core, color_correction, vram_rev);
         }
         if self.show_oam {
-            self.draw_oam_window(ctx, core, color_correction);
+            self.draw_oam_window(ctx, core, color_correction, vram_rev);
         }
-        if self.show_audio {
-            self.draw_audio_window(ctx, core);
+        if self.show_audio
+            && let Some(new_mask) = self.draw_audio_window(ctx, core)
+        {
+            actions.push(DebugAction::AudioChannelMaskChanged(new_mask));
         }
 
-        action
+        actions
     }
 
     fn draw_cpu_window(
@@ -451,7 +469,8 @@ impl DebuggerWindows {
                         if ui.button("Add BP").clicked()
                             && let Some(a) = parse_hex_u32(&self.bp_addr_input)
                         {
-                            let aligned = a & if is_thumb { !1 } else { !3 };
+                            // Align to halfword (!1) so Thumb breakpoints can be set while paused in ARM mode.
+                            let aligned = a & !1;
                             if !self.breakpoints.contains(&aligned) {
                                 self.breakpoints.push(aligned);
                             }
@@ -662,11 +681,16 @@ impl DebuggerWindows {
                             0x06 => Some(MemoryRegion::Vram),
                             0x07 => Some(MemoryRegion::Oam),
                             0x08..=0x0D => Some(MemoryRegion::Rom),
+                            0x0E | 0x0F => Some(MemoryRegion::Sram),
                             _ => None,
                         };
                         if let Some(tr) = target_region {
                             self.hex_region = tr;
-                            let off = addr.saturating_sub(tr.base_addr()) as usize;
+                            let off = match tr {
+                                MemoryRegion::Rom => (addr & 0x01FF_FFFF) as usize,
+                                MemoryRegion::Sram => (addr & 0xFFFF) as usize,
+                                _ => addr.saturating_sub(tr.base_addr()) as usize,
+                            };
                             self.hex_scroll_row = Some(off / 16);
                         }
                     }
@@ -881,7 +905,13 @@ impl DebuggerWindows {
         self.show_palette = open;
     }
 
-    fn draw_vram_window(&mut self, ctx: &egui::Context, core: &GbaCore, color_correction: bool) {
+    fn draw_vram_window(
+        &mut self,
+        ctx: &egui::Context,
+        core: &GbaCore,
+        color_correction: bool,
+        vram_rev: u64,
+    ) {
         let mut open = self.show_vram;
         egui::Window::new("VRAM Tile Viewer")
             .open(&mut open)
@@ -929,48 +959,61 @@ impl DebuggerWindows {
                 let is_obj = self.tile_cbb >= 4;
                 let pal_base = if is_obj { 256 } else { 0 };
 
-                let mut rgba = vec![0u8; img_w * img_h * 4];
-                for t in 0..num_tiles {
-                    let tx = (t % cols) * 8;
-                    let ty = (t / cols) * 8;
-                    let tile_off = cbb_base + t * tile_bytes;
-                    for py in 0..8usize {
-                        for px in 0..8usize {
-                            let color_idx = if self.tile_8bpp {
-                                let b = core.bus.ppu.vram[tile_off + py * 8 + px] as usize;
-                                if b == 0 { None } else { Some(pal_base + b) }
-                            } else {
-                                let byte = core.bus.ppu.vram[tile_off + py * 4 + (px / 2)];
-                                let nib =
-                                    if (px & 1) == 0 { byte & 0xF } else { byte >> 4 } as usize;
-                                if nib == 0 {
-                                    None
+                let cache_key = (
+                    vram_rev,
+                    self.tile_cbb,
+                    self.tile_8bpp,
+                    self.tile_pal_bank,
+                    color_correction,
+                );
+                if self.tile_tex.is_none() || self.tile_cache_key != Some(cache_key) {
+                    let mut rgba = vec![0u8; img_w * img_h * 4];
+                    for t in 0..num_tiles {
+                        let tx = (t % cols) * 8;
+                        let ty = (t / cols) * 8;
+                        let tile_off = cbb_base + t * tile_bytes;
+                        for py in 0..8usize {
+                            for px in 0..8usize {
+                                let color_idx = if self.tile_8bpp {
+                                    let b = core.bus.ppu.vram[tile_off + py * 8 + px] as usize;
+                                    if b == 0 { None } else { Some(pal_base + b) }
                                 } else {
-                                    Some(pal_base + self.tile_pal_bank * 16 + nib)
+                                    let byte = core.bus.ppu.vram[tile_off + py * 4 + (px / 2)];
+                                    let nib =
+                                        if (px & 1) == 0 { byte & 0xF } else { byte >> 4 } as usize;
+                                    if nib == 0 {
+                                        None
+                                    } else {
+                                        Some(pal_base + self.tile_pal_bank * 16 + nib)
+                                    }
+                                };
+                                let dst = ((ty + py) * img_w + (tx + px)) * 4;
+                                if let Some(pidx) = color_idx {
+                                    let raw = read_pram_u16(&core.bus.ppu.pram, pidx);
+                                    let c = bgr555_to_rgba(raw, color_correction);
+                                    rgba[dst..dst + 4].copy_from_slice(&c);
+                                } else {
+                                    let cb = checkerboard_color(tx + px, ty + py);
+                                    rgba[dst] = cb.r();
+                                    rgba[dst + 1] = cb.g();
+                                    rgba[dst + 2] = cb.b();
+                                    rgba[dst + 3] = 255;
                                 }
-                            };
-                            let dst = ((ty + py) * img_w + (tx + px)) * 4;
-                            if let Some(pidx) = color_idx {
-                                let raw = read_pram_u16(&core.bus.ppu.pram, pidx);
-                                let c = bgr555_to_rgba(raw, color_correction);
-                                rgba[dst..dst + 4].copy_from_slice(&c);
-                            } else {
-                                let cb = checkerboard_color(tx + px, ty + py);
-                                rgba[dst] = cb.r();
-                                rgba[dst + 1] = cb.g();
-                                rgba[dst + 2] = cb.b();
-                                rgba[dst + 3] = 255;
                             }
                         }
                     }
+
+                    let img = ColorImage::from_rgba_unmultiplied([img_w, img_h], &rgba);
+                    if let Some(tex) = &mut self.tile_tex {
+                        tex.set(img, TextureOptions::NEAREST);
+                    } else {
+                        self.tile_tex =
+                            Some(ctx.load_texture("vram_tiles", img, TextureOptions::NEAREST));
+                    }
+                    self.tile_cache_key = Some(cache_key);
                 }
 
-                let img = ColorImage::from_rgba_unmultiplied([img_w, img_h], &rgba);
-                let tex = self.tile_tex.get_or_insert_with(|| {
-                    ctx.load_texture("vram_tiles", img.clone(), TextureOptions::NEAREST)
-                });
-                tex.set(img, TextureOptions::NEAREST);
-
+                let tex = self.tile_tex.as_ref().expect("tile_tex populated");
                 let disp_size =
                     Vec2::new(img_w as f32 * self.tile_zoom, img_h as f32 * self.tile_zoom);
                 egui::ScrollArea::vertical()
@@ -1001,7 +1044,13 @@ impl DebuggerWindows {
         self.show_vram = open;
     }
 
-    fn draw_bg_window(&mut self, ctx: &egui::Context, core: &GbaCore, color_correction: bool) {
+    fn draw_bg_window(
+        &mut self,
+        ctx: &egui::Context,
+        core: &GbaCore,
+        color_correction: bool,
+        vram_rev: u64,
+    ) {
         let mut open = self.show_bg;
         egui::Window::new("BG Map Viewer")
             .open(&mut open)
@@ -1026,20 +1075,41 @@ impl DebuggerWindows {
                 let hofs = core.bus.ppu.bghofs[self.bg_layer];
                 let vofs = core.bus.ppu.bgvofs[self.bg_layer];
 
+                let is_bitmap_bg2 = self.bg_layer == 2 && (3..=5).contains(&mode);
+                let is_affine_bg = (mode == 1 && self.bg_layer == 2)
+                    || (mode == 2 && (self.bg_layer == 2 || self.bg_layer == 3));
+                let kind_str = if is_bitmap_bg2 {
+                    match mode {
+                        3 => "Bitmap 15bpp",
+                        4 => "Bitmap 8bpp",
+                        _ => "Bitmap 15bpp (M5)",
+                    }
+                } else if is_affine_bg {
+                    "Affine 8bpp"
+                } else if is_8bpp {
+                    "Text 8bpp"
+                } else {
+                    "Text 4bpp"
+                };
+
                 ui.monospace(format!(
-                    "Mode {mode} | Enabled: {enabled} | Prio: {prio} | CBB: 0x{:05X} | SBB: 0x{:05X} | {} | Scroll: ({hofs}, {vofs})",
+                    "Mode {mode} | Enabled: {enabled} | Prio: {prio} | CBB: 0x{:05X} | SBB: 0x{:05X} | {kind_str} | Scroll: ({hofs}, {vofs})",
                     char_base,
                     screen_base,
-                    if is_8bpp { "8bpp" } else { "4bpp" }
                 ));
                 ui.separator();
 
-                // Determine dimensions in pixels cleanly for text mode vs bitmap/affine BG2/BG3
-                let is_bitmap_bg2 = self.bg_layer == 2 && (3..=5).contains(&mode);
                 let (map_w, map_h) = if is_bitmap_bg2 {
                     match mode {
                         3 | 4 => (240usize, 160usize),
                         _ => (160usize, 128usize),
+                    }
+                } else if is_affine_bg {
+                    match size_flag {
+                        0 => (128, 128),
+                        1 => (256, 256),
+                        2 => (512, 512),
+                        _ => (1024, 1024),
                     }
                 } else {
                     match size_flag {
@@ -1050,101 +1120,157 @@ impl DebuggerWindows {
                     }
                 };
 
-                let mut rgba = vec![0u8; map_w * map_h * 4];
-                if is_bitmap_bg2 {
-                    for y in 0..map_h {
-                        for x in 0..map_w {
-                            let dst = (y * map_w + x) * 4;
-                            let raw = match mode {
-                                3 | 5 => {
-                                    let off = (y * map_w + x) * 2;
-                                    u16::from_le_bytes([
-                                        core.bus.ppu.vram[off],
-                                        core.bus.ppu.vram[off + 1],
-                                    ])
-                                }
-                                _ => {
-                                    let frame_off = if (dispcnt & 0x10) != 0 { 0xA000 } else { 0 };
-                                    let pidx = core.bus.ppu.vram[frame_off + y * map_w + x] as usize;
-                                    read_pram_u16(&core.bus.ppu.pram, pidx)
-                                }
-                            };
-                            rgba[dst..dst + 4].copy_from_slice(&bgr555_to_rgba(raw, color_correction));
+                let cache_key = (vram_rev, self.bg_layer, color_correction);
+                if self.bg_tex.is_none() || self.bg_cache_key != Some(cache_key) {
+                    let mut rgba = vec![0u8; map_w * map_h * 4];
+                    if is_bitmap_bg2 {
+                        let frame_off = if (mode == 4 || mode == 5) && (dispcnt & 0x10) != 0 {
+                            0xA000
+                        } else {
+                            0
+                        };
+                        for y in 0..map_h {
+                            for x in 0..map_w {
+                                let dst = (y * map_w + x) * 4;
+                                let raw = match mode {
+                                    3 | 5 => {
+                                        let off = frame_off + (y * map_w + x) * 2;
+                                        u16::from_le_bytes([
+                                            core.bus.ppu.vram[off],
+                                            core.bus.ppu.vram[off + 1],
+                                        ])
+                                    }
+                                    _ => {
+                                        let pidx = core.bus.ppu.vram[frame_off + y * map_w + x] as usize;
+                                        read_pram_u16(&core.bus.ppu.pram, pidx)
+                                    }
+                                };
+                                rgba[dst..dst + 4]
+                                    .copy_from_slice(&bgr555_to_rgba(raw, color_correction));
+                            }
                         }
-                    }
-                } else {
-                    let bd_raw = read_pram_u16(&core.bus.ppu.pram, 0);
-                    let bd_col = bgr555_to_rgba(bd_raw, color_correction);
-                    let tiles_x = map_w / 8;
-                    let tiles_y = map_h / 8;
-                    for ty in 0..tiles_y {
-                        for tx in 0..tiles_x {
-                            let sc_block = match size_flag {
-                                1 => usize::from(tx >= 32),
-                                2 => usize::from(ty >= 32),
-                                3 => usize::from(tx >= 32) + usize::from(ty >= 32) * 2,
-                                _ => 0,
-                            };
-                            let ltx = tx & 31;
-                            let lty = ty & 31;
-                            let entry_off = (screen_base + sc_block * 0x800 + (lty * 32 + ltx) * 2)
-                                % core.bus.ppu.vram.len();
-                            let entry = u16::from_le_bytes([
-                                core.bus.ppu.vram[entry_off],
-                                core.bus.ppu.vram[entry_off + 1],
-                            ]);
-                            let tile_id = (entry & 0x03FF) as usize;
-                            let hflip = (entry & 0x0400) != 0;
-                            let vflip = (entry & 0x0800) != 0;
-                            let pal_bank = ((entry >> 12) & 0xF) as usize;
-
-                            for py in 0..8usize {
-                                let sy = if vflip { 7 - py } else { py };
-                                for px in 0..8usize {
-                                    let sx = if hflip { 7 - px } else { px };
-                                    let pidx = if is_8bpp {
-                                        let off = char_base + tile_id * 64 + sy * 8 + sx;
-                                        if off < 0x10000 {
+                    } else if is_affine_bg {
+                        let bd_raw = read_pram_u16(&core.bus.ppu.pram, 0);
+                        let bd_col = bgr555_to_rgba(bd_raw, color_correction);
+                        let tiles_x = map_w / 8;
+                        let tiles_y = map_h / 8;
+                        for ty in 0..tiles_y {
+                            for tx in 0..tiles_x {
+                                let entry_off = (screen_base + ty * tiles_x + tx)
+                                    % core.bus.ppu.vram.len();
+                                let tile_id = core.bus.ppu.vram[entry_off] as usize;
+                                for py in 0..8usize {
+                                    for px in 0..8usize {
+                                        let off = char_base + tile_id * 64 + py * 8 + px;
+                                        let pidx = if off < 0x10000 {
                                             core.bus.ppu.vram[off] as usize
                                         } else {
                                             0
-                                        }
-                                    } else {
-                                        let off = char_base + tile_id * 32 + sy * 4 + (sx / 2);
-                                        if off < 0x10000 {
-                                            let b = core.bus.ppu.vram[off];
-                                            let nib = if (sx & 1) == 0 { b & 0xF } else { b >> 4 } as usize;
-                                            if nib == 0 { 0 } else { pal_bank * 16 + nib }
+                                        };
+                                        let dst = ((ty * 8 + py) * map_w + (tx * 8 + px)) * 4;
+                                        if pidx == 0 {
+                                            rgba[dst..dst + 4].copy_from_slice(&bd_col);
                                         } else {
-                                            0
+                                            let raw = read_pram_u16(&core.bus.ppu.pram, pidx);
+                                            rgba[dst..dst + 4].copy_from_slice(&bgr555_to_rgba(
+                                                raw,
+                                                color_correction,
+                                            ));
                                         }
-                                    };
-                                    let dst = ((ty * 8 + py) * map_w + (tx * 8 + px)) * 4;
-                                    if pidx == 0 {
-                                        rgba[dst..dst + 4].copy_from_slice(&bd_col);
-                                    } else {
-                                        let raw = read_pram_u16(&core.bus.ppu.pram, pidx);
-                                        rgba[dst..dst + 4]
-                                            .copy_from_slice(&bgr555_to_rgba(raw, color_correction));
+                                    }
+                                }
+                            }
+                        }
+                    } else {
+                        let bd_raw = read_pram_u16(&core.bus.ppu.pram, 0);
+                        let bd_col = bgr555_to_rgba(bd_raw, color_correction);
+                        let tiles_x = map_w / 8;
+                        let tiles_y = map_h / 8;
+                        for ty in 0..tiles_y {
+                            for tx in 0..tiles_x {
+                                let sc_block = match size_flag {
+                                    1 => usize::from(tx >= 32),
+                                    2 => usize::from(ty >= 32),
+                                    3 => usize::from(tx >= 32) + usize::from(ty >= 32) * 2,
+                                    _ => 0,
+                                };
+                                let ltx = tx & 31;
+                                let lty = ty & 31;
+                                let entry_off = (screen_base + sc_block * 0x800 + (lty * 32 + ltx) * 2)
+                                    % core.bus.ppu.vram.len();
+                                let entry = u16::from_le_bytes([
+                                    core.bus.ppu.vram[entry_off],
+                                    core.bus.ppu.vram[entry_off + 1],
+                                ]);
+                                let tile_id = (entry & 0x03FF) as usize;
+                                let hflip = (entry & 0x0400) != 0;
+                                let vflip = (entry & 0x0800) != 0;
+                                let pal_bank = ((entry >> 12) & 0xF) as usize;
+
+                                for py in 0..8usize {
+                                    let sy = if vflip { 7 - py } else { py };
+                                    for px in 0..8usize {
+                                        let sx = if hflip { 7 - px } else { px };
+                                        let pidx = if is_8bpp {
+                                            let off = char_base + tile_id * 64 + sy * 8 + sx;
+                                            if off < 0x10000 {
+                                                core.bus.ppu.vram[off] as usize
+                                            } else {
+                                                0
+                                            }
+                                        } else {
+                                            let off = char_base + tile_id * 32 + sy * 4 + (sx / 2);
+                                            if off < 0x10000 {
+                                                let b = core.bus.ppu.vram[off];
+                                                let nib = if (sx & 1) == 0 {
+                                                    b & 0xF
+                                                } else {
+                                                    b >> 4
+                                                } as usize;
+                                                if nib == 0 { 0 } else { pal_bank * 16 + nib }
+                                            } else {
+                                                0
+                                            }
+                                        };
+                                        let dst = ((ty * 8 + py) * map_w + (tx * 8 + px)) * 4;
+                                        if pidx == 0 {
+                                            rgba[dst..dst + 4].copy_from_slice(&bd_col);
+                                        } else {
+                                            let raw = read_pram_u16(&core.bus.ppu.pram, pidx);
+                                            rgba[dst..dst + 4].copy_from_slice(&bgr555_to_rgba(
+                                                raw,
+                                                color_correction,
+                                            ));
+                                        }
                                     }
                                 }
                             }
                         }
                     }
+
+                    let img = ColorImage::from_rgba_unmultiplied([map_w, map_h], &rgba);
+                    if let Some(tex) = &mut self.bg_tex {
+                        tex.set(img, TextureOptions::NEAREST);
+                    } else {
+                        self.bg_tex =
+                            Some(ctx.load_texture("bg_map_view", img, TextureOptions::NEAREST));
+                    }
+                    self.bg_cache_key = Some(cache_key);
                 }
 
-                let img = ColorImage::from_rgba_unmultiplied([map_w, map_h], &rgba);
-                let tex = self.bg_tex.get_or_insert_with(|| {
-                    ctx.load_texture("bg_map_view", img.clone(), TextureOptions::NEAREST)
-                });
-                tex.set(img, TextureOptions::NEAREST);
-
+                let tex = self.bg_tex.as_ref().expect("bg_tex populated");
                 egui::ScrollArea::both().show(ui, |ui| {
-                    let scale = if map_w > 256 { 1.0 } else { 1.5 };
+                    let scale = if map_w > 512 {
+                        0.5
+                    } else if map_w > 256 {
+                        1.0
+                    } else {
+                        1.5
+                    };
                     let size = Vec2::new(map_w as f32 * scale, map_h as f32 * scale);
                     let resp = ui.image((tex.id(), size));
-                    // Draw 240x160 hardware viewport scroll box
-                    if !is_bitmap_bg2 {
+                    // Draw 240x160 hardware viewport scroll box for text modes
+                    if !is_bitmap_bg2 && !is_affine_bg {
                         let rx = (hofs as usize % map_w) as f32 * scale;
                         let ry = (vofs as usize % map_h) as f32 * scale;
                         let vp_rect = Rect::from_min_size(
@@ -1163,7 +1289,13 @@ impl DebuggerWindows {
         self.show_bg = open;
     }
 
-    fn draw_oam_window(&mut self, ctx: &egui::Context, core: &GbaCore, color_correction: bool) {
+    fn draw_oam_window(
+        &mut self,
+        ctx: &egui::Context,
+        core: &GbaCore,
+        color_correction: bool,
+        vram_rev: u64,
+    ) {
         let mut open = self.show_oam;
         egui::Window::new("OAM Sprite Viewer")
             .open(&mut open)
@@ -1252,66 +1384,82 @@ impl DebuggerWindows {
                     let hflip = obj_mode_rot == 0 && (a1 & (1 << 12)) != 0;
                     let vflip = obj_mode_rot == 0 && (a1 & (1 << 13)) != 0;
 
-                    let mut rgba = vec![0u8; w * h * 4];
-                    for py in 0..h {
-                        let sy = if vflip { h - 1 - py } else { py };
-                        let ty = sy / 8;
-                        let in_ty = sy % 8;
-                        for px in 0..w {
-                            let sx = if hflip { w - 1 - px } else { px };
-                            let tx = sx / 8;
-                            let in_tx = sx % 8;
-                            let tile_off = if mapping_1d {
-                                let step = if is_8bpp { 2 } else { 1 };
-                                tile_id + ty * (w / 8) * step + tx * step
-                            } else {
-                                let row_stride = 32;
-                                let step = if is_8bpp { 2 } else { 1 };
-                                tile_id + ty * row_stride + tx * step
-                            };
-                            let byte_base = 0x10000 + tile_off * 32;
-                            let pidx = if is_8bpp {
-                                let off = byte_base + in_ty * 8 + in_tx;
-                                if off < core.bus.ppu.vram.len() {
-                                    core.bus.ppu.vram[off] as usize
+                    let cache_key = (vram_rev, idx, color_correction);
+                    if self.sprite_tex.is_none() || self.sprite_cache_key != Some(cache_key) {
+                        let base_tile = if !mapping_1d && is_8bpp {
+                            tile_id & !1
+                        } else {
+                            tile_id
+                        };
+                        let mut rgba = vec![0u8; w * h * 4];
+                        for py in 0..h {
+                            let sy = if vflip { h - 1 - py } else { py };
+                            let ty = sy / 8;
+                            let in_ty = sy % 8;
+                            for px in 0..w {
+                                let sx = if hflip { w - 1 - px } else { px };
+                                let tx = sx / 8;
+                                let in_tx = sx % 8;
+                                let tile_off = if mapping_1d {
+                                    let step = if is_8bpp { 2 } else { 1 };
+                                    base_tile + ty * (w / 8) * step + tx * step
                                 } else {
-                                    0
-                                }
-                            } else {
-                                let off = byte_base + in_ty * 4 + (in_tx / 2);
-                                if off < core.bus.ppu.vram.len() {
-                                    let b = core.bus.ppu.vram[off];
-                                    if (in_tx & 1) == 0 {
-                                        (b & 0xF) as usize
+                                    let row_stride = 32;
+                                    let step = if is_8bpp { 2 } else { 1 };
+                                    base_tile + ty * row_stride + tx * step
+                                };
+                                let byte_base = 0x10000 + tile_off * 32;
+                                let pidx = if is_8bpp {
+                                    let off = byte_base + in_ty * 8 + in_tx;
+                                    if off < core.bus.ppu.vram.len() {
+                                        core.bus.ppu.vram[off] as usize
                                     } else {
-                                        (b >> 4) as usize
+                                        0
                                     }
                                 } else {
-                                    0
+                                    let off = byte_base + in_ty * 4 + (in_tx / 2);
+                                    if off < core.bus.ppu.vram.len() {
+                                        let b = core.bus.ppu.vram[off];
+                                        if (in_tx & 1) == 0 {
+                                            (b & 0xF) as usize
+                                        } else {
+                                            (b >> 4) as usize
+                                        }
+                                    } else {
+                                        0
+                                    }
+                                };
+                                let dst = (py * w + px) * 4;
+                                if pidx == 0 {
+                                    let cb = checkerboard_color(px, py);
+                                    rgba[dst] = cb.r();
+                                    rgba[dst + 1] = cb.g();
+                                    rgba[dst + 2] = cb.b();
+                                    rgba[dst + 3] = 255;
+                                } else {
+                                    let real_pidx =
+                                        256 + if is_8bpp { pidx } else { pal_bank * 16 + pidx };
+                                    let raw = read_pram_u16(&core.bus.ppu.pram, real_pidx);
+                                    rgba[dst..dst + 4]
+                                        .copy_from_slice(&bgr555_to_rgba(raw, color_correction));
                                 }
-                            };
-                            let dst = (py * w + px) * 4;
-                            if pidx == 0 {
-                                let cb = checkerboard_color(px, py);
-                                rgba[dst] = cb.r();
-                                rgba[dst + 1] = cb.g();
-                                rgba[dst + 2] = cb.b();
-                                rgba[dst + 3] = 255;
-                            } else {
-                                let real_pidx =
-                                    256 + if is_8bpp { pidx } else { pal_bank * 16 + pidx };
-                                let raw = read_pram_u16(&core.bus.ppu.pram, real_pidx);
-                                rgba[dst..dst + 4]
-                                    .copy_from_slice(&bgr555_to_rgba(raw, color_correction));
                             }
                         }
+
+                        let img = ColorImage::from_rgba_unmultiplied([w, h], &rgba);
+                        if let Some(tex) = &mut self.sprite_tex {
+                            tex.set(img, TextureOptions::NEAREST);
+                        } else {
+                            self.sprite_tex = Some(ctx.load_texture(
+                                "oam_sprite_preview",
+                                img,
+                                TextureOptions::NEAREST,
+                            ));
+                        }
+                        self.sprite_cache_key = Some(cache_key);
                     }
 
-                    let img = ColorImage::from_rgba_unmultiplied([w, h], &rgba);
-                    let tex = self.sprite_tex.get_or_insert_with(|| {
-                        ctx.load_texture("oam_sprite_preview", img.clone(), TextureOptions::NEAREST)
-                    });
-                    tex.set(img, TextureOptions::NEAREST);
+                    let tex = self.sprite_tex.as_ref().expect("sprite_tex populated");
 
                     det_ui
                         .label(RichText::new(format!("Sprite #{idx} Preview ({w}x{h})")).strong());
@@ -1353,8 +1501,9 @@ impl DebuggerWindows {
         self.show_oam = open;
     }
 
-    fn draw_audio_window(&mut self, ctx: &egui::Context, core: &mut GbaCore) {
+    fn draw_audio_window(&mut self, ctx: &egui::Context, core: &mut GbaCore) -> Option<u8> {
         let mut open = self.show_audio;
+        let mut new_mask = None;
         egui::Window::new("Audio Channel Visualizer")
             .open(&mut open)
             .default_size([560.0, 440.0])
@@ -1390,6 +1539,7 @@ impl DebuggerWindows {
                                     } else {
                                         core.bus.apu.channel_enable_mask &= !(1 << ch);
                                     }
+                                    new_mask = Some(core.bus.apu.channel_enable_mask);
                                 }
                                 let status_col = if *hw_active && ch_enabled {
                                     ACCENT_TEAL
@@ -1435,6 +1585,7 @@ impl DebuggerWindows {
                 }
             });
         self.show_audio = open;
+        new_mask
     }
 
     fn draw_overrides_window(&mut self, ctx: &egui::Context, core: &mut GbaCore) -> bool {
@@ -1504,10 +1655,10 @@ impl DebuggerWindows {
                 {
                     changed = true;
                 }
-                if ui
-                    .add(egui::Slider::new(&mut core.bus.cart.solar_lux, 0..=255).text("Solar Lux"))
-                    .changed()
-                {
+                let lux_resp = ui.add(
+                    egui::Slider::new(&mut core.bus.cart.solar_lux, 0..=255).text("Solar Lux"),
+                );
+                if lux_resp.drag_stopped() || lux_resp.lost_focus() {
                     changed = true;
                 }
                 ui.horizontal(|ui| {
@@ -1571,7 +1722,12 @@ impl DebuggerWindows {
         changed
     }
 
-    fn draw_cheats_window(&mut self, ctx: &egui::Context, cheats: &mut Vec<CheatEntry>) -> bool {
+    fn draw_cheats_window(
+        &mut self,
+        ctx: &egui::Context,
+        cheats: &mut Vec<CheatEntry>,
+        hardcore: bool,
+    ) -> bool {
         let mut open = self.show_cheats;
         let mut changed = false;
 
@@ -1580,6 +1736,24 @@ impl DebuggerWindows {
             .default_size([520.0, 440.0])
             .resizable(true)
             .show(ctx, |ui| {
+                if hardcore {
+                    egui::Frame::new()
+                        .fill(Color32::from_rgb(44, 32, 16))
+                        .stroke(Stroke::new(1.0_f32, ACCENT_AMBER))
+                        .inner_margin(8.0)
+                        .corner_radius(4.0)
+                        .show(ui, |ui| {
+                            ui.label(
+                                RichText::new(
+                                    "RetroAchievements Hardcore mode is active — cheats are suspended and locked.",
+                                )
+                                .color(ACCENT_AMBER)
+                                .strong(),
+                            );
+                        });
+                    ui.add_space(6.0);
+                }
+                ui.add_enabled_ui(!hardcore, |ui| {
                 ui.label(RichText::new("Active Cheats").strong());
                 let mut remove_idx = None;
                 egui::Frame::new()
@@ -1678,6 +1852,7 @@ impl DebuggerWindows {
                         changed = true;
                     }
                 });
+                });
             });
 
         self.show_cheats = open;
@@ -1765,21 +1940,17 @@ impl DebuggerWindows {
             0x06 => MemoryRegion::Vram,
             0x07 => MemoryRegion::Oam,
             0x08..=0x0D => MemoryRegion::Rom,
+            0x0E | 0x0F => MemoryRegion::Sram,
             _ => MemoryRegion::Ewram,
         };
-        let base = match region {
-            MemoryRegion::Bios => 0x0000_0000,
-            MemoryRegion::Ewram => 0x0200_0000,
-            MemoryRegion::Iwram => 0x0300_0000,
-            MemoryRegion::Io => 0x0400_0000,
-            MemoryRegion::Pram => 0x0500_0000,
-            MemoryRegion::Vram => 0x0600_0000,
-            MemoryRegion::Oam => 0x0700_0000,
-            MemoryRegion::Rom => 0x0800_0000,
+        let off = match region {
+            MemoryRegion::Rom => (addr & 0x01FF_FFFF) as usize,
+            MemoryRegion::Sram => (addr & 0xFFFF) as usize,
+            _ => addr.saturating_sub(region.base_addr()) as usize,
         };
         self.hex_region = region;
         self.hex_goto_input = format!("{addr:08X}");
-        self.hex_scroll_row = Some((addr.saturating_sub(base) as usize) / 16);
+        self.hex_scroll_row = Some(off / 16);
         self.hex_match_addr = Some(addr);
     }
 

@@ -78,10 +78,12 @@ pub fn linear_lut() -> &'static [[u8; 4]; 32_768] {
 #[inline]
 pub fn agb_srgb_lut() -> &'static [[u8; 4]; 32_768] {
     AGB_LUT.get_or_init(|| {
-        build_lut(|r, g, b| {
-            let lr = r.powf(2.4);
-            let lg = g.powf(2.4);
-            let lb = b.powf(2.4);
+        let lin5: [f32; 32] = std::array::from_fn(|i| (i as f32 / 31.0).powf(2.4));
+        let mut table = vec![[0u8; 4]; 32_768].into_boxed_slice();
+        for (c, slot) in table.iter_mut().enumerate() {
+            let lr = lin5[c & 0x1F];
+            let lg = lin5[(c >> 5) & 0x1F];
+            let lb = lin5[(c >> 10) & 0x1F];
 
             let out_r =
                 (255.0 * (lr * 0.845 + lg * 0.125 + lb * 0.030).powf(1.0 / 2.2)).clamp(0.0, 255.0);
@@ -90,8 +92,9 @@ pub fn agb_srgb_lut() -> &'static [[u8; 4]; 32_768] {
             let out_b =
                 (255.0 * (lr * 0.000 + lg * 0.195 + lb * 0.805).powf(1.0 / 2.2)).clamp(0.0, 255.0);
 
-            [out_r as u8, out_g as u8, out_b as u8, 255]
-        })
+            *slot = [out_r as u8, out_g as u8, out_b as u8, 255];
+        }
+        table.try_into().expect("32768-entry RGBA LUT")
     })
 }
 

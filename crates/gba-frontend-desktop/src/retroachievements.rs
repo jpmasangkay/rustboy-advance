@@ -33,15 +33,18 @@ pub fn hash_rom_md5(rom_bytes: &[u8]) -> String {
 
 /// Maps a RetroAchievements GBA address onto the GBA CPU bus.
 ///
-/// Official RetroAchievements GBA memory layout:
-/// - `0x000000..=0x03FFFF` -> EWRAM `0x0200_0000..=0x0203_FFFF`
-/// - `0x040000..=0x047FFF` -> IWRAM `0x0300_0000..=0x0300_7FFF`
+/// Official RetroAchievements (`rcheevos`) GBA memory layout:
+/// - `0x000000..=0x007FFF` -> IWRAM `0x0300_0000..=0x0300_7FFF` (32 KiB)
+/// - `0x008000..=0x047FFF` -> EWRAM `0x0200_0000..=0x0203_FFFF` (256 KiB)
+/// - `0x048000..=0x057FFF` -> Cart SRAM `0x0E00_0000..=0x0E00_FFFF` (64 KiB)
 /// - Raw bus addresses (`>= 0x0200_0000`, e.g. `0x02xxxxxx`, `0x03xxxxxx`) pass through directly.
 pub fn map_ra_gba_addr(addr: u32) -> u32 {
-    if addr <= 0x0003_FFFF {
-        0x0200_0000 + addr
-    } else if (0x0004_0000..=0x0004_7FFF).contains(&addr) {
-        0x0300_0000 + (addr - 0x0004_0000)
+    if addr <= 0x0000_7FFF {
+        0x0300_0000 + addr
+    } else if (0x0000_8000..=0x0004_7FFF).contains(&addr) {
+        0x0200_0000 + (addr - 0x0000_8000)
+    } else if (0x0004_8000..=0x0005_7FFF).contains(&addr) {
+        0x0E00_0000 + (addr - 0x0004_8000)
     } else {
         addr
     }
@@ -129,7 +132,7 @@ impl MemRefHistory {
     fn update(&mut self, value: u32) {
         if !self.initialized {
             self.current = value;
-            self.delta = 0;
+            self.delta = value;
             self.prior = 0;
             self.initialized = true;
             return;
@@ -153,8 +156,10 @@ impl MemRefHistory {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ArithOp {
     BitAnd,
+    BitXor,
     Mul,
     Div,
+    Mod,
     Add,
     Sub,
 }
@@ -175,29 +180,25 @@ pub enum OperandExpr {
 }
 
 impl OperandExpr {
-    fn collect_memrefs(&self, out: &mut Vec<(usize, MemRef)>) {
-        match self {
-            Self::Mem { mem, history_idx } => out.push((*history_idx, mem.clone())),
-            Self::Const(_) => {}
-            Self::UnaryNeg(inner) => inner.collect_memrefs(out),
-            Self::Binary { lhs, rhs, .. } => {
-                lhs.collect_memrefs(out);
-                rhs.collect_memrefs(out);
-            }
-        }
-    }
-
-    fn eval(&self, core: &GbaCore, histories: &[MemRefHistory], addr_offset: Option<u32>) -> i64 {
+    fn eval_and_update(
+        &self,
+        core: &GbaCore,
+        histories: &mut [MemRefHistory],
+        addr_offset: Option<u32>,
+    ) -> i64 {
         match self {
             Self::Mem { mem, history_idx } => {
-                let mut raw = if let Some(off) = addr_offset {
-                    let effective = map_ra_gba_addr(off.wrapping_add(mem.addr));
-                    mem.size.read_from_core(core, effective)
+                let eff_ra_addr = match addr_offset {
+                    Some(off) => off.wrapping_add(mem.addr),
+                    None => mem.addr,
+                };
+                let effective = map_ra_gba_addr(eff_ra_addr);
+                let current_val = mem.size.read_from_core(core, effective);
+                let mut raw = if let Some(h) = histories.get_mut(*history_idx) {
+                    h.update(current_val);
+                    h.read(mem.mode)
                 } else {
-                    histories
-                        .get(*history_idx)
-                        .map(|h| h.read(mem.mode))
-                        .unwrap_or(0)
+                    current_val
                 };
                 if mem.invert {
                     raw = (!raw) & mem.size.value_mask();
@@ -208,18 +209,26 @@ impl OperandExpr {
                 i64::from(raw)
             }
             Self::Const(v) => *v,
-            Self::UnaryNeg(inner) => -inner.eval(core, histories, addr_offset),
+            Self::UnaryNeg(inner) => -inner.eval_and_update(core, histories, addr_offset),
             Self::Binary { op, lhs, rhs } => {
-                let l = lhs.eval(core, histories, addr_offset);
-                let r = rhs.eval(core, histories, addr_offset);
+                let l = lhs.eval_and_update(core, histories, addr_offset);
+                let r = rhs.eval_and_update(core, histories, addr_offset);
                 match op {
                     ArithOp::BitAnd => l & r,
+                    ArithOp::BitXor => l ^ r,
                     ArithOp::Mul => l.wrapping_mul(r),
                     ArithOp::Div => {
                         if r == 0 {
                             0
                         } else {
                             l.wrapping_div(r)
+                        }
+                    }
+                    ArithOp::Mod => {
+                        if r == 0 {
+                            0
+                        } else {
+                            l.wrapping_rem(r)
                         }
                     }
                     ArithOp::Add => l.wrapping_add(r),
@@ -302,7 +311,6 @@ pub struct ConditionGroup {
 pub struct TriggerProgram {
     pub groups: Vec<ConditionGroup>,
     histories: Vec<MemRefHistory>,
-    mem_slots: Vec<(usize, MemRef)>,
 }
 
 /// Evaluation result for a single frame of a `TriggerProgram`.
@@ -347,25 +355,12 @@ impl TriggerProgram {
             return Err("MemAddr contained no conditions".to_string());
         }
 
-        let mut mem_slots = Vec::new();
-        for g in &groups {
-            for cond in &g.conditions {
-                cond.lhs.collect_memrefs(&mut mem_slots);
-                if let Some((_, rhs)) = &cond.cmp {
-                    rhs.collect_memrefs(&mut mem_slots);
-                }
-            }
-        }
-        mem_slots.sort_by_key(|(idx, _)| *idx);
-
         Ok(Self {
             groups,
             histories: vec![MemRefHistory::default(); next_history_idx],
-            mem_slots,
         })
     }
 
-    #[allow(dead_code)]
     pub fn reset(&mut self) {
         for group in &mut self.groups {
             group.paused = false;
@@ -380,24 +375,15 @@ impl TriggerProgram {
 
     /// Evaluates one emulated frame against `core`, updating delta/prior histories and hit counts.
     pub fn evaluate_frame(&mut self, core: &GbaCore) -> TriggerEvalResult {
-        // Step 1: Snapshot all referenced memory locations and advance Delta/Prior history.
-        for (idx, mem) in &self.mem_slots {
-            let gba_addr = map_ra_gba_addr(mem.addr);
-            let val = mem.size.read_from_core(core, gba_addr);
-            if let Some(h) = self.histories.get_mut(*idx) {
-                h.update(val);
-            }
-        }
-
         let mut reset_all = false;
         let mut measured_current = None;
         let mut measured_target = None;
         let mut measured_if_ok = true;
-        let mut group_met = Vec::with_capacity(self.groups.len());
+        let mut group_outcomes = Vec::with_capacity(self.groups.len());
 
-        // Step 2: Evaluate each group.
+        // Evaluate each group (updating Delta/Prior per effective AddAddress pointer).
         for group in &mut self.groups {
-            let res = evaluate_group(group, core, &self.histories);
+            let res = evaluate_group(group, core, &mut self.histories);
             group.paused = res.paused;
             if res.reset_all {
                 reset_all = true;
@@ -409,10 +395,10 @@ impl TriggerProgram {
                 measured_current = res.measured_current;
                 measured_target = res.measured_target;
             }
-            group_met.push(res.met);
+            group_outcomes.push((res.met, res.has_required, res.paused));
         }
 
-        // Step 3: Apply global ResetIf across all conditions in the trigger.
+        // Apply global ResetIf across all conditions in the trigger.
         if reset_all {
             for group in &mut self.groups {
                 for cond in &mut group.conditions {
@@ -431,12 +417,23 @@ impl TriggerProgram {
             };
         }
 
-        // Core group (index 0) must pass, plus at least one Alt group if any alt groups exist.
-        let core_ok = group_met.first().copied().unwrap_or(false);
-        let alts_ok = if group_met.len() <= 1 {
+        // Core group (index 0) must pass; if any Alt groups contain required conditions,
+        // at least one such Alt group must pass (reset-only Alt groups do not satisfy alts).
+        let core_ok = group_outcomes
+            .first()
+            .map(|&(met, has_req, paused)| if has_req { met } else { !paused })
+            .unwrap_or(false);
+        let alts_ok = if group_outcomes.len() <= 1 {
             true
         } else {
-            group_met[1..].iter().any(|ok| *ok)
+            let any_alt_has_req = group_outcomes[1..].iter().any(|&(_, has_req, _)| has_req);
+            if any_alt_has_req {
+                group_outcomes[1..]
+                    .iter()
+                    .any(|&(met, has_req, _)| has_req && met)
+            } else {
+                true
+            }
         };
 
         TriggerEvalResult {
@@ -454,6 +451,7 @@ impl TriggerProgram {
 
 struct GroupEvalOutcome {
     met: bool,
+    has_required: bool,
     paused: bool,
     reset_all: bool,
     measured_if_ok: bool,
@@ -467,42 +465,74 @@ enum ChainLink {
     Or(bool),
 }
 
+fn chain_targets_pause_if(conditions: &[Condition], idx: usize) -> bool {
+    let mut j = idx + 1;
+    while j < conditions.len() {
+        match conditions[j].flag {
+            CondFlag::AddSource
+            | CondFlag::SubSource
+            | CondFlag::AddAddress
+            | CondFlag::AndNext
+            | CondFlag::OrNext
+            | CondFlag::ResetNextIf => {
+                j += 1;
+            }
+            CondFlag::PauseIf => return true,
+            _ => return false,
+        }
+    }
+    false
+}
+
 fn evaluate_group(
     group: &mut ConditionGroup,
     core: &GbaCore,
-    histories: &[MemRefHistory],
+    histories: &mut [MemRefHistory],
 ) -> GroupEvalOutcome {
-    // First pass: check PauseIf conditions so paused groups freeze all hit counters cleanly.
+    let n = group.conditions.len();
+    let is_pause_chain: Vec<bool> = (0..n)
+        .map(|i| match group.conditions[i].flag {
+            CondFlag::PauseIf => true,
+            CondFlag::AndNext | CondFlag::OrNext | CondFlag::ResetNextIf => {
+                chain_targets_pause_if(&group.conditions, i)
+            }
+            _ => false,
+        })
+        .collect();
+
+    // First pass: evaluate all operands (advancing Delta/Prior with active AddAddress offsets)
+    // and evaluate PauseIf chains so paused groups freeze all non-PauseIf hit counters cleanly.
     let mut source_acc: i64 = 0;
     let mut addr_offset: Option<u32> = None;
-    let mut chain: Option<ChainLink> = None;
-    let mut raw_matches = Vec::with_capacity(group.conditions.len());
-    let mut lhs_values = Vec::with_capacity(group.conditions.len());
-    let mut rhs_values = Vec::with_capacity(group.conditions.len());
+    let mut p1_chain: Option<ChainLink> = None;
+    let mut p1_reset_next = false;
+    let mut raw_ok_list = Vec::with_capacity(n);
+    let mut lhs_values = Vec::with_capacity(n);
+    let mut rhs_values = Vec::with_capacity(n);
     let mut any_paused = false;
 
-    for cond in &mut group.conditions {
-        let raw_lhs = cond.lhs.eval(core, histories, addr_offset);
+    for (idx, cond) in group.conditions.iter_mut().enumerate() {
+        let raw_lhs = cond.lhs.eval_and_update(core, histories, addr_offset);
         addr_offset = None;
 
         match cond.flag {
             CondFlag::AddSource => {
                 source_acc = source_acc.wrapping_add(raw_lhs);
-                raw_matches.push(true);
+                raw_ok_list.push(true);
                 lhs_values.push(raw_lhs);
                 rhs_values.push(0);
                 continue;
             }
             CondFlag::SubSource => {
                 source_acc = source_acc.wrapping_sub(raw_lhs);
-                raw_matches.push(true);
+                raw_ok_list.push(true);
                 lhs_values.push(raw_lhs);
                 rhs_values.push(0);
                 continue;
             }
             CondFlag::AddAddress => {
                 addr_offset = Some(raw_lhs as u32);
-                raw_matches.push(true);
+                raw_ok_list.push(true);
                 lhs_values.push(raw_lhs);
                 rhs_values.push(0);
                 continue;
@@ -514,58 +544,98 @@ fn evaluate_group(
         source_acc = 0;
 
         let (raw_ok, rhs_val) = if let Some((cmp_op, rhs_expr)) = &cond.cmp {
-            let r = rhs_expr.eval(core, histories, None);
+            let r = rhs_expr.eval_and_update(core, histories, None);
             (cmp_op.eval(effective_lhs, r), r)
         } else {
             (effective_lhs != 0, 0)
         };
 
-        let chained_ok = match chain {
-            None => raw_ok,
-            Some(ChainLink::And(prev)) => prev && raw_ok,
-            Some(ChainLink::Or(prev)) => prev || raw_ok,
-        };
-
         lhs_values.push(effective_lhs);
         rhs_values.push(rhs_val);
-        raw_matches.push(chained_ok);
+        raw_ok_list.push(raw_ok);
 
-        match cond.flag {
-            CondFlag::AndNext => {
-                let step_val = if cond.hit_target > 0 {
-                    // Track hits during active check below if unpaused; for PauseIf pass through.
-                    chained_ok
-                } else {
-                    chained_ok
-                };
-                chain = Some(ChainLink::And(step_val));
+        if is_pause_chain[idx] {
+            let mut chained_ok = match p1_chain {
+                None => raw_ok,
+                Some(ChainLink::And(prev)) => prev && raw_ok,
+                Some(ChainLink::Or(prev)) => prev || raw_ok,
+            };
+            if p1_reset_next {
+                cond.hits = 0;
+                chained_ok = false;
+                p1_reset_next = false;
             }
-            CondFlag::OrNext => {
-                chain = Some(ChainLink::Or(chained_ok));
-            }
-            CondFlag::PauseIf => {
-                chain = None;
-                let satisfied = if cond.hit_target > 0 {
-                    if chained_ok && cond.hits < cond.hit_target {
-                        cond.hits += 1;
+            match cond.flag {
+                CondFlag::AndNext => {
+                    let step_ok = if cond.hit_target > 0 {
+                        if chained_ok && cond.hits < cond.hit_target {
+                            cond.hits = cond.hits.saturating_add(1);
+                        }
+                        cond.hits >= cond.hit_target
+                    } else {
+                        chained_ok
+                    };
+                    p1_chain = Some(ChainLink::And(step_ok));
+                }
+                CondFlag::OrNext => {
+                    let step_ok = if cond.hit_target > 0 {
+                        if chained_ok && cond.hits < cond.hit_target {
+                            cond.hits = cond.hits.saturating_add(1);
+                        }
+                        cond.hits >= cond.hit_target
+                    } else {
+                        chained_ok
+                    };
+                    p1_chain = Some(ChainLink::Or(step_ok));
+                }
+                CondFlag::ResetNextIf => {
+                    let fired = if cond.hit_target > 0 {
+                        if chained_ok && cond.hits < cond.hit_target {
+                            cond.hits = cond.hits.saturating_add(1);
+                        }
+                        cond.hits >= cond.hit_target
+                    } else {
+                        chained_ok
+                    };
+                    p1_chain = None;
+                    if fired {
+                        p1_reset_next = true;
                     }
-                    cond.hits >= cond.hit_target
-                } else {
-                    chained_ok
-                };
-                if satisfied {
-                    any_paused = true;
+                }
+                CondFlag::PauseIf => {
+                    p1_chain = None;
+                    let satisfied = if cond.hit_target > 0 {
+                        if chained_ok && cond.hits < cond.hit_target {
+                            cond.hits = cond.hits.saturating_add(1);
+                        }
+                        cond.hits >= cond.hit_target
+                    } else {
+                        chained_ok
+                    };
+                    if satisfied {
+                        any_paused = true;
+                    }
+                }
+                _ => {
+                    p1_chain = None;
                 }
             }
-            _ => {
-                chain = None;
-            }
+        } else {
+            p1_chain = None;
+            p1_reset_next = false;
         }
     }
 
     if any_paused {
+        let has_required = group.conditions.iter().any(|c| {
+            matches!(
+                c.flag,
+                CondFlag::Standard | CondFlag::Trigger | CondFlag::Measured
+            )
+        });
         return GroupEvalOutcome {
             met: false,
+            has_required,
             paused: true,
             reset_all: false,
             measured_if_ok: true,
@@ -574,24 +644,39 @@ fn evaluate_group(
         };
     }
 
-    // Second pass (group is unpaused): advance hitcounts, ResetNextIf, AddHits/SubHits, and check satisfaction.
+    // Second pass (group is unpaused): evaluate chains, advance hitcounts, ResetNextIf,
+    // AddHits/SubHits, and check satisfaction.
     let mut reset_all = false;
     let mut reset_next = false;
+    let mut chain: Option<ChainLink> = None;
     let mut add_hits_acc: u32 = 0;
     let mut sub_hits_acc: u32 = 0;
+    let mut has_required = false;
     let mut all_required_met = true;
     let mut measured_if_ok = true;
     let mut measured_current = None;
     let mut measured_target = None;
 
     for (idx, cond) in group.conditions.iter_mut().enumerate() {
-        let mut cond_match = raw_matches[idx];
-        if reset_next
-            && !matches!(
-                cond.flag,
-                CondFlag::AddSource | CondFlag::SubSource | CondFlag::AddAddress
-            )
-        {
+        if matches!(
+            cond.flag,
+            CondFlag::AddSource | CondFlag::SubSource | CondFlag::AddAddress
+        ) {
+            continue;
+        }
+        if is_pause_chain[idx] {
+            chain = None;
+            reset_next = false;
+            continue;
+        }
+
+        let raw_ok = raw_ok_list[idx];
+        let mut cond_match = match chain {
+            None => raw_ok,
+            Some(ChainLink::And(prev)) => prev && raw_ok,
+            Some(ChainLink::Or(prev)) => prev || raw_ok,
+        };
+        if reset_next {
             cond.hits = 0;
             cond_match = false;
             reset_next = false;
@@ -601,41 +686,71 @@ fn evaluate_group(
             CondFlag::AddSource
             | CondFlag::SubSource
             | CondFlag::AddAddress
-            | CondFlag::PauseIf => {
-                continue;
-            }
+            | CondFlag::PauseIf => {}
             CondFlag::ResetNextIf => {
-                if cond_match {
+                let fired = if cond.hit_target > 0 {
+                    if cond_match && cond.hits < cond.hit_target {
+                        cond.hits = cond.hits.saturating_add(1);
+                    }
+                    cond.hits >= cond.hit_target
+                } else {
+                    cond_match
+                };
+                chain = None;
+                if fired {
                     reset_next = true;
                 }
-                continue;
             }
-            CondFlag::AndNext | CondFlag::OrNext => {
-                if cond.hit_target > 0 && cond_match && cond.hits < cond.hit_target {
-                    cond.hits += 1;
-                }
-                continue;
+            CondFlag::AndNext => {
+                let step_ok = if cond.hit_target > 0 {
+                    if cond_match && cond.hits < cond.hit_target {
+                        cond.hits = cond.hits.saturating_add(1);
+                    }
+                    cond.hits >= cond.hit_target
+                } else {
+                    cond_match
+                };
+                chain = Some(ChainLink::And(step_ok));
+            }
+            CondFlag::OrNext => {
+                let step_ok = if cond.hit_target > 0 {
+                    if cond_match && cond.hits < cond.hit_target {
+                        cond.hits = cond.hits.saturating_add(1);
+                    }
+                    cond.hits >= cond.hit_target
+                } else {
+                    cond_match
+                };
+                chain = Some(ChainLink::Or(step_ok));
             }
             CondFlag::AddHits => {
+                chain = None;
                 if cond_match && (cond.hit_target == 0 || cond.hits < cond.hit_target) {
                     cond.hits = cond.hits.saturating_add(1);
                 }
                 add_hits_acc = add_hits_acc.saturating_add(cond.hits);
-                continue;
             }
             CondFlag::SubHits => {
+                chain = None;
                 if cond_match && (cond.hit_target == 0 || cond.hits < cond.hit_target) {
                     cond.hits = cond.hits.saturating_add(1);
                 }
                 sub_hits_acc = sub_hits_acc.saturating_add(cond.hits);
-                continue;
             }
             CondFlag::ResetIf => {
+                chain = None;
                 let fired = if cond.hit_target > 0 {
-                    if cond_match && cond.hits < cond.hit_target {
-                        cond.hits += 1;
+                    let effective_now = cond
+                        .hits
+                        .saturating_add(add_hits_acc)
+                        .saturating_sub(sub_hits_acc);
+                    if cond_match && effective_now < cond.hit_target {
+                        cond.hits = cond.hits.saturating_add(1);
                     }
-                    cond.hits >= cond.hit_target
+                    cond.hits
+                        .saturating_add(add_hits_acc)
+                        .saturating_sub(sub_hits_acc)
+                        >= cond.hit_target
                 } else {
                     cond_match
                 };
@@ -644,14 +759,21 @@ fn evaluate_group(
                 if fired {
                     reset_all = true;
                 }
-                continue;
             }
             CondFlag::MeasuredIf => {
+                chain = None;
                 let ok = if cond.hit_target > 0 {
-                    if cond_match && cond.hits < cond.hit_target {
-                        cond.hits += 1;
+                    let effective_now = cond
+                        .hits
+                        .saturating_add(add_hits_acc)
+                        .saturating_sub(sub_hits_acc);
+                    if cond_match && effective_now < cond.hit_target {
+                        cond.hits = cond.hits.saturating_add(1);
                     }
-                    cond.hits >= cond.hit_target
+                    cond.hits
+                        .saturating_add(add_hits_acc)
+                        .saturating_sub(sub_hits_acc)
+                        >= cond.hit_target
                 } else {
                     cond_match
                 };
@@ -660,9 +782,10 @@ fn evaluate_group(
                 if !ok {
                     measured_if_ok = false;
                 }
-                continue;
             }
             CondFlag::Standard | CondFlag::Trigger | CondFlag::Measured => {
+                has_required = true;
+                chain = None;
                 let satisfied = if cond.hit_target > 0 {
                     let effective_now = cond
                         .hits
@@ -699,7 +822,8 @@ fn evaluate_group(
     }
 
     GroupEvalOutcome {
-        met: all_required_met,
+        met: has_required && all_required_met,
+        has_required,
         paused: false,
         reset_all,
         measured_if_ok,
@@ -893,13 +1017,13 @@ impl<'a> ExprParser<'a> {
     }
 
     fn parse_mul_div(&mut self) -> Result<OperandExpr, String> {
-        let mut lhs = self.parse_bit_and()?;
+        let mut lhs = self.parse_bit_ops()?;
         loop {
             self.skip_ws();
             match self.peek() {
                 Some(b'*') => {
                     self.pos += 1;
-                    let rhs = self.parse_bit_and()?;
+                    let rhs = self.parse_bit_ops()?;
                     lhs = OperandExpr::Binary {
                         op: ArithOp::Mul,
                         lhs: Box::new(lhs),
@@ -908,9 +1032,18 @@ impl<'a> ExprParser<'a> {
                 }
                 Some(b'/') => {
                     self.pos += 1;
-                    let rhs = self.parse_bit_and()?;
+                    let rhs = self.parse_bit_ops()?;
                     lhs = OperandExpr::Binary {
                         op: ArithOp::Div,
+                        lhs: Box::new(lhs),
+                        rhs: Box::new(rhs),
+                    };
+                }
+                Some(b'%') => {
+                    self.pos += 1;
+                    let rhs = self.parse_bit_ops()?;
+                    lhs = OperandExpr::Binary {
+                        op: ArithOp::Mod,
                         lhs: Box::new(lhs),
                         rhs: Box::new(rhs),
                     };
@@ -921,20 +1054,30 @@ impl<'a> ExprParser<'a> {
         Ok(lhs)
     }
 
-    fn parse_bit_and(&mut self) -> Result<OperandExpr, String> {
+    fn parse_bit_ops(&mut self) -> Result<OperandExpr, String> {
         let mut lhs = self.parse_atom()?;
         loop {
             self.skip_ws();
-            if self.peek() == Some(b'&') {
-                self.pos += 1;
-                let rhs = self.parse_atom()?;
-                lhs = OperandExpr::Binary {
-                    op: ArithOp::BitAnd,
-                    lhs: Box::new(lhs),
-                    rhs: Box::new(rhs),
-                };
-            } else {
-                break;
+            match self.peek() {
+                Some(b'&') => {
+                    self.pos += 1;
+                    let rhs = self.parse_atom()?;
+                    lhs = OperandExpr::Binary {
+                        op: ArithOp::BitAnd,
+                        lhs: Box::new(lhs),
+                        rhs: Box::new(rhs),
+                    };
+                }
+                Some(b'^') => {
+                    self.pos += 1;
+                    let rhs = self.parse_atom()?;
+                    lhs = OperandExpr::Binary {
+                        op: ArithOp::BitXor,
+                        lhs: Box::new(lhs),
+                        rhs: Box::new(rhs),
+                    };
+                }
+                _ => break,
             }
         }
         Ok(lhs)
@@ -1098,8 +1241,13 @@ impl<'a> ExprParser<'a> {
             return Ok(OperandExpr::Const(val));
         }
 
+        let mut negate_v = false;
         if matches!(self.peek(), Some(b'v' | b'V')) {
             self.pos += 1;
+            if self.peek() == Some(b'-') {
+                self.pos += 1;
+                negate_v = true;
+            }
         }
 
         let start = self.pos;
@@ -1112,9 +1260,12 @@ impl<'a> ExprParser<'a> {
         }
         let dec_str = std::str::from_utf8(&self.bytes[start..self.pos])
             .map_err(|_| "non-UTF8 integer literal")?;
-        let val = dec_str
+        let mut val = dec_str
             .parse::<i64>()
             .map_err(|_| format!("invalid integer literal '{dec_str}'"))?;
+        if negate_v {
+            val = val.wrapping_neg();
+        }
         Ok(OperandExpr::Const(val))
     }
 
@@ -1124,8 +1275,23 @@ impl<'a> ExprParser<'a> {
     }
 
     fn looks_like_prefix_then_0x(&self) -> bool {
-        self.bytes.get(self.pos + 1) == Some(&b'0')
-            && matches!(self.bytes.get(self.pos + 2), Some(b'x' | b'X'))
+        let mut i = self.pos;
+        while i < self.bytes.len() {
+            if self.bytes.get(i) == Some(&b'0')
+                && matches!(self.bytes.get(i + 1), Some(b'x' | b'X'))
+            {
+                return true;
+            }
+            if matches!(
+                self.bytes[i].to_ascii_lowercase(),
+                b'd' | b'p' | b'b' | b'~'
+            ) {
+                i += 1;
+            } else {
+                return false;
+            }
+        }
+        false
     }
 }
 
@@ -1233,6 +1399,8 @@ enum WorkerEvent {
         title: String,
         rich_presence_script: String,
         achievements: Vec<PatchAchievement>,
+        unlocked_softcore: Vec<u64>,
+        unlocked_hardcore: Vec<u64>,
     },
     GameLoadFailed {
         md5: String,
@@ -1240,8 +1408,10 @@ enum WorkerEvent {
     },
     AwardResult {
         achievement_id: u64,
+        hardcore: bool,
         success: bool,
         new_score: Option<u32>,
+        new_softcore_score: Option<u32>,
         error: Option<String>,
     },
     PingResult(Result<(), String>),
@@ -1267,6 +1437,8 @@ struct ApiResponseEnvelope {
     patch_data: Option<PatchData>,
     #[serde(rename = "AchievementID")]
     achievement_id: Option<u64>,
+    #[serde(rename = "UserUnlocks", default)]
+    user_unlocks: Vec<u64>,
 }
 
 #[derive(Clone, Debug, Deserialize)]
@@ -1484,9 +1656,9 @@ impl RetroAchievementsManager {
             PatchAchievement {
                 id: 900_001,
                 title: "First Contact".to_string(),
-                description: "Write any non-zero byte to EWRAM 0x02000000 (RA 0x000000)."
+                description: "Write any non-zero byte to EWRAM 0x02000000 (RA 0x008000)."
                     .to_string(),
-                mem_addr: "0xH000000>0".to_string(),
+                mem_addr: "0xH008000>0".to_string(),
                 points: 5,
                 flags: 3,
             },
@@ -1494,7 +1666,7 @@ impl RetroAchievementsManager {
                 id: 900_002,
                 title: "Collector's Streak".to_string(),
                 description: "Reach value 5 at EWRAM 0x02000004 (Measured progress).".to_string(),
-                mem_addr: "M:0xH000004=5".to_string(),
+                mem_addr: "M:0xH008004=5".to_string(),
                 points: 10,
                 flags: 3,
             },
@@ -1502,47 +1674,57 @@ impl RetroAchievementsManager {
                 id: 900_003,
                 title: "Steady Hold".to_string(),
                 description: "Keep IWRAM 0x03000008 == 1 for 3 consecutive frames.".to_string(),
-                mem_addr: "0xH040008=1(3)_R:0xH040008!=1".to_string(),
+                mem_addr: "0xH000008=1(3)_R:0xH000008!=1".to_string(),
                 points: 25,
                 flags: 3,
             },
         ];
-        self.install_patch_achievements(demo);
+        self.install_patch_achievements(demo, &[], &[], false);
     }
 
-    fn install_patch_achievements(&mut self, patch_list: Vec<PatchAchievement>) {
+    fn install_patch_achievements(
+        &mut self,
+        patch_list: Vec<PatchAchievement>,
+        unlocked_softcore: &[u64],
+        unlocked_hardcore: &[u64],
+        hardcore_mode: bool,
+    ) {
         self.achievements = patch_list
             .into_iter()
             .filter(|a| a.flags == 3)
-            .map(|a| match TriggerProgram::parse(&a.mem_addr) {
-                Ok(prog) => RuntimeAchievement {
-                    id: a.id,
-                    title: a.title,
-                    description: a.description,
-                    points: a.points,
-                    flags: a.flags,
-                    mem_addr: a.mem_addr,
-                    earned: false,
-                    hardcore_earned: false,
-                    measured_current: None,
-                    measured_target: None,
-                    parse_error: None,
-                    program: Some(prog),
-                },
-                Err(err) => RuntimeAchievement {
-                    id: a.id,
-                    title: a.title,
-                    description: a.description,
-                    points: a.points,
-                    flags: a.flags,
-                    mem_addr: a.mem_addr,
-                    earned: false,
-                    hardcore_earned: false,
-                    measured_current: None,
-                    measured_target: None,
-                    parse_error: Some(err),
-                    program: None,
-                },
+            .map(|a| {
+                let hc_earned = unlocked_hardcore.contains(&a.id);
+                let earned = hc_earned || (!hardcore_mode && unlocked_softcore.contains(&a.id));
+                match TriggerProgram::parse(&a.mem_addr) {
+                    Ok(prog) => RuntimeAchievement {
+                        id: a.id,
+                        title: a.title,
+                        description: a.description,
+                        points: a.points,
+                        flags: a.flags,
+                        mem_addr: a.mem_addr,
+                        earned,
+                        hardcore_earned: hc_earned,
+                        measured_current: None,
+                        measured_target: None,
+                        parse_error: None,
+                        program: Some(prog),
+                    },
+                    Err(err) => RuntimeAchievement {
+                        id: a.id,
+                        title: a.title,
+                        description: a.description,
+                        points: a.points,
+                        flags: a.flags,
+                        mem_addr: a.mem_addr,
+                        earned,
+                        hardcore_earned: hc_earned,
+                        measured_current: None,
+                        measured_target: None,
+                        parse_error: Some(err),
+                        program: None,
+                    },
+                }
             })
             .collect();
     }
@@ -1667,10 +1849,17 @@ impl RetroAchievementsManager {
                     title,
                     rich_presence_script,
                     achievements,
+                    unlocked_softcore,
+                    unlocked_hardcore,
                 } => {
                     if self.current_rom_md5.as_deref() == Some(&md5) {
                         self.rich_presence = RichPresenceScript::parse(&rich_presence_script);
-                        self.install_patch_achievements(achievements);
+                        self.install_patch_achievements(
+                            achievements,
+                            &unlocked_softcore,
+                            &unlocked_hardcore,
+                            config.ra_hardcore,
+                        );
                         self.game_state = RaGameState::Ready { game_id, title };
                         self.last_rp_ping = None;
                     }
@@ -1682,12 +1871,21 @@ impl RetroAchievementsManager {
                 }
                 WorkerEvent::AwardResult {
                     achievement_id,
+                    hardcore,
                     success,
                     new_score,
+                    new_softcore_score,
                     error,
                 } => {
                     if let Some(score) = new_score {
-                        self.hardcore_score = score;
+                        if hardcore || new_softcore_score.is_some() {
+                            self.hardcore_score = score;
+                        } else {
+                            self.softcore_score = score;
+                        }
+                    }
+                    if let Some(sc_score) = new_softcore_score {
+                        self.softcore_score = sc_score;
                     }
                     if !success {
                         self.last_status_note = Some(format!(
@@ -1732,17 +1930,19 @@ impl RetroAchievementsManager {
     }
 
     /// Renders the `Tools -> RetroAchievements...` floating window.
+    /// Returns `(config_changed, request_hard_reset)`.
     pub fn show_retroachievements_window(
         &mut self,
         ctx: &egui::Context,
         config: &mut AppConfig,
-    ) -> bool {
+        rom_loaded: bool,
+    ) -> (bool, bool) {
         if !self.show_window {
-            return false;
+            return (false, false);
         }
 
         let mut open = self.show_window;
-        let mut config_changed = false;
+        let mut outcome = (false, false);
 
         egui::Window::new("RetroAchievements")
             .open(&mut open)
@@ -1752,15 +1952,21 @@ impl RetroAchievementsManager {
             .min_height(380.0)
             .resizable(true)
             .show(ctx, |ui| {
-                config_changed = self.draw_window_contents(ui, config);
+                outcome = self.draw_window_contents(ui, config, rom_loaded);
             });
 
         self.show_window = open;
-        config_changed
+        outcome
     }
 
-    fn draw_window_contents(&mut self, ui: &mut egui::Ui, config: &mut AppConfig) -> bool {
+    fn draw_window_contents(
+        &mut self,
+        ui: &mut egui::Ui,
+        config: &mut AppConfig,
+        rom_loaded: bool,
+    ) -> (bool, bool) {
         let mut config_changed = false;
+        let mut request_hard_reset = false;
 
         let card_bg = Color32::from_rgb(18, 21, 28);
         let elevated_bg = Color32::from_rgb(24, 28, 37);
@@ -1784,17 +1990,43 @@ impl RetroAchievementsManager {
                         config_changed = true;
                         if !config.ra_enabled {
                             self.achievements.clear();
+                        } else if self.is_logged_in(config)
+                            && let Some(md5) = self.current_rom_md5.clone()
+                        {
+                            self.game_state = RaGameState::LookingUpHash;
+                            self.send_cmd(WorkerCommand::LoadGameByMd5 {
+                                username: config.ra_username.clone(),
+                                token: config.ra_token.clone(),
+                                md5,
+                            });
                         }
                     }
 
                     if ui
                         .checkbox(&mut config.ra_hardcore, "Hardcore Mode")
                         .on_hover_text(
-                            "Disables Rewind, Cheats, Save/Load State, Lua memory writes, and Debugger stepping while a game is active.",
+                            "Disables Rewind, Cheats, Save/Load State, Lua memory writes, and Debugger stepping while a game is active. Enabling mid-game resets the console.",
                         )
                         .changed()
                     {
                         config_changed = true;
+                        if config.ra_hardcore {
+                            for ach in &mut self.achievements {
+                                if !ach.hardcore_earned {
+                                    ach.earned = false;
+                                    if let Some(prog) = &mut ach.program {
+                                        prog.reset();
+                                    }
+                                }
+                            }
+                            if rom_loaded && config.ra_enabled && self.is_logged_in(config) {
+                                request_hard_reset = true;
+                                self.last_status_note = Some(
+                                    "Hardcore Mode enabled mid-game — hard-resetting system for a verified session."
+                                        .to_string(),
+                                );
+                            }
+                        }
                     }
 
                     if ui
@@ -2163,7 +2395,7 @@ impl RetroAchievementsManager {
                 }
             });
 
-        config_changed
+        (config_changed, request_hard_reset)
     }
 }
 
@@ -2387,7 +2619,7 @@ fn perform_load_game(username: &str, token: &str, md5: &str) -> WorkerEvent {
     }
 
     let gid_str = game_id.to_string();
-    let patch_env = match api_get(&[
+    let patch_env = match api_post(&[
         ("r", "patch"),
         ("u", username),
         ("t", token),
@@ -2418,12 +2650,49 @@ fn perform_load_game(username: &str, token: &str, md5: &str) -> WorkerEvent {
         };
     };
 
+    let resolved_gid = if patch.id > 0 { patch.id } else { game_id };
+    let resolved_gid_str = resolved_gid.to_string();
+
+    // Start RA session and fetch previously unlocked achievement IDs (softcore + hardcore)
+    // via POST so the auth token is never exposed in URL query strings.
+    let _ = api_post(&[
+        ("r", "startsession"),
+        ("u", username),
+        ("t", token),
+        ("g", &resolved_gid_str),
+        ("m", md5),
+    ]);
+    let unlocked_softcore = api_post(&[
+        ("r", "unlocks"),
+        ("u", username),
+        ("t", token),
+        ("g", &resolved_gid_str),
+        ("h", "0"),
+    ])
+    .ok()
+    .filter(|e| e.success)
+    .map(|e| e.user_unlocks)
+    .unwrap_or_default();
+    let unlocked_hardcore = api_post(&[
+        ("r", "unlocks"),
+        ("u", username),
+        ("t", token),
+        ("g", &resolved_gid_str),
+        ("h", "1"),
+    ])
+    .ok()
+    .filter(|e| e.success)
+    .map(|e| e.user_unlocks)
+    .unwrap_or_default();
+
     WorkerEvent::GameLoaded {
         md5: md5.to_string(),
-        game_id: if patch.id > 0 { patch.id } else { game_id },
+        game_id: resolved_gid,
         title: patch.title,
         rich_presence_script: patch.rich_presence_patch,
         achievements: patch.achievements,
+        unlocked_softcore,
+        unlocked_hardcore,
     }
 }
 
@@ -2439,7 +2708,7 @@ fn perform_award(
     let sig_input = format!("{achievement_id}{username}{hc_str}");
     let sig = hash_rom_md5(sig_input.as_bytes());
 
-    match api_get(&[
+    match api_post(&[
         ("r", "awardachievement"),
         ("u", username),
         ("t", token),
@@ -2450,14 +2719,18 @@ fn perform_award(
     ]) {
         Ok(env) => WorkerEvent::AwardResult {
             achievement_id: env.achievement_id.unwrap_or(achievement_id),
+            hardcore,
             success: env.success,
             new_score: env.score,
+            new_softcore_score: env.softcore_score,
             error: env.error,
         },
         Err(err) => WorkerEvent::AwardResult {
             achievement_id,
+            hardcore,
             success: false,
             new_score: None,
+            new_softcore_score: None,
             error: Some(err),
         },
     }
@@ -2510,13 +2783,19 @@ mod tests {
     #[test]
     fn mem_addr_sizes_comparisons_and_bits() {
         let mut core = test_core();
-        // EWRAM 0x0200_0010 -> RA 0x000010, IWRAM 0x0300_0020 -> RA 0x040020
-        core.poke8(0x0200_0010, 0xA5); // binary 1010_0101 -> bits 0,2,5,7 set (4 bits)
-        core.poke16(0x0200_0012, 1024);
-        core.poke32(0x0300_0020, 0x1234_5678);
+        // Official RA GBA layout: IWRAM 0x0300_0000 -> RA 0x000000..=0x007FFF,
+        // EWRAM 0x0200_0000 -> RA 0x008000..=0x047FFF, SRAM 0x0E00_0000 -> RA 0x048000..=0x057FFF.
+        assert_eq!(map_ra_gba_addr(0x0000_0010), 0x0300_0010);
+        assert_eq!(map_ra_gba_addr(0x0000_8010), 0x0200_0010);
+        assert_eq!(map_ra_gba_addr(0x0004_8004), 0x0E00_0004);
+        assert_eq!(map_ra_gba_addr(0x0200_0050), 0x0200_0050);
+
+        core.poke8(0x0300_0010, 0xA5); // binary 1010_0101 -> bits 0,2,5,7 set (4 bits)
+        core.poke16(0x0300_0012, 1024);
+        core.poke32(0x0200_0020, 0x1234_5678);
 
         let mut p_eq =
-            TriggerProgram::parse("0xH000010=165_0x 000012>500_0xX040020=305419896").unwrap();
+            TriggerProgram::parse("0xH000010=165_0x 000012>500_0xX008020=305419896").unwrap();
         assert!(p_eq.evaluate_frame(&core).triggered);
 
         let mut p_nib = TriggerProgram::parse("0xL000010=5_0xU000010=10_0xK000010=4").unwrap();
@@ -2535,20 +2814,24 @@ mod tests {
         let mut core = test_core();
         let mut prog = TriggerProgram::parse("d0xH000010=1_0xH000010=2").unwrap();
 
-        core.poke8(0x0200_0010, 1);
+        core.poke8(0x0300_0010, 1);
         assert!(!prog.evaluate_frame(&core).triggered);
 
-        core.poke8(0x0200_0010, 2);
+        core.poke8(0x0300_0010, 2);
         assert!(prog.evaluate_frame(&core).triggered);
 
         // On next frame delta becomes 2, so d0x == 1 is now false.
         assert!(!prog.evaluate_frame(&core).triggered);
 
+        // Frame 0 delta equals current value (never falsely triggers d0x == 0 on boot).
+        let mut boot_prog = TriggerProgram::parse("d0xH000010=0_0xH000010=2").unwrap();
+        assert!(!boot_prog.evaluate_frame(&core).triggered);
+
         // Verify Prior (`p`) retains the last differing value even across idle frames.
         let mut prior_prog = TriggerProgram::parse("p0xH000010=5_0xH000010=9").unwrap();
-        core.poke8(0x0200_0010, 5);
+        core.poke8(0x0300_0010, 5);
         assert!(!prior_prog.evaluate_frame(&core).triggered);
-        core.poke8(0x0200_0010, 9);
+        core.poke8(0x0300_0010, 9);
         assert!(prior_prog.evaluate_frame(&core).triggered);
         // Holding at 9 keeps prior=5 across subsequent frames!
         assert!(prior_prog.evaluate_frame(&core).triggered);
@@ -2558,8 +2841,8 @@ mod tests {
     fn mem_addr_andnext_ornext_addsource_pauseif_resetif_and_hitcounts() {
         let mut core = test_core();
 
-        // HitCounts (3) + ResetIf
-        let mut hit_prog = TriggerProgram::parse("0xH000010=5(3)_R:0xH000011=1").unwrap();
+        // HitCounts (3) + ResetIf (RA 0x008010 -> EWRAM 0x0200_0010)
+        let mut hit_prog = TriggerProgram::parse("0xH008010=5(3)_R:0xH008011=1").unwrap();
         core.poke8(0x0200_0010, 5);
         assert!(!hit_prog.evaluate_frame(&core).triggered); // hits = 1
         assert!(!hit_prog.evaluate_frame(&core).triggered); // hits = 2
@@ -2575,7 +2858,7 @@ mod tests {
         assert!(hit_prog.evaluate_frame(&core).triggered); // 3!
 
         // PauseIf freezes hit accumulation without resetting existing hits.
-        let mut pause_prog = TriggerProgram::parse("0xH000010=7(2)_P:0xH000012=1").unwrap();
+        let mut pause_prog = TriggerProgram::parse("0xH008010=7(2)_P:0xH008012=1").unwrap();
         core.poke8(0x0200_0010, 7);
         assert!(!pause_prog.evaluate_frame(&core).triggered); // hits = 1
         core.poke8(0x0200_0012, 1);
@@ -2585,7 +2868,7 @@ mod tests {
 
         // AndNext & OrNext
         let mut logic_prog =
-            TriggerProgram::parse("N:0xH000020=1_O:0xH000021=2_0xH000022=3").unwrap();
+            TriggerProgram::parse("N:0xH008020=1_O:0xH008021=2_0xH008022=3").unwrap();
         core.poke8(0x0200_0020, 1);
         core.poke8(0x0200_0021, 0);
         core.poke8(0x0200_0022, 3);
@@ -2594,20 +2877,67 @@ mod tests {
         assert!(!logic_prog.evaluate_frame(&core).triggered);
 
         // AddSource + SubSource + scaling & mask
-        let mut add_prog = TriggerProgram::parse("A:0xH000030*2_B:0xH000031_0xH000032=10").unwrap();
+        let mut add_prog = TriggerProgram::parse("A:0xH008030*2_B:0xH008031_0xH008032=10").unwrap();
         core.poke8(0x0200_0030, 4); // * 2 = 8
         core.poke8(0x0200_0031, 3); // - 3 = 5
         core.poke8(0x0200_0032, 5); // + 5 = 10
         assert!(add_prog.evaluate_frame(&core).triggered);
 
         // Alt groups (S)
-        let mut alt_prog = TriggerProgram::parse("0xH000040=1S0xH000041=2S0xH000042=3").unwrap();
+        let mut alt_prog = TriggerProgram::parse("0xH008040=1S0xH008041=2S0xH008042=3").unwrap();
         core.poke8(0x0200_0040, 1);
         core.poke8(0x0200_0041, 0);
         core.poke8(0x0200_0042, 0);
         assert!(!alt_prog.evaluate_frame(&core).triggered);
         core.poke8(0x0200_0042, 3);
         assert!(alt_prog.evaluate_frame(&core).triggered);
+    }
+
+    #[test]
+    fn mem_addr_addaddress_delta_resetnext_pause_and_reset_only_alt() {
+        let mut core = test_core();
+
+        // AddAddress (I:) + Delta tracking through dynamic pointer
+        core.poke32(0x0300_0100, 0x0200_0200);
+        core.poke8(0x0200_0204, 10);
+        let mut ind_prog =
+            TriggerProgram::parse("I:0xX000100_d0xH000004=10_I:0xX000100_0xH000004=11").unwrap();
+        assert!(!ind_prog.evaluate_frame(&core).triggered);
+        core.poke8(0x0200_0204, 11);
+        assert!(ind_prog.evaluate_frame(&core).triggered);
+
+        // ResetNextIf (Z:) clearing PauseIf with HitCount (1)
+        let mut zp_prog =
+            TriggerProgram::parse("0xH000010=1_Z:0xH000011=1_P:0xH000012=1(1)").unwrap();
+        core.poke8(0x0300_0010, 1);
+        core.poke8(0x0300_0011, 0);
+        core.poke8(0x0300_0012, 1);
+        assert!(!zp_prog.evaluate_frame(&core).triggered); // PauseIf latches hit=1
+        core.poke8(0x0300_0012, 0);
+        assert!(!zp_prog.evaluate_frame(&core).triggered); // Still paused due to hit=1
+        core.poke8(0x0300_0011, 1);
+        assert!(zp_prog.evaluate_frame(&core).triggered); // Z: clears PauseIf hit -> unpaused & triggers!
+
+        // Reset-only Alt group must NOT trivially satisfy alts when another Alt has required conds.
+        let mut alt_reset = TriggerProgram::parse("0xH000020=1S0xH000021=1SR:0xH000022=1").unwrap();
+        core.poke8(0x0300_0020, 1);
+        core.poke8(0x0300_0021, 0);
+        core.poke8(0x0300_0022, 0);
+        assert!(!alt_reset.evaluate_frame(&core).triggered);
+        core.poke8(0x0300_0021, 1);
+        assert!(alt_reset.evaluate_frame(&core).triggered);
+
+        // AndNext with HitCount + v-N, bd0x, %, ^ operators
+        core.poke8(0x0300_0030, 0x15); // BCD 15; 15 % 4 == 3; 0x15 ^ 0x13 == 6
+        let mut expr_prog =
+            TriggerProgram::parse("b0xH000030%4=3_0xH000030^h13=6_0xH000031=v-0").unwrap();
+        core.poke8(0x0300_0031, 0);
+        assert!(expr_prog.evaluate_frame(&core).triggered);
+
+        let mut bcd_delta = TriggerProgram::parse("bd0xH000030=15_b0xH000030=16").unwrap();
+        assert!(!bcd_delta.evaluate_frame(&core).triggered);
+        core.poke8(0x0300_0030, 0x16);
+        assert!(bcd_delta.evaluate_frame(&core).triggered);
     }
 
     #[test]
@@ -2676,9 +3006,9 @@ mod tests {
             TriggerProgram::parse("0xH02000050&15=10_T:0xH02000050&h0F/2=5").unwrap();
         assert!(mask_prog.evaluate_frame(&core).triggered);
 
-        // AddHits (C:) + SubHits (D:) feeding target (3)
+        // AddHits (C:) + SubHits (D:) feeding target (3) (RA 0x008060 -> EWRAM 0x0200_0060)
         let mut hits_prog =
-            TriggerProgram::parse("C:0xH000060=1_D:0xH000061=1_0xH000062=1(3)").unwrap();
+            TriggerProgram::parse("C:0xH008060=1_D:0xH008061=1_0xH008062=1(3)").unwrap();
         core.poke8(0x0200_0060, 1); // +1 hit
         core.poke8(0x0200_0061, 0);
         core.poke8(0x0200_0062, 1); // +1 hit => effective 2

@@ -1,6 +1,11 @@
+use std::collections::HashMap;
 use std::fs::{self, File};
 use std::io::{BufWriter, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::mpsc::{self, SyncSender};
+use std::thread::{self, JoinHandle};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use gba_core::{LCD_HEIGHT, LCD_WIDTH, SAMPLE_RATE_HZ};
@@ -9,6 +14,7 @@ use crate::config::{AppConfig, ColorProfileChoice};
 use crate::filters::{agb_srgb_lut, ags_001_lut, ags_101_lut, linear_lut};
 
 const GIF_QUANT_SPEED: i32 = 10;
+const GBA_FRAME_CS: f64 = 100.0 * 280_896.0 / 16_777_216.0; // ~1.67427 centiseconds per GBA frame
 const WAV_HEADER_LEN: u64 = 44;
 const MAX_WAV_DATA_BYTES: u64 = (u32::MAX as u64) - 36;
 
@@ -23,13 +29,6 @@ impl GifFpsMode {
         match self {
             Self::Fps60 => 1,
             Self::Fps30 => 2,
-        }
-    }
-
-    pub(crate) const fn delay_cs(self) -> u16 {
-        match self {
-            Self::Fps60 => 2,
-            Self::Fps30 => 3,
         }
     }
 
@@ -106,29 +105,55 @@ pub(crate) fn bgr555_to_rgba(
 pub(crate) struct GifRecorder<W: Write> {
     encoder: Option<gif::Encoder<W>>,
     output_path: Option<PathBuf>,
+    width: usize,
+    height: usize,
     fps_mode: GifFpsMode,
     source_frames: u64,
     frames_written: u64,
+    delay_accum_cs: f64,
     scratch_rgba: Vec<u8>,
+    exact_palette: Vec<u8>,
+    exact_indices: Vec<u8>,
+    exact_map: HashMap<u32, u8>,
 }
 
 impl GifRecorder<BufWriter<File>> {
+    #[allow(dead_code)]
     pub(crate) fn start(path: PathBuf, fps_mode: GifFpsMode) -> Result<Self, String> {
+        Self::start_sized(path, fps_mode, LCD_WIDTH, LCD_HEIGHT)
+    }
+
+    pub(crate) fn start_sized(
+        path: PathBuf,
+        fps_mode: GifFpsMode,
+        width: usize,
+        height: usize,
+    ) -> Result<Self, String> {
         if let Some(parent) = path.parent()
             && !parent.as_os_str().is_empty()
         {
             fs::create_dir_all(parent).map_err(|e| format!("Failed creating capture dir: {e}"))?;
         }
         let file = File::create(&path).map_err(|e| format!("Failed creating GIF file: {e}"))?;
-        let mut rec = Self::start_with_writer(BufWriter::new(file), fps_mode)?;
+        let mut rec = Self::start_with_writer_sized(BufWriter::new(file), fps_mode, width, height)?;
         rec.output_path = Some(path);
         Ok(rec)
     }
 }
 
 impl<W: Write> GifRecorder<W> {
+    #[allow(dead_code)]
     pub(crate) fn start_with_writer(writer: W, fps_mode: GifFpsMode) -> Result<Self, String> {
-        let mut encoder = gif::Encoder::new(writer, LCD_WIDTH as u16, LCD_HEIGHT as u16, &[])
+        Self::start_with_writer_sized(writer, fps_mode, LCD_WIDTH, LCD_HEIGHT)
+    }
+
+    pub(crate) fn start_with_writer_sized(
+        writer: W,
+        fps_mode: GifFpsMode,
+        width: usize,
+        height: usize,
+    ) -> Result<Self, String> {
+        let mut encoder = gif::Encoder::new(writer, width as u16, height as u16, &[])
             .map_err(|e| format!("Failed initializing GIF encoder: {e}"))?;
         if let Err(e) = encoder.set_repeat(gif::Repeat::Infinite) {
             let _ = encoder.into_inner();
@@ -137,19 +162,27 @@ impl<W: Write> GifRecorder<W> {
         Ok(Self {
             encoder: Some(encoder),
             output_path: None,
+            width,
+            height,
             fps_mode,
             source_frames: 0,
             frames_written: 0,
-            scratch_rgba: vec![0u8; LCD_WIDTH * LCD_HEIGHT * 4],
+            delay_accum_cs: 0.0,
+            scratch_rgba: vec![0u8; width * height * 4],
+            exact_palette: Vec::with_capacity(256 * 3),
+            exact_indices: vec![0u8; width * height],
+            exact_map: HashMap::with_capacity(256),
         })
     }
 
+    #[allow(dead_code)]
     pub(crate) fn frames_written(&self) -> u64 {
         self.frames_written
     }
 
+    #[allow(dead_code)]
     pub(crate) fn push_rgba_frame(&mut self, rgba: &[u8]) -> Result<bool, String> {
-        let expected = LCD_WIDTH * LCD_HEIGHT * 4;
+        let expected = self.width * self.height * 4;
         if rgba.len() != expected {
             return Err(format!(
                 "Invalid RGBA frame length for GIF: got {}, expected {expected}",
@@ -184,23 +217,85 @@ impl<W: Write> GifRecorder<W> {
             return Ok(false);
         }
 
-        bgr555_to_rgba(fb_bgr555, color_correction, profile, &mut self.scratch_rgba);
+        if self.width == LCD_WIDTH && self.height == LCD_HEIGHT {
+            bgr555_to_rgba(fb_bgr555, color_correction, profile, &mut self.scratch_rgba);
+        } else {
+            let mut full = vec![0u8; LCD_WIDTH * LCD_HEIGHT * 4];
+            bgr555_to_rgba(fb_bgr555, color_correction, profile, &mut full);
+            let cropped = crate::gb_bridge::crop_gb_rgba_from_240x160(&full);
+            let len = self.scratch_rgba.len().min(cropped.len());
+            self.scratch_rgba[..len].copy_from_slice(&cropped[..len]);
+        }
         self.encode_scratch_frame()?;
         Ok(true)
     }
 
+    fn next_frame_delay_cs(&mut self) -> u16 {
+        let step_cs = GBA_FRAME_CS * (self.fps_mode.frame_skip() as f64);
+        self.delay_accum_cs += step_cs;
+        let delay = self.delay_accum_cs.round().max(1.0) as u16;
+        self.delay_accum_cs -= f64::from(delay);
+        delay
+    }
+
+    fn try_build_exact_palette(&mut self) -> bool {
+        self.exact_map.clear();
+        self.exact_palette.clear();
+        let pixel_count = self.width * self.height;
+        if self.exact_indices.len() != pixel_count {
+            self.exact_indices.resize(pixel_count, 0);
+        }
+        for (i, px) in self
+            .scratch_rgba
+            .as_chunks::<4>()
+            .0
+            .iter()
+            .take(pixel_count)
+            .enumerate()
+        {
+            let key = (u32::from(px[0]) << 16) | (u32::from(px[1]) << 8) | u32::from(px[2]);
+            if let Some(&idx) = self.exact_map.get(&key) {
+                self.exact_indices[i] = idx;
+            } else {
+                let next = self.exact_map.len();
+                if next >= 256 {
+                    return false;
+                }
+                let idx = next as u8;
+                self.exact_map.insert(key, idx);
+                self.exact_palette.push(px[0]);
+                self.exact_palette.push(px[1]);
+                self.exact_palette.push(px[2]);
+                self.exact_indices[i] = idx;
+            }
+        }
+        true
+    }
+
     fn encode_scratch_frame(&mut self) -> Result<(), String> {
+        let delay = self.next_frame_delay_cs();
+        let exact = self.try_build_exact_palette();
         let encoder = self
             .encoder
             .as_mut()
             .ok_or_else(|| "GIF encoder already closed".to_string())?;
-        let mut frame = gif::Frame::from_rgba_speed(
-            LCD_WIDTH as u16,
-            LCD_HEIGHT as u16,
-            &mut self.scratch_rgba,
-            GIF_QUANT_SPEED,
-        );
-        frame.delay = self.fps_mode.delay_cs();
+        let mut frame = if exact {
+            gif::Frame::from_palette_pixels(
+                self.width as u16,
+                self.height as u16,
+                self.exact_indices.clone(),
+                self.exact_palette.clone(),
+                None,
+            )
+        } else {
+            gif::Frame::from_rgba_speed(
+                self.width as u16,
+                self.height as u16,
+                &mut self.scratch_rgba,
+                GIF_QUANT_SPEED,
+            )
+        };
+        frame.delay = delay;
         encoder
             .write_frame(&frame)
             .map_err(|e| format!("Failed writing GIF frame: {e}"))?;
@@ -277,11 +372,6 @@ impl<W: Write + Seek> WavRecorder<W> {
             samples_written: 0,
             byte_buf: Vec::with_capacity(4096),
         })
-    }
-
-    pub(crate) fn duration_secs(&self) -> f64 {
-        let stereo_frames = self.samples_written / 2;
-        (stereo_frames as f64) / f64::from(self.sample_rate.max(1))
     }
 
     pub(crate) fn push_samples(&mut self, samples: &[i16]) -> Result<(), String> {
@@ -403,9 +493,35 @@ pub(crate) fn capture_output_path(dir: &Path, rom_title: &str, ext: &str) -> Pat
     candidate
 }
 
+enum GifWorkerMsg {
+    Frame {
+        fb: Box<[u16; LCD_WIDTH * LCD_HEIGHT]>,
+        color_correction: bool,
+        profile: ColorProfileChoice,
+    },
+    Finish,
+}
+
+struct AsyncGifSession {
+    tx: SyncSender<GifWorkerMsg>,
+    frames_written: Arc<AtomicU64>,
+    join: Option<JoinHandle<Result<GifCaptureSummary, String>>>,
+}
+
+enum WavWorkerMsg {
+    Samples(Vec<i16>),
+    Finish,
+}
+
+struct AsyncWavSession {
+    tx: SyncSender<WavWorkerMsg>,
+    samples_written: Arc<AtomicU64>,
+    join: Option<JoinHandle<Result<WavCaptureSummary, String>>>,
+}
+
 pub(crate) struct CaptureController {
-    pub(crate) gif: Option<GifRecorder<BufWriter<File>>>,
-    pub(crate) wav: Option<WavRecorder<BufWriter<File>>>,
+    gif: Option<AsyncGifSession>,
+    wav: Option<AsyncWavSession>,
     pub(crate) gif_fps_mode: GifFpsMode,
 }
 
@@ -433,17 +549,34 @@ impl CaptureController {
     }
 
     pub(crate) fn gif_frames(&self) -> u64 {
-        self.gif.as_ref().map_or(0, GifRecorder::frames_written)
+        self.gif
+            .as_ref()
+            .map_or(0, |g| g.frames_written.load(Ordering::Relaxed))
     }
 
     pub(crate) fn wav_duration_secs(&self) -> f64 {
-        self.wav.as_ref().map_or(0.0, WavRecorder::duration_secs)
+        let samples = self
+            .wav
+            .as_ref()
+            .map_or(0, |w| w.samples_written.load(Ordering::Relaxed));
+        ((samples / 2) as f64) / f64::from(SAMPLE_RATE_HZ.max(1))
     }
 
+    #[allow(dead_code)]
     pub(crate) fn start_gif(
         &mut self,
         rom_title: &str,
         custom_path: Option<PathBuf>,
+    ) -> Result<PathBuf, String> {
+        self.start_gif_sized(rom_title, custom_path, LCD_WIDTH, LCD_HEIGHT)
+    }
+
+    pub(crate) fn start_gif_sized(
+        &mut self,
+        rom_title: &str,
+        custom_path: Option<PathBuf>,
+        width: usize,
+        height: usize,
     ) -> Result<PathBuf, String> {
         if self.gif.is_some() {
             return Err("GIF recording is already active".into());
@@ -451,17 +584,54 @@ impl CaptureController {
         let path = custom_path.unwrap_or_else(|| {
             capture_output_path(&AppConfig::screenshots_dir(), rom_title, "gif")
         });
-        let rec = GifRecorder::start(path.clone(), self.gif_fps_mode)?;
-        self.gif = Some(rec);
+        let mut rec = GifRecorder::start_sized(path.clone(), self.gif_fps_mode, width, height)?;
+        let (tx, rx) = mpsc::sync_channel::<GifWorkerMsg>(16);
+        let frames_written = Arc::new(AtomicU64::new(0));
+        let fw_worker = frames_written.clone();
+
+        let join = thread::Builder::new()
+            .name("rba-gif-enc".into())
+            .spawn(move || -> Result<GifCaptureSummary, String> {
+                while let Ok(msg) = rx.recv() {
+                    match msg {
+                        GifWorkerMsg::Frame {
+                            fb,
+                            color_correction,
+                            profile,
+                        } => {
+                            if rec.push_bgr555_frame(&fb, color_correction, profile)? {
+                                fw_worker.store(rec.frames_written(), Ordering::Relaxed);
+                            }
+                        }
+                        GifWorkerMsg::Finish => break,
+                    }
+                }
+                let (_w, summary) = rec.finish()?;
+                Ok(summary)
+            })
+            .map_err(|e| format!("Failed spawning GIF worker thread: {e}"))?;
+
+        self.gif = Some(AsyncGifSession {
+            tx,
+            frames_written,
+            join: Some(join),
+        });
         Ok(path)
     }
 
     pub(crate) fn stop_gif(&mut self) -> Result<Option<GifCaptureSummary>, String> {
-        let Some(rec) = self.gif.take() else {
+        let Some(mut sess) = self.gif.take() else {
             return Ok(None);
         };
-        let (_w, summary) = rec.finish()?;
-        Ok(Some(summary))
+        let _ = sess.tx.send(GifWorkerMsg::Finish);
+        drop(sess.tx);
+        match sess.join.take() {
+            Some(handle) => match handle.join() {
+                Ok(res) => res.map(Some),
+                Err(_) => Err("GIF capture worker thread panicked".into()),
+            },
+            None => Ok(None),
+        }
     }
 
     pub(crate) fn start_wav(
@@ -475,17 +645,50 @@ impl CaptureController {
         let path = custom_path.unwrap_or_else(|| {
             capture_output_path(&AppConfig::screenshots_dir(), rom_title, "wav")
         });
-        let rec = WavRecorder::start(path.clone())?;
-        self.wav = Some(rec);
+        let mut rec = WavRecorder::start(path.clone())?;
+        let (tx, rx) = mpsc::sync_channel::<WavWorkerMsg>(64);
+        let samples_written = Arc::new(AtomicU64::new(0));
+        let sw_worker = samples_written.clone();
+
+        let join = thread::Builder::new()
+            .name("rba-wav-enc".into())
+            .spawn(move || -> Result<WavCaptureSummary, String> {
+                while let Ok(msg) = rx.recv() {
+                    match msg {
+                        WavWorkerMsg::Samples(samples) => {
+                            let n = samples.len() as u64;
+                            rec.push_samples(&samples)?;
+                            sw_worker.fetch_add(n, Ordering::Relaxed);
+                        }
+                        WavWorkerMsg::Finish => break,
+                    }
+                }
+                let (_w, summary) = rec.finish()?;
+                Ok(summary)
+            })
+            .map_err(|e| format!("Failed spawning WAV worker thread: {e}"))?;
+
+        self.wav = Some(AsyncWavSession {
+            tx,
+            samples_written,
+            join: Some(join),
+        });
         Ok(path)
     }
 
     pub(crate) fn stop_wav(&mut self) -> Result<Option<WavCaptureSummary>, String> {
-        let Some(rec) = self.wav.take() else {
+        let Some(mut sess) = self.wav.take() else {
             return Ok(None);
         };
-        let (_w, summary) = rec.finish()?;
-        Ok(Some(summary))
+        let _ = sess.tx.send(WavWorkerMsg::Finish);
+        drop(sess.tx);
+        match sess.join.take() {
+            Some(handle) => match handle.join() {
+                Ok(res) => res.map(Some),
+                Err(_) => Err("WAV capture worker thread panicked".into()),
+            },
+            None => Ok(None),
+        }
     }
 
     pub(crate) fn push_video_frame(
@@ -494,37 +697,37 @@ impl CaptureController {
         color_correction: bool,
         profile: ColorProfileChoice,
     ) -> Result<(), String> {
-        let Some(gif) = &mut self.gif else {
+        let Some(gif) = &self.gif else {
             return Ok(());
         };
-        if let Err(e) = gif.push_bgr555_frame(fb_bgr555, color_correction, profile) {
-            let _ = self.stop_gif();
-            return Err(e);
-        }
-        Ok(())
-    }
-
-    #[allow(dead_code)]
-    pub(crate) fn push_video_rgba(&mut self, rgba: &[u8]) -> Result<(), String> {
-        let Some(gif) = &mut self.gif else {
-            return Ok(());
+        let msg = GifWorkerMsg::Frame {
+            fb: Box::new(*fb_bgr555),
+            color_correction,
+            profile,
         };
-        if let Err(e) = gif.push_rgba_frame(rgba) {
-            let _ = self.stop_gif();
-            return Err(e);
+        match gif.tx.try_send(msg) {
+            Ok(()) | Err(mpsc::TrySendError::Full(_)) => Ok(()),
+            Err(mpsc::TrySendError::Disconnected(_)) => {
+                self.stop_gif()?;
+                Err("GIF worker disconnected".into())
+            }
         }
-        Ok(())
     }
 
     pub(crate) fn push_audio_samples(&mut self, samples: &[i16]) -> Result<(), String> {
-        let Some(wav) = &mut self.wav else {
+        let Some(wav) = &self.wav else {
             return Ok(());
         };
-        if let Err(e) = wav.push_samples(samples) {
-            let _ = self.stop_wav();
-            return Err(e);
+        if samples.is_empty() {
+            return Ok(());
         }
-        Ok(())
+        match wav.tx.try_send(WavWorkerMsg::Samples(samples.to_vec())) {
+            Ok(()) | Err(mpsc::TrySendError::Full(_)) => Ok(()),
+            Err(mpsc::TrySendError::Disconnected(_)) => {
+                self.stop_wav()?;
+                Err("WAV worker disconnected".into())
+            }
+        }
     }
 
     pub(crate) fn stop_all(
@@ -571,16 +774,23 @@ mod tests {
         assert_eq!(reader.width(), LCD_WIDTH as u16);
         assert_eq!(reader.height(), LCD_HEIGHT as u16);
         let mut decoded_count = 0usize;
+        let mut total_delay_60 = 0u32;
         while let Some(frame) = reader.read_next_frame().unwrap() {
-            assert_eq!(frame.delay, 2);
+            assert!(
+                (1..=2).contains(&frame.delay),
+                "unexpected 60fps delay {}",
+                frame.delay
+            );
+            total_delay_60 += u32::from(frame.delay);
             assert_eq!(frame.width, LCD_WIDTH as u16);
             assert_eq!(frame.height, LCD_HEIGHT as u16);
             assert_eq!(frame.buffer.len(), LCD_WIDTH * LCD_HEIGHT * 4);
             decoded_count += 1;
         }
         assert_eq!(decoded_count, 4);
+        assert_eq!(total_delay_60, 7); // 4 * 1.674cs = 6.70cs -> 7cs
 
-        // 2. 30fps mode (frame_skip = 2, delay = 3): 4 source frames -> 2 encoded GIF frames
+        // 2. 30fps mode (frame_skip = 2, ~3.35cs/frame): 4 source frames -> 2 encoded GIF frames
         let mut rec_30 = GifRecorder::start_with_writer(Vec::new(), GifFpsMode::Fps30).unwrap();
         let mut rgba = vec![0u8; LCD_WIDTH * LCD_HEIGHT * 4];
         for (i, px) in rgba.as_chunks_mut::<4>().0.iter_mut().enumerate() {
@@ -603,11 +813,18 @@ mod tests {
             .read_info(Cursor::new(&gif30_bytes))
             .unwrap();
         let mut count30 = 0usize;
+        let mut total_delay_30 = 0u32;
         while let Some(frame) = dec30.read_next_frame().unwrap() {
-            assert_eq!(frame.delay, 3);
+            assert!(
+                (3..=4).contains(&frame.delay),
+                "unexpected 30fps delay {}",
+                frame.delay
+            );
+            total_delay_30 += u32::from(frame.delay);
             count30 += 1;
         }
         assert_eq!(count30, 2);
+        assert_eq!(total_delay_30, 7); // 2 * 3.35cs = 6.70cs -> 7cs
     }
 
     #[test]

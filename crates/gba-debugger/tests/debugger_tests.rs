@@ -593,3 +593,160 @@ fn tcp_gdb_stub_handles_handshake_watchpoint_continue_and_stop_reply() {
     );
     assert_eq!(core.peek32(0x0200_0400), 0x55);
 }
+
+#[test]
+fn debugger_regressions_disasm_io_regs_rsp_and_callstack() {
+    use gba_debugger::{disassemble_arm, disassemble_range};
+
+    // 1. Disassembler: unmatched bits7_4 == 9 and invalid MRS/MSR emit udf
+    assert!(disassemble_arm(0xE120_0090, 0x0800_0000).starts_with("udf"));
+    assert!(disassemble_arm(0xE120_0070, 0x0800_0000).starts_with("udf")); // ARMv5 BKPT
+    assert!(disassemble_arm(0xE16F_0F11, 0x0800_0000).starts_with("udf")); // ARMv5 CLZ
+    assert!(disassemble_arm(0xE300_0000, 0x0800_0000).starts_with("udf")); // invalid imm MRS
+
+    // 2. DisasmLine::size distinguishes 2-byte Thumb ops from 4-byte Thumb BL pairs
+    let mut core = core_with_dummy_rom();
+    core.poke16(0x0300_0000, 0x2001);
+    core.poke16(0x0300_0002, 0xF000);
+    core.poke16(0x0300_0004, 0xF802);
+    let lines = disassemble_range(&core, 0x0300_0000, 2, true);
+    assert_eq!(lines[0].size, 2);
+    assert_eq!(lines[1].size, 4);
+
+    // 3. IO register fixes: BLDCNT BD (not SFX), MEMCNT waitstates, UART bit 7, no PAUSE_CTRL, DMA0 14-bit count
+    let bld = decode_io_reg(0x0400_0050, (1 << 5) | (1 << 6) | (1 << 13)).unwrap();
+    assert!(bld.summary.contains("BD"));
+    assert!(!bld.summary.contains("SFX"));
+    let memcnt = decode_io_reg(0x0400_0800, 0x0D00_0020).unwrap();
+    assert_eq!(memcnt.name, "MEMCNT");
+    assert_eq!(memcnt.width, 4);
+    assert!(memcnt.summary.contains("3c"));
+    let uart = decode_io_reg(0x0400_0128, (3 << 12) | (1 << 7)).unwrap();
+    assert!(uart.summary.contains("UART"));
+    assert!(uart.fields.iter().any(|f| f.name == "Data Length"));
+    assert!(decode_io_reg(0x0400_0302, 0).is_none());
+    let dma0 = decode_io_reg(0x0400_00B8, 0).unwrap();
+    assert!(dma0.summary.contains("16384"));
+
+    // 4. RSP parser payload cap, m-read cap, P19 Thumb toggle pipeline flush, vCont;C05, M BIOS reject
+    let mut parser = RspParser::new();
+    let mut ev = Vec::new();
+    let mut oversized = vec![b'$'];
+    oversized.extend(std::iter::repeat_n(b'a', 0x4005));
+    oversized.extend_from_slice(b"#00");
+    parser.feed(&oversized, &mut ev);
+    assert!(ev.contains(&RspEvent::BadChecksum));
+
+    let mut session = GdbSession::new();
+    assert_eq!(
+        session.handle_packet(&mut core, "vCont?").reply.as_deref(),
+        Some("vCont;c;C;s;S")
+    );
+    assert_eq!(
+        session.handle_packet(&mut core, "vCont;C05:01").action,
+        GdbAction::Continue
+    );
+    // m read is capped to 0x1FFE raw bytes (0x3FFC hex chars <= PacketSize=4000)
+    let mem = session
+        .handle_packet(&mut core, "m02000000,4000")
+        .reply
+        .unwrap();
+    assert_eq!(mem.len(), 0x1FFE * 2);
+    // Writing to read-only BIOS returns E0E
+    assert_eq!(
+        session
+            .handle_packet(&mut core, "M00000000,1:ff")
+            .reply
+            .as_deref(),
+        Some("E0E")
+    );
+    // P19 toggling Thumb bit flushes pipeline cleanly
+    core.cpu.set_cpsr(0x1F);
+    core.cpu.flush_pipeline(&mut core.bus, 0x0200_0000);
+    core.poke16(0x0200_0000, 0x207F); // Thumb MOV R0, #0x7F
+    assert_eq!(
+        session
+            .handle_packet(&mut core, "P19=3f000000")
+            .reply
+            .as_deref(),
+        Some("OK")
+    );
+    assert!(core.cpu.is_thumb());
+    assert_eq!(core.cpu.current_exec_pc(), 0x0200_0000);
+    core.step_one();
+    assert_eq!(core.cpu.gpr[0], 0x7F);
+
+    // 5. Callstack: Thumb `pop {r3}; bx r3` interworking return, BIOS `ldr pc, [r0, #-4]`, IRQ step_out
+    core.poke16(0x0300_0200, 0xBC08); // POP {R3}
+    core.poke16(0x0300_0202, 0x4718); // BX R3
+    assert!(is_return_instruction(&core, 0x0300_0202, true, 0x3F));
+
+    core.cpu.set_cpsr(0x1F);
+    core.poke32(0x0200_0300, 0xE1A0_E00F); // MOV LR, PC
+    core.poke32(0x0200_0304, 0xE510_F004); // LDR PC, [R0, #-4]
+    assert_eq!(
+        is_call_instruction(&core, 0x0200_0300, false),
+        Some(0x0200_0308)
+    );
+
+    // IRQ step-out uses LR - 4
+    let empty_tracker = CallStackTracker::new();
+    core.cpu.set_cpsr(0x12); // IRQ mode
+    core.cpu.gpr[14] = 0x0800_0104;
+    core.cpu.flush_pipeline(&mut core.bus, 0x0000_0128);
+    assert_eq!(
+        step_out_return_addr(&core, &empty_tracker),
+        Some(0x0800_0100)
+    );
+}
+
+#[cfg(feature = "std")]
+#[test]
+fn tcp_gdb_stub_single_step_at_breakpoint_does_not_deadlock() {
+    use gba_debugger::GdbStub;
+    use std::io::{Read, Write};
+    use std::net::TcpStream;
+    use std::time::{Duration, Instant};
+
+    let mut core = core_with_dummy_rom();
+    core.poke32(0x0200_0000, 0xE3A0_0011); // MOV R0, #0x11
+    core.poke32(0x0200_0004, 0xE3A0_1022); // MOV R1, #0x22
+    core.cpu.set_cpsr(0x0000_001F);
+    core.cpu.flush_pipeline(&mut core.bus, 0x0200_0000);
+
+    let mut stub = GdbStub::new();
+    let port = stub.start(0).unwrap();
+    let mut client = TcpStream::connect(("127.0.0.1", port)).unwrap();
+    client.set_nonblocking(true).unwrap();
+
+    // Insert breakpoint at current PC (0x0200_0000), then single-step `s`.
+    client
+        .write_all(encode_rsp_packet("Z0,02000000,4").as_bytes())
+        .unwrap();
+    client.write_all(encode_rsp_packet("s").as_bytes()).unwrap();
+
+    let mut out = String::new();
+    let deadline = Instant::now() + Duration::from_secs(2);
+    let mut tmp = [0u8; 512];
+    while Instant::now() < deadline {
+        stub.step_protocol(&mut core);
+        if let Ok(n) = client.read(&mut tmp)
+            && n > 0
+        {
+            out.push_str(&String::from_utf8_lossy(&tmp[..n]));
+            if out.contains("$S05#") {
+                break;
+            }
+        }
+        std::thread::sleep(Duration::from_millis(1));
+    }
+    assert!(out.contains("$S05#"), "got: {out}");
+    assert_eq!(core.cpu.gpr[0], 0x11);
+    assert_eq!(core.cpu.current_exec_pc(), 0x0200_0004);
+    // Calling notify_stop while already halted must NOT emit a duplicate $S05.
+    stub.notify_stop(&StopReason::FrameComplete);
+    std::thread::sleep(Duration::from_millis(5));
+    let mut extra = [0u8; 64];
+    let extra_n = client.read(&mut extra).unwrap_or(0);
+    assert_eq!(extra_n, 0, "unexpected duplicate stop reply");
+}

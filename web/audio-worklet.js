@@ -15,6 +15,7 @@ class GbaAudioProcessor extends AudioWorkletProcessor {
     this.count = 0;
 
     this.inputRate = 32768;
+    this.speed = 1.0;
     this.baseRatio = this.inputRate / sampleRate;
     this.phase = 0;
     this.curL = 0;
@@ -23,6 +24,7 @@ class GbaAudioProcessor extends AudioWorkletProcessor {
     this.nextR = 0;
     this.muted = false;
     this.volume = 1.0;
+    this.primed = false;
 
     this.updateTargets();
 
@@ -33,14 +35,28 @@ class GbaAudioProcessor extends AudioWorkletProcessor {
           const rate = Number(data.inputSampleRate);
           if (Number.isFinite(rate) && rate >= 8000) {
             this.inputRate = rate;
-            this.baseRatio = this.inputRate / sampleRate;
+            this.baseRatio = (this.inputRate * this.speed) / sampleRate;
+            this.updateTargets();
+          }
+          break;
+        }
+        case "speed": {
+          const spd = Number(data.speed);
+          if (Number.isFinite(spd) && spd > 0) {
+            this.speed = Math.max(0.25, Math.min(8.0, spd));
+            this.baseRatio = (this.inputRate * this.speed) / sampleRate;
             this.updateTargets();
           }
           break;
         }
         case "samples": {
-          const samples = new Int16Array(data.buffer);
+          const length = Number.isInteger(data.length)
+            ? data.length
+            : data.buffer.byteLength >> 1;
+          const samples = new Int16Array(data.buffer, 0, length);
           this.pushSamples(samples);
+          // Return ArrayBuffer to main thread pool to eliminate per-frame GC churn.
+          this.port.postMessage({ type: "recycle", buffer: data.buffer }, [data.buffer]);
           break;
         }
         case "clear": {
@@ -52,6 +68,7 @@ class GbaAudioProcessor extends AudioWorkletProcessor {
           this.curR = 0;
           this.nextL = 0;
           this.nextR = 0;
+          this.primed = false;
           break;
         }
         case "mute": {
@@ -70,10 +87,17 @@ class GbaAudioProcessor extends AudioWorkletProcessor {
   }
 
   updateTargets() {
-    // Target ~45ms steady-state stereo buffer (even sample count).
-    this.targetFill = Math.max(512, Math.round(this.inputRate * 0.045) * 2);
+    const effRate = this.inputRate * this.speed;
+    // Target ~45ms steady-state stereo buffer (even sample count), clamped to ring capacity.
+    this.targetFill = Math.min(
+      RING_CAPACITY_SAMPLES >> 2,
+      Math.max(512, Math.round(effRate * 0.045) * 2),
+    ) & ~1;
     // Cap queued audio at ~200ms so fast-forward or tab resume never builds seconds of lag.
-    this.maxQueued = Math.max(this.targetFill * 4, Math.round(this.inputRate * 0.2) * 2);
+    this.maxQueued = Math.min(
+      RING_CAPACITY_SAMPLES - 512,
+      Math.max(this.targetFill * 4, Math.round(effRate * 0.2) * 2),
+    ) & ~1;
   }
 
   pushSamples(samples) {
@@ -99,6 +123,9 @@ class GbaAudioProcessor extends AudioWorkletProcessor {
       this.writeIdx = (this.writeIdx + 1) % RING_CAPACITY_SAMPLES;
     }
     this.count += toCopy;
+    if (!this.primed && this.count >= this.targetFill) {
+      this.primed = true;
+    }
   }
 
   process(_inputs, outputs) {
@@ -108,6 +135,12 @@ class GbaAudioProcessor extends AudioWorkletProcessor {
     const leftOut = output[0];
     const rightOut = output.length > 1 ? output[1] : null;
     const frames = leftOut.length;
+
+    if (!this.primed) {
+      leftOut.fill(0);
+      if (rightOut) rightOut.fill(0);
+      return true;
+    }
 
     const fillNorm = Math.max(
       -1,

@@ -1,5 +1,9 @@
-use std::path::Path;
+//! Generates minimal, deterministic ARM7TDMI `.gba` stress ROMs for Phase 3C PPU benchmarking.
+//!
+//! Run with:
+//!   cargo run -p gba-testrunner --example gen_stress_roms
 
+use std::path::Path;
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let written =
         gba_testrunner::stress_roms::write_synthetic_stress_roms(Path::new("roms/homebrew"))?;

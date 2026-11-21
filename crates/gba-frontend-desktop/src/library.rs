@@ -83,6 +83,34 @@ fn civil_from_days(days: i64) -> (i32, u32, u32) {
     (y, m, d)
 }
 
+#[derive(Clone)]
+pub(crate) struct CoverLoadRequest {
+    pub(crate) entry: RomLibraryEntry,
+    pub(crate) allow_download: bool,
+}
+
+pub(crate) struct CoverLoadResult {
+    pub(crate) rom_path: PathBuf,
+    pub(crate) display_name: String,
+    pub(crate) image: Option<egui::ColorImage>,
+}
+
+fn lookup_playtime_for_entry<'a>(
+    config: &'a crate::config::AppConfig,
+    game_code: &str,
+) -> Option<&'a crate::config::RomPlaytime> {
+    if let Some(pt) = config.playtimes.get(game_code) {
+        return Some(pt);
+    }
+    let prefix = format!("{game_code}_");
+    config
+        .playtimes
+        .iter()
+        .filter(|(k, _)| k.starts_with(&prefix))
+        .max_by_key(|(_, v)| (v.last_played_timestamp, v.total_seconds))
+        .map(|(_, v)| v)
+}
+
 fn format_last_played_ts(ts: u64) -> String {
     if ts == 0 {
         return "-".to_string();
@@ -92,24 +120,24 @@ fn format_last_played_ts(ts: u64) -> String {
         .unwrap_or_default()
         .as_secs();
 
-    let days = (ts / 86400) as i64;
-    let now_days = (now_ts / 86400) as i64;
-    let time_of_day = ts % 86400;
-    let hour = time_of_day / 3600;
-    let min = (time_of_day % 3600) / 60;
-
-    if now_days == days {
-        format!("Today, {:02}:{:02}", hour, min)
-    } else if now_days == days + 1 {
-        format!("Yesterday, {:02}:{:02}", hour, min)
-    } else {
-        let (y, m, d) = civil_from_days(days);
-        let months = [
-            "Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec",
-        ];
-        let m_idx = (m.saturating_sub(1) as usize).min(11);
-        format!("{} {:02}, {}", months[m_idx], d, y)
+    if ts <= now_ts {
+        let diff = now_ts - ts;
+        if diff < 60 {
+            return "Just now".to_string();
+        } else if diff < 3600 {
+            return format!("{}m ago", diff / 60);
+        } else if diff < 86_400 {
+            return format!("{}h ago", diff / 3600);
+        }
     }
+
+    let days = (ts / 86400) as i64;
+    let (y, m, d) = civil_from_days(days);
+    let months = [
+        "Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec",
+    ];
+    let m_idx = (m.saturating_sub(1) as usize).min(11);
+    format!("{} {:02}, {}", months[m_idx], d, y)
 }
 
 fn format_playtime(seconds: u64) -> String {
@@ -303,85 +331,122 @@ fn find_user_cover_image(entry: &RomLibraryEntry) -> Option<PathBuf> {
     None
 }
 
-pub(crate) fn trigger_cover_download(
-    entry: &RomLibraryEntry,
-    done_tx: Option<mpsc::Sender<(PathBuf, bool)>>,
+fn decode_cover_bytes(bytes: &[u8]) -> Option<egui::ColorImage> {
+    let img = image::load_from_memory(bytes).ok()?;
+    let rgba = img.to_rgba8();
+    let size = [rgba.width() as usize, rgba.height() as usize];
+    Some(egui::ColorImage::from_rgba_unmultiplied(
+        size,
+        &rgba.into_raw(),
+    ))
+}
+
+pub(crate) fn spawn_cover_loader_worker() -> (
+    mpsc::Sender<CoverLoadRequest>,
+    mpsc::Sender<CoverLoadResult>,
+    mpsc::Receiver<CoverLoadResult>,
 ) {
-    let entry_path = entry.path.clone();
+    let (req_tx, req_rx) = mpsc::channel::<CoverLoadRequest>();
+    let (res_tx, res_rx) = mpsc::channel::<CoverLoadResult>();
+    let worker_res_tx = res_tx.clone();
+
+    std::thread::Builder::new()
+        .name("rba-cover-loader".into())
+        .spawn(move || {
+            while let Ok(req) = req_rx.recv() {
+                let decoded = if let Some(cover_path) = find_cover_image(&req.entry) {
+                    fs::read(&cover_path)
+                        .ok()
+                        .and_then(|b| decode_cover_bytes(&b))
+                } else if req.allow_download {
+                    download_and_cache_cover(&req.entry).and_then(|b| decode_cover_bytes(&b))
+                } else {
+                    None
+                };
+                if worker_res_tx
+                    .send(CoverLoadResult {
+                        rom_path: req.entry.path,
+                        display_name: req.entry.display_name,
+                        image: decoded,
+                    })
+                    .is_err()
+                {
+                    break;
+                }
+            }
+        })
+        .ok();
+
+    (req_tx, res_tx, res_rx)
+}
+
+fn download_and_cache_cover(entry: &RomLibraryEntry) -> Option<Vec<u8>> {
     let display_name = entry.display_name.clone();
     let stem = entry
         .path
         .file_stem()
         .map(|s| s.to_string_lossy().to_string())
         .unwrap_or_else(|| display_name.clone());
-    let region = entry.region.to_string();
-    let platform = entry.platform;
+    let region = entry.region;
+    let repo_folder = match entry.platform {
+        RomPlatform::Gba => "Nintendo_-_Game_Boy_Advance",
+        RomPlatform::Gbc => "Nintendo_-_Game_Boy_Color",
+        RomPlatform::Gb => "Nintendo_-_Game_Boy",
+    };
 
-    std::thread::spawn(move || {
-        let repo_folder = match platform {
-            RomPlatform::Gba => "Nintendo_-_Game_Boy_Advance",
-            RomPlatform::Gbc => "Nintendo_-_Game_Boy_Color",
-            RomPlatform::Gb => "Nintendo_-_Game_Boy",
-        };
+    let mut candidates = vec![display_name.clone()];
+    if stem != display_name {
+        candidates.push(stem);
+    }
+    if !display_name.contains('(') && !region.is_empty() {
+        candidates.push(format!("{display_name} ({region})"));
+    }
 
-        // Try candidate names in order
-        let mut candidates = vec![display_name.clone()];
-        if stem != display_name {
-            candidates.push(stem.clone());
-        }
-        if !display_name.contains('(') && !region.is_empty() {
-            candidates.push(format!("{display_name} ({region})"));
-        }
-
-        let mut downloaded_bytes = None;
-        for cand in &candidates {
-            let encoded = url_encode_name(cand);
-            let url = format!(
-                "https://raw.githubusercontent.com/libretro-thumbnails/{repo_folder}/master/Named_Boxarts/{encoded}.png"
-            );
-            if let Ok(resp) = ureq::get(&url)
-                .timeout(std::time::Duration::from_secs(6))
-                .call()
-                && resp.status() == 200
+    let mut downloaded_bytes = None;
+    for cand in &candidates {
+        let encoded = url_encode_name(cand);
+        let url = format!(
+            "https://raw.githubusercontent.com/libretro-thumbnails/{repo_folder}/master/Named_Boxarts/{encoded}.png"
+        );
+        if let Ok(resp) = ureq::get(&url)
+            .timeout(std::time::Duration::from_secs(6))
+            .call()
+            && resp.status() == 200
+        {
+            let mut bytes = Vec::new();
+            use std::io::Read;
+            if resp
+                .into_reader()
+                .take(8 * 1024 * 1024)
+                .read_to_end(&mut bytes)
+                .is_ok()
+                && !bytes.is_empty()
             {
-                let mut bytes = Vec::new();
-                use std::io::Read;
-                if resp.into_reader().read_to_end(&mut bytes).is_ok() && !bytes.is_empty() {
-                    downloaded_bytes = Some(bytes);
-                    break;
-                }
+                downloaded_bytes = Some(bytes);
+                break;
             }
         }
+    }
 
-        let succeeded = downloaded_bytes.is_some();
-        if let Some(bytes) = downloaded_bytes {
-            let appdata_covers = crate::config::AppConfig::covers_dir();
-            let _ = std::fs::create_dir_all(&appdata_covers);
-            let _ = std::fs::write(appdata_covers.join(format!("{display_name}.png")), &bytes);
-
-            if let Ok(exe) = std::env::current_exe()
-                && let Some(exe_dir) = exe.parent()
-            {
-                let _ = std::fs::create_dir_all(exe_dir.join("covers"));
-                let _ = std::fs::write(
-                    exe_dir.join("covers").join(format!("{display_name}.png")),
-                    &bytes,
-                );
-                if let Some(target_dir) = exe_dir.parent()
-                    && let Some(proj) = target_dir.parent()
-                {
-                    let _ = std::fs::create_dir_all(proj.join("covers"));
-                    let _ = std::fs::write(
-                        proj.join("covers").join(format!("{display_name}.png")),
-                        &bytes,
-                    );
+    if let Some(bytes) = downloaded_bytes {
+        // Persist downloaded covers ONLY inside the configured covers cache directory.
+        let appdata_covers = crate::config::AppConfig::covers_dir();
+        let safe_name: String = display_name
+            .chars()
+            .map(|c| {
+                if matches!(c, '/' | '\\' | ':' | '*' | '?' | '"' | '<' | '>' | '|') {
+                    '_'
+                } else {
+                    c
                 }
-            }
-        }
-        if let Some(tx) = done_tx {
-            let _ = tx.send((entry_path, succeeded));
-        }
-    });
+            })
+            .collect();
+        let target = appdata_covers.join(format!("{safe_name}.png"));
+        let _ = crate::config::write_atomic(&target, &bytes);
+        Some(bytes)
+    } else {
+        None
+    }
 }
 
 fn url_encode_name(s: &str) -> String {
@@ -881,17 +946,22 @@ impl RustboyApp {
         }
     }
 
-    /// Drains completed cover art download notifications so idle repaints stop once finished.
+    /// Drains completed cover art loads from the background worker so idle repaints stop once finished.
     pub(crate) fn poll_cover_downloads(&mut self, ctx: &egui::Context) {
-        let mut any_finished = false;
-        while let Ok((path, succeeded)) = self.cover_download_rx.try_recv() {
-            self.pending_cover_downloads.remove(&path);
-            if succeeded {
-                self.cover_textures.remove(&path);
+        let mut updated = false;
+        while let Ok(res) = self.cover_result_rx.try_recv() {
+            self.pending_cover_downloads.remove(&res.rom_path);
+            if let Some(color_img) = res.image {
+                let tex = ctx.load_texture(
+                    format!("cover_{}", res.display_name),
+                    color_img,
+                    egui::TextureOptions::LINEAR,
+                );
+                self.cover_textures.insert(res.rom_path, tex);
             }
-            any_finished = true;
+            updated = true;
         }
-        if any_finished {
+        if updated {
             ctx.request_repaint();
         }
     }
@@ -1024,7 +1094,6 @@ impl RustboyApp {
             self.save_persistent_config();
         }
     }
-
     pub(crate) fn add_rom_folder_dialog(&mut self) {
         if let Some(folder) = rfd::FileDialog::new()
             .set_title("Select ROM Directory")
@@ -1638,20 +1707,7 @@ impl RustboyApp {
                                 }
                                 if ui.button("📁 Open Save Folder").clicked() {
                                     if let Some(parent) = entry.path.parent() {
-                                        #[cfg(windows)]
-                                        {
-                                            use std::os::windows::process::CommandExt;
-                                            let _ = std::process::Command::new("explorer")
-                                                .arg(parent)
-                                                .creation_flags(0x08000000)
-                                                .spawn();
-                                        }
-                                        #[cfg(not(windows))]
-                                        {
-                                            let _ = std::process::Command::new("xdg-open")
-                                                .arg(parent)
-                                                .spawn();
-                                        }
+                                        crate::menus::open_folder_in_file_manager(parent);
                                     }
                                     ui.close_menu();
                                 }
@@ -1702,7 +1758,7 @@ impl RustboyApp {
                                     .rect_filled(bar_rect, CornerRadius::ZERO, ACCENT_TEAL);
                             }
 
-                            let pt = self.config.playtimes.get(&entry.game_code);
+                            let pt = lookup_playtime_for_entry(&self.config, &entry.game_code);
                             let last_played_ts = pt.map(|p| p.last_played_timestamp).unwrap_or(0);
                             let total_seconds = pt.map(|p| p.total_seconds).unwrap_or(0);
 
@@ -1833,36 +1889,23 @@ impl RustboyApp {
                 let mut sorted_entries = filtered;
                 self.sort_library_entries(&mut sorted_entries);
 
-                // Ensure covers are loaded or scheduled once for download
+                // Queue missing covers onto the single bounded background worker (never block UI thread).
                 for entry in &sorted_entries {
-                    if !self.cover_textures.contains_key(&entry.path) {
-                        if let Some(cover_path) = find_cover_image(entry) {
-                            if let Ok(img) = image::open(&cover_path) {
-                                let rgba = img.to_rgba8();
-                                let size = [rgba.width() as usize, rgba.height() as usize];
-                                let pixels = rgba.into_raw();
-                                let color_img =
-                                    egui::ColorImage::from_rgba_unmultiplied(size, &pixels);
-                                let tex = ctx.load_texture(
-                                    format!("cover_{}", entry.display_name),
-                                    color_img,
-                                    egui::TextureOptions::LINEAR,
-                                );
-                                self.cover_textures.insert(entry.path.clone(), tex);
-                            }
-                        } else if self.config.auto_download_covers
-                            && !self.pending_cover_downloads.contains(&entry.path)
-                            && !self.attempted_cover_downloads.contains(&entry.path)
-                        {
-                            self.pending_cover_downloads.insert(entry.path.clone());
-                            self.attempted_cover_downloads.insert(entry.path.clone());
-                            trigger_cover_download(entry, Some(self.cover_download_tx.clone()));
-                        }
+                    if !self.cover_textures.contains_key(&entry.path)
+                        && !self.pending_cover_downloads.contains(&entry.path)
+                        && !self.attempted_cover_downloads.contains(&entry.path)
+                    {
+                        self.pending_cover_downloads.insert(entry.path.clone());
+                        self.attempted_cover_downloads.insert(entry.path.clone());
+                        let _ = self.cover_req_tx.send(CoverLoadRequest {
+                            entry: entry.clone(),
+                            allow_download: self.config.auto_download_covers,
+                        });
                     }
                 }
 
                 if !self.pending_cover_downloads.is_empty() {
-                    ctx.request_repaint_after(std::time::Duration::from_millis(300));
+                    ctx.request_repaint_after(std::time::Duration::from_millis(250));
                 }
 
                 egui::ScrollArea::vertical()
@@ -1932,24 +1975,7 @@ impl RustboyApp {
                                                         {
                                                             if let Some(parent) = entry.path.parent()
                                                             {
-                                                                #[cfg(windows)]
-                                                                {
-                                                                    use std::os::windows::process::CommandExt;
-                                                                    let _ = std::process::Command::new(
-                                                                        "explorer",
-                                                                    )
-                                                                    .arg(parent)
-                                                                    .creation_flags(0x08000000)
-                                                                    .spawn();
-                                                                }
-                                                                #[cfg(not(windows))]
-                                                                {
-                                                                    let _ = std::process::Command::new(
-                                                                        "xdg-open",
-                                                                    )
-                                                                    .arg(parent)
-                                                                    .spawn();
-                                                                }
+                                                                crate::menus::open_folder_in_file_manager(parent);
                                                             }
                                                             ui.close_menu();
                                                         }
@@ -1962,9 +1988,11 @@ impl RustboyApp {
                                                                 .insert(entry.path.clone());
                                                             self.pending_cover_downloads
                                                                 .insert(entry.path.clone());
-                                                            trigger_cover_download(
-                                                                entry,
-                                                                Some(self.cover_download_tx.clone()),
+                                                            let _ = self.cover_req_tx.send(
+                                                                CoverLoadRequest {
+                                                                    entry: entry.clone(),
+                                                                    allow_download: true,
+                                                                },
                                                             );
                                                             ui.close_menu();
                                                         }
@@ -2384,7 +2412,10 @@ mod tests {
     fn test_sort_missing_launch_subfolder_remove_and_idle_repaint() {
         use std::mem::ManuallyDrop;
 
-        let mut app = ManuallyDrop::new(RustboyApp::new(crate::headless::CliConfig::default()));
+        let mut app = ManuallyDrop::new(RustboyApp::new(
+            crate::headless::CliConfig::default(),
+            crate::config::AppConfig::default(),
+        ));
         app.library_scan_rx = None;
         app.library_scanning = false;
         app.rom_folders.clear();
@@ -2469,12 +2500,19 @@ mod tests {
         app.library_view_mode = LibraryViewMode::Grid;
         app.config.auto_download_covers = true;
         let sample_path = entries[0].path.clone();
+        let sample_name = entries[0].display_name.clone();
         app.pending_cover_downloads.insert(sample_path.clone());
         for entry in &entries {
             app.attempted_cover_downloads.insert(entry.path.clone());
         }
         app.library_entries = entries;
-        app.cover_download_tx.send((sample_path, false)).unwrap();
+        app.cover_result_tx
+            .send(CoverLoadResult {
+                rom_path: sample_path,
+                display_name: sample_name,
+                image: None,
+            })
+            .unwrap();
         let raw_input = egui::RawInput {
             screen_rect: Some(egui::Rect::from_min_size(
                 egui::Pos2::ZERO,
@@ -2617,8 +2655,10 @@ mod tests {
 
     #[test]
     fn test_welcome_card_renders_and_stays_idle_without_timer_repaints() {
-        let mut app =
-            std::mem::ManuallyDrop::new(RustboyApp::new(crate::headless::CliConfig::default()));
+        let mut app = std::mem::ManuallyDrop::new(RustboyApp::new(
+            crate::headless::CliConfig::default(),
+            crate::config::AppConfig::default(),
+        ));
         app.rom_folders.clear();
         app.library_entries.clear();
         app.config.welcome_completed = false;

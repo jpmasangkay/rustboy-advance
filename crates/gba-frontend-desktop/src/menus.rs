@@ -48,6 +48,36 @@ const AUDIO_CHANNEL_NAMES: [(u8, &str); 6] = [
     (5, "Direct Sound FIFO B"),
 ];
 
+fn primary_mod_label() -> &'static str {
+    #[cfg(target_os = "macos")]
+    {
+        "Cmd"
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        "Ctrl"
+    }
+}
+
+pub(crate) fn open_folder_in_file_manager(dir: &std::path::Path) {
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt;
+        let _ = std::process::Command::new("explorer")
+            .arg(dir)
+            .creation_flags(0x08000000)
+            .spawn();
+    }
+    #[cfg(target_os = "macos")]
+    {
+        let _ = std::process::Command::new("open").arg(dir).spawn();
+    }
+    #[cfg(all(not(windows), not(target_os = "macos")))]
+    {
+        let _ = std::process::Command::new("xdg-open").arg(dir).spawn();
+    }
+}
+
 fn toolbar_btn(ui: &mut egui::Ui, label: &str, active: bool, enabled: bool) -> egui::Response {
     let text_color = if !enabled {
         COLOR_TEXT_DISABLED
@@ -124,7 +154,8 @@ impl RustboyApp {
             .hotkeys
             .display(HotkeyAction::StateManager);
 
-        if ui.button("Open ROM... (Ctrl+O)").clicked() {
+        let mod_lbl = primary_mod_label();
+        if ui.button(format!("Open ROM... ({mod_lbl}+O)")).clicked() {
             ui.close_menu();
             self.trigger_open_rom_dialog(ctx);
         }
@@ -191,7 +222,10 @@ impl RustboyApp {
 
         ui.separator();
         ui.add_enabled_ui(has_rom, |ui| {
-            if ui.button("Return to Library (Ctrl+W)").clicked() {
+            if ui
+                .button(format!("Return to Library ({mod_lbl}+W)"))
+                .clicked()
+            {
                 ui.close_menu();
                 self.request_close_rom(ctx);
             }
@@ -222,7 +256,10 @@ impl RustboyApp {
                         ui.close_menu();
                         self.show_state_manager = true;
                     }
-                    if ui.button("Undo State Action (Ctrl+Z)").clicked() {
+                    if ui
+                        .button(format!("Undo State Action ({mod_lbl}+Z)"))
+                        .clicked()
+                    {
                         ui.close_menu();
                         self.undo_last_state_action();
                     }
@@ -234,7 +271,7 @@ impl RustboyApp {
                 });
                 ui.menu_button("Load State", |ui| {
                     for s in 1..=5 {
-                        let exists = self.existing_slot_path(s).is_some();
+                        let exists = self.slot_exists_cached(s);
                         let lbl = if exists {
                             format!("Slot {s} (Shift+F{s}) [Saved]")
                         } else {
@@ -289,7 +326,12 @@ impl RustboyApp {
             self.show_settings = true;
             ui.close_menu();
         }
-        if ui.button("Exit (Alt+F4)").clicked() {
+        let exit_lbl = if cfg!(target_os = "macos") {
+            "Exit (Cmd+Q)"
+        } else {
+            "Exit (Alt+F4)"
+        };
+        if ui.button(exit_lbl).clicked() {
             self.quit_requested = true;
             ctx.send_viewport_cmd(egui::ViewportCommand::Close);
         }
@@ -302,6 +344,7 @@ impl RustboyApp {
         has_rom: bool,
         dev_tools: bool,
     ) {
+        let mod_lbl = primary_mod_label();
         let hotkeys = &self.config.keybindings.hotkeys;
         let pause_key = hotkeys.display(HotkeyAction::Pause);
         let adv_key = hotkeys.display(HotkeyAction::FrameAdvance);
@@ -367,7 +410,10 @@ impl RustboyApp {
                 ui.close_menu();
             }
 
-            if ui.button("Return to Library (Ctrl+W)").clicked() {
+            if ui
+                .button(format!("Return to Library ({mod_lbl}+W)"))
+                .clicked()
+            {
                 self.request_close_rom(ctx);
                 ui.close_menu();
             }
@@ -748,14 +794,15 @@ impl RustboyApp {
         }
 
         ui.separator();
-        if crate::theme::add_slider(
+        let vol_slider = crate::theme::add_slider(
             ui,
             true,
             egui::Slider::new(&mut self.config.master_volume, 0..=100).text("Volume %"),
-        )
-        .changed()
-        {
+        );
+        if vol_slider.changed() {
             self.sync_audio_volume();
+        }
+        if vol_slider.drag_stopped() || vol_slider.lost_focus() {
             self.config.save();
         }
         if ui
@@ -983,9 +1030,10 @@ impl RustboyApp {
                     .stroke(STROKE_BORDER),
             )
             .show(ctx, |ui| {
-                ui.horizontal(|ui| {
+                ui.horizontal_wrapped(|ui| {
                     let has_rom = self.has_active_game();
                     let hardcore = self.is_ra_hardcore_active();
+                    let mod_lbl = primary_mod_label();
                     let hotkeys = &self.config.keybindings.hotkeys;
                     let pause_key = hotkeys.display(HotkeyAction::Pause);
                     let reset_key = hotkeys.display(HotkeyAction::HardReset);
@@ -997,7 +1045,7 @@ impl RustboyApp {
 
                     // 1. Open
                     if toolbar_btn(ui, "+ Open", false, true)
-                        .on_hover_text("Open GBA / GB / GBC ROM File (Ctrl+O)")
+                        .on_hover_text(format!("Open GBA / GB / GBC ROM File ({mod_lbl}+O)"))
                         .clicked()
                     {
                         self.trigger_open_rom_dialog(ctx);
@@ -1052,6 +1100,7 @@ impl RustboyApp {
                     // 5. Quick Save
                     if toolbar_btn(ui, "💾 Save", false, has_rom && !hardcore)
                         .on_hover_text(format!("Quick Save ({save_key})"))
+                        .on_disabled_hover_text("Disabled in RetroAchievements Hardcore Mode")
                         .clicked()
                     {
                         self.quick_save(1);
@@ -1060,6 +1109,7 @@ impl RustboyApp {
                     // 6. Quick Load
                     if toolbar_btn(ui, "↓ Load", false, has_rom && !hardcore)
                         .on_hover_text(format!("Quick Load ({load_key})"))
+                        .on_disabled_hover_text("Disabled in RetroAchievements Hardcore Mode")
                         .clicked()
                     {
                         self.quick_load(1);

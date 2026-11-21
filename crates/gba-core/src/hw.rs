@@ -339,6 +339,24 @@ impl SysBus {
         }
     }
 
+    pub fn trigger_video_capture_dma(&mut self) {
+        let dma = &mut self.hw.dma[3];
+        if dma.enabled() && dma.timing() == 3 && !dma.active {
+            dma.int_count = if dma.count == 0 {
+                0x10000
+            } else {
+                dma.count as u32
+            };
+            let dest_ctrl = (dma.cnt >> 5) & 0x03;
+            if dest_ctrl == 3 {
+                dma.int_dad = dma.dad;
+            }
+            dma.active = true;
+            dma.first_unit = true;
+            self.hw.recompute_active_dma();
+        }
+    }
+
     pub fn trigger_sound_dma(&mut self, ch: usize) {
         let dma = &mut self.hw.dma[ch];
         if dma.enabled() && dma.timing() == 3 && !dma.active {
@@ -398,11 +416,20 @@ impl SysBus {
         self.prefetch.count = 0;
 
         if access_kind == AccessType::NonSequential {
-            self.scheduler.current_cycle += 2;
+            self.rom_burst_active = false;
         }
-        let mut cycles = 0u64;
+        // HBlank DMA has a 2-cycle hardware startup latency from PpuHDrawEnd (dot 1006) that
+        // overlaps with any in-flight CPU instruction crossing dot 1006.
+        let mut cycles =
+            if access_kind == AccessType::NonSequential && self.hw.dma[ch].timing() == 2 {
+                (self.hblank_start_cycle + 2).saturating_sub(self.scheduler.current_cycle)
+            } else {
+                0u64
+            };
 
         if self.hw.dma[ch].int_count > 0 {
+            let sad_mask = if ch == 0 { 0x07FF_FFFF } else { 0x0FFF_FFFF };
+            let dad_mask = if ch == 3 { 0x0FFF_FFFF } else { 0x07FF_FFFF };
             if is_32bit {
                 let s_addr = sad & !3;
                 let d_addr = dad & !3;
@@ -415,8 +442,8 @@ impl SysBus {
                 } else {
                     (self.hw.dma[ch].latch, 1)
                 };
-                self.last_access_was_dma = true;
                 let wc = self.write_32(d_addr, val, access_kind);
+                self.last_access_was_dma = true;
                 cycles += rc + wc;
             } else {
                 let s_addr = sad & !1;
@@ -438,7 +465,6 @@ impl SysBus {
                     let v = (self.hw.dma[ch].latch >> ((d_addr & 2) * 8)) as u16;
                     (v, 1)
                 };
-                self.last_access_was_dma = true;
                 let wc = if self.cart.is_eeprom_addr(d_addr) {
                     let total_len = if self.hw.dma[ch].count == 0 {
                         0x10000
@@ -463,18 +489,22 @@ impl SysBus {
                 } else {
                     self.write_16(d_addr, val, access_kind)
                 };
+                self.last_access_was_dma = true;
                 cycles += rc + wc;
             }
 
-            self.hw.dma[ch].int_sad = sad.wrapping_add(src_step as u32);
-            self.hw.dma[ch].int_dad = dad.wrapping_add(dst_step as u32);
+            self.hw.dma[ch].int_sad = sad.wrapping_add(src_step as u32) & sad_mask;
+            self.hw.dma[ch].int_dad = dad.wrapping_add(dst_step as u32) & dad_mask;
             self.hw.dma[ch].int_count -= 1;
         }
 
         if self.hw.dma[ch].int_count == 0 {
             self.hw.dma[ch].active = false;
+            self.rom_burst_active = false;
             self.force_next_fetch_nseq = true;
             self.invalidate_code_page();
+            // 2 internal cycles for DMA bus handoff / turnaround (matching hardware timing)
+            cycles += 2;
             if self.hw.dma[ch].irq_enabled() {
                 self.hw.request_irq(IRQ_DMA0 << ch);
             }
@@ -513,7 +543,7 @@ impl SysBus {
 
     #[inline]
     fn timer_read_cycle(&self) -> u64 {
-        self.scheduler.current_cycle + self.instr_fetch_cycles.saturating_sub(1)
+        (self.scheduler.current_cycle + self.instr_fetch_cycles).saturating_sub(1)
     }
 
     #[inline]
@@ -555,19 +585,44 @@ impl SysBus {
         // Cascade increment into ch + 1
         let mut next_ch = ch + 1;
         while next_ch < 4 {
-            let nt = &mut self.hw.timers[next_ch];
-            if nt.enabled() && nt.cascade() {
-                let (val, overflow) = nt.counter.overflowing_add(1);
-                if overflow {
-                    nt.counter = nt.reload;
-                    if nt.irq_enabled() {
-                        self.hw.request_irq(IRQ_TIMER0 << next_ch);
+            let cascaded_overflow = {
+                let nt = &mut self.hw.timers[next_ch];
+                if nt.enabled() && nt.cascade() {
+                    let (val, overflow) = nt.counter.overflowing_add(1);
+                    if overflow {
+                        nt.counter = nt.reload;
+                        if nt.irq_enabled() {
+                            self.hw.request_irq(IRQ_TIMER0 << next_ch);
+                        }
+                        true
+                    } else {
+                        nt.counter = val;
+                        false
                     }
-                    next_ch += 1;
-                    continue;
                 } else {
-                    nt.counter = val;
+                    false
                 }
+            };
+            if cascaded_overflow {
+                if next_ch == 1 {
+                    let (req_a, req_b) = self.apu.on_timer_overflow(1, ev_cycle);
+                    if req_a {
+                        for dma_ch in 1..=2 {
+                            if (self.hw.dma[dma_ch].dad & !3) == 0x0400_00A0 {
+                                self.trigger_sound_dma(dma_ch);
+                            }
+                        }
+                    }
+                    if req_b {
+                        for dma_ch in 1..=2 {
+                            if (self.hw.dma[dma_ch].dad & !3) == 0x0400_00A4 {
+                                self.trigger_sound_dma(dma_ch);
+                            }
+                        }
+                    }
+                }
+                next_ch += 1;
+                continue;
             }
             break;
         }
@@ -590,11 +645,11 @@ impl SysBus {
     pub fn read_io_16(&mut self, addr: u32, pc: u32, is_thumb: bool) -> u16 {
         let off = addr & 0x0FFF_FFFE;
         if off >= 0x0400_0400 {
-            if (off & 0x0FFF) == 0x0800 {
+            if (off & 0xFFFF) == 0x0800 {
                 self.last_access_was_dma = false;
                 return (self.hw.memcnt & 0xFFFF) as u16;
             }
-            if (off & 0x0FFF) == 0x0802 {
+            if (off & 0xFFFF) == 0x0802 {
                 self.last_access_was_dma = false;
                 return (self.hw.memcnt >> 16) as u16;
             }
@@ -712,13 +767,14 @@ impl SysBus {
     pub fn write_io_8(&mut self, addr: u32, val: u8) {
         let off = addr & 0x0FFF_FFFF;
         if off == 0x0400_0300 {
-            if self.debug_pc < 0x4000 || self.last_access_was_dma {
-                self.hw.postflg = val;
+            if self.debug_pc < 0x4000 {
+                // POSTFLG bit 0 is a hardware write-once latch (cannot be cleared back to 0).
+                self.hw.postflg |= val & 1;
             }
             return;
         }
         if off == 0x0400_0301 {
-            if self.debug_pc < 0x4000 || self.last_access_was_dma {
+            if self.debug_pc < 0x4000 {
                 if (val & 0x80) == 0 {
                     self.hw.halt_requested = true;
                 } else {
@@ -760,40 +816,51 @@ impl SysBus {
         // Avoid accidental trigger bit re-firing if only lower byte of SOUNDxCNT_X / TMxCNT_H written, etc.
         match aligned {
             0x0400_0064 => {
-                if (off & 1) == 0 {
-                    self.apu.sq1.freq = (self.apu.sq1.freq & 0x0700) | (val as u16);
-                    self.apu.sq1.reg_x = (self.apu.sq1.reg_x & 0xFF00) | (val as u16);
-                } else {
-                    self.apu.sq1.write_freq_ctrl(new_val);
+                if self.apu.master_enabled() {
+                    if (off & 1) == 0 {
+                        self.apu.sq1.freq = (self.apu.sq1.freq & 0x0700) | (val as u16);
+                        self.apu.sq1.reg_x = (self.apu.sq1.reg_x & 0xFF00) | (val as u16);
+                    } else {
+                        self.apu.sq1.write_freq_ctrl(new_val);
+                    }
                 }
             }
             0x0400_006C => {
-                if (off & 1) == 0 {
-                    self.apu.sq2.freq = (self.apu.sq2.freq & 0x0700) | (val as u16);
-                    self.apu.sq2.reg_x = (self.apu.sq2.reg_x & 0xFF00) | (val as u16);
-                } else {
-                    self.apu.sq2.write_freq_ctrl(new_val);
+                if self.apu.master_enabled() {
+                    if (off & 1) == 0 {
+                        self.apu.sq2.freq = (self.apu.sq2.freq & 0x0700) | (val as u16);
+                        self.apu.sq2.reg_x = (self.apu.sq2.reg_x & 0xFF00) | (val as u16);
+                    } else {
+                        self.apu.sq2.write_freq_ctrl(new_val);
+                    }
                 }
             }
             0x0400_0074 => {
-                if (off & 1) == 0 {
-                    self.apu.wave.freq = (self.apu.wave.freq & 0x0700) | (val as u16);
-                    self.apu.wave.reg_x = (self.apu.wave.reg_x & 0xFF00) | (val as u16);
-                } else {
-                    self.apu.wave.write_x(new_val);
+                if self.apu.master_enabled() {
+                    if (off & 1) == 0 {
+                        self.apu.wave.freq = (self.apu.wave.freq & 0x0700) | (val as u16);
+                        self.apu.wave.reg_x = (self.apu.wave.reg_x & 0xFF00) | (val as u16);
+                    } else {
+                        self.apu.wave.write_x(new_val);
+                    }
                 }
             }
             0x0400_007C => {
-                if (off & 1) == 0 {
-                    self.apu.noise.divisor_code = val & 0x07;
-                    self.apu.noise.width_7 = (val & 0x08) != 0;
-                    self.apu.noise.shift_clock = (val >> 4) & 0x0F;
-                    self.apu.noise.reg_h = (self.apu.noise.reg_h & 0xFF00) | (val as u16);
-                } else {
-                    self.apu.noise.write_h(new_val);
+                if self.apu.master_enabled() {
+                    if (off & 1) == 0 {
+                        self.apu.noise.divisor_code = val & 0x07;
+                        self.apu.noise.width_7 = (val & 0x08) != 0;
+                        self.apu.noise.shift_clock = (val >> 4) & 0x0F;
+                        self.apu.noise.reg_h = (self.apu.noise.reg_h & 0xFF00) | (val as u16);
+                    } else {
+                        self.apu.noise.write_h(new_val);
+                    }
                 }
             }
             0x0400_0202 => {
+                // Flush pending timer overflows before acknowledging IF bits.
+                let write_cycle = self.timer_write_cycle();
+                self.flush_timer_overflows_until(write_cycle);
                 // IF 1-to-clear byte write must NOT clear bits of the untouched byte!
                 let clear_mask = if (off & 1) == 0 {
                     val as u16
@@ -810,11 +877,40 @@ impl SysBus {
     }
 
     fn read_io_16_for_rmw(&self, aligned: u32) -> u16 {
+        if aligned >= 0x0400_0400 {
+            return match aligned & 0xFFFF {
+                0x0800 => (self.hw.memcnt & 0xFFFF) as u16,
+                0x0802 => (self.hw.memcnt >> 16) as u16,
+                _ => 0,
+            };
+        }
         match aligned {
             0x0400_0000 => self.ppu.dispcnt,
             0x0400_0002 => self.ppu.greenswap,
             0x0400_0004 => self.ppu.dispstat,
             0x0400_0008..=0x0400_000E => self.ppu.bgcnt[((aligned - 0x0400_0008) / 2) as usize],
+            0x0400_0010 | 0x0400_0014 | 0x0400_0018 | 0x0400_001C => {
+                self.ppu.bghofs[((aligned - 0x0400_0010) / 4) as usize]
+            }
+            0x0400_0012 | 0x0400_0016 | 0x0400_001A | 0x0400_001E => {
+                self.ppu.bgvofs[((aligned - 0x0400_0012) / 4) as usize]
+            }
+            0x0400_0020 => self.ppu.bgp_a[0] as u16,
+            0x0400_0022 => self.ppu.bgp_b[0] as u16,
+            0x0400_0024 => self.ppu.bgp_c[0] as u16,
+            0x0400_0026 => self.ppu.bgp_d[0] as u16,
+            0x0400_0028 => self.ppu.bgx[0] as u16,
+            0x0400_002A => ((self.ppu.bgx[0] as u32) >> 16) as u16,
+            0x0400_002C => self.ppu.bgy[0] as u16,
+            0x0400_002E => ((self.ppu.bgy[0] as u32) >> 16) as u16,
+            0x0400_0030 => self.ppu.bgp_a[1] as u16,
+            0x0400_0032 => self.ppu.bgp_b[1] as u16,
+            0x0400_0034 => self.ppu.bgp_c[1] as u16,
+            0x0400_0036 => self.ppu.bgp_d[1] as u16,
+            0x0400_0038 => self.ppu.bgx[1] as u16,
+            0x0400_003A => ((self.ppu.bgx[1] as u32) >> 16) as u16,
+            0x0400_003C => self.ppu.bgy[1] as u16,
+            0x0400_003E => ((self.ppu.bgy[1] as u32) >> 16) as u16,
             0x0400_0040 => self.ppu.winh[0],
             0x0400_0042 => self.ppu.winh[1],
             0x0400_0044 => self.ppu.winv[0],
@@ -839,10 +935,19 @@ impl SysBus {
             0x0400_0082 => self.apu.soundcnt_h,
             0x0400_0084 => self.apu.read_soundcnt_x(),
             0x0400_0088 => self.apu.soundbias,
-            0x0400_00BA => self.hw.dma[0].cnt,
-            0x0400_00C6 => self.hw.dma[1].cnt,
-            0x0400_00D2 => self.hw.dma[2].cnt,
-            0x0400_00DE => self.hw.dma[3].cnt,
+            0x0400_00B0..=0x0400_00DF => {
+                let rel = aligned - 0x0400_00B0;
+                let ch = (rel / 12) as usize;
+                match rel % 12 {
+                    0 => self.hw.dma[ch].sad as u16,
+                    2 => (self.hw.dma[ch].sad >> 16) as u16,
+                    4 => self.hw.dma[ch].dad as u16,
+                    6 => (self.hw.dma[ch].dad >> 16) as u16,
+                    8 => self.hw.dma[ch].count,
+                    10 => self.hw.dma[ch].cnt,
+                    _ => 0,
+                }
+            }
             0x0400_0100 => self.hw.timers[0].reload,
             0x0400_0102 => self.hw.timers[0].cnt,
             0x0400_0104 => self.hw.timers[1].reload,
@@ -869,16 +974,16 @@ impl SysBus {
     pub fn write_io_16(&mut self, addr: u32, val: u16) {
         let off = addr & 0x0FFF_FFFE;
         if off >= 0x0400_0400 {
-            if (off & 0x0FFF) == 0x0800 {
+            if (off & 0xFFFF) == 0x0800 {
                 self.hw.memcnt = (self.hw.memcnt & 0xFFFF_0000) | (val as u32);
-            } else if (off & 0x0FFF) == 0x0802 {
+                self.rebuild_waitstate_table();
+                self.invalidate_all_jit = true;
+            } else if (off & 0xFFFF) == 0x0802 {
                 self.hw.memcnt = (self.hw.memcnt & 0x0000_FFFF) | ((val as u32) << 16);
+                self.rebuild_waitstate_table();
+                self.invalidate_all_jit = true;
             }
             return;
-        }
-
-        if off <= 0x0400_0054 {
-            self.sync_ppu_hdraw();
         }
 
         let is_apu = (0x0400_0060..=0x0400_009E).contains(&off);
@@ -888,8 +993,19 @@ impl SysBus {
 
         match off {
             // PPU
-            0x0400_0000 => self.ppu.dispcnt = val & 0xFFF7,
-            0x0400_0002 => self.ppu.greenswap = val & 1,
+            0x0400_0000 => {
+                if (val & 0xFFF7) != self.ppu.dispcnt {
+                    self.sync_ppu_hdraw();
+                    self.ppu.write_dispcnt(val);
+                }
+            }
+            0x0400_0002 => {
+                let next = val & 1;
+                if next != self.ppu.greenswap {
+                    self.sync_ppu_hdraw_now();
+                    self.ppu.greenswap = next;
+                }
+            }
             0x0400_0004 => {
                 let prev_match = (self.ppu.dispstat & 0x0004) != 0;
                 self.ppu.dispstat = (self.ppu.dispstat & 0x0007) | (val & 0xFF38);
@@ -905,66 +1021,191 @@ impl SysBus {
             }
             0x0400_0008..=0x0400_000E => {
                 let idx = ((off - 0x0400_0008) / 2) as usize;
-                self.ppu.bgcnt[idx] = val;
+                if self.ppu.bgcnt[idx] != val {
+                    self.sync_ppu_hdraw();
+                    self.ppu.bgcnt[idx] = val;
+                }
             }
             0x0400_0010 | 0x0400_0014 | 0x0400_0018 | 0x0400_001C => {
                 let idx = ((off - 0x0400_0010) / 4) as usize;
-                self.ppu.bghofs[idx] = val & 0x01FF;
+                let next = val & 0x01FF;
+                if self.ppu.bghofs[idx] != next {
+                    self.sync_ppu_hdraw();
+                    self.ppu.bghofs[idx] = next;
+                }
             }
             0x0400_0012 | 0x0400_0016 | 0x0400_001A | 0x0400_001E => {
                 let idx = ((off - 0x0400_0012) / 4) as usize;
-                self.ppu.bgvofs[idx] = val & 0x01FF;
+                let next = val & 0x01FF;
+                if self.ppu.bgvofs[idx] != next {
+                    self.sync_ppu_hdraw();
+                    self.ppu.bgvofs[idx] = next;
+                }
             }
-            0x0400_0020 => self.ppu.bgp_a[0] = val as i16,
-            0x0400_0022 => self.ppu.bgp_b[0] = val as i16,
-            0x0400_0024 => self.ppu.bgp_c[0] = val as i16,
-            0x0400_0026 => self.ppu.bgp_d[0] = val as i16,
-            0x0400_0028 => {
-                let new = ((self.ppu.bgx[0] as u32) & 0xFFFF_0000) | (val as u32);
-                self.ppu.set_bgx(0, new);
+            0x0400_0020 => {
+                self.sync_ppu_hdraw();
+                self.ppu.bgp_a[0] = val as i16;
             }
-            0x0400_002A => {
-                let new = ((self.ppu.bgx[0] as u32) & 0x0000_FFFF) | ((val as u32) << 16);
-                self.ppu.set_bgx(0, new);
+            0x0400_0022 => {
+                let in_hblank = self.ppu.vcount < 160 && (self.ppu.dispstat & 0x0002) != 0;
+                let allow_latch = !in_hblank
+                    || self
+                        .scheduler
+                        .current_cycle
+                        .saturating_sub(self.hblank_start_cycle)
+                        <= 206;
+                self.ppu.set_bgp_b(0, val as i16, allow_latch);
             }
-            0x0400_002C => {
-                let new = ((self.ppu.bgy[0] as u32) & 0xFFFF_0000) | (val as u32);
-                self.ppu.set_bgy(0, new);
+            0x0400_0024 => {
+                self.sync_ppu_hdraw();
+                self.ppu.bgp_c[0] = val as i16;
             }
-            0x0400_002E => {
-                let new = ((self.ppu.bgy[0] as u32) & 0x0000_FFFF) | ((val as u32) << 16);
-                self.ppu.set_bgy(0, new);
+            0x0400_0026 => {
+                let in_hblank = self.ppu.vcount < 160 && (self.ppu.dispstat & 0x0002) != 0;
+                let allow_latch = !in_hblank
+                    || self
+                        .scheduler
+                        .current_cycle
+                        .saturating_sub(self.hblank_start_cycle)
+                        <= 206;
+                self.ppu.set_bgp_d(0, val as i16, allow_latch);
             }
-            0x0400_0030 => self.ppu.bgp_a[1] = val as i16,
-            0x0400_0032 => self.ppu.bgp_b[1] = val as i16,
-            0x0400_0034 => self.ppu.bgp_c[1] = val as i16,
-            0x0400_0036 => self.ppu.bgp_d[1] = val as i16,
-            0x0400_0038 => {
-                let new = ((self.ppu.bgx[1] as u32) & 0xFFFF_0000) | (val as u32);
-                self.ppu.set_bgx(1, new);
+            0x0400_0028 | 0x0400_002A => {
+                let new = if off == 0x0400_0028 {
+                    ((self.ppu.bgx[0] as u32) & 0xFFFF_0000) | (val as u32)
+                } else {
+                    ((self.ppu.bgx[0] as u32) & 0x0000_FFFF) | ((val as u32) << 16)
+                };
+                let in_vblank = self.ppu.vcount >= 160;
+                let in_hblank = !in_vblank && (self.ppu.dispstat & 0x0002) != 0;
+                let before_latch = in_hblank
+                    && self
+                        .scheduler
+                        .current_cycle
+                        .saturating_sub(self.hblank_start_cycle)
+                        <= 222;
+                self.ppu
+                    .set_bgx_timed(0, new, in_hblank, before_latch, in_vblank);
             }
-            0x0400_003A => {
-                let new = ((self.ppu.bgx[1] as u32) & 0x0000_FFFF) | ((val as u32) << 16);
-                self.ppu.set_bgx(1, new);
+            0x0400_002C | 0x0400_002E => {
+                let new = if off == 0x0400_002C {
+                    ((self.ppu.bgy[0] as u32) & 0xFFFF_0000) | (val as u32)
+                } else {
+                    ((self.ppu.bgy[0] as u32) & 0x0000_FFFF) | ((val as u32) << 16)
+                };
+                let in_vblank = self.ppu.vcount >= 160;
+                let in_hblank = !in_vblank && (self.ppu.dispstat & 0x0002) != 0;
+                let before_latch = in_hblank
+                    && self
+                        .scheduler
+                        .current_cycle
+                        .saturating_sub(self.hblank_start_cycle)
+                        <= 222;
+                self.ppu
+                    .set_bgy_timed(0, new, in_hblank, before_latch, in_vblank);
             }
-            0x0400_003C => {
-                let new = ((self.ppu.bgy[1] as u32) & 0xFFFF_0000) | (val as u32);
-                self.ppu.set_bgy(1, new);
+            0x0400_0030 => {
+                self.sync_ppu_hdraw();
+                self.ppu.bgp_a[1] = val as i16;
             }
-            0x0400_003E => {
-                let new = ((self.ppu.bgy[1] as u32) & 0x0000_FFFF) | ((val as u32) << 16);
-                self.ppu.set_bgy(1, new);
+            0x0400_0032 => {
+                let in_hblank = self.ppu.vcount < 160 && (self.ppu.dispstat & 0x0002) != 0;
+                let allow_latch = !in_hblank
+                    || self
+                        .scheduler
+                        .current_cycle
+                        .saturating_sub(self.hblank_start_cycle)
+                        <= 206;
+                self.ppu.set_bgp_b(1, val as i16, allow_latch);
             }
-            0x0400_0040 => self.ppu.winh[0] = val,
-            0x0400_0042 => self.ppu.winh[1] = val,
-            0x0400_0044 => self.ppu.winv[0] = val,
-            0x0400_0046 => self.ppu.winv[1] = val,
-            0x0400_0048 => self.ppu.winin = val & 0x3F3F,
-            0x0400_004A => self.ppu.winout = val & 0x3F3F,
-            0x0400_004C => self.ppu.mosaic = val,
-            0x0400_0050 => self.ppu.bldcnt = val & 0x3FFF,
-            0x0400_0052 => self.ppu.bldalpha = val & 0x1F1F,
-            0x0400_0054 => self.ppu.bldy = val & 0x001F,
+            0x0400_0034 => {
+                self.sync_ppu_hdraw();
+                self.ppu.bgp_c[1] = val as i16;
+            }
+            0x0400_0036 => {
+                let in_hblank = self.ppu.vcount < 160 && (self.ppu.dispstat & 0x0002) != 0;
+                let allow_latch = !in_hblank
+                    || self
+                        .scheduler
+                        .current_cycle
+                        .saturating_sub(self.hblank_start_cycle)
+                        <= 206;
+                self.ppu.set_bgp_d(1, val as i16, allow_latch);
+            }
+            0x0400_0038 | 0x0400_003A => {
+                let new = if off == 0x0400_0038 {
+                    ((self.ppu.bgx[1] as u32) & 0xFFFF_0000) | (val as u32)
+                } else {
+                    ((self.ppu.bgx[1] as u32) & 0x0000_FFFF) | ((val as u32) << 16)
+                };
+                let in_vblank = self.ppu.vcount >= 160;
+                let in_hblank = !in_vblank && (self.ppu.dispstat & 0x0002) != 0;
+                let before_latch = in_hblank
+                    && self
+                        .scheduler
+                        .current_cycle
+                        .saturating_sub(self.hblank_start_cycle)
+                        <= 222;
+                self.ppu
+                    .set_bgx_timed(1, new, in_hblank, before_latch, in_vblank);
+            }
+            0x0400_003C | 0x0400_003E => {
+                let new = if off == 0x0400_003C {
+                    ((self.ppu.bgy[1] as u32) & 0xFFFF_0000) | (val as u32)
+                } else {
+                    ((self.ppu.bgy[1] as u32) & 0x0000_FFFF) | ((val as u32) << 16)
+                };
+                let in_vblank = self.ppu.vcount >= 160;
+                let in_hblank = !in_vblank && (self.ppu.dispstat & 0x0002) != 0;
+                let before_latch = in_hblank
+                    && self
+                        .scheduler
+                        .current_cycle
+                        .saturating_sub(self.hblank_start_cycle)
+                        <= 222;
+                self.ppu
+                    .set_bgy_timed(1, new, in_hblank, before_latch, in_vblank);
+            }
+            0x0400_0040 => {
+                self.sync_ppu_hdraw();
+                self.ppu.winh[0] = val;
+            }
+            0x0400_0042 => {
+                self.sync_ppu_hdraw();
+                self.ppu.winh[1] = val;
+            }
+            0x0400_0044 => {
+                self.sync_ppu_hdraw();
+                self.ppu.winv[0] = val;
+            }
+            0x0400_0046 => {
+                self.sync_ppu_hdraw();
+                self.ppu.winv[1] = val;
+            }
+            0x0400_0048 => {
+                self.sync_ppu_hdraw();
+                self.ppu.winin = val & 0x3F3F;
+            }
+            0x0400_004A => {
+                self.sync_ppu_hdraw();
+                self.ppu.winout = val & 0x3F3F;
+            }
+            0x0400_004C => {
+                self.sync_ppu_hdraw();
+                self.ppu.mosaic = val;
+            }
+            0x0400_0050 => {
+                self.sync_ppu_hdraw();
+                self.ppu.bldcnt = val & 0x3FFF;
+            }
+            0x0400_0052 => {
+                self.sync_ppu_hdraw();
+                self.ppu.bldalpha = val & 0x1F1F;
+            }
+            0x0400_0054 => {
+                self.sync_ppu_hdraw();
+                self.ppu.bldy = val & 0x001F;
+            }
 
             // APU PSG (only active when SOUNDCNT_X bit 7 set, except SOUNDCNT_X/H/BIAS/WaveRAM)
             0x0400_0060 if self.apu.master_enabled() => self.apu.sq1.write_sweep(val),
@@ -980,7 +1221,7 @@ impl SysBus {
             0x0400_0080 if self.apu.master_enabled() => self.apu.soundcnt_l = val,
             0x0400_0082 => self.apu.write_soundcnt_h(val),
             0x0400_0084 => self.apu.write_soundcnt_x(val),
-            0x0400_0088 => self.apu.soundbias = val,
+            0x0400_0088 => self.apu.soundbias = val & 0xC3FE,
             0x0400_0090..=0x0400_009E => {
                 let idx = (off - 0x0400_0090) as usize;
                 self.apu.wave.write_wave_ram(idx, val as u8);
@@ -1035,11 +1276,10 @@ impl SysBus {
                             };
 
                             if self.hw.dma[ch].timing() == 0 {
-                                // Immediate DMA starts after 2 cycles startup/bus-arbitration latency
-                                self.scheduler.schedule(
-                                    self.scheduler.current_cycle + 2,
-                                    EventType::DmaActivate(ch as u8),
-                                );
+                                // Immediate DMA starts 2 cycles after the DMAxCNT_H write completes.
+                                let write_cycle = self.timer_write_cycle();
+                                self.scheduler
+                                    .schedule(write_cycle + 2, EventType::DmaActivate(ch as u8));
                             } else if (ch == 1 || ch == 2) && self.hw.dma[ch].timing() == 3 {
                                 // Sound FIFO DMA refill if target FIFO needs initial data
                                 let dad = self.hw.dma[ch].dad & !3;
@@ -1105,7 +1345,9 @@ impl SysBus {
             }
             0x0400_0128 => {
                 let was_busy = (self.hw.siocnt & 0x0080) != 0;
-                let is_multi = (val & 0x3000) == 0x2000;
+                let mode_bits = (val >> 12) & 0x03;
+                let is_multi = mode_bits == 2;
+                let is_uart = mode_bits == 3;
                 let cleaned = if is_multi {
                     (val & !0x007C) | (self.hw.siocnt & 0x0070) | 0x0008
                 } else {
@@ -1113,8 +1355,11 @@ impl SysBus {
                 };
                 self.hw.siocnt = cleaned;
 
-                let start_requested =
-                    !was_busy && (cleaned & 0x0080) != 0 && (self.hw.rcnt & 0x8000) == 0;
+                // In UART mode (bits 13..12 == 3), bit 7 selects 7/8-bit data length, NOT transfer start.
+                let start_requested = !is_uart
+                    && !was_busy
+                    && (cleaned & 0x0080) != 0
+                    && (self.hw.rcnt & 0x8000) == 0;
                 if start_requested
                     && let Some((mode, duration)) = HardwareControl::sio_transfer_duration(cleaned)
                 {
@@ -1138,7 +1383,14 @@ impl SysBus {
             0x0400_012A => {
                 self.hw.siodata8 = val;
             }
-            0x0400_0134 => self.hw.rcnt = val & 0xC1FF,
+            0x0400_0134 => {
+                self.hw.rcnt = val & 0xC1FF;
+                if (self.hw.rcnt & 0x8000) != 0 {
+                    self.scheduler.cancel(EventType::SioTransferComplete);
+                    self.hw.pending_sio_transfer = None;
+                    self.hw.siocnt &= !0x0080;
+                }
+            }
 
             0x0400_0132 => {
                 self.hw.keycnt = val & 0xC3FF;
@@ -1147,7 +1399,11 @@ impl SysBus {
 
             // Interrupts & System Control
             0x0400_0200 => self.hw.ie = val & 0x3FFF,
-            0x0400_0202 => self.hw.if_flag &= !val,
+            0x0400_0202 => {
+                let write_cycle = self.timer_write_cycle();
+                self.flush_timer_overflows_until(write_cycle);
+                self.hw.if_flag &= !val;
+            }
             0x0400_0204 => {
                 self.hw.waitcnt = val & 0x5FFF;
                 self.update_waitcnt(self.hw.waitcnt);
@@ -1159,8 +1415,9 @@ impl SysBus {
                     self.irq_sync_delay = 1;
                 }
             }
-            0x0400_0300 if self.debug_pc < 0x4000 || self.last_access_was_dma => {
-                self.hw.postflg = val as u8;
+            0x0400_0300 if self.debug_pc < 0x4000 => {
+                // POSTFLG bit 0 is a hardware write-once latch (cannot be cleared back to 0).
+                self.hw.postflg |= (val as u8) & 1;
                 let halt_byte = (val >> 8) as u8;
                 if (halt_byte & 0x80) == 0 {
                     self.hw.halt_requested = true;
@@ -1176,10 +1433,17 @@ impl SysBus {
     }
 
     pub fn hle_swi(&mut self, cpu: &mut Arm7tdmi, comment: u8) {
+        let saved_debug_pc = self.debug_pc;
         self.debug_pc = 0x0100;
+        self.hle_swi_inner(cpu, comment);
+        self.debug_pc = saved_debug_pc;
+    }
+
+    fn hle_swi_inner(&mut self, cpu: &mut Arm7tdmi, comment: u8) {
         // Magic internal HLE wait sentinel used by IntrWait / VBlankIntrWait loop at 0x0000_0140
         if comment == 0xFE {
             if let Some((wait_flags, saved_ret, saved_spsr)) = cpu.intr_wait {
+                self.hw.ime = 1;
                 let check = self.read_32(0x0300_7FF8, AccessType::NonSequential, 0);
                 let matched = (check as u16) & wait_flags;
                 if matched != 0 {
@@ -1196,11 +1460,11 @@ impl SysBus {
                     cpu.flush_pipeline(self, saved_ret);
                     return;
                 }
+                // Still waiting: keep IRQ enabled in CPSR and halt
+                cpu.cpsr &= !(1 << 7);
+                cpu.flush_pipeline(self, 0x0000_0140);
+                cpu.halted = true;
             }
-            // Still waiting: keep IRQ enabled in CPSR and halt
-            cpu.cpsr &= !(1 << 7);
-            cpu.flush_pipeline(self, 0x0000_0140);
-            cpu.halted = true;
             return;
         }
 
@@ -1209,6 +1473,7 @@ impl SysBus {
                 // SoftReset
                 let flag = self.iwram[0x7FFA];
                 self.iwram[0x7E00..0x8000].fill(0);
+                self.invalidate_all_code();
                 cpu.gpr.fill(0);
                 cpu.banked_r13 = [0x0300_7F00, 0, 0x0300_7FA0, 0x0300_7FE0, 0, 0];
                 cpu.banked_r14 = [0; 6];
@@ -1229,11 +1494,13 @@ impl SysBus {
                 let mut reset_cycles = 96u64;
                 if (flags & 0x01) != 0 {
                     self.ewram.fill(0);
+                    self.invalidate_all_code();
                     reset_cycles += 4_096;
                 }
                 if (flags & 0x02) != 0 {
                     // Clears all IWRAM except last 0x200 bytes (SP area)
                     self.iwram[..0x7E00].fill(0);
+                    self.invalidate_all_code();
                     reset_cycles += 512;
                 }
                 if (flags & 0x04) != 0 {
@@ -1263,9 +1530,38 @@ impl SysBus {
                     self.apu.commit_mix(cycle);
                 }
                 if (flags & 0x80) != 0 {
-                    self.ppu.dispcnt = 0;
-                    self.ppu.dispstat = 0;
+                    self.ppu.write_dispcnt(0x0080);
+                    self.ppu.greenswap = 0;
+                    self.ppu.dispstat &= 0x0007;
+                    self.ppu.bgcnt = [0; 4];
+                    self.ppu.bghofs = [0; 4];
+                    self.ppu.bgvofs = [0; 4];
+                    self.ppu.bgp_a = [0x0100; 2];
+                    self.ppu.bgp_b = [0; 2];
+                    self.ppu.bgp_c = [0; 2];
+                    self.ppu.bgp_d = [0x0100; 2];
+                    self.ppu.bgx = [0; 2];
+                    self.ppu.bgy = [0; 2];
+                    self.ppu.reload_affine_refs();
+                    self.ppu.winh = [0; 2];
+                    self.ppu.winv = [0; 2];
+                    self.ppu.winin = 0;
+                    self.ppu.winout = 0;
+                    self.ppu.mosaic = 0;
                     self.ppu.bldcnt = 0;
+                    self.ppu.bldalpha = 0;
+                    self.ppu.bldy = 0;
+                    for ch in 0..4 {
+                        self.hw.dma[ch] = DmaChannel::new();
+                        self.scheduler.cancel(EventType::DmaActivate(ch as u8));
+                        self.hw.timers[ch] = TimerChannel::new();
+                        self.scheduler.cancel(EventType::TimerOverflow(ch as u8));
+                    }
+                    self.hw.active_dma = None;
+                    self.hw.keycnt = 0;
+                    self.hw.ie = 0;
+                    self.hw.if_flag = 0;
+                    self.hw.ime = 0;
                 }
                 cpu.flush_cycles += reset_cycles;
                 cpu.return_from_swi(self);
@@ -1376,46 +1672,10 @@ impl SysBus {
                 cpu.return_from_swi(self);
             }
             0x0B => {
-                // CpuSet(src, dst, cnt)
-                let mut src = cpu.gpr[0];
-                let mut dst = cpu.gpr[1];
-                let cnt = cpu.gpr[2];
-                let count = cnt & 0x001F_FFFF;
-                let fixed_src = (cnt & (1 << 24)) != 0;
-                let is_32 = (cnt & (1 << 26)) != 0;
-
-                // Model BIOS execution cycles: SWI dispatch, register stacking, and loop overhead.
-                let caller_pc = cpu.gpr[14];
-                let bios_base_cycles = if caller_pc >= 0x0800_0000 {
-                    116u64
-                } else {
-                    104u64
-                };
-                if is_32 {
-                    src &= !3;
-                    dst &= !3;
-                    for _ in 0..count {
-                        let v = self.read_32(src, AccessType::Sequential, 0);
-                        self.write_32(dst, v, AccessType::Sequential);
-                        if !fixed_src {
-                            src = src.wrapping_add(4);
-                        }
-                        dst = dst.wrapping_add(4);
-                    }
-                } else {
-                    src &= !1;
-                    dst &= !1;
-                    for _ in 0..count {
-                        let v = self.read_16(src, AccessType::Sequential, 0, false);
-                        self.write_16(dst, v, AccessType::Sequential);
-                        if !fixed_src {
-                            src = src.wrapping_add(2);
-                        }
-                        dst = dst.wrapping_add(2);
-                    }
-                }
-                cpu.flush_cycles += bios_base_cycles;
-                cpu.return_from_swi(self);
+                // CpuSet(src, dst, cnt): enter clean-room ARM SWI vector & dispatcher in BIOS space
+                // so HALTCNT/POSTFLG writes, mid-routine HALT wake-ups, and DMA activation occur
+                // with genuine BIOS privilege (`PC < 0x4000`) and real prologue/epilogue timing.
+                cpu.flush_pipeline(self, 0x0000_0008);
             }
             0x0C => {
                 // CpuFastSet(src, dst, cnt)
@@ -1426,9 +1686,9 @@ impl SysBus {
                 let fixed_src = (cnt & (1 << 24)) != 0;
                 let mut transfer_cycles = 88u64;
                 for _ in 0..count {
-                    let v = self.read_32(src, AccessType::Sequential, 0);
+                    let v = self.read_32(src, AccessType::NonSequential, 0);
                     transfer_cycles += self.last_cycles;
-                    transfer_cycles += self.write_32(dst, v, AccessType::Sequential);
+                    transfer_cycles += self.write_32(dst, v, AccessType::NonSequential);
                     if !fixed_src {
                         src = src.wrapping_add(4);
                     }
@@ -1448,34 +1708,48 @@ impl SysBus {
                 // BgAffineSet(src, dst, count)
                 let mut src = cpu.gpr[0];
                 let mut dst = cpu.gpr[1];
-                let count = cpu.gpr[2];
+                let count = cpu.gpr[2].min(0x10000);
                 for _ in 0..count {
-                    let orig_x = self.read_32(src, AccessType::Sequential, 0) as i32;
-                    let orig_y = self.read_32(src + 4, AccessType::Sequential, 0) as i32;
+                    let orig_x = self.read_32(src, AccessType::NonSequential, 0) as i32;
+                    let orig_y =
+                        self.read_32(src.wrapping_add(4), AccessType::NonSequential, 0) as i32;
                     let disp_x =
-                        self.read_16(src + 8, AccessType::Sequential, 0, false) as i16 as i32;
+                        self.read_16(src.wrapping_add(8), AccessType::NonSequential, 0, false)
+                            as i16 as i32;
                     let disp_y =
-                        self.read_16(src + 10, AccessType::Sequential, 0, false) as i16 as i32;
-                    let sx = self.read_16(src + 12, AccessType::Sequential, 0, false) as i16 as i32;
-                    let sy = self.read_16(src + 14, AccessType::Sequential, 0, false) as i16 as i32;
-                    let alpha = self.read_16(src + 16, AccessType::Sequential, 0, false);
-                    src += 20;
+                        self.read_16(src.wrapping_add(10), AccessType::NonSequential, 0, false)
+                            as i16 as i32;
+                    let sx = self.read_16(src.wrapping_add(12), AccessType::NonSequential, 0, false)
+                        as i16 as i32;
+                    let sy = self.read_16(src.wrapping_add(14), AccessType::NonSequential, 0, false)
+                        as i16 as i32;
+                    let alpha =
+                        self.read_16(src.wrapping_add(16), AccessType::NonSequential, 0, false);
+                    src = src.wrapping_add(20);
 
                     let (sin_v, cos_v) = hle_sin_cos(alpha);
-                    let pa = ((cos_v * sx) >> 14) as i16;
-                    let pb = ((-sin_v * sx) >> 14) as i16;
-                    let pc = ((sin_v * sy) >> 14) as i16;
-                    let pd = ((cos_v * sy) >> 14) as i16;
-                    let rx = orig_x - ((pa as i32) * disp_x + (pb as i32) * disp_y);
-                    let ry = orig_y - ((pc as i32) * disp_x + (pd as i32) * disp_y);
+                    let pa = ((cos_v.wrapping_mul(sx)) >> 14) as i16;
+                    let pb = (((-sin_v).wrapping_mul(sx)) >> 14) as i16;
+                    let pc = ((sin_v.wrapping_mul(sy)) >> 14) as i16;
+                    let pd = ((cos_v.wrapping_mul(sy)) >> 14) as i16;
+                    let rx = orig_x.wrapping_sub(
+                        (pa as i32)
+                            .wrapping_mul(disp_x)
+                            .wrapping_add((pb as i32).wrapping_mul(disp_y)),
+                    );
+                    let ry = orig_y.wrapping_sub(
+                        (pc as i32)
+                            .wrapping_mul(disp_x)
+                            .wrapping_add((pd as i32).wrapping_mul(disp_y)),
+                    );
 
-                    self.write_16(dst, pa as u16, AccessType::Sequential);
-                    self.write_16(dst + 2, pb as u16, AccessType::Sequential);
-                    self.write_16(dst + 4, pc as u16, AccessType::Sequential);
-                    self.write_16(dst + 6, pd as u16, AccessType::Sequential);
-                    self.write_32(dst + 8, rx as u32, AccessType::Sequential);
-                    self.write_32(dst + 12, ry as u32, AccessType::Sequential);
-                    dst += 16;
+                    self.write_16(dst, pa as u16, AccessType::NonSequential);
+                    self.write_16(dst.wrapping_add(2), pb as u16, AccessType::NonSequential);
+                    self.write_16(dst.wrapping_add(4), pc as u16, AccessType::NonSequential);
+                    self.write_16(dst.wrapping_add(6), pd as u16, AccessType::NonSequential);
+                    self.write_32(dst.wrapping_add(8), rx as u32, AccessType::NonSequential);
+                    self.write_32(dst.wrapping_add(12), ry as u32, AccessType::NonSequential);
+                    dst = dst.wrapping_add(16);
                 }
                 cpu.flush_cycles += 64 + u64::from(count.min(0x1_0000)).saturating_mul(110);
                 cpu.return_from_swi(self);
@@ -1484,28 +1758,30 @@ impl SysBus {
                 // ObjAffineSet(src, dst, count, stride)
                 let mut src = cpu.gpr[0];
                 let mut dst = cpu.gpr[1];
-                let count = cpu.gpr[2];
+                let count = cpu.gpr[2].min(0x10000);
                 let stride = cpu.gpr[3];
                 for _ in 0..count {
-                    let sx = self.read_16(src, AccessType::Sequential, 0, false) as i16 as i32;
-                    let sy = self.read_16(src + 2, AccessType::Sequential, 0, false) as i16 as i32;
-                    let alpha = self.read_16(src + 4, AccessType::Sequential, 0, false);
-                    src += 8;
+                    let sx = self.read_16(src, AccessType::NonSequential, 0, false) as i16 as i32;
+                    let sy = self.read_16(src.wrapping_add(2), AccessType::NonSequential, 0, false)
+                        as i16 as i32;
+                    let alpha =
+                        self.read_16(src.wrapping_add(4), AccessType::NonSequential, 0, false);
+                    src = src.wrapping_add(8);
 
                     let (sin_v, cos_v) = hle_sin_cos(alpha);
-                    let pa = ((cos_v * sx) >> 14) as i16;
-                    let pb = ((-sin_v * sx) >> 14) as i16;
-                    let pc = ((sin_v * sy) >> 14) as i16;
-                    let pd = ((cos_v * sy) >> 14) as i16;
+                    let pa = ((cos_v.wrapping_mul(sx)) >> 14) as i16;
+                    let pb = (((-sin_v).wrapping_mul(sx)) >> 14) as i16;
+                    let pc = ((sin_v.wrapping_mul(sy)) >> 14) as i16;
+                    let pd = ((cos_v.wrapping_mul(sy)) >> 14) as i16;
 
-                    self.write_16(dst, pa as u16, AccessType::Sequential);
-                    dst += stride;
-                    self.write_16(dst, pb as u16, AccessType::Sequential);
-                    dst += stride;
-                    self.write_16(dst, pc as u16, AccessType::Sequential);
-                    dst += stride;
-                    self.write_16(dst, pd as u16, AccessType::Sequential);
-                    dst += stride;
+                    self.write_16(dst, pa as u16, AccessType::NonSequential);
+                    dst = dst.wrapping_add(stride);
+                    self.write_16(dst, pb as u16, AccessType::NonSequential);
+                    dst = dst.wrapping_add(stride);
+                    self.write_16(dst, pc as u16, AccessType::NonSequential);
+                    dst = dst.wrapping_add(stride);
+                    self.write_16(dst, pd as u16, AccessType::NonSequential);
+                    dst = dst.wrapping_add(stride);
                 }
                 cpu.flush_cycles += 64 + u64::from(count.min(0x1_0000)).saturating_mul(90);
                 cpu.return_from_swi(self);
@@ -1515,20 +1791,24 @@ impl SysBus {
                 let mut src = cpu.gpr[0];
                 let mut dst = cpu.gpr[1];
                 let info = cpu.gpr[2];
-                let src_len = self.read_16(info, AccessType::Sequential, 0, false) as usize;
-                let src_width = self.read_8(info + 2, AccessType::Sequential, 0, false) as u32;
-                let dst_width = self.read_8(info + 3, AccessType::Sequential, 0, false) as u32;
-                let offset_cfg = self.read_32(info + 4, AccessType::Sequential, 0);
+                let src_len = self.read_16(info, AccessType::NonSequential, 0, false) as usize;
+                let src_width =
+                    self.read_8(info.wrapping_add(2), AccessType::NonSequential, 0, false) as u32;
+                let dst_width =
+                    self.read_8(info.wrapping_add(3), AccessType::NonSequential, 0, false) as u32;
+                let offset_cfg = self.read_32(info.wrapping_add(4), AccessType::NonSequential, 0);
                 let data_offset = offset_cfg & 0x7FFF_FFFF;
                 let zero_flag = (offset_cfg & 0x8000_0000) != 0;
 
-                if src_width > 0 && dst_width > 0 {
+                if matches!(src_width, 1 | 2 | 4 | 8)
+                    && matches!(dst_width, 1 | 2 | 4 | 8 | 16 | 32)
+                {
                     let src_mask = (1u32 << src_width) - 1;
                     let mut out_word = 0u32;
                     let mut out_bits = 0u32;
                     for _ in 0..src_len {
-                        let byte = self.read_8(src, AccessType::Sequential, 0, false) as u32;
-                        src += 1;
+                        let byte = self.read_8(src, AccessType::NonSequential, 0, false) as u32;
+                        src = src.wrapping_add(1);
                         let mut bit = 0u32;
                         while bit < 8 {
                             let val = (byte >> bit) & src_mask;
@@ -1540,8 +1820,8 @@ impl SysBus {
                             out_word |= unpacked << out_bits;
                             out_bits += dst_width;
                             if out_bits >= 32 {
-                                self.write_32(dst, out_word, AccessType::Sequential);
-                                dst += 4;
+                                self.write_32(dst, out_word, AccessType::NonSequential);
+                                dst = dst.wrapping_add(4);
                                 out_word = 0;
                                 out_bits = 0;
                             }
@@ -1583,8 +1863,8 @@ impl SysBus {
                 cpu.return_from_swi(self);
             }
             0x19 => {
-                // SoundBias: r0 == 0 sets bias level 0x000, non-zero r0 sets 0x200 (preserving bits 14-15)
-                let bias_level = if cpu.gpr[0] == 0 { 0x0000 } else { 0x0200 };
+                // SoundBias(level): GBA BIOS sets SOUNDBIAS level to 0x0000 when r0 == 0, else 0x0200 (preserving bits 14-15).
+                let bias_level: u16 = if cpu.gpr[0] == 0 { 0x0000 } else { 0x0200 };
                 let cur = self.apu.soundbias & !0x03FE;
                 self.write_io_16(0x0400_0088, cur | bias_level);
                 cpu.flush_cycles += 128;
@@ -1601,15 +1881,21 @@ impl SysBus {
                 cpu.flush_cycles += 96;
                 cpu.return_from_swi(self);
             }
-            0x1A..=0x1E | 0x20..=0x29 => {
-                // SoundDriverInit, SoundDriverMode, SoundDriverMain, SoundDriverVSync,
-                // SoundChannelClear, SoundDriverVSyncOff, SoundDriverVSyncOn, etc.
+            0x27 => {
+                // CustomHalt(r2 = HALTCNT byte: bit 7 selects STOP vs HALT)
+                if (cpu.gpr[2] & 0x80) != 0 {
+                    cpu.stopped = true;
+                    cpu.halted = false;
+                } else {
+                    cpu.halted = true;
+                }
                 cpu.flush_cycles += 48;
                 cpu.return_from_swi(self);
             }
-            0x2A => {
-                // CustomHalt
-                cpu.halted = true;
+            0x1A..=0x1E | 0x20..=0x26 | 0x28..=0x2A => {
+                // SoundDriverInit, SoundDriverMode, SoundDriverMain, SoundDriverVSync,
+                // SoundChannelClear, SoundDriverVSyncOff, SoundDriverVSyncOn, SoundGetJumpList, etc.
+                cpu.flush_cycles += 48;
                 cpu.return_from_swi(self);
             }
             _ => {
@@ -1620,22 +1906,22 @@ impl SysBus {
     }
 
     fn hle_lz77_uncomp(&mut self, mut src: u32, mut dst: u32, is_16bit: bool) {
-        let header = self.read_32(src, AccessType::Sequential, 0);
-        src += 4;
-        let decomp_len = (header >> 8) as usize;
+        let header = self.read_32(src, AccessType::NonSequential, 0);
+        src = src.wrapping_add(4);
+        let decomp_len = ((header >> 8) as usize).min(0x10_0000);
         let mut written = 0usize;
         let mut half_buf = 0u16;
 
         while written < decomp_len {
-            let flags = self.read_8(src, AccessType::Sequential, 0, false);
-            src += 1;
+            let flags = self.read_8(src, AccessType::NonSequential, 0, false);
+            src = src.wrapping_add(1);
             for bit in (0..8).rev() {
                 if written >= decomp_len {
                     break;
                 }
                 if (flags & (1 << bit)) == 0 {
-                    let b = self.read_8(src, AccessType::Sequential, 0, false);
-                    src += 1;
+                    let b = self.read_8(src, AccessType::NonSequential, 0, false);
+                    src = src.wrapping_add(1);
                     if is_16bit {
                         if (written & 1) == 0 {
                             half_buf = b as u16;
@@ -1643,19 +1929,20 @@ impl SysBus {
                             self.write_16(
                                 dst,
                                 half_buf | ((b as u16) << 8),
-                                AccessType::Sequential,
+                                AccessType::NonSequential,
                             );
-                            dst += 2;
+                            dst = dst.wrapping_add(2);
                         }
                     } else {
-                        self.write_8(dst, b, AccessType::Sequential);
-                        dst += 1;
+                        self.write_8(dst, b, AccessType::NonSequential);
+                        dst = dst.wrapping_add(1);
                     }
                     written += 1;
                 } else {
-                    let b1 = self.read_8(src, AccessType::Sequential, 0, false) as usize;
-                    let b2 = self.read_8(src + 1, AccessType::Sequential, 0, false) as usize;
-                    src += 2;
+                    let b1 = self.read_8(src, AccessType::NonSequential, 0, false) as usize;
+                    let b2 = self.read_8(src.wrapping_add(1), AccessType::NonSequential, 0, false)
+                        as usize;
+                    src = src.wrapping_add(2);
                     let len = (b1 >> 4) + 3;
                     let disp = (((b1 & 0x0F) << 8) | b2) + 1;
                     for _ in 0..len {
@@ -1663,7 +1950,7 @@ impl SysBus {
                             break;
                         }
                         let copy_addr = if is_16bit {
-                            let cur_byte_addr = dst + ((written as u32) & 1);
+                            let cur_byte_addr = dst.wrapping_add((written as u32) & 1);
                             cur_byte_addr.wrapping_sub(disp as u32)
                         } else {
                             dst.wrapping_sub(disp as u32)
@@ -1671,7 +1958,7 @@ impl SysBus {
                         let b = if is_16bit && (disp == 1) && ((written & 1) == 1) {
                             (half_buf & 0xFF) as u8
                         } else {
-                            self.read_8(copy_addr, AccessType::Sequential, 0, false)
+                            self.read_8(copy_addr, AccessType::NonSequential, 0, false)
                         };
                         if is_16bit {
                             if (written & 1) == 0 {
@@ -1680,13 +1967,13 @@ impl SysBus {
                                 self.write_16(
                                     dst,
                                     half_buf | ((b as u16) << 8),
-                                    AccessType::Sequential,
+                                    AccessType::NonSequential,
                                 );
-                                dst += 2;
+                                dst = dst.wrapping_add(2);
                             }
                         } else {
-                            self.write_8(dst, b, AccessType::Sequential);
-                            dst += 1;
+                            self.write_8(dst, b, AccessType::NonSequential);
+                            dst = dst.wrapping_add(1);
                         }
                         written += 1;
                     }
@@ -1707,30 +1994,34 @@ impl SysBus {
             if (*written & 1) == 0 {
                 *half_buf = b as u16;
             } else {
-                self.write_16(*dst, *half_buf | ((b as u16) << 8), AccessType::Sequential);
-                *dst += 2;
+                self.write_16(
+                    *dst,
+                    *half_buf | ((b as u16) << 8),
+                    AccessType::NonSequential,
+                );
+                *dst = dst.wrapping_add(2);
             }
         } else {
-            self.write_8(*dst, b, AccessType::Sequential);
-            *dst += 1;
+            self.write_8(*dst, b, AccessType::NonSequential);
+            *dst = dst.wrapping_add(1);
         }
         *written += 1;
     }
 
     fn hle_rl_uncomp(&mut self, mut src: u32, mut dst: u32, is_16bit: bool) {
-        let header = self.read_32(src, AccessType::Sequential, 0);
-        src += 4;
-        let decomp_len = (header >> 8) as usize;
+        let header = self.read_32(src, AccessType::NonSequential, 0);
+        src = src.wrapping_add(4);
+        let decomp_len = ((header >> 8) as usize).min(0x10_0000);
         let mut written = 0usize;
         let mut half_buf = 0u16;
 
         while written < decomp_len {
-            let flag = self.read_8(src, AccessType::Sequential, 0, false);
-            src += 1;
+            let flag = self.read_8(src, AccessType::NonSequential, 0, false);
+            src = src.wrapping_add(1);
             if (flag & 0x80) != 0 {
                 let len = ((flag & 0x7F) as usize) + 3;
-                let data = self.read_8(src, AccessType::Sequential, 0, false);
-                src += 1;
+                let data = self.read_8(src, AccessType::NonSequential, 0, false);
+                src = src.wrapping_add(1);
                 for _ in 0..len {
                     if written >= decomp_len {
                         break;
@@ -1743,8 +2034,8 @@ impl SysBus {
                     if written >= decomp_len {
                         break;
                     }
-                    let data = self.read_8(src, AccessType::Sequential, 0, false);
-                    src += 1;
+                    let data = self.read_8(src, AccessType::NonSequential, 0, false);
+                    src = src.wrapping_add(1);
                     self.emit_decomp_byte(&mut dst, &mut written, &mut half_buf, is_16bit, data);
                 }
             }
@@ -1752,43 +2043,67 @@ impl SysBus {
     }
 
     fn hle_huff_uncomp(&mut self, src: u32, mut dst: u32) {
-        let header = self.read_32(src, AccessType::Sequential, 0);
+        let header = self.read_32(src, AccessType::NonSequential, 0);
         let bit_depth = header & 0x0F;
         if bit_depth != 4 && bit_depth != 8 {
             return;
         }
-        let decomp_len = (header >> 8) as usize;
-        let tree_size = ((self.read_8(src + 4, AccessType::Sequential, 0, false) as u32) + 1) * 2;
-        let tree_base = src + 4;
-        let mut data_ptr = src + 4 + tree_size;
+        let decomp_len = ((header >> 8) as usize).min(0x10_0000);
+        let tree_base = src.wrapping_add(4);
+        let tree_size =
+            ((self.read_8(tree_base, AccessType::NonSequential, 0, false) as u32) + 1) * 2;
+        if !(2..=512).contains(&tree_size) {
+            return;
+        }
+        let mut data_ptr = tree_base.wrapping_add(tree_size);
 
         let mut written = 0usize;
         let mut out_word = 0u32;
         let mut out_bits = 0u32;
         let mut node_off = 1u32;
+        let sym_mask = if bit_depth == 4 { 0x0Fu32 } else { 0xFFu32 };
+        let max_words = decomp_len.saturating_mul(2).saturating_add(1024);
+        let mut words_read = 0usize;
 
-        while written < decomp_len {
-            let word = self.read_32(data_ptr, AccessType::Sequential, 0);
-            data_ptr += 4;
+        while written < decomp_len && words_read < max_words {
+            let word = self.read_32(data_ptr, AccessType::NonSequential, 0);
+            data_ptr = data_ptr.wrapping_add(4);
+            words_read += 1;
             for shift in (0..32).rev() {
                 if written >= decomp_len {
                     break;
                 }
+                if node_off >= tree_size {
+                    return;
+                }
                 let bit = (word >> shift) & 1;
-                let node_val = self.read_8(tree_base + node_off, AccessType::Sequential, 0, false);
+                let node_val = self.read_8(
+                    tree_base.wrapping_add(node_off),
+                    AccessType::NonSequential,
+                    0,
+                    false,
+                );
                 let is_leaf = if bit == 0 {
                     (node_val & 0x80) != 0
                 } else {
                     (node_val & 0x40) != 0
                 };
                 let next_off = ((node_off & !1) + ((node_val as u32 & 0x3F) + 1) * 2) + bit;
+                if next_off >= tree_size {
+                    return;
+                }
                 if is_leaf {
-                    let sym = self.read_8(tree_base + next_off, AccessType::Sequential, 0, false);
-                    out_word |= (sym as u32) << out_bits;
+                    let sym = self.read_8(
+                        tree_base.wrapping_add(next_off),
+                        AccessType::NonSequential,
+                        0,
+                        false,
+                    );
+                    out_word |= ((sym as u32) & sym_mask) << out_bits;
                     out_bits += bit_depth;
                     if out_bits == 32 {
-                        self.write_32(dst, out_word, AccessType::Sequential);
-                        dst += 4;
+                        self.write_32(dst, out_word, AccessType::NonSequential);
+                        dst = dst.wrapping_add(4);
                         out_word = 0;
                         out_bits = 0;
                         written += 4;
@@ -1802,38 +2117,38 @@ impl SysBus {
     }
 
     fn hle_diff_unfilter(&mut self, mut src: u32, mut dst: u32, mode: u8) {
-        let header = self.read_32(src, AccessType::Sequential, 0);
-        src += 4;
-        let len = (header >> 8) as usize;
+        let header = self.read_32(src, AccessType::NonSequential, 0);
+        src = src.wrapping_add(4);
+        let len = ((header >> 8) as usize).min(0x10_0000);
         let is_16bit_data = mode == 0x18;
         let is_vram = mode == 0x17;
 
         if is_16bit_data {
             let mut acc = 0u16;
             for _ in (0..len).step_by(2) {
-                let d = self.read_16(src, AccessType::Sequential, 0, false);
-                src += 2;
+                let d = self.read_16(src, AccessType::NonSequential, 0, false);
+                src = src.wrapping_add(2);
                 acc = acc.wrapping_add(d);
-                self.write_16(dst, acc, AccessType::Sequential);
-                dst += 2;
+                self.write_16(dst, acc, AccessType::NonSequential);
+                dst = dst.wrapping_add(2);
             }
         } else {
             let mut acc = 0u8;
             let mut half = 0u16;
             for i in 0..len {
-                let d = self.read_8(src, AccessType::Sequential, 0, false);
-                src += 1;
+                let d = self.read_8(src, AccessType::NonSequential, 0, false);
+                src = src.wrapping_add(1);
                 acc = acc.wrapping_add(d);
                 if is_vram {
                     if (i & 1) == 0 {
                         half = acc as u16;
                     } else {
-                        self.write_16(dst, half | ((acc as u16) << 8), AccessType::Sequential);
-                        dst += 2;
+                        self.write_16(dst, half | ((acc as u16) << 8), AccessType::NonSequential);
+                        dst = dst.wrapping_add(2);
                     }
                 } else {
-                    self.write_8(dst, acc, AccessType::Sequential);
-                    dst += 1;
+                    self.write_8(dst, acc, AccessType::NonSequential);
+                    dst = dst.wrapping_add(1);
                 }
             }
         }
@@ -1841,13 +2156,17 @@ impl SysBus {
 }
 
 fn hle_arctan(i: i32) -> i32 {
-    // Polynomial minimax approximation accurate across Q1.14 range [-16384..16384] -> [-0x2000..0x2000]
-    let a = -((i * i) >> 14);
-    let mut b = ((109 * a) >> 14) - 574;
-    b = ((b * a) >> 14) + 1707;
-    b = ((b * a) >> 14) - 3476;
-    b = ((b * a) >> 14) + 10430;
-    (b * i) >> 14
+    // Authentic GBA BIOS SWI 0x09 polynomial in i64 arithmetic (avoids i16::MIN overflow).
+    let i64_val = i as i64;
+    let a = -((i64_val * i64_val) >> 14);
+    let mut b = ((a * 0x00A9) >> 14) + 0x0390;
+    b = ((a * b) >> 14) + 0x091C;
+    b = ((a * b) >> 14) + 0x0FB6;
+    b = ((a * b) >> 14) + 0x16AA;
+    b = ((a * b) >> 14) + 0x2081;
+    b = ((a * b) >> 14) + 0x3651;
+    b = ((a * b) >> 14) + 0xA2F9;
+    ((i64_val * b) >> 16) as i32
 }
 
 fn hle_arctan2(x: i32, y: i32) -> u16 {

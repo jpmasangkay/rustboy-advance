@@ -2,9 +2,13 @@
 set -euo pipefail
 
 FORCE=0
-if [[ "${1:-}" == "--force" || "${1:-}" == "-f" ]]; then
-  FORCE=1
-fi
+ROMS_ONLY=0
+for arg in "$@"; do
+  case "$arg" in
+    --force|-f) FORCE=1 ;;
+    --roms-only) ROMS_ONLY=1 ;;
+  esac
+done
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
@@ -26,7 +30,7 @@ download_file() {
   echo "  [fetch]  $url -> $dest"
   local tmp="${dest}.tmp"
   rm -f "$tmp"
-  curl -fsSL --retry 3 --retry-delay 2 --max-time 60 -o "$tmp" "$url"
+  curl -fsSL --retry 3 --retry-delay 2 --connect-timeout 15 --max-time 180 -o "$tmp" "$url"
   if [[ ! -s "$tmp" ]]; then
     echo "Error: downloaded empty file from $url" >&2
     rm -f "$tmp"
@@ -73,16 +77,11 @@ for f in \
   haltcnt/haltcnt.gba \
   irq/irq-delay/irq-delay.gba \
   ppu/bgpd/bgpd.gba \
-  ppu/bgpd/expected.png \
   ppu/bgx/bgx.gba \
-  ppu/bgx/expected.png \
   ppu/dispcnt-latch/dispcnt-latch.gba \
-  ppu/dispcnt-latch/expected.png \
   ppu/greenswap/greenswap.gba \
-  ppu/greenswap/expected.png \
   ppu/ram-access-timing/ram-access-timing.gba \
   ppu/sprite-hmosaic/sprite-hmosaic.gba \
-  ppu/sprite-hmosaic/expected.png \
   ppu/status-irq-dma/status-irq-dma.gba \
   ppu/vram-mirror/vram-mirror.gba \
   timer/reload/reload.gba \
@@ -90,10 +89,31 @@ for f in \
   timer/tick-before-reload/tick-before-reload.gba; do
   download_file "$NBA_BASE/$f" "$OUT_ROOT/nba-hw-test/$f"
 done
+if [[ "$ROMS_ONLY" -eq 0 ]]; then
+  for f in \
+    ppu/bgpd/expected.png \
+    ppu/bgx/expected.png \
+    ppu/dispcnt-latch/expected.png \
+    ppu/greenswap/expected.png \
+    ppu/sprite-hmosaic/expected.png; do
+    download_file "$NBA_BASE/$f" "$OUT_ROOT/nba-hw-test/$f"
+  done
+fi
 
 echo "==> Fetching Tonc prebuilt demos (tonc-bin.zip, Copyright (c) Jasper Vijn / cearn, MIT License)"
 TONC_DIR="$OUT_ROOT/tonc"
-if [[ "$FORCE" -eq 1 || ! -s "$TONC_DIR/win_demo.gba" ]]; then
+TONC_REQUIRED=(
+  bm_modes.gba mos_demo.gba win_demo.gba bld_demo.gba obj_aff.gba obj_demo.gba
+  m7_demo.gba prio_demo.gba tte_demo.gba irq_demo.gba tmr_demo.gba dma_demo.gba
+)
+TONC_MISSING=0
+for rom in "${TONC_REQUIRED[@]}"; do
+  if [[ ! -s "$TONC_DIR/$rom" ]]; then
+    TONC_MISSING=1
+    break
+  fi
+done
+if [[ "$FORCE" -eq 1 || "$TONC_MISSING" -eq 1 ]]; then
   mkdir -p "$TONC_DIR"
   TONC_ZIP="$OUT_ROOT/tonc-bin.zip"
   download_file "https://www.coranac.com/files/tonc-bin.zip" "$TONC_ZIP"
@@ -113,7 +133,39 @@ PY
   fi
   rm -f "$TONC_ZIP"
 else
-  echo "  [cached] $TONC_DIR"
+  echo "  [cached] $TONC_DIR (all ${#TONC_REQUIRED[@]} manifest ROMs present)"
+fi
+
+CHECKSUM_FILE="$SCRIPT_DIR/test-roms.sha256"
+if [[ -f "$CHECKSUM_FILE" ]]; then
+  echo "==> Verifying SHA-256 checksums ($CHECKSUM_FILE)"
+  if command -v sha256sum >/dev/null 2>&1; then
+    SHA_CMD=(sha256sum)
+  elif command -v shasum >/dev/null 2>&1; then
+    SHA_CMD=(shasum -a 256)
+  else
+    echo "Error: neither sha256sum nor shasum found to verify ROM checksums" >&2
+    exit 1
+  fi
+  VERIFIED=0
+  while read -r expected relpath; do
+    [[ -z "$expected" || "$expected" == \#* ]] && continue
+    if [[ "$ROMS_ONLY" -eq 1 && "$relpath" == *.png ]]; then
+      continue
+    fi
+    target="$OUT_ROOT/$relpath"
+    if [[ ! -f "$target" ]]; then
+      echo "Error: missing expected file $target" >&2
+      exit 1
+    fi
+    actual="$("${SHA_CMD[@]}" "$target" | awk '{print $1}')"
+    if [[ "$actual" != "$expected" ]]; then
+      echo "Error: SHA-256 mismatch for $relpath (expected $expected, got $actual)" >&2
+      exit 1
+    fi
+    VERIFIED=$((VERIFIED + 1))
+  done < "$CHECKSUM_FILE"
+  echo "  Verified $VERIFIED files against SHA-256 manifest."
 fi
 
 echo ""

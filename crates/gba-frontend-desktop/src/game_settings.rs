@@ -162,7 +162,7 @@ impl RustboyApp {
             core.bus.ppu.dot_accurate_mode = self.config.dot_accurate_ppu;
             core.bus.ppu.layer_enable_mask = self.config.layer_mask;
             core.bus.apu.channel_enable_mask = self.config.audio_channel_mask;
-            core.bus.apu.master_volume_pct = self.config.master_volume;
+            core.bus.apu.master_volume_pct = 100;
 
             let save_ov = ov.save_override.and_then(SaveOverrideChoice::to_core);
             core.bus.set_save_type_override(save_ov);
@@ -175,7 +175,9 @@ impl RustboyApp {
             core.bus.cart.tilt_enabled = ov.tilt_enabled.unwrap_or(hw.tilt_enabled);
             core.bus.cart.gyro_enabled = ov.gyro_enabled.unwrap_or(hw.gyro_enabled);
         }
+        self.sink.audio.set_master_volume(self.config.master_volume);
         self.active_cheats = ov.cheats;
+        self.recompile_active_cheats();
         self.sink.frame_dirty = true;
     }
 
@@ -566,14 +568,23 @@ impl RustboyApp {
                                             if let Some(mut lux) = ov.solar_lux {
                                                 let lvl = ((f32::from(lux) / 255.0) * 10.0).round()
                                                     as u8;
-                                                if ui
-                                                    .add(
-                                                        egui::Slider::new(&mut lux, 0..=255)
-                                                            .text(format!("Lv {lvl}/10")),
-                                                    )
-                                                    .changed()
-                                                {
+                                                let slider = ui.add(
+                                                    egui::Slider::new(&mut lux, 0..=255)
+                                                        .text(format!("Lv {lvl}/10")),
+                                                );
+                                                if slider.changed() {
                                                     ov.solar_lux = Some(lux);
+                                                    save_game_settings_entry_in_memory(
+                                                        &mut self.config,
+                                                        &target.code,
+                                                        target.crc32,
+                                                        ov.clone(),
+                                                    );
+                                                    if is_active_rom {
+                                                        self.apply_active_game_settings_to_core();
+                                                    }
+                                                }
+                                                if slider.drag_stopped() || slider.lost_focus() {
                                                     changed = true;
                                                 }
                                             } else {

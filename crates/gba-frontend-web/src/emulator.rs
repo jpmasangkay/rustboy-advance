@@ -26,6 +26,7 @@ pub struct WebFrontend {
     pub keyinput: u16,
     color_profile: ColorProfile,
     lcd_ghosting: bool,
+    skip_rgba: bool,
 }
 
 impl WebFrontend {
@@ -38,6 +39,7 @@ impl WebFrontend {
             keyinput: 0x03FF,
             color_profile: ColorProfile::Linear,
             lcd_ghosting: false,
+            skip_rgba: false,
         }
     }
 
@@ -68,10 +70,12 @@ impl WebFrontend {
 
     /// Enables or disables LCD frame persistence blending.
     pub fn set_lcd_ghosting(&mut self, enabled: bool) {
-        self.lcd_ghosting = enabled;
-        if !enabled {
+        if enabled && !self.lcd_ghosting {
+            // Seed history from the current displayed frame so enabling ghosting
+            // mid-game does not flash/blend against stale or black pixels.
             self.prev_rgba.copy_from_slice(&self.rgba_frame);
         }
+        self.lcd_ghosting = enabled;
     }
 
     /// Clears pending audio samples and resets frame buffers to transparent black.
@@ -90,6 +94,9 @@ impl Default for WebFrontend {
 
 impl HostFrontend for WebFrontend {
     fn present_frame(&mut self, fb: &[u16; LCD_WIDTH * LCD_HEIGHT]) {
+        if self.skip_rgba {
+            return;
+        }
         let lut = self.color_profile.lut();
         if self.lcd_ghosting {
             for (idx, &px) in fb.iter().enumerate() {
@@ -168,6 +175,21 @@ pub fn validate_rom(bytes: &[u8]) -> Result<(), String> {
             "This looks like a ZIP archive. Please extract the .gba ROM file first.",
         ));
     }
+    if bytes.starts_with(b"7z\xBC\xAF\x27\x1C") {
+        return Err(String::from(
+            "This looks like a 7-Zip archive. Please extract the .gba ROM file first.",
+        ));
+    }
+    if bytes.starts_with(b"Rar!\x1A\x07") {
+        return Err(String::from(
+            "This looks like a RAR archive. Please extract the .gba ROM file first.",
+        ));
+    }
+    if bytes.starts_with(&[0x1F, 0x8B]) {
+        return Err(String::from(
+            "This looks like a GZIP archive. Please extract the .gba ROM file first.",
+        ));
+    }
     if bytes.starts_with(b"\x89PNG\r\n\x1a\n") {
         return Err(String::from(
             "This is a PNG image, not a Game Boy Advance ROM.",
@@ -181,15 +203,33 @@ pub fn validate_rom(bytes: &[u8]) -> Result<(), String> {
     if bytes.starts_with(b"%PDF-") {
         return Err(String::from("This is a PDF document, not a GBA ROM."));
     }
+    // Detect classic Game Boy / Game Boy Color ROMs via the Nintendo logo at 0x104..0x10C
+    // (when the GBA fixed header byte 0xB2 != 0x96).
+    const GB_NINTENDO_LOGO_HEAD: [u8; 8] = [0xCE, 0xED, 0x66, 0x66, 0xCC, 0x0D, 0x00, 0x0B];
+    if bytes.len() >= 0x150 && bytes[0xB2] != 0x96 && bytes[0x104..0x10C] == GB_NINTENDO_LOGO_HEAD {
+        return Err(String::from(
+            "This is a Game Boy / Game Boy Color (.gb/.gbc) ROM. The web frontend currently runs Game Boy Advance (.gba) ROMs only.",
+        ));
+    }
     Ok(())
 }
 
-/// Validates a GBA BIOS dump (must be exactly 16 KiB).
+/// Validates a GBA BIOS dump (must be exactly 16 KiB and start with an ARM reset vector).
 pub fn validate_bios(bytes: &[u8]) -> Result<(), String> {
     if bytes.len() != BIOS_BYTES {
         return Err(alloc::format!(
             "Invalid GBA BIOS: expected exactly {BIOS_BYTES} bytes (16 KiB), got {} bytes.",
             bytes.len()
+        ));
+    }
+    let reset_word = u32::from_le_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]);
+    // Authentic GBA BIOS & open-source replacements start with an unconditional ARM branch
+    // (`0xEAxxxxxx`) or PC load (`0xE59FFxxx`) at vector 0x0000_0000.
+    let valid_entry =
+        (reset_word & 0xFF00_0000) == 0xEA00_0000 || (reset_word & 0xFFFF_F000) == 0xE59F_F000;
+    if !valid_entry {
+        return Err(alloc::format!(
+            "Invalid GBA BIOS: reset vector 0x{reset_word:08X} is not a valid ARM branch instruction."
         ));
     }
     Ok(())
@@ -220,12 +260,17 @@ impl WebEmulator {
         }
     }
 
-    /// Loads a `.gba` ROM image and boots a fresh [`GbaCore`].
+    /// Loads a `.gba` ROM image slice and boots a fresh [`GbaCore`].
     pub fn load_rom(&mut self, bytes: &[u8]) -> Result<(), String> {
-        validate_rom(bytes)?;
-        let crc = crc32(bytes);
+        self.load_rom_owned(bytes.to_vec())
+    }
+
+    /// Loads an owned `.gba` ROM buffer without copying up to 32 MiB a second time.
+    pub fn load_rom_owned(&mut self, bytes: Vec<u8>) -> Result<(), String> {
+        validate_rom(&bytes)?;
         let rom_len = bytes.len();
-        let mut core = GbaCore::new(self.bios.as_deref(), bytes.to_vec());
+        let mut core = GbaCore::new(self.bios.as_deref(), bytes);
+        let crc = core.rom_crc32();
         core.bus.apu.master_volume_pct = self.volume_pct;
         self.frontend.clear_buffers();
         self.frontend.present_frame(&core.bus.ppu.framebuffer);
@@ -240,7 +285,9 @@ impl WebEmulator {
         validate_bios(bytes)?;
         let owned = bytes.to_vec();
         if let Some(core) = &mut self.core {
+            let was_dirty = core.bus.cart.save_dirty;
             core.load_bios(Some(&owned));
+            core.bus.cart.save_dirty |= was_dirty;
             core.bus.apu.master_volume_pct = self.volume_pct;
             self.frontend.clear_buffers();
             self.frontend.present_frame(&core.bus.ppu.framebuffer);
@@ -253,7 +300,9 @@ impl WebEmulator {
     pub fn clear_bios(&mut self) {
         self.bios = None;
         if let Some(core) = &mut self.core {
+            let was_dirty = core.bus.cart.save_dirty;
             core.load_bios(None);
+            core.bus.cart.save_dirty |= was_dirty;
             core.bus.apu.master_volume_pct = self.volume_pct;
             self.frontend.clear_buffers();
             self.frontend.present_frame(&core.bus.ppu.framebuffer);
@@ -265,8 +314,32 @@ impl WebEmulator {
         let Some(core) = &mut self.core else {
             return false;
         };
+        core.bus.ppu.skip_rendering = false;
+        self.frontend.skip_rgba = false;
         self.frontend.step_frame(core);
         true
+    }
+
+    /// Steps `count` GBA frames, skipping intermediate PPU pixel rendering and RGBA LUT
+    /// conversion when running multiple frames in fast-forward (unless LCD ghosting is on).
+    pub fn step_frames(&mut self, count: u32) -> u32 {
+        let Some(core) = &mut self.core else {
+            return 0;
+        };
+        if count == 0 {
+            return 0;
+        }
+        let allow_skip = !self.frontend.lcd_ghosting();
+        for i in 0..count {
+            let is_last = i + 1 == count;
+            let skip = allow_skip && !is_last;
+            core.bus.ppu.skip_rendering = skip;
+            self.frontend.skip_rgba = skip;
+            self.frontend.step_frame(core);
+        }
+        core.bus.ppu.skip_rendering = false;
+        self.frontend.skip_rgba = false;
+        count
     }
 
     /// Performs a hard reset while keeping the loaded ROM, BIOS, and battery save.
@@ -274,7 +347,9 @@ impl WebEmulator {
         let Some(core) = &mut self.core else {
             return false;
         };
+        let was_dirty = core.bus.cart.save_dirty;
         core.reset();
+        core.bus.cart.save_dirty |= was_dirty;
         core.bus.apu.master_volume_pct = self.volume_pct;
         self.frontend.clear_buffers();
         self.frontend.present_frame(&core.bus.ppu.framebuffer);
@@ -388,8 +463,12 @@ impl WebEmulator {
             .core
             .as_mut()
             .ok_or_else(|| String::from("Load a ROM before loading a save state."))?;
+        let was_dirty = core.bus.cart.save_dirty;
+        let prev_save = core.bus.cart.export_save_data().to_vec();
         core.load_state(bytes)
             .map_err(|e| alloc::format!("Invalid or incompatible save state: {e}"))?;
+        let save_changed = core.bus.cart.export_save_data() != prev_save.as_slice();
+        core.bus.cart.save_dirty |= was_dirty || save_changed;
         core.bus.apu.master_volume_pct = self.volume_pct;
         self.frontend.audio_samples.clear();
         self.frontend.present_frame(&core.bus.ppu.framebuffer);
@@ -412,6 +491,21 @@ impl WebEmulator {
             .ok_or_else(|| String::from("Load a ROM before importing a save file."))?;
         if bytes.is_empty() {
             return Err(String::from("Save file is empty."));
+        }
+        // If the ROM did not expose a standard Nintendo save magic string, infer a matching
+        // backup save type from the imported `.sav` file size so saves still work.
+        if core.bus.cart.effective_save_type() == SaveType::None {
+            let inferred = match bytes.len() {
+                512 => Some(SaveType::Eeprom512B),
+                8_192 => Some(SaveType::Eeprom8K),
+                32_768 => Some(SaveType::Sram32K),
+                65_536 => Some(SaveType::Flash64K),
+                131_072 => Some(SaveType::Flash128K),
+                _ => None,
+            };
+            if let Some(st) = inferred {
+                core.bus.cart.set_save_type_override(Some(st));
+            }
         }
         core.bus.cart.load_save_data(bytes);
         Ok(())

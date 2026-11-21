@@ -2,15 +2,19 @@
 
 **Cycle-Aware Game Boy Advance & Game Boy Emulator — Rust `no_std` Core, Desktop (`eframe`/`wgpu`), WebAssembly & Libretro**
 
-> **Accuracy Status:** `gba-core` uses **cycle-aware** CPU, pipeline, prefetch/waitstate, DMA, and timer scheduling alongside a built-in High-Level Emulation (HLE) BIOS and optional real 16 KB GBA BIOS support. It is **not** claimed to be 100% cycle-accurate; see [`docs/TEST_RESULTS.md`](docs/TEST_RESULTS.md) for current automated pass/fail counts and [`docs/COMPATIBILITY.md`](docs/COMPATIBILITY.md) for commercial database coverage and real-BIOS recommendations.
+> **Accuracy Status:** `gba-core` uses **cycle-aware** CPU, pipeline, prefetch/waitstate, DMA, and timer scheduling alongside a built-in High-Level Emulation (HLE) BIOS and optional real 16 KB GBA BIOS support. It is **not** claimed to be 100% cycle-accurate; see [`TEST_RESULTS.md`](TEST_RESULTS.md) (mirrored in [`docs/TEST_RESULTS.md`](docs/TEST_RESULTS.md)) for current automated pass/fail counts and [`docs/COMPATIBILITY.md`](docs/COMPATIBILITY.md) for commercial database coverage and real-BIOS recommendations.
 
-[![Rust](https://img.shields.io/badge/Rust-1.85+-DEA584?style=flat-square&logo=rust&logoColor=white)](https://www.rust-lang.org)
+[![Rust](https://img.shields.io/badge/Rust-1.95+-DEA584?style=flat-square&logo=rust&logoColor=white)](https://www.rust-lang.org)
 [![Edition](https://img.shields.io/badge/Edition-2024-blue?style=flat-square)](https://www.rust-lang.org)
+[![WebAssembly](https://img.shields.io/badge/WebAssembly-WASM-654FF0?style=flat-square&logo=webassembly&logoColor=white)](https://webassembly.org)
+[![egui](https://img.shields.io/badge/egui-0.31-4183C4?style=flat-square)](https://github.com/emilk/egui)
+[![winit](https://img.shields.io/badge/winit-0.30-333333?style=flat-square)](https://github.com/rust-windowing/winit)
+[![wgpu](https://img.shields.io/badge/wgpu-24.0-4E8EE9?style=flat-square)](https://wgpu.rs)
 [![License: MPL-2.0](https://img.shields.io/badge/License-MPL--2.0-yellow.svg?style=flat-square)](LICENSE)
 
 - **Source Repository:** <https://github.com/jpmasangkay/rustboy-advance>
 - **Release Tag:** `v0.1.0`
-- **Test Results:** [`docs/TEST_RESULTS.md`](docs/TEST_RESULTS.md)
+- **Test Results:** [`TEST_RESULTS.md`](TEST_RESULTS.md) / [`docs/TEST_RESULTS.md`](docs/TEST_RESULTS.md)
 - **Compatibility Database:** [`docs/COMPATIBILITY.md`](docs/COMPATIBILITY.md)
 - **Changelog:** [`CHANGELOG.md`](CHANGELOG.md)
 - **Third-Party Notices:** [`THIRD-PARTY-NOTICES.md`](THIRD-PARTY-NOTICES.md)
@@ -36,8 +40,8 @@ Captured directly from the headless release renderer using freely-redistributabl
 - **Game Boy / Game Boy Color (`gb-core`)** — `#![no_std]` + `alloc` SM83 CPU, MBC1/2/3(+RTC)/5(+rumble), PPU with STAT blocking, HDMA, and 48 kHz APU.
 
 ### PPU, Shaders & Display Filters
-- **All GBA video modes** — Mode 0, 1, 2 (text & affine backgrounds), Mode 3, 4, 5 (bitmap modes with page flipping and VRAM unmapped mirroring), 128 sprites (affine transforms, mosaic, double-size, semi-transparency), alpha blending, brightness fades, Windows (`WIN0`, `WIN1`, `WINOBJ`), and `GREENSWAP` (partial; see Known Issues).
-- **Desktop Display Filters** (`View -> Filter` and CLI `--filter <slug>`):
+- **All GBA video modes** — Mode 0, 1, 2 (text & affine backgrounds), Mode 3, 4, 5 (bitmap modes with page flipping and VRAM unmapped mirroring), 128 sprites (affine transforms, mosaic, double-size, semi-transparency), alpha blending, brightness fades, Windows (`WIN0`, `WIN1`, `WINOBJ`), and `GREENSWAP`.
+- **Desktop Display Filters** (`Screen & Sound -> Screen -> Sharpness & Look` and CLI `--filter <slug>`):
 
 | UI Name | `--filter` CLI Slug | Scaling / Behavior |
 | :--- | :--- | :--- |
@@ -49,9 +53,9 @@ Captured directly from the headless release renderer using freely-redistributabl
 | `Scale2x` | `scale2x` | 2x EPX / Scale2x smoothing |
 | `CRT Scanlines` | `crt-scanlines` | 2x scanline gaps |
 
-- **GPU WGSL Shader Presets (`wgpu`)**: `Nearest (Pixel Perfect)`, `Sharp Bilinear (Anti-Shimmer)`, `GBA LCD Grid (RGB Subpixels)`, `CRT Scanlines & Curvature`, and `ScaleEdge (Edge Smoothing)`.
+- **GPU WGSL Shader Presets (`wgpu`)**: `Nearest`, `SharpBilinear`, `LcdGrid`, `CrtScanlines`, and `ScaleEdge`.
 - **Color Profiles**: `AGB-001`, `AGS-101`, `AGS-001`, and `Linear`.
-- **Startup Probe & `--no-gpu` Fallback**: Child-process GPU startup probe guards `Vulkan -> DX12 -> GL` initialization, automatically switching to `winit + softbuffer` (`--no-gpu`) if GPU initialization fails or hangs, with adaptive `QualityGovernor` (`<= 720x480` intermediate cap + Win32 `StretchDIBits` on Windows).
+- **Startup Probe & `--no-gpu` Fallback**: Child-process GPU startup probe guards `Metal` / `Vulkan -> DX12 -> GL` initialization, automatically switching to `winit + softbuffer` (`--no-gpu`) if GPU initialization fails or hangs, with adaptive `QualityGovernor` (`<= 720x480` intermediate cap, auto-frameskip fallback, and Win32 `StretchDIBits` on Windows).
 
 ### APU & Audio
 - **6-channel synthesizer** — bandlimited Blip-buffer square/wave channels, noise channel, Direct Sound A/B DMA FIFOs, 16 Hz DC blocker, 8-tap Blackman-sinc resampler, `cpal` real-time output, and optional `60 Hz` dynamic rate control (DRC) cadence lock.
@@ -69,26 +73,24 @@ Captured directly from the headless release renderer using freely-redistributabl
 - **TAS Input Movies (`.rbm`)** — `RBMV` v1 binary movie recording and deterministic replay (`rerecord` tracking, initial state embedding).
 - **Cheats Engine** — supports **CodeBreaker**, **GameShark / Action Replay v1**, and **Action Replay v3** codes.
 - **Lua 5.4 Scripting (`piccolo`)** — sandboxed pure-Rust Lua VM with per-step instruction fuel limits, side-effect-safe memory read/write hooks, joypad injection, and `gui.*` native `240x160` overlays.
-- **Debugger & GDB Remote Serial Protocol** — live ARM/Thumb disassembler, breakpoints, callstack tracker, IO register decoder, memory search/freeze, and integrated **GDB RSP server** (default `localhost:2345`, started from the Debugger window — not via a CLI flag).
+- **Debugger & GDB Remote Serial Protocol** — live ARM/Thumb disassembler, breakpoints, callstack tracker, IO register decoder, memory search/freeze, and integrated **GDB RSP server** (default `localhost:2345`, enabled via **Settings -> Developer Tools**).
 - **Link Cable & TCP Netplay** — local 2-player split-screen or peer-to-peer TCP socket link cable (default port `27888`; SIO Normal 8-bit, Normal 32-bit, and Multiplayer modes).
-- **Libretro Core (`gba-libretro`)** — `libretro.h` v1 C ABI shared library (`gba_libretro.dll` / `libgba_libretro.so` / `libgba_libretro.dylib`).
+- **Libretro Core (`gba-libretro`)** — `libretro.h` v1 C ABI shared library (`rustboy_advance_libretro.dll` / `librustboy_advance_libretro.so` / `librustboy_advance_libretro.dylib`).
 - **WebAssembly Frontend (`gba-frontend-web` + `web/`)** — browser build using Canvas / WebGL rendering and AudioWorklet audio output.
 
 ---
 
 ## Accuracy, Test Suites & Known Issues
 
-Automated accuracy checks run via `gba-testrunner` (comparing framebuffer CRC32 / pass registers) and `gb-core` unit/harness tests. See [`docs/TEST_RESULTS.md`](docs/TEST_RESULTS.md) for full details.
+Automated accuracy checks run via `gba-testrunner` (comparing framebuffer CRC32 / pass registers) and `gb-core` unit/harness tests. See [`TEST_RESULTS.md`](TEST_RESULTS.md) (and [`docs/TEST_RESULTS.md`](docs/TEST_RESULTS.md)) for full details.
 
 | Runner | Command | Observed Result |
 | :--- | :--- | :--- |
-| **`gba-testrunner`** | `cargo run -p gba-testrunner -- --allow-failures --report docs/TEST_RESULTS.md` | **43 passed, 9 failed, 2 skipped (missing ROM), 2 skipped (missing golden)** (`56` entries) |
-| **`gb-core`** | `cargo test -p gb-core` | **13 passed, 0 failed** (unit tests + optional `test-roms/gb/mooneye/` runner) |
+| **`gba-testrunner`** | `cargo run --release -p gba-testrunner -- --report TEST_RESULTS.md --fail-on-unexpected` | **58 passed, 0 failed, 2 skipped (missing ROM), 2 skipped (missing golden)** (`62` entries) |
+| **`gb-core`** | `cargo test -p gb-core` | **14 passed, 0 failed** (unit tests + optional `test-roms/gb/mooneye/` runner) |
 
 ### Known Issues
-- **GBA Hardware Edge-Case Failures (`9` failing `nba-hw-test` ROMs in [`docs/TEST_RESULTS.md`](docs/TEST_RESULTS.md)):**
-  - Bus, DMA & IRQ timing (`4`): `nba-hw-test/bus/128kb-boundary.gba`, `nba-hw-test/dma/burst-into-tears.gba`, `nba-hw-test/dma/force-nseq-access.gba`, and `nba-hw-test/irq/irq-delay.gba`.
-  - PPU mid-scanline latches, mosaic & `GREENSWAP` (`5`): `nba-hw-test/ppu/bgpd.gba`, `nba-hw-test/ppu/bgx.gba`, `nba-hw-test/ppu/dispcnt-latch.gba`, `nba-hw-test/ppu/greenswap.gba`, and `nba-hw-test/ppu/sprite-hmosaic.gba`.
+- **GBA Hardware Edge-Case Coverage:** All `58` runnable suites in `TEST_RESULTS.md` (`JSMolka`, `FuzzARM`, `ARMWrestler`, `nba-hw-test`, `Tonc`, and synthetic stress ROMs) currently pass cleanly. Remaining unverified `GREENSWAP` mid-scanline edge cases not yet covered by automated ROMs remain tracked for future hardware tests.
 - **Optional External Test Suites Not Redistributed in Repo:**
   - `mgba/suite.gba`, `ags/ags.gba`, and external `test-roms/gb/mooneye/` ROMs are skipped unless supplied locally (see [`scripts/README.md`](scripts/README.md)).
 - **HLE BIOS Timing & Open Bus:** Games checking exact BIOS ROM protected values, checksums, or `SoundDriver` SWI cycles (`REAL_BIOS_FALLBACK_GAMES` in [`docs/COMPATIBILITY.md`](docs/COMPATIBILITY.md)) should be run with a user-provided 16 KB GBA BIOS (`--bios`).
@@ -165,7 +167,7 @@ Verified numbers observed on an AMD Ryzen 9 8945HX laptop (`rustc 1.99.1`, relea
 | `gba-frontend-desktop` | Desktop GUI (`eframe`/`egui`/`wgpu`/`winit`+`softbuffer`/`cpal`/`gilrs`), Lua (`piccolo`), RetroAchievements (`keyring`), Netplay, `.rbm` TAS |
 | `gba-frontend-web` | WebAssembly bindings for `web/` (Canvas/WebGL + AudioWorklet) |
 | `gba-libretro` | Libretro v1 C ABI core (`gba_libretro.dll` / `.so` / `.dylib`) |
-| `gba-testrunner` | Automated headless test runner generating [`docs/TEST_RESULTS.md`](docs/TEST_RESULTS.md) |
+| `gba-testrunner` | Automated headless test runner generating [`TEST_RESULTS.md`](TEST_RESULTS.md) |
 
 ### CLI Usage & Headless Harness
 
@@ -178,6 +180,10 @@ rustboy-advance "path/to/game.gba" --portable --bios "path/to/gba_bios.bin"
 
 # Headless deterministic test run with CRC32 & screenshot dump
 rustboy-advance "path/to/rom.gba" --headless --frames 120 --fb-crc32 --screenshot frame.ppm
+
+# Force pure-CPU winit+softbuffer renderer (or retry GPU probing after a driver update)
+rustboy-advance --no-gpu "path/to/game.gba"
+rustboy-advance --retry-gpu
 
 # Self-contained performance & GPU/software-fallback benchmark
 rustboy-advance --selftest
@@ -193,8 +199,8 @@ rustboy-advance --version
 # Fetch freely-redistributable test suites locally (not committed to git)
 ./scripts/fetch-test-roms.sh    # Windows: .\scripts\fetch-test-roms.ps1
 
-# Run full automated suite and regenerate docs/TEST_RESULTS.md
-cargo run -p gba-testrunner -- --report docs/TEST_RESULTS.md --fail-on-unexpected
+# Run full automated suite and regenerate TEST_RESULTS.md
+cargo run --release -p gba-testrunner -- --report TEST_RESULTS.md --fail-on-unexpected
 ```
 
 ### Reproducible Clean Release Builds, Path Stripping & PGO
@@ -219,7 +225,16 @@ cargo run -p gba-testrunner -- --report docs/TEST_RESULTS.md --fail-on-unexpecte
 3. **Archive Hygiene & Checksums:**
    - Release archives publish `SHA256SUMS.txt` alongside binaries. On Windows, package archives with `tar.exe -a -cf` (not PowerShell `Compress-Archive`) so entries use forward slashes (`/`) for clean extraction on Linux and macOS.
 
-### WebAssembly Frontend
+### Libretro Core (RetroArch)
+
+```bash
+# Build the shared library (`librustboy_advance_libretro.{so,dylib}` / `rustboy_advance_libretro.dll`)
+cargo build --release -p gba-libretro
+```
+
+See [crates/gba-libretro/README.md](crates/gba-libretro/README.md) for RetroArch installation instructions and [`rustboy_advance_libretro.info`](crates/gba-libretro/rustboy_advance_libretro.info).
+
+### WebAssembly (WASM) Web Frontend
 
 ```bash
 cargo build --target wasm32-unknown-unknown --release -p gba-frontend-web
@@ -239,7 +254,32 @@ node web/server.js
 | `Start` / `Select` | `Enter` / `Backspace` | `N` / `M` |
 | Turbo `A` / Turbo `B` | `V` / `C` | — |
 
-Key shortcuts: `Ctrl+O` Open ROM, `Space` Pause, `Hold R` Rewind, `Hold Tab` Fast Forward, `F11` Fullscreen, `F1–F5` / `Shift+F1–F5` Save/Load State, `F6` State Manager, `F12` Screenshot, `[` / `]` Solar Sensor (`Boktai`). Gamepad inputs via `gilrs` are customizable under **Input Settings**.
+| **Boktai Solar Sensor (- / +)** | `[` / `]` |
+Game inputs and gamepad bindings (`gilrs`) are customizable under **Settings -> Controls** or **Help -> Controls Cheat-Sheet**.
+
+### Hotkeys & Shortcuts
+
+| Action | Shortcut |
+| :--- | :--- |
+| **Open ROM** | `Ctrl+O` (`Cmd+O` on macOS) |
+| **Return to Library** | `Ctrl+W` (`Cmd+W` on macOS) |
+| **Pause Overlay / Close Dialog / Exit Fullscreen** | `Esc` |
+| **Pause / Resume** | `Space` |
+| **Rewind Gameplay** | Hold `R` |
+| **Fast Forward (Turbo)** | Hold `Tab` |
+| **Toggle Fullscreen** | `F11` |
+| **Visual Save State Manager** | `F6` |
+| **Quick Save State (Slots 1–5)** | `F1`–`F5` |
+| **Quick Load State (Slots 1–5)** | `Shift+F1`–`Shift+F5` |
+| **Undo Last Save / Load Action** | `Ctrl+Z` (`Cmd+Z` on macOS) |
+| **Advance Single Frame** | `Ctrl+N` |
+| **Restart Game (Hard Reset)** | `Ctrl+R` |
+| **Mute / Unmute Audio** | `Ctrl+M` |
+| **Take Screenshot** | `F12` |
+| **Toggle Menu Bar** | `Ctrl+Shift+M` |
+| **Toggle Action Toolbar** | `Ctrl+T` |
+| **Toggle Status Bar** | `Ctrl+S` |
+| **Boktai Solar Sensor (- / +)** | `[` / `]` |
 
 ---
 

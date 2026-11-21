@@ -211,7 +211,8 @@ impl BlipBuf {
     /// Returns the maximum number of CPU cycles that can safely accumulate before draining.
     #[inline]
     pub fn max_chunk_cycles(&self) -> u64 {
-        let safe_samples = self.buf_l.len().saturating_sub(KERNEL_WIDTH + 4) as u64;
+        let used = (self.offset >> 32) as usize;
+        let safe_samples = self.buf_l.len().saturating_sub(KERNEL_WIDTH + 4 + used) as u64;
         ((safe_samples << 32) / self.factor.max(1)).max(1)
     }
 
@@ -234,7 +235,7 @@ impl BlipBuf {
             return;
         }
         let rel = cycle.saturating_sub(self.base_cycle);
-        let fixed = self.offset + rel * self.factor;
+        let fixed = self.offset.saturating_add(rel.saturating_mul(self.factor));
         let idx = (fixed >> 32) as usize;
         if idx + KERNEL_WIDTH > self.buf_l.len() {
             return;
@@ -248,37 +249,45 @@ impl BlipBuf {
         let t1 = &STEP_TABLE[phase + 1];
 
         if delta_l != 0 && delta_r != 0 {
+            let bl = &mut self.buf_l[idx..idx + KERNEL_WIDTH];
+            let br = &mut self.buf_r[idx..idx + KERNEL_WIDTH];
+            let dl = delta_l as i64;
+            let dr = delta_r as i64;
             let mut prev_l = 0i32;
             let mut prev_r = 0i32;
             for k in 0..(KERNEL_WIDTH - 1) {
-                let s = t0[k] + (((t1[k] - t0[k]) * frac) >> 8);
-                let cur_l = (delta_l * s) >> 4;
-                let cur_r = (delta_r * s) >> 4;
-                self.buf_l[idx + k] += cur_l - prev_l;
-                self.buf_r[idx + k] += cur_r - prev_r;
+                let s = (t0[k] + (((t1[k] - t0[k]) * frac) >> 8)) as i64;
+                let cur_l = ((dl * s) >> 4) as i32;
+                let cur_r = ((dr * s) >> 4) as i32;
+                bl[k] = bl[k].wrapping_add(cur_l - prev_l);
+                br[k] = br[k].wrapping_add(cur_r - prev_r);
                 prev_l = cur_l;
                 prev_r = cur_r;
             }
-            self.buf_l[idx + KERNEL_WIDTH - 1] += (delta_l << Q_SHIFT) - prev_l;
-            self.buf_r[idx + KERNEL_WIDTH - 1] += (delta_r << Q_SHIFT) - prev_r;
+            bl[KERNEL_WIDTH - 1] = bl[KERNEL_WIDTH - 1].wrapping_add((delta_l << Q_SHIFT) - prev_l);
+            br[KERNEL_WIDTH - 1] = br[KERNEL_WIDTH - 1].wrapping_add((delta_r << Q_SHIFT) - prev_r);
         } else if delta_l != 0 {
+            let bl = &mut self.buf_l[idx..idx + KERNEL_WIDTH];
+            let dl = delta_l as i64;
             let mut prev_l = 0i32;
             for k in 0..(KERNEL_WIDTH - 1) {
-                let s = t0[k] + (((t1[k] - t0[k]) * frac) >> 8);
-                let cur_l = (delta_l * s) >> 4;
-                self.buf_l[idx + k] += cur_l - prev_l;
+                let s = (t0[k] + (((t1[k] - t0[k]) * frac) >> 8)) as i64;
+                let cur_l = ((dl * s) >> 4) as i32;
+                bl[k] = bl[k].wrapping_add(cur_l - prev_l);
                 prev_l = cur_l;
             }
-            self.buf_l[idx + KERNEL_WIDTH - 1] += (delta_l << Q_SHIFT) - prev_l;
+            bl[KERNEL_WIDTH - 1] = bl[KERNEL_WIDTH - 1].wrapping_add((delta_l << Q_SHIFT) - prev_l);
         } else {
+            let br = &mut self.buf_r[idx..idx + KERNEL_WIDTH];
+            let dr = delta_r as i64;
             let mut prev_r = 0i32;
             for k in 0..(KERNEL_WIDTH - 1) {
-                let s = t0[k] + (((t1[k] - t0[k]) * frac) >> 8);
-                let cur_r = (delta_r * s) >> 4;
-                self.buf_r[idx + k] += cur_r - prev_r;
+                let s = (t0[k] + (((t1[k] - t0[k]) * frac) >> 8)) as i64;
+                let cur_r = ((dr * s) >> 4) as i32;
+                br[k] = br[k].wrapping_add(cur_r - prev_r);
                 prev_r = cur_r;
             }
-            self.buf_r[idx + KERNEL_WIDTH - 1] += (delta_r << Q_SHIFT) - prev_r;
+            br[KERNEL_WIDTH - 1] = br[KERNEL_WIDTH - 1].wrapping_add((delta_r << Q_SHIFT) - prev_r);
         }
     }
 

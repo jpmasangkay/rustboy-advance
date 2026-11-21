@@ -26,12 +26,18 @@ pub const FRAME_PIXELS: usize = LCD_WIDTH * LCD_HEIGHT;
 /// Lock-free triple buffer for 38,400-pixel frames.
 ///
 /// Guaranteed zero allocations per frame and zero Mutex contention on the rendering path.
+/// Uses an atomic reader-in-flight lock (`read_lock`) + packed `(slot, dirty)` state so concurrent
+/// callers on `&SharedTripleBuffer` can never alias a buffer slot or trigger UB.
 pub struct SharedTripleBuffer {
     buffers: [UnsafeCell<[u16; FRAME_PIXELS]>; 3],
     reading: AtomicUsize,
-    latest: AtomicUsize,
-    frame_dirty: AtomicBool,
+    latest_packed: AtomicUsize,
+    read_lock: AtomicBool,
+    write_lock: AtomicBool,
 }
+
+const SLOT_MASK: usize = 0b11;
+const DIRTY_BIT: usize = 0b100;
 
 unsafe impl Send for SharedTripleBuffer {}
 unsafe impl Sync for SharedTripleBuffer {}
@@ -45,8 +51,9 @@ impl SharedTripleBuffer {
                 UnsafeCell::new([0; FRAME_PIXELS]),
             ],
             reading: AtomicUsize::new(1),
-            latest: AtomicUsize::new(2),
-            frame_dirty: AtomicBool::new(false),
+            latest_packed: AtomicUsize::new(2), // slot 2, dirty = false
+            read_lock: AtomicBool::new(false),
+            write_lock: AtomicBool::new(false),
         }
     }
 
@@ -55,46 +62,88 @@ impl SharedTripleBuffer {
         0
     }
 
+    /// Safe producer write helper: copies `frame` into `written_slot` and publishes it,
+    /// returning the recycled slot for the next frame.
+    pub fn write_and_publish(&self, written_slot: usize, frame: &[u16; FRAME_PIXELS]) -> usize {
+        let slot = written_slot % 3;
+        while self
+            .write_lock
+            .compare_exchange_weak(false, true, Ordering::Acquire, Ordering::Relaxed)
+            .is_err()
+        {
+            std::hint::spin_loop();
+        }
+        // SAFETY: `write_lock` serializes producers, and the triple-buffer invariant guarantees
+        // `slot` is neither the consumer's `reading` slot nor the published `latest` slot.
+        unsafe {
+            (*self.buffers[slot].get()).copy_from_slice(frame);
+        }
+        let prev = self.latest_packed.swap(slot | DIRTY_BIT, Ordering::AcqRel);
+        self.write_lock.store(false, Ordering::Release);
+        prev & SLOT_MASK
+    }
+
     /// Mutable reference to a designated write slot.
     ///
     /// # Safety
-    /// Only the emulation worker thread accesses this write slot before publishing.
+    /// Only the single emulation worker thread may call this on its owned write slot
+    /// before calling `publish_frame`.
     #[allow(clippy::mut_from_ref)]
     pub unsafe fn write_buffer_mut(&self, slot: usize) -> &mut [u16; FRAME_PIXELS] {
-        unsafe { &mut *self.buffers[slot].get() }
+        debug_assert!(slot < 3);
+        unsafe { &mut *self.buffers[slot % 3].get() }
     }
 
     /// Marks the given slot as the latest published frame for the UI and returns
     /// the new unread buffer slot allocated for the writer.
     pub fn publish_frame(&self, written_slot: usize) -> usize {
-        let next_slot = self.latest.swap(written_slot, Ordering::AcqRel);
-        self.frame_dirty.store(true, Ordering::Release);
-        next_slot
+        let slot = written_slot % 3;
+        let prev = self.latest_packed.swap(slot | DIRTY_BIT, Ordering::AcqRel);
+        prev & SLOT_MASK
     }
 
     /// Checks if a new frame is pending for display.
     pub fn is_dirty(&self) -> bool {
-        self.frame_dirty.load(Ordering::Acquire)
+        (self.latest_packed.load(Ordering::Acquire) & DIRTY_BIT) != 0
     }
 
     /// Reads the latest frame without allocations or Mutex contention.
     ///
-    /// Atomically swaps the consumer's current read slot with the latest published
-    /// frame slot, ensuring writer and reader never access the same slot simultaneously.
+    /// Serializes concurrent readers via an atomic try/spin guard and swaps the consumer's
+    /// read slot with the latest published slot atomically, so writer and reader never alias.
     pub fn read_latest<R>(&self, reader: impl FnOnce(&[u16; FRAME_PIXELS]) -> R) -> Option<R> {
-        if !self.frame_dirty.swap(false, Ordering::AcqRel) {
+        while self
+            .read_lock
+            .compare_exchange_weak(false, true, Ordering::Acquire, Ordering::Relaxed)
+            .is_err()
+        {
+            std::hint::spin_loop();
+        }
+        struct ReadGuard<'a>(&'a AtomicBool);
+        impl Drop for ReadGuard<'_> {
+            fn drop(&mut self) {
+                self.0.store(false, Ordering::Release);
+            }
+        }
+        let _guard = ReadGuard(&self.read_lock);
+
+        let cur = self.latest_packed.load(Ordering::Acquire);
+        if (cur & DIRTY_BIT) == 0 {
             return None;
         }
         let old_read = self.reading.load(Ordering::Relaxed);
-        let new_read = self.latest.swap(old_read, Ordering::AcqRel);
+        let prev = self.latest_packed.swap(old_read, Ordering::AcqRel);
+        let new_read = prev & SLOT_MASK;
         self.reading.store(new_read, Ordering::Release);
+        // SAFETY: `new_read` is exclusively owned by this consumer while `_guard` is held,
+        // and the producer can only receive `old_read` from `latest_packed`.
         let buf = unsafe { &*self.buffers[new_read].get() };
         Some(reader(buf))
     }
 
     /// Force marks dirty (e.g. after savestate restore or palette clear).
     pub fn mark_dirty(&self) {
-        self.frame_dirty.store(true, Ordering::Release);
+        self.latest_packed.fetch_or(DIRTY_BIT, Ordering::Release);
     }
 }
 
@@ -199,6 +248,57 @@ pub(crate) mod win_timer {
     }
 }
 
+#[cfg(target_os = "macos")]
+pub(crate) mod mac_timer {
+    use std::sync::OnceLock;
+    use std::time::Duration;
+
+    #[repr(C)]
+    #[derive(Clone, Copy)]
+    struct MachTimebaseInfo {
+        numer: u32,
+        denom: u32,
+    }
+
+    unsafe extern "C" {
+        fn mach_absolute_time() -> u64;
+        fn mach_timebase_info(info: *mut MachTimebaseInfo) -> i32;
+        fn mach_wait_until(deadline: u64) -> i32;
+    }
+
+    fn timebase() -> (u64, u64) {
+        static TB: OnceLock<(u64, u64)> = OnceLock::new();
+        *TB.get_or_init(|| {
+            let mut info = MachTimebaseInfo { numer: 1, denom: 1 };
+            // SAFETY: Valid stack pointer to MachTimebaseInfo; libSystem always provides mach_timebase_info.
+            if unsafe { mach_timebase_info(&mut info) } == 0 && info.numer > 0 && info.denom > 0 {
+                (info.numer as u64, info.denom as u64)
+            } else {
+                (1, 1)
+            }
+        })
+    }
+
+    /// Sleeps using macOS `mach_wait_until`, bypassing POSIX `nanosleep` timer coalescing
+    /// for sub-millisecond frame pacing on Apple Silicon and Intel Macs.
+    pub fn sleep_for(duration: Duration) {
+        let nanos = duration.as_nanos();
+        if nanos == 0 {
+            return;
+        }
+        let (numer, denom) = timebase();
+        let ticks = (nanos.saturating_mul(denom as u128) / (numer as u128)) as u64;
+        if ticks == 0 {
+            return;
+        }
+        // SAFETY: Standard Mach kernel trap sleeping until the computed absolute tick deadline.
+        unsafe {
+            let now = mach_absolute_time();
+            let _ = mach_wait_until(now.saturating_add(ticks));
+        }
+    }
+}
+
 /// Dynamic Rate Control (DRC) pacer for the emulation thread.
 pub struct DrcPacer {
     target: usize,
@@ -211,7 +311,7 @@ pub struct DrcPacer {
 impl DrcPacer {
     pub fn new(capacity: usize) -> Self {
         Self {
-            target: capacity / 2,
+            target: (capacity / 2).max(1),
             base_frame_duration: Duration::from_secs_f64(280_896.0 / 16_777_216.0),
             next_deadline: Instant::now(),
             #[cfg(windows)]
@@ -257,7 +357,9 @@ impl DrcPacer {
                 let sleep_dur = remaining - spin_tail;
                 #[cfg(windows)]
                 self.timer.sleep_for(sleep_dur);
-                #[cfg(not(windows))]
+                #[cfg(target_os = "macos")]
+                mac_timer::sleep_for(sleep_dur);
+                #[cfg(all(not(windows), not(target_os = "macos")))]
                 thread::sleep(sleep_dur);
             }
             while Instant::now() < target_instant {

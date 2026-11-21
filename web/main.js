@@ -116,6 +116,7 @@ class RustboyWebApp {
 
     this.userPaused = false;
     this.bgPaused = false;
+    this.modalPaused = false;
     this.lastFrameTs = 0;
     this.accMs = 0;
     this.rafId = 0;
@@ -123,6 +124,9 @@ class RustboyWebApp {
     this.fpsFrames = 0;
     this.fpsWindowStart = performance.now();
     this.lastAutosaveTs = performance.now();
+    this.sramFlushInFlight = false;
+    this.sramNeedsRetry = false;
+    this.audioBufferPool = [];
     this.toastTimer = 0;
 
     this.canvas = document.getElementById("gba-canvas");
@@ -319,28 +323,51 @@ class RustboyWebApp {
       if (file) this.handleDroppedOrPickedFile(file);
     });
 
-    // Toolbar actions (respecting aria-disabled)
+    // Toolbar actions (respecting aria-disabled) — return focus to canvas so Enter/Space
+    // don't accidentally re-trigger the last clicked toolbar button during gameplay.
+    const refocusCanvas = () => {
+      if (this.emu?.rom_loaded && !document.querySelector("dialog[open]")) {
+        this.canvas.focus({ preventScroll: true });
+      }
+    };
     this.el.btnPause.addEventListener("click", () => {
       if (this.isDisabled(this.el.btnPause)) return;
       this.togglePause();
+      refocusCanvas();
     });
-    this.el.btnScrimResume.addEventListener("click", () => this.togglePause(false));
+    this.el.btnScrimResume.addEventListener("click", () => {
+      this.togglePause(false);
+      refocusCanvas();
+    });
     this.el.btnReset.addEventListener("click", () => {
       if (this.isDisabled(this.el.btnReset)) return;
       this.resetConsole();
+      refocusCanvas();
     });
     this.el.btnFastForward.addEventListener("click", () => {
       if (this.isDisabled(this.el.btnFastForward)) return;
       this.toggleFastForward();
+      refocusCanvas();
     });
-    this.el.btnMute.addEventListener("click", () => this.toggleMute());
-    this.el.btnUnlockAudio.addEventListener("click", () => this.resumeAudio());
+    this.el.btnMute.addEventListener("click", () => {
+      this.toggleMute();
+      refocusCanvas();
+    });
+    this.el.btnUnlockAudio.addEventListener("click", () => {
+      this.resumeAudio();
+      refocusCanvas();
+    });
     this.el.btnStates.addEventListener("click", () => {
       if (this.isDisabled(this.el.btnStates)) return;
       this.openStatesDialog();
     });
-    this.el.btnSettings.addEventListener("click", () => this.el.settingsDialog.showModal());
-    this.el.btnFullscreen.addEventListener("click", () => this.toggleFullscreen());
+    this.el.btnSettings.addEventListener("click", () => {
+      this.openModalDialog(this.el.settingsDialog);
+    });
+    this.el.btnFullscreen.addEventListener("click", () => {
+      this.toggleFullscreen();
+      refocusCanvas();
+    });
     this.el.btnDismissError.addEventListener("click", () => this.clearError());
 
     // Quick controls & Settings bindings
@@ -354,6 +381,7 @@ class RustboyWebApp {
         this.emu.set_color_profile(id);
         this.presentFrame();
       }
+      refocusCanvas();
     };
     this.el.quickColorProfile.addEventListener("change", (e) => onProfileChange(e.target.value));
     this.el.setColorProfile.addEventListener("change", (e) => onProfileChange(e.target.value));
@@ -364,6 +392,7 @@ class RustboyWebApp {
       this.el.btnQuickInteger.setAttribute("aria-pressed", String(checked));
       savePrefs(this.prefs);
       this.updateCanvasSize();
+      refocusCanvas();
     };
     this.el.btnQuickInteger.addEventListener("click", () =>
       onIntegerToggle(!this.prefs.integerScale),
@@ -376,6 +405,7 @@ class RustboyWebApp {
       this.el.btnQuickGrid.setAttribute("aria-pressed", String(checked));
       savePrefs(this.prefs);
       this.updateCanvasSize();
+      refocusCanvas();
     };
     this.el.btnQuickGrid.addEventListener("click", () => onGridToggle(!this.prefs.lcdGrid));
     this.el.setLcdGrid.addEventListener("change", (e) => onGridToggle(e.target.checked));
@@ -386,7 +416,10 @@ class RustboyWebApp {
       this.emu?.set_lcd_ghosting(this.prefs.lcdGhosting);
     });
 
-    const onTouchToggle = (checked) => this.setTouchDeckVisible(checked, true);
+    const onTouchToggle = (checked) => {
+      this.setTouchDeckVisible(checked, true);
+      refocusCanvas();
+    };
     this.el.btnQuickTouch.addEventListener("click", () =>
       onTouchToggle(this.el.touchDeck.hidden),
     );
@@ -401,7 +434,7 @@ class RustboyWebApp {
       this.prefs.volume = vol;
       this.el.volReadout.textContent = `${vol}%`;
       savePrefs(this.prefs);
-      this.emu?.set_volume(vol);
+      // Scale volume strictly once in AudioWorklet (keep core APU at 100% to avoid quadratic attenuation).
       this.audioNode?.port.postMessage({ type: "volume", volume: vol / 100 });
     });
 
@@ -424,6 +457,12 @@ class RustboyWebApp {
       dlg.addEventListener("close", () => {
         dlg.returnValue = "";
         this.input.rebindingButton = null;
+        this.modalPaused = Boolean(document.querySelector("dialog[open]"));
+        if (!this.modalPaused) {
+          this.lastFrameTs = performance.now();
+          this.accMs = 0;
+          refocusCanvas();
+        }
       });
     }
 
@@ -512,7 +551,7 @@ class RustboyWebApp {
       this.emu = new Emulator();
       this.emu.set_color_profile(this.prefs.colorProfile);
       this.emu.set_lcd_ghosting(this.prefs.lcdGhosting);
-      this.emu.set_volume(this.prefs.volume);
+      this.emu.set_volume(100);
       this.emu.set_speed(this.prefs.speed);
 
       const savedBios = await this.storage.loadBios().catch(() => null);
@@ -563,11 +602,17 @@ class RustboyWebApp {
           numberOfOutputs: 1,
           outputChannelCount: [2],
         });
+        this.audioNode.port.onmessage = ({ data }) => {
+          if (data?.type === "recycle" && data.buffer && this.audioBufferPool.length < 8) {
+            this.audioBufferPool.push(data.buffer);
+          }
+        };
         this.audioNode.connect(this.audioCtx.destination);
         this.audioNode.port.postMessage({
           type: "config",
           inputSampleRate: this.emu.sample_rate(),
         });
+        this.audioNode.port.postMessage({ type: "speed", speed: this.prefs.speed });
         this.audioNode.port.postMessage({ type: "mute", muted: this.prefs.muted });
         this.audioNode.port.postMessage({ type: "volume", volume: this.prefs.volume / 100 });
         this.audioWorkletReady = true;
@@ -775,6 +820,7 @@ class RustboyWebApp {
     this.el.setSpeed.value = String(clamped);
     savePrefs(this.prefs);
     this.emu?.set_speed(clamped);
+    this.audioNode?.port.postMessage({ type: "speed", speed: clamped });
     this.updateSpeedUi();
     this.updatePowerState();
   }
@@ -869,8 +915,20 @@ class RustboyWebApp {
     if (this.audioWorkletReady && this.audioNode && this.audioCtx?.state === "running") {
       const ptr = this.emu.audio_ptr();
       const view = new Int16Array(this.wasm.memory.buffer, ptr, len);
-      const copy = new Int16Array(view);
-      this.audioNode.port.postMessage({ type: "samples", buffer: copy.buffer }, [copy.buffer]);
+      const byteLen = len * 2;
+      let buf = null;
+      for (let i = this.audioBufferPool.length - 1; i >= 0; i--) {
+        if (this.audioBufferPool[i].byteLength >= byteLen) {
+          buf = this.audioBufferPool.splice(i, 1)[0];
+          break;
+        }
+      }
+      if (!buf) {
+        buf = new ArrayBuffer(Math.max(byteLen, 4096));
+      }
+      const copy = new Int16Array(buf, 0, len);
+      copy.set(view);
+      this.audioNode.port.postMessage({ type: "samples", buffer: buf, length: len }, [buf]);
     }
     this.emu.clear_audio();
   }
@@ -879,7 +937,7 @@ class RustboyWebApp {
     this.lastFrameTs = performance.now();
     const tick = (now) => {
       this.rafId = requestAnimationFrame(tick);
-      if (!this.emu?.rom_loaded || this.userPaused || this.bgPaused) {
+      if (!this.emu?.rom_loaded || this.userPaused || this.bgPaused || this.modalPaused) {
         this.lastFrameTs = now;
         return;
       }
@@ -895,12 +953,12 @@ class RustboyWebApp {
       this.emu.set_keys(mask);
 
       const maxSteps = Math.max(4, Math.ceil(speed * 2));
+      const dueSteps = Math.min(maxSteps, Math.floor(this.accMs / stepMs));
       let stepped = 0;
-      while (this.accMs >= stepMs && stepped < maxSteps) {
-        this.emu.run_frame();
-        this.accMs -= stepMs;
-        stepped += 1;
-        this.fpsFrames += 1;
+      if (dueSteps > 0) {
+        stepped = this.emu.step_frames(dueSteps);
+        this.accMs -= stepped * stepMs;
+        this.fpsFrames += stepped;
       }
       if (stepped === maxSteps && this.accMs > stepMs * 2) {
         this.accMs = 0;
@@ -927,25 +985,36 @@ class RustboyWebApp {
   }
 
   async flushSramIfDirty() {
-    if (!this.emu?.rom_loaded || !this.emu.sram_dirty()) return;
+    if (!this.emu?.rom_loaded || this.sramFlushInFlight) return;
+    if (!this.emu.sram_dirty() && !this.sramNeedsRetry) return;
     const data = this.emu.export_sram();
     if (data.length === 0) return;
 
+    const storageKey = this.emu.storage_key;
+    const meta = {
+      title: this.emu.title,
+      gameCode: this.emu.game_code,
+      crc32Hex: this.emu.rom_crc32_hex,
+      saveType: this.emu.save_type,
+    };
+
+    // Clear dirty flag BEFORE awaiting IndexedDB so writes made by the game during the
+    // async transaction re-dirty the flag instead of being silently dropped on completion.
+    this.emu.clear_sram_dirty();
+    this.sramNeedsRetry = false;
+    this.sramFlushInFlight = true;
     try {
-      await this.storage.saveSram(
-        this.emu.storage_key,
-        {
-          title: this.emu.title,
-          gameCode: this.emu.game_code,
-          crc32Hex: this.emu.rom_crc32_hex,
-          saveType: this.emu.save_type,
-        },
-        data,
-      );
-      this.emu.clear_sram_dirty();
-      this.el.statSave.textContent = `${this.emu.save_type} · Synced`;
+      await this.storage.saveSram(storageKey, meta, data);
+      if (this.emu?.storage_key === storageKey) {
+        this.el.statSave.textContent = `${this.emu.save_type} · Synced`;
+      }
     } catch {
-      this.el.statSave.textContent = `${this.emu.save_type} · Unsaved`;
+      this.sramNeedsRetry = true;
+      if (this.emu?.storage_key === storageKey) {
+        this.el.statSave.textContent = `${this.emu.save_type} · Unsaved`;
+      }
+    } finally {
+      this.sramFlushInFlight = false;
     }
   }
 
@@ -976,6 +1045,13 @@ class RustboyWebApp {
     this.notify("Exported .sav file");
   }
 
+  openModalDialog(dlg) {
+    this.modalPaused = true;
+    this.input.clearAllInputs();
+    this.audioNode?.port.postMessage({ type: "clear" });
+    dlg.showModal();
+  }
+
   async importSramFile(file) {
     if (!this.emu?.rom_loaded) {
       this.showError("No ROM Loaded", "Load the matching .gba ROM before importing a .sav file.");
@@ -995,7 +1071,12 @@ class RustboyWebApp {
         bytes,
       );
       this.emu.clear_sram_dirty();
-      this.notify("Imported .sav into battery memory");
+      this.sramNeedsRetry = false;
+      this.emu.reset();
+      this.audioNode?.port.postMessage({ type: "clear" });
+      this.presentFrame();
+      this.el.statSave.textContent = `${this.emu.save_type} · Synced`;
+      this.notify("Imported .sav and reset console");
     } catch (err) {
       this.showError("Save Import Failed", err?.message || String(err));
     }
@@ -1005,7 +1086,7 @@ class RustboyWebApp {
     if (!this.emu?.rom_loaded) return;
     this.el.statesGameLabel.textContent = `${this.emu.title} (${this.emu.storage_key})`;
     await this.renderStateSlots();
-    this.el.statesDialog.showModal();
+    this.openModalDialog(this.el.statesDialog);
   }
 
   async renderStateSlots() {

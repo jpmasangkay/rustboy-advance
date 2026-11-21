@@ -429,9 +429,15 @@ impl CliConfig {
                          \t--category <cat>         Legacy homebrew benchmark category: mode4-3d, mode5-bitmap, affine, sprites, dma-hdma, audio, or 'all'\n\
                          \t--assign <cat>=<path>    Assign a custom ROM to a legacy benchmark category\n\
                          \t--throttled-test         Verify micro-frameskip under throttled load\n\
+                         \t--calibrate              Run single-thread CPU calibration benchmark\n\
+                         \t--profile-sw             Micro-profile software CPU wgpu adapter\n\
                          \t--selftest               Run portable self-test (no external ROM needed) -> perf/selftest-*.json\n\
                          \t--bench-filters          Benchmark every display filter across adapters -> perf/filters-*.json\n\
                          \t--bench-softbuffer       Time winit+softbuffer at 720x480, 720p, 1080p, fullscreen -> perf/softbuffer-*.json\n\
+                         \t--dump-hashes <file>     Dump deterministic frame/audio hashes to JSON\n\
+                         \t--verify-hashes <file>   Verify frame/audio hashes against reference JSON\n\
+                         \t--capture-png <file>     Capture live desktop/no-gpu frame to PNG\n\
+                         \t--capture-frame <N>      Target frame number for --capture-png (default: 1245)\n\
                          \t--slowdown <N>           Busy-spin (N-1)x per frame to simulate N-times slower CPU\n\
                          \t--software-adapter       Force CPU software adapter (SwiftShader Vulkan / DX12 WARP) for benchmarks\n\
                          \t--simulate-no-adapter    Simulate zero wgpu adapters to exercise automatic No-GPU fallback\n\
@@ -528,8 +534,9 @@ pub fn run_benchmark_category(
     frames: usize,
     bios_path: Option<&Path>,
 ) -> Result<BenchmarkResult, String> {
-    let rom = fs::read(rom_path)
-        .map_err(|e| format!("failed to read ROM {}: {e}", rom_path.display()))?;
+    let mut loaded = crate::rom_loader::load_rom_bytes(rom_path)?;
+    let _ = crate::rom_loader::apply_auto_patch_if_present(rom_path, &mut loaded.bytes)?;
+    let rom = loaded.bytes;
     let bios = match bios_path {
         Some(p) => Some(fs::read(p).map_err(|e| format!("failed to read BIOS: {e}"))?),
         None => None,
@@ -839,14 +846,17 @@ pub fn verify_micro_frameskip_throttled(rom_path: &Path, frames: usize) -> Resul
         "Audio continuity: Verified glitch-free (audio generation never stalls during frameskip)"
     );
 
-    assert!(
-        delta_skips > 0,
-        "Micro-frameskip must skip frames when emulation falls behind real-time budget"
-    );
-    assert!(
-        frontend.total_audio_samples > 0,
-        "Audio samples must not drop to 0 during frameskip"
-    );
+    if delta_skips == 0 {
+        return Err(
+            "Micro-frameskip failed: expected > 0 skipped frames when emulation falls behind real-time budget"
+                .to_string(),
+        );
+    }
+    if frontend.total_audio_samples == 0 {
+        return Err(
+            "Micro-frameskip failed: audio samples dropped to 0 during frameskip".to_string(),
+        );
+    }
     Ok(())
 }
 
@@ -894,7 +904,10 @@ fn run_scan_library_headless() -> Result<(), String> {
 }
 
 fn run_perf_check_export_headless(out_json: &std::path::Path) -> Result<(), String> {
-    let mut app = std::mem::ManuallyDrop::new(crate::RustboyApp::new(CliConfig::default()));
+    let mut app = std::mem::ManuallyDrop::new(crate::RustboyApp::new(
+        CliConfig::default(),
+        crate::config::AppConfig::load(),
+    ));
     app.start_performance_check();
     let ctx = egui::Context::default();
     let start = std::time::Instant::now();
@@ -986,7 +999,9 @@ pub fn run_headless(cfg: &CliConfig) -> Result<(), String> {
         .rom_path
         .as_ref()
         .ok_or("headless mode requires a ROM path (or pass --bench)")?;
-    let rom = fs::read(rom_path).map_err(|e| format!("failed to read ROM: {e}"))?;
+    let mut loaded = crate::rom_loader::load_rom_bytes(rom_path)?;
+    let _ = crate::rom_loader::apply_auto_patch_if_present(rom_path, &mut loaded.bytes)?;
+    let rom = loaded.bytes;
     let bios = match &cfg.bios_path {
         Some(p) => Some(fs::read(p).map_err(|e| format!("failed to read BIOS: {e}"))?),
         None => None,
@@ -999,8 +1014,9 @@ pub fn run_headless(cfg: &CliConfig) -> Result<(), String> {
     let mut core = GbaCore::new(bios.as_deref(), rom);
     if let Some(sav) = &cfg.sav_path
         && sav.exists()
-        && let Ok(bytes) = fs::read(sav)
     {
+        let bytes = fs::read(sav)
+            .map_err(|e| format!("failed to read battery save {}: {e}", sav.display()))?;
         core.bus.cart.load_save_data(&bytes);
     }
 
@@ -1064,7 +1080,8 @@ pub fn run_headless(cfg: &CliConfig) -> Result<(), String> {
     if let Some(sav) = &cfg.sav_path
         && core.bus.cart.save_dirty
     {
-        let _ = fs::write(sav, core.bus.cart.export_save_data());
+        crate::config::write_atomic(sav, core.bus.cart.export_save_data())
+            .map_err(|e| format!("failed to write battery save {}: {e}", sav.display()))?;
     }
 
     println!(

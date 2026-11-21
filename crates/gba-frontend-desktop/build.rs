@@ -2,11 +2,7 @@ use std::path::Path;
 use std::process::Command;
 use std::time::{SystemTime, UNIX_EPOCH};
 
-fn format_utc_now() -> String {
-    let secs = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|d| d.as_secs())
-        .unwrap_or(0);
+fn format_utc_timestamp(secs: u64) -> String {
     let days = (secs / 86_400) as i64;
     let rem = secs % 86_400;
     let hour = rem / 3_600;
@@ -26,6 +22,19 @@ fn format_utc_now() -> String {
     let year = y + i64::from(month <= 2);
 
     format!("{year:04}-{month:02}-{day:02}T{hour:02}:{minute:02}:{second:02}Z")
+}
+
+fn format_utc_now() -> String {
+    if let Ok(epoch) = std::env::var("SOURCE_DATE_EPOCH")
+        && let Ok(secs) = epoch.trim().parse::<u64>()
+    {
+        return format_utc_timestamp(secs);
+    }
+    let secs = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+    format_utc_timestamp(secs)
 }
 
 fn read_git_commit() -> String {
@@ -54,9 +63,29 @@ fn main() {
     println!("cargo:rerun-if-changed=src");
     println!("cargo:rerun-if-changed=build.rs");
     println!("cargo:rerun-if-changed=Cargo.toml");
-    let git_head = Path::new("../../.git/HEAD");
+    println!("cargo:rerun-if-env-changed=SOURCE_DATE_EPOCH");
+    let git_dir = Path::new("../../.git");
+    let git_head = git_dir.join("HEAD");
     if git_head.exists() {
         println!("cargo:rerun-if-changed=../../.git/HEAD");
+        if let Ok(head_text) = std::fs::read_to_string(&git_head)
+            && let Some(ref_rel) = head_text.trim().strip_prefix("ref:")
+        {
+            let ref_rel = ref_rel.trim();
+            if git_dir.join(ref_rel).exists() {
+                println!("cargo:rerun-if-changed=../../.git/{ref_rel}");
+            }
+        }
+    }
+    // Give the Windows main thread a 16 MB stack so winit/eframe runs on the OS main thread
+    // cleanly without needing a secondary spawned thread (which breaks macOS/Linux event loops).
+    if std::env::var("CARGO_CFG_TARGET_OS").as_deref() == Ok("windows") {
+        let target_env = std::env::var("CARGO_CFG_TARGET_ENV").unwrap_or_default();
+        if target_env == "msvc" {
+            println!("cargo:rustc-link-arg=/STACK:16777216");
+        } else {
+            println!("cargo:rustc-link-arg=-Wl,--stack,16777216");
+        }
     }
     println!("cargo:rustc-env=RBA_GIT_COMMIT={}", read_git_commit());
     println!("cargo:rustc-env=RBA_BUILD_TIME_UTC={}", format_utc_now());

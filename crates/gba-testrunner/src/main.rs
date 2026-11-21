@@ -19,6 +19,7 @@ struct CliArgs {
     dump_all: bool,
     allow_failures: bool,
     fail_on_unexpected: bool,
+    preserve_diagnosis: bool,
 }
 
 fn parse_args() -> Result<CliArgs, String> {
@@ -34,6 +35,7 @@ fn parse_args() -> Result<CliArgs, String> {
         dump_all: false,
         allow_failures: false,
         fail_on_unexpected: false,
+        preserve_diagnosis: false,
     };
 
     let mut args = std::env::args().skip(1).peekable();
@@ -52,13 +54,13 @@ fn parse_args() -> Result<CliArgs, String> {
                 cli.bios_path = Some(PathBuf::from(v));
             }
             "--report" => {
-                // Support both `--report` (defaults to docs/TEST_RESULTS.md) and `--report <path>`.
+                // Support both `--report` (defaults to TEST_RESULTS.md) and `--report <path>`.
                 let next_is_path = args.peek().is_some_and(|s| !s.starts_with('-'));
                 if next_is_path {
                     let v = args.next().ok_or("missing path for --report")?;
                     cli.report_path = Some(PathBuf::from(v));
                 } else {
-                    cli.report_path = Some(PathBuf::from("docs/TEST_RESULTS.md"));
+                    cli.report_path = Some(PathBuf::from("TEST_RESULTS.md"));
                 }
             }
             "--out-dir" => {
@@ -77,6 +79,7 @@ fn parse_args() -> Result<CliArgs, String> {
             "--dump-all" => cli.dump_all = true,
             "--allow-failures" => cli.allow_failures = true,
             "--fail-on-unexpected" => cli.fail_on_unexpected = true,
+            "--preserve-diagnosis" => cli.preserve_diagnosis = true,
             "--help" | "-h" => {
                 println!(
                     "Usage: gba-testrunner [OPTIONS]\n\
@@ -87,11 +90,12 @@ fn parse_args() -> Result<CliArgs, String> {
                      \t--suite <name>          Run only tests in a given suite\n\
                      \t--filter <substr>       Run only tests matching substring\n\
                      \t--record                (Re)generate golden hashes/PNGs in golden/ (skips known_failure & interactive)\n\
-                     \t--report [path]         Write Markdown results (default: docs/TEST_RESULTS.md)\n\
+                     \t--report [path]         Write Markdown results (default: TEST_RESULTS.md)\n\
+                     \t--preserve-diagnosis    Retain existing `## Failure Diagnosis` section when updating --report\n\
                      \t--out-dir <path>        Directory for failure PNGs (default: test_output)\n\
                      \t--dump-all              Save PNG screenshots for all executed ROMs\n\
                      \t--allow-failures        Exit 0 even if tests fail\n\
-                     \t--fail-on-unexpected    Exit 1 only on regressions not marked known_failure"
+                     \t--fail-on-unexpected    Exit 1 on unexpected failures or known_bad_crc32 drift"
                 );
                 std::process::exit(0);
             }
@@ -168,7 +172,8 @@ fn main() -> ExitCode {
             .map(|p| format!("LLE (`{}`)", p.display()))
             .unwrap_or_else(|| "HLE (built-in)".to_string());
         let mut md = render_markdown_report(&results, &bios_label);
-        if let Ok(existing) = fs::read_to_string(&report_abs)
+        if cli.preserve_diagnosis
+            && let Ok(existing) = fs::read_to_string(&report_abs)
             && let Some(idx) = existing.find("\n## Failure Diagnosis")
         {
             md.push_str(&existing[idx..]);
@@ -180,10 +185,7 @@ fn main() -> ExitCode {
         println!("Wrote report to {}", report_abs.display());
     }
 
-    let unexpected_failures = results
-        .iter()
-        .filter(|r| r.outcome == gba_testrunner::TestOutcome::Fail && !r.known_failure)
-        .count();
+    let unexpected_failures = results.iter().filter(|r| r.is_unexpected_failure()).count();
 
     if cli.allow_failures {
         ExitCode::SUCCESS

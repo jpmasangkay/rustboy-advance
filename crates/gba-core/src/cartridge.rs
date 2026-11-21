@@ -1,7 +1,7 @@
 use alloc::{boxed::Box, string::String, vec::Vec};
 use serde::{Deserialize, Serialize};
 
-use crate::serde_helpers::alloc_boxed_array;
+use crate::serde_helpers::{alloc_boxed_array, box_bytes};
 
 #[derive(Copy, Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub enum SaveType {
@@ -29,6 +29,7 @@ pub enum FlashStage {
     EraseCmd1,
     EraseCmd2,
     WriteByte,
+    WriteAtmelPage,
     BankSwitch,
 }
 
@@ -80,6 +81,8 @@ pub struct FlashState {
     pub is_128k: bool,
     #[serde(default)]
     pub id_override: Option<FlashChipId>,
+    #[serde(default)]
+    pub atmel_page_count: u8,
 }
 
 impl FlashState {
@@ -90,6 +93,7 @@ impl FlashState {
             bank: 0,
             is_128k,
             id_override: None,
+            atmel_page_count: 0,
         }
     }
 
@@ -139,6 +143,20 @@ impl FlashState {
                 *dirty = true;
                 self.stage = FlashStage::Ready;
             }
+            FlashStage::WriteAtmelPage => {
+                // Atmel AT29LV512 writes 128-byte pages with automatic page erase on byte 0.
+                let page_base = (addr_16 as usize) & 0xFF80;
+                if self.atmel_page_count == 0 {
+                    sram[page_base..page_base + 128].fill(0xFF);
+                }
+                sram[addr_16 as usize] = val;
+                *dirty = true;
+                self.atmel_page_count = self.atmel_page_count.wrapping_add(1);
+                if self.atmel_page_count >= 128 {
+                    self.atmel_page_count = 0;
+                    self.stage = FlashStage::Ready;
+                }
+            }
             FlashStage::BankSwitch => {
                 if self.is_128k && addr_16 == 0x0000 {
                     self.bank = val & 1;
@@ -174,7 +192,12 @@ impl FlashState {
                             self.stage = FlashStage::EraseCmd;
                         }
                         0xA0 => {
-                            self.stage = FlashStage::WriteByte;
+                            if !self.is_128k && self.chip_id() == FlashChipId::ATMEL_64K {
+                                self.atmel_page_count = 0;
+                                self.stage = FlashStage::WriteAtmelPage;
+                            } else {
+                                self.stage = FlashStage::WriteByte;
+                            }
                         }
                         0xB0 if self.is_128k => {
                             self.stage = FlashStage::BankSwitch;
@@ -299,6 +322,9 @@ impl EepromState {
         let bit = (val & 1) as u64;
         match self.stage {
             EepromStage::Idle => {
+                if bit == 0 {
+                    return;
+                }
                 self.cmd_bits = bit;
                 self.cmd_len = 1;
                 self.stage = EepromStage::Command;
@@ -312,9 +338,6 @@ impl EepromState {
                 self.cmd_bits = (self.cmd_bits << 1) | bit;
                 self.cmd_len += 1;
                 let addr_bits = if self.detected_8k { 14 } else { 6 };
-                if self.cmd_len == 2 {
-                    // Check opcode top 2 bits
-                }
                 let is_read = ((self.cmd_bits >> (self.cmd_len - 2)) & 0b11) == 0b11;
                 let is_write = ((self.cmd_bits >> (self.cmd_len - 2)) & 0b11) == 0b10;
 
@@ -324,7 +347,8 @@ impl EepromState {
                     self.addr = (raw_addr % max_blocks) * 8;
                     let mut w = 0u64;
                     for i in 0..8 {
-                        w = (w << 8) | (sram[self.addr + i] as u64);
+                        // Little-endian 64-bit block storage (compatible with mGBA/RetroArch .sav)
+                        w = (w << 8) | (sram[self.addr + (7 - i)] as u64);
                     }
                     self.read_word = w;
                     self.bit_idx = 0;
@@ -349,7 +373,7 @@ impl EepromState {
             }
             EepromStage::WriteDummyZero => {
                 for i in 0..8 {
-                    sram[self.addr + i] = ((self.write_word >> (56 - i * 8)) & 0xFF) as u8;
+                    sram[self.addr + (7 - i)] = ((self.write_word >> (56 - i * 8)) & 0xFF) as u8;
                 }
                 *dirty = true;
                 self.stage = EepromStage::Idle;
@@ -417,29 +441,31 @@ impl GpioRtc {
         if !self.is_readable() {
             return None;
         }
-        match addr & 0xFFFF_FFFE {
-            0x0800_00C4 => Some(self.data),
-            0x0800_00C6 => Some(self.dir),
-            0x0800_00C8 => Some(self.control),
+        match addr & 0x01FF_FFFE {
+            0x0000_00C4 => Some(self.data),
+            0x0000_00C6 => Some(self.dir),
+            0x0000_00C8 => Some(self.control),
             _ => None,
         }
     }
 
-    pub fn write(&mut self, addr: u32, val: u16) -> bool {
-        match addr & 0xFFFF_FFFE {
-            0x0800_00C4 => {
+    pub fn write(&mut self, addr: u32, val: u16, rtc_enabled: bool) -> bool {
+        match addr & 0x01FF_FFFE {
+            0x0000_00C4 => {
                 // Only bits configured as output in `dir` are driven by GBA,
                 // preserve input bits (like SIO when dir bit 1 == 0).
                 let out_mask = self.dir & 0x0F;
                 self.data = (self.data & !out_mask) | (val & out_mask);
-                self.step_rtc();
+                if rtc_enabled {
+                    self.step_rtc();
+                }
                 true
             }
-            0x0800_00C6 => {
+            0x0000_00C6 => {
                 self.dir = val & 0x0F;
                 true
             }
-            0x0800_00C8 => {
+            0x0000_00C8 => {
                 self.control = val & 1;
                 true
             }
@@ -489,13 +515,14 @@ impl GpioRtc {
                         self.stage = RtcStage::Idle;
                     } else {
                         self.reg_len = match self.cmd {
-                            0 | 1 | 3 => 1, // Reset / Control
-                            2 => 7,         // DateTime
-                            6 => 3,         // Time
+                            0 => 0, // Reset
+                            1 => 1, // Status/Control
+                            2 => 7, // DateTime
+                            3 => 3, // Time-only (Hour, Min, Sec)
                             _ => 0,
                         };
                         if self.cmd == 0 {
-                            self.status = 0x40;
+                            self.status = 0x00;
                             self.stage = RtcStage::Idle;
                         } else if self.reg_len == 0 {
                             self.stage = RtcStage::Idle;
@@ -513,11 +540,11 @@ impl GpioRtc {
                 self.bit_idx += 1;
                 if self.bit_idx == 8 {
                     let b = self.shift_reg;
-                    if self.cmd == 1 || self.cmd == 3 {
+                    if self.cmd == 1 {
                         self.status = b & 0x6A;
                     } else if self.cmd == 2 && self.reg_pos < 7 {
                         self.regs[self.reg_pos] = b;
-                    } else if self.cmd == 6 && self.reg_pos < 3 {
+                    } else if self.cmd == 3 && self.reg_pos < 3 {
                         self.regs[4 + self.reg_pos] = b;
                     }
                     self.reg_pos += 1;
@@ -553,21 +580,27 @@ impl GpioRtc {
 
     fn load_out_byte(&mut self) {
         self.shift_reg = match self.cmd {
-            1 | 3 => self.status,
+            1 => self.status,
             2 => self.regs[self.reg_pos.min(6)],
-            6 => self.regs[(4 + self.reg_pos).min(6)],
+            3 => self.regs[(4 + self.reg_pos).min(6)],
             _ => 0,
         };
     }
 
     pub fn advance_second(&mut self) {
+        fn from_bcd(v: u8) -> u8 {
+            (v >> 4).min(9) * 10 + (v & 0xF).min(9)
+        }
+        fn to_bcd(v: u8) -> u8 {
+            ((v / 10) << 4) | (v % 10)
+        }
         fn bcd_inc(v: u8, limit: u8) -> (u8, bool) {
-            let mut val = (v >> 4) * 10 + (v & 0xF) + 1;
+            let mut val = from_bcd(v) + 1;
             let carry = val >= limit;
             if carry {
                 val = 0;
             }
-            (((val / 10) << 4) | (val % 10), carry)
+            (to_bcd(val), carry)
         }
         let (sec, c1) = bcd_inc(self.regs[6] & 0x7F, 60);
         self.regs[6] = sec;
@@ -579,14 +612,27 @@ impl GpioRtc {
                 self.regs[4] = hr;
                 if c3 {
                     self.regs[3] = (self.regs[3] + 1) % 7;
-                    let (day, c4) = bcd_inc(self.regs[2] & 0x3F, 32);
+                    let year = from_bcd(self.regs[0]);
+                    let month = from_bcd(self.regs[1] & 0x1F).clamp(1, 12);
+                    let max_day = match month {
+                        4 | 6 | 9 | 11 => 30,
+                        2 => {
+                            if year.is_multiple_of(4) {
+                                29
+                            } else {
+                                28
+                            }
+                        }
+                        _ => 31,
+                    };
+                    let (day, c4) = bcd_inc(self.regs[2] & 0x3F, max_day + 1);
                     self.regs[2] = if day == 0 { 1 } else { day };
                     if c4 {
-                        let (month, c5) = bcd_inc(self.regs[1] & 0x1F, 13);
-                        self.regs[1] = if month == 0 { 1 } else { month };
+                        let (month_next, c5) = bcd_inc(self.regs[1] & 0x1F, 13);
+                        self.regs[1] = if month_next == 0 { 1 } else { month_next };
                         if c5 {
-                            let (year, _) = bcd_inc(self.regs[0], 100);
-                            self.regs[0] = year;
+                            let (year_next, _) = bcd_inc(self.regs[0], 100);
+                            self.regs[0] = year_next;
                         }
                     }
                 }
@@ -661,10 +707,6 @@ pub fn crc32_ieee(data: &[u8]) -> u32 {
     !crc
 }
 
-fn alloc_sram() -> Box<[u8; 0x20000]> {
-    alloc_boxed_array(0xFFu8)
-}
-
 #[derive(Clone, Serialize, Deserialize)]
 pub struct Cartridge {
     #[serde(skip)]
@@ -674,7 +716,7 @@ pub struct Cartridge {
     pub rom_crc32: u32,
     #[serde(default)]
     pub idle_loop_addr: Option<u32>,
-    #[serde(skip, default = "alloc_sram")]
+    #[serde(with = "box_bytes")]
     pub sram: Box<[u8; 0x20000]>,
     pub save_type: SaveType,
     pub mapper: MapperType,
@@ -739,11 +781,7 @@ impl Cartridge {
             idle_loop_addr,
         ) = if let Some(entry) = db_entry {
             (
-                if sig_save_type != SaveType::None {
-                    sig_save_type
-                } else {
-                    entry.save_type
-                },
+                entry.save_type,
                 entry.has_rtc,
                 entry.solar,
                 entry.tilt,
@@ -761,7 +799,7 @@ impl Cartridge {
                 sig_save_type,
                 Self::detect_rtc(&rom),
                 matches!(code3, b"U3I" | b"U32" | b"U33"),
-                code3 == b"KYG",
+                code3 == b"KYG" || code3 == b"KHP",
                 code3 == b"RZW",
                 code3 == b"RZW" || code3 == b"V49",
                 None,
@@ -883,6 +921,7 @@ impl Cartridge {
     pub fn load_save_data(&mut self, data: &[u8]) {
         let len = data.len().min(self.sram.len());
         self.sram[..len].copy_from_slice(&data[..len]);
+        self.sram[len..].fill(0xFF);
         self.save_dirty = false;
     }
 
@@ -952,27 +991,30 @@ impl Cartridge {
         if region != 0x0D {
             return false;
         }
-        matches!(
-            self.effective_save_type(),
-            SaveType::Eeprom512B | SaveType::Eeprom8K
-        ) || (self.save_type_override.is_none()
-            && self.rom.len() <= 0x0100_0000
-            && addr >= 0x0D00_0000)
-            || (self.save_type_override.is_none()
-                && self.rom.len() > 0x0100_0000
-                && addr >= 0x0DFF_FF00)
+        let in_eeprom_window = self.rom.len() <= 0x0100_0000 || addr >= 0x0DFF_FF00;
+        if !in_eeprom_window {
+            return false;
+        }
+        match self.effective_save_type() {
+            SaveType::Eeprom512B | SaveType::Eeprom8K => true,
+            SaveType::None => self.save_type_override.is_none(),
+            _ => false,
+        }
+    }
+
+    #[inline]
+    pub fn gpio_enabled(&self) -> bool {
+        self.effective_rtc() || self.solar_enabled || self.gyro_enabled || self.rumble_enabled
     }
 
     #[inline]
     pub fn read_rom_16(&self, addr: u32) -> u16 {
-        if (0x0800_00C4..=0x0800_00C8).contains(&(addr & 0xFFFF_FFFE)) {
-            let gpio_allowed = !matches!(self.rtc_override, Some(false))
-                || self.solar_enabled
-                || self.gyro_enabled
-                || self.rumble_enabled;
-            if gpio_allowed && let Some(gpio_val) = self.rtc.read(addr) {
-                return gpio_val;
-            }
+        let gpio_off = addr & 0x01FF_FFFE;
+        if (0x0000_00C4..=0x0000_00C8).contains(&gpio_off)
+            && self.gpio_enabled()
+            && let Some(gpio_val) = self.rtc.read(addr)
+        {
+            return gpio_val;
         }
         let offset = (addr as usize) & 0x01FF_FFFE;
         if offset + 1 < self.rom.len() {
@@ -993,47 +1035,46 @@ impl Cartridge {
     }
 
     pub fn write_rom_16(&mut self, addr: u32, val: u16) {
-        let aligned = addr & 0xFFFF_FFFE;
-        if (0x0800_00C4..=0x0800_00C8).contains(&aligned) {
-            let allow_gpio = !matches!(self.rtc_override, Some(false))
-                || self.solar_enabled
-                || self.gyro_enabled
-                || self.rumble_enabled;
-            if allow_gpio && self.rtc.write(addr, val) && aligned == 0x0800_00C4 {
-                if self.solar_enabled && (self.rtc.data & 0x04) == 0 {
-                    let rst = (self.rtc.data & 0x02) != 0;
-                    let clk = (self.rtc.data & 0x01) != 0;
-                    if rst {
-                        self.solar_counter = 0;
+        let gpio_off = addr & 0x01FF_FFFE;
+        if (0x0000_00C4..=0x0000_00C8).contains(&gpio_off)
+            && self.gpio_enabled()
+            && self.rtc.write(addr, val, self.effective_rtc())
+            && gpio_off == 0x0000_00C4
+        {
+            if self.solar_enabled && (self.rtc.data & 0x04) == 0 {
+                let rst = (self.rtc.data & 0x02) != 0;
+                let clk = (self.rtc.data & 0x01) != 0;
+                if rst {
+                    self.solar_counter = 0;
+                    self.rtc.data &= !0x08;
+                } else if !self.solar_prev_clk && clk {
+                    self.solar_counter = self.solar_counter.saturating_add(1);
+                    let threshold = 255u8.saturating_sub(self.solar_lux).max(1);
+                    if self.solar_counter >= threshold {
+                        self.rtc.data |= 0x08;
+                    } else {
                         self.rtc.data &= !0x08;
-                    } else if !self.solar_prev_clk && clk {
-                        self.solar_counter = self.solar_counter.saturating_add(1);
-                        let threshold = 255u8.saturating_sub(self.solar_lux).max(1);
-                        if self.solar_counter >= threshold {
-                            self.rtc.data |= 0x08;
-                        } else {
-                            self.rtc.data &= !0x08;
-                        }
                     }
-                    self.solar_prev_clk = clk;
                 }
-                if self.rumble_enabled && (self.rtc.dir & 0x08) != 0 {
-                    self.rumble_active = (self.rtc.data & 0x08) != 0;
-                }
-                if self.gyro_enabled {
-                    let sample_start = (self.rtc.data & 0x02) != 0;
-                    let clk = (self.rtc.data & 0x01) != 0;
-                    if sample_start {
-                        self.gyro_shift = (self.gyro_val & 0x0FFF) << 4;
-                    } else if self.gyro_prev_clk && !clk {
-                        let bit = (self.gyro_shift >> 15) & 1;
-                        if (self.rtc.dir & 0x04) == 0 {
-                            self.rtc.data = (self.rtc.data & !0x04) | (bit << 2);
-                        }
-                        self.gyro_shift <<= 1;
+                self.solar_prev_clk = clk;
+            }
+            if self.rumble_enabled && (self.rtc.dir & 0x08) != 0 {
+                self.rumble_active = (self.rtc.data & 0x08) != 0;
+            }
+            if self.gyro_enabled {
+                // WarioWare: Twisted! GPIO pinout: Bit 0 = RES/sample_start, Bit 1 = CLK, Bit 2 = DATA_OUT
+                let sample_start = (self.rtc.data & 0x01) != 0;
+                let clk = (self.rtc.data & 0x02) != 0;
+                if sample_start {
+                    self.gyro_shift = (self.gyro_val & 0x0FFF) << 4;
+                } else if self.gyro_prev_clk && !clk {
+                    let bit = (self.gyro_shift >> 15) & 1;
+                    if (self.rtc.dir & 0x04) == 0 {
+                        self.rtc.data = (self.rtc.data & !0x04) | (bit << 2);
                     }
-                    self.gyro_prev_clk = clk;
+                    self.gyro_shift <<= 1;
                 }
+                self.gyro_prev_clk = clk;
             }
         }
     }

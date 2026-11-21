@@ -96,6 +96,16 @@ enum ParseState {
     Checksum2(u8),
 }
 
+const MAX_RSP_PAYLOAD_BYTES: usize = 0x4000;
+const MAX_MEMORY_READ_BYTES: usize = 0x1FFE; // 0x1FFE * 2 = 0x3FFC hex chars + `$` + `#cc` <= 0x4000
+const HEX_DIGITS: &[u8; 16] = b"0123456789abcdef";
+
+#[inline]
+fn push_hex_byte(out: &mut String, byte: u8) {
+    out.push(HEX_DIGITS[(byte >> 4) as usize] as char);
+    out.push(HEX_DIGITS[(byte & 0x0F) as usize] as char);
+}
+
 /// Incremental byte-stream parser for incoming GDB RSP frames.
 #[derive(Debug, Default)]
 pub struct RspParser {
@@ -135,6 +145,11 @@ impl RspParser {
                         self.buf.clear();
                     } else if b == b'#' {
                         self.state = ParseState::Checksum1;
+                    } else if self.buf.len() >= MAX_RSP_PAYLOAD_BYTES {
+                        // Drop oversized payload to prevent unbounded memory growth.
+                        self.buf.clear();
+                        self.state = ParseState::Idle;
+                        events.push(RspEvent::BadChecksum);
                     } else {
                         self.buf.push(b);
                     }
@@ -177,7 +192,7 @@ fn hex_nibble(b: u8) -> Option<u8> {
 
 fn encode_u32_le_hex(val: u32, out: &mut String) {
     for byte in val.to_le_bytes() {
-        out.push_str(&format!("{byte:02x}"));
+        push_hex_byte(out, byte);
     }
 }
 
@@ -345,15 +360,26 @@ impl GdbSession {
                 let norm = pc & !1;
                 if self.hw_breakpoints.contains(&norm) {
                     String::from("T05hwbreak:;")
-                } else {
+                } else if self.sw_breakpoints.contains(&norm) {
                     String::from("T05swbreak:;")
+                } else {
+                    String::from("S05")
                 }
             }
             StopReason::Watchpoint { addr, write, .. } => {
+                let matches_dir = |kind: WatchpointKind| {
+                    if *write {
+                        matches!(kind, WatchpointKind::Write | WatchpointKind::ReadWrite)
+                    } else {
+                        matches!(kind, WatchpointKind::Read | WatchpointKind::ReadWrite)
+                    }
+                };
                 let tag = self
                     .watchpoints
                     .iter()
-                    .find(|w| *addr >= w.start && *addr <= w.end)
+                    .find(|w| {
+                        matches_dir(w.kind) && w.start <= addr.saturating_add(3) && *addr <= w.end
+                    })
                     .map(|w| match w.kind {
                         WatchpointKind::Read => "rwatch",
                         WatchpointKind::Write => "watch",
@@ -383,10 +409,14 @@ impl GdbSession {
                 let norm = pc & !1;
                 self.sw_breakpoints.contains(&norm) || self.hw_breakpoints.contains(&norm)
             }
-            StopReason::Watchpoint { addr, .. } => self
-                .watchpoints
-                .iter()
-                .any(|w| *addr >= w.start && *addr <= w.end),
+            StopReason::Watchpoint { addr, write, .. } => self.watchpoints.iter().any(|w| {
+                let dir_ok = if *write {
+                    matches!(w.kind, WatchpointKind::Write | WatchpointKind::ReadWrite)
+                } else {
+                    matches!(w.kind, WatchpointKind::Read | WatchpointKind::ReadWrite)
+                };
+                dir_ok && w.start <= addr.saturating_add(3) && *addr <= w.end
+            }),
             StopReason::FrameComplete => false,
         }
     }
@@ -473,7 +503,7 @@ impl GdbSession {
             };
         }
         if payload == "vCont?" {
-            return Self::reply_ok(String::from("vCont;c;s"));
+            return Self::reply_ok(String::from("vCont;c;C;s;S"));
         }
         if let Some(rest) = payload.strip_prefix("vCont;") {
             return self.handle_vcont(rest);
@@ -559,24 +589,26 @@ impl GdbSession {
     fn handle_vcont(&mut self, rest: &str) -> PacketOutcome {
         let first_action = rest.split(';').next().unwrap_or("");
         let cmd = first_action.split(':').next().unwrap_or("");
-        match cmd {
-            "c" | "C" => {
-                self.run_state = RunState::Running;
-                PacketOutcome {
-                    reply: None,
-                    action: GdbAction::Continue,
-                    enable_no_ack: false,
-                }
+        if cmd == "c"
+            || (cmd.starts_with('C') && cmd.len() == 3 && parse_hex_u32(&cmd[1..]).is_some())
+        {
+            self.run_state = RunState::Running;
+            PacketOutcome {
+                reply: None,
+                action: GdbAction::Continue,
+                enable_no_ack: false,
             }
-            "s" | "S" => {
-                self.run_state = RunState::Halted;
-                PacketOutcome {
-                    reply: None,
-                    action: GdbAction::Step,
-                    enable_no_ack: false,
-                }
+        } else if cmd == "s"
+            || (cmd.starts_with('S') && cmd.len() == 3 && parse_hex_u32(&cmd[1..]).is_some())
+        {
+            self.run_state = RunState::Halted;
+            PacketOutcome {
+                reply: None,
+                action: GdbAction::Step,
+                enable_no_ack: false,
             }
-            _ => Self::reply_ok(String::new()),
+        } else {
+            Self::reply_ok(String::new())
         }
     }
 
@@ -584,8 +616,8 @@ impl GdbSession {
         if self.target_xml_read {
             // 17 registers described in ARM7TDMI_TARGET_XML: r0..r14, exec_pc, cpsr.
             let mut out = String::with_capacity(17 * 8);
-            for i in 0..15 {
-                encode_u32_le_hex(core.cpu.gpr[i], &mut out);
+            for &reg in core.cpu.gpr.iter().take(15) {
+                encode_u32_le_hex(reg, &mut out);
             }
             encode_u32_le_hex(core.cpu.current_exec_pc(), &mut out);
             encode_u32_le_hex(core.cpu.cpsr, &mut out);
@@ -593,8 +625,8 @@ impl GdbSession {
         } else {
             // Legacy 26-register ARM FPA layout (16*4 + 8*12 + 4 + 4 = 168 bytes).
             let mut out = String::with_capacity(168 * 2);
-            for i in 0..15 {
-                encode_u32_le_hex(core.cpu.gpr[i], &mut out);
+            for &reg in core.cpu.gpr.iter().take(15) {
+                encode_u32_le_hex(reg, &mut out);
             }
             encode_u32_le_hex(core.cpu.current_exec_pc(), &mut out);
             // 8 x 96-bit FPA registers (f0..f7) + 32-bit fps = 100 zero bytes (200 hex chars)
@@ -628,8 +660,8 @@ impl GdbSession {
         };
         let new_cpsr = read_u32(cpsr_off);
         core.cpu.set_cpsr(new_cpsr);
-        for i in 0..15 {
-            core.cpu.gpr[i] = read_u32(i * 4);
+        for (i, slot) in core.cpu.gpr.iter_mut().enumerate().take(15) {
+            *slot = read_u32(i * 4);
         }
         let new_pc = read_u32(15 * 4);
         core.cpu.flush_pipeline(&mut core.bus, new_pc);
@@ -659,8 +691,22 @@ impl GdbSession {
         match reg {
             0..=14 => core.cpu.gpr[reg as usize] = val,
             15 => core.cpu.flush_pipeline(&mut core.bus, val),
-            16 if self.target_xml_read => core.cpu.set_cpsr(val),
-            25 => core.cpu.set_cpsr(val),
+            16 if self.target_xml_read => {
+                let old_pc = core.cpu.current_exec_pc();
+                let old_thumb = core.cpu.is_thumb();
+                core.cpu.set_cpsr(val);
+                if core.cpu.is_thumb() != old_thumb {
+                    core.cpu.flush_pipeline(&mut core.bus, old_pc);
+                }
+            }
+            25 => {
+                let old_pc = core.cpu.current_exec_pc();
+                let old_thumb = core.cpu.is_thumb();
+                core.cpu.set_cpsr(val);
+                if core.cpu.is_thumb() != old_thumb {
+                    core.cpu.flush_pipeline(&mut core.bus, old_pc);
+                }
+            }
             _ => {}
         }
     }
@@ -675,11 +721,11 @@ impl GdbSession {
         let Some(len) = parse_hex_usize(len_s) else {
             return String::from("E01");
         };
-        let capped_len = len.min(0x4000);
+        let capped_len = len.min(MAX_MEMORY_READ_BYTES);
         let mut out = String::with_capacity(capped_len * 2);
         for off in 0..capped_len {
             let b = core.peek8(addr.wrapping_add(off as u32));
-            out.push_str(&format!("{b:02x}"));
+            push_hex_byte(&mut out, b);
         }
         out
     }
@@ -703,8 +749,24 @@ impl GdbSession {
         if bytes.len() != len {
             return String::from("E01");
         }
+        if len > 0 {
+            let end_addr = addr.saturating_add((len - 1) as u32);
+            // Reject writes to read-only BIOS or unmapped high address space.
+            if !(0x0000_4000..0x1000_0000).contains(&addr) || end_addr >= 0x1000_0000 {
+                return String::from("E0E");
+            }
+        }
         for (off, b) in bytes.into_iter().enumerate() {
             core.poke8(addr.wrapping_add(off as u32), b);
+        }
+        // Flush CPU prefetch pipeline if the write overlapped currently buffered instructions.
+        if len > 0 {
+            let exec_pc = core.cpu.current_exec_pc();
+            let pipe_end = exec_pc.saturating_add(12);
+            let write_end = addr.saturating_add(len as u32);
+            if addr < pipe_end && write_end > exec_pc {
+                core.cpu.flush_pipeline(&mut core.bus, exec_pc);
+            }
         }
         String::from("OK")
     }

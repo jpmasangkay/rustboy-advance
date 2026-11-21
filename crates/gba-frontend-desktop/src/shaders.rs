@@ -7,7 +7,8 @@ use gba_core::{LCD_HEIGHT, LCD_WIDTH};
 
 use crate::config::{ColorProfileChoice, DisplayFilter, ShaderPreset};
 use crate::filters::{
-    FilterCost, VideoPostProcessor, fill_linear_rgba, sort_filter_costs, test_filter_pattern_fb,
+    FilterCost, VideoPostProcessor, fill_linear_rgba, fill_profile_rgba, sort_filter_costs,
+    test_filter_pattern_fb,
 };
 
 #[repr(C)]
@@ -16,12 +17,16 @@ pub struct Uniforms {
     pub src_size: [f32; 2],
     pub dst_size: [f32; 2],
     pub ndc_rect: [f32; 4],
+    pub tex_origin: [f32; 2],
     pub color_profile: i32,
     pub frame_blend: f32,
     pub lcd_ghosting: f32,
+    pub lcd_grid_intensity: f32,
+    pub srgb_output: i32,
     pub _pad: f32,
 }
 
+#[allow(dead_code)]
 pub const fn color_profile_uniform(color_correction: bool, profile: ColorProfileChoice) -> i32 {
     if !color_correction {
         return 0;
@@ -39,9 +44,12 @@ struct Uniforms {
     src_size: vec2<f32>,
     dst_size: vec2<f32>,
     ndc_rect: vec4<f32>,
+    tex_origin: vec2<f32>,
     color_profile: i32,
     frame_blend: f32,
     lcd_ghosting: f32,
+    lcd_grid_intensity: f32,
+    srgb_output: i32,
     _pad: f32,
 };
 
@@ -79,7 +87,21 @@ fn safe_pow(v: vec3<f32>, e: f32) -> vec3<f32> {
     return m * pow(max(v, vec3<f32>(0.000001)), vec3<f32>(e));
 }
 
+fn encode_output(c: vec3<f32>) -> vec4<f32> {
+    let clamped = clamp(c, vec3<f32>(0.0), vec3<f32>(1.0));
+    if (uniforms.srgb_output != 0) {
+        let lo = clamped / 12.92;
+        let hi = pow((clamped + vec3<f32>(0.055)) / 1.055, vec3<f32>(2.4));
+        let lin = select(lo, hi, clamped > vec3<f32>(0.04045));
+        return vec4<f32>(lin, 1.0);
+    }
+    return vec4<f32>(clamped, 1.0);
+}
+
 fn apply_color_profile(c: vec3<f32>, profile: i32) -> vec3<f32> {
+    if (profile == 0) {
+        return clamp(c, vec3<f32>(0.0), vec3<f32>(1.0));
+    }
     if (profile == 1) {
         let lin = safe_pow(c, 2.4);
         let mapped = vec3<f32>(
@@ -108,7 +130,7 @@ fn apply_color_profile(c: vec3<f32>, profile: i32) -> vec3<f32> {
 
 fn sample_texel(coord: vec2<i32>) -> vec3<f32> {
     let max_coord = vec2<i32>(uniforms.src_size) - vec2<i32>(1);
-    let c = clamp(coord, vec2<i32>(0), max_coord);
+    let c = clamp(coord, vec2<i32>(0), max_coord) + vec2<i32>(uniforms.tex_origin);
     let curr_raw = textureLoad(curr_tex, c, 0).rgb;
     let curr = apply_color_profile(curr_raw, uniforms.color_profile);
     let temporal = clamp(max(uniforms.frame_blend, uniforms.lcd_ghosting), 0.0, 0.5);
@@ -137,19 +159,19 @@ fn sample_sharp_bilinear(uv: vec2<f32>) -> vec3<f32> {
 @fragment
 fn fs_plain(in: VertexOutput) -> @location(0) vec4<f32> {
     let max_coord = vec2<i32>(uniforms.src_size) - vec2<i32>(1);
-    let texel = clamp(vec2<i32>(in.uv * uniforms.src_size), vec2<i32>(0), max_coord);
+    let texel = clamp(vec2<i32>(in.uv * uniforms.src_size), vec2<i32>(0), max_coord) + vec2<i32>(uniforms.tex_origin);
     return textureLoad(curr_tex, texel, 0);
 }
 
 @fragment
 fn fs_nearest(in: VertexOutput) -> @location(0) vec4<f32> {
     let texel = vec2<i32>(floor(in.uv * uniforms.src_size));
-    return vec4<f32>(sample_texel(texel), 1.0);
+    return encode_output(sample_texel(texel));
 }
 
 @fragment
 fn fs_sharp_bilinear(in: VertexOutput) -> @location(0) vec4<f32> {
-    return vec4<f32>(sample_sharp_bilinear(in.uv), 1.0);
+    return encode_output(sample_sharp_bilinear(in.uv));
 }
 
 @fragment
@@ -160,20 +182,22 @@ fn fs_lcd_grid(in: VertexOutput) -> @location(0) vec4<f32> {
 
     let sub = fract(in.uv * uniforms.src_size);
 
-    let grid_strength = smoothstep(1.4, 2.8, scale);
+    let grid_mul = clamp(uniforms.lcd_grid_intensity / 0.08, 0.0, 3.125);
+    let grid_strength = smoothstep(1.4, 2.8, scale) * grid_mul;
     let row_gap = smoothstep(0.34, 0.50, abs(sub.y - 0.5));
     let col_gap = smoothstep(0.38, 0.50, abs(sub.x - 0.5));
-    let grid_mask = (1.0 - grid_strength * 0.28 * row_gap) * (1.0 - grid_strength * 0.14 * col_gap);
+    let grid_mask = clamp(1.0 - grid_strength * 0.22 * row_gap, 0.45, 1.0)
+                  * clamp(1.0 - grid_strength * 0.12 * col_gap, 0.55, 1.0);
 
-    let triad_strength = smoothstep(2.2, 3.0, scale) * 0.72;
+    let triad_strength = smoothstep(2.2, 3.0, scale) * clamp(0.42 * grid_mul, 0.0, 0.78);
     let rw = exp(-18.0 * (sub.x - 1.0 / 6.0) * (sub.x - 1.0 / 6.0));
     let gw = exp(-18.0 * (sub.x - 0.5) * (sub.x - 0.5));
     let bw = exp(-18.0 * (sub.x - 5.0 / 6.0) * (sub.x - 5.0 / 6.0));
     let triad = mix(vec3<f32>(1.0), vec3<f32>(0.76) + 0.44 * vec3<f32>(rw, gw, bw), triad_strength);
 
-    let gain = 1.0 + 0.10 * grid_strength;
+    let gain = 1.0 + 0.08 * min(grid_strength, 1.5);
     let col = clamp(base * triad * grid_mask * gain, vec3<f32>(0.0), vec3<f32>(1.0));
-    return vec4<f32>(col, 1.0);
+    return encode_output(col);
 }
 
 fn crt_curve(uv: vec2<f32>) -> vec2<f32> {
@@ -225,7 +249,7 @@ fn fs_crt_scanlines(in: VertexOutput) -> @location(0) vec4<f32> {
     let vignette = clamp(1.0 - 0.16 * dot(centered, centered), 0.72, 1.0);
 
     let col = (base * scanline + glow * (0.12 + 0.08 * luma)) * grille * vignette * edge_mask;
-    return vec4<f32>(clamp(col, vec3<f32>(0.0), vec3<f32>(1.0)), 1.0);
+    return encode_output(col);
 }
 
 fn yuv_dist(c1: vec3<f32>, c2: vec3<f32>) -> f32 {
@@ -246,33 +270,28 @@ fn fs_scale_edge(in: VertexOutput) -> @location(0) vec4<f32> {
     let sy = select(-1, 1, f.y >= 0.0);
     let q = abs(f);
 
-    let E  = sample_texel(p);
-    let F  = sample_texel(p + vec2<i32>(sx, 0));
-    let H  = sample_texel(p + vec2<i32>(0, sy));
-    let I  = sample_texel(p + vec2<i32>(sx, sy));
-    let D  = sample_texel(p + vec2<i32>(-sx, 0));
-    let B  = sample_texel(p + vec2<i32>(0, -sy));
-    let C  = sample_texel(p + vec2<i32>(sx, -sy));
-    let G  = sample_texel(p + vec2<i32>(-sx, sy));
-    let F4 = sample_texel(p + vec2<i32>(2 * sx, 0));
-    let I4 = sample_texel(p + vec2<i32>(2 * sx, sy));
-    let H5 = sample_texel(p + vec2<i32>(0, 2 * sy));
-    let I5 = sample_texel(p + vec2<i32>(sx, 2 * sy));
+    let E = sample_texel(p);
+    let F = sample_texel(p + vec2<i32>(sx, 0));
+    let H = sample_texel(p + vec2<i32>(0, sy));
 
     let df_EF = yuv_dist(E, F);
     let df_EH = yuv_dist(E, H);
-    let df_FH = yuv_dist(F, H);
-    let df_EI = yuv_dist(E, I);
-
-    let aa = clamp(
-        max(uniforms.src_size.x / max(uniforms.dst_size.x, 1.0), uniforms.src_size.y / max(uniforms.dst_size.y, 1.0)) * 0.75,
-        0.02,
-        0.35
-    );
 
     var out_col = E;
 
     if (df_EF > 1.2 && df_EH > 1.2) {
+        let I  = sample_texel(p + vec2<i32>(sx, sy));
+        let D  = sample_texel(p + vec2<i32>(-sx, 0));
+        let B  = sample_texel(p + vec2<i32>(0, -sy));
+        let C  = sample_texel(p + vec2<i32>(sx, -sy));
+        let G  = sample_texel(p + vec2<i32>(-sx, sy));
+        let F4 = sample_texel(p + vec2<i32>(2 * sx, 0));
+        let I4 = sample_texel(p + vec2<i32>(2 * sx, sy));
+        let H5 = sample_texel(p + vec2<i32>(0, 2 * sy));
+        let I5 = sample_texel(p + vec2<i32>(sx, 2 * sy));
+
+        let df_FH = yuv_dist(F, H);
+        let df_EI = yuv_dist(E, I);
         let df_EC = yuv_dist(E, C);
         let df_EG = yuv_dist(E, G);
         let df_IH5 = yuv_dist(I, H5);
@@ -290,6 +309,11 @@ fn fs_scale_edge(in: VertexOutput) -> @location(0) vec4<f32> {
         let connected = (min(min(df_EC, df_EG), min(df_EB, df_ED)) < 4.0) || (df_FH < 2.5);
 
         if (w_diag < w_orth && connected) {
+            let aa = clamp(
+                max(uniforms.src_size.x / max(uniforms.dst_size.x, 1.0), uniforms.src_size.y / max(uniforms.dst_size.y, 1.0)) * 0.75,
+                0.02,
+                0.35
+            );
             let df_FG = yuv_dist(F, G);
             let df_HC = yuv_dist(H, C);
             let shallow_h = (2.0 * df_FG <= df_EC) && (df_EI > 1.0) && (df_EF > df_FG);
@@ -313,16 +337,19 @@ fn fs_scale_edge(in: VertexOutput) -> @location(0) vec4<f32> {
         }
     }
 
-    return vec4<f32>(out_col, 1.0);
+    return encode_output(out_col);
 }
 "#;
 
 #[derive(Clone, Copy, Debug)]
 pub struct ShaderRenderParams {
     pub preset: ShaderPreset,
+    pub src_size: [f32; 2],
+    pub tex_origin: [f32; 2],
     pub color_profile_id: i32,
     pub frame_blend: f32,
     pub lcd_ghosting: f32,
+    pub lcd_grid_intensity: f32,
 }
 
 pub struct WgpuShaderPipeline {
@@ -332,11 +359,16 @@ pub struct WgpuShaderPipeline {
     prev_tex: wgpu::Texture,
     uniform_buf: Arc<wgpu::Buffer>,
     bind_group: Arc<wgpu::BindGroup>,
+    bind_group_swapped: Arc<wgpu::BindGroup>,
+    active_slot: usize,
+    target_is_srgb: bool,
     pipelines: [Arc<wgpu::RenderPipeline>; ShaderPreset::COUNT],
     plain_pipeline: Arc<wgpu::RenderPipeline>,
     curr_staging: Vec<u8>,
     prev_staging: Vec<u8>,
     upload_dirty: bool,
+    upload_prev_dirty: bool,
+    last_lut_key: Option<(bool, ColorProfileChoice)>,
     has_uploaded_once: bool,
     warned_failure: bool,
 }
@@ -373,13 +405,17 @@ impl WgpuShaderPipeline {
         let curr_view = curr_tex.create_view(&wgpu::TextureViewDescriptor::default());
         let prev_view = prev_tex.create_view(&wgpu::TextureViewDescriptor::default());
 
+        let target_is_srgb = target_format.is_srgb();
         let initial_uniforms = Uniforms {
             src_size: [LCD_WIDTH as f32, LCD_HEIGHT as f32],
             dst_size: [LCD_WIDTH as f32, LCD_HEIGHT as f32],
             ndc_rect: [-1.0, 1.0, 1.0, -1.0],
+            tex_origin: [0.0, 0.0],
             color_profile: 0,
             frame_blend: 0.0,
             lcd_ghosting: 0.0,
+            lcd_grid_intensity: 0.08,
+            srgb_output: i32::from(target_is_srgb),
             _pad: 0.0,
         };
 
@@ -428,7 +464,7 @@ impl WgpuShaderPipeline {
         });
 
         let bind_group = Arc::new(device.create_bind_group(&wgpu::BindGroupDescriptor {
-            label: Some("gba_shader_bg"),
+            label: Some("gba_shader_bg_a"),
             layout: &bind_group_layout,
             entries: &[
                 wgpu::BindGroupEntry {
@@ -442,6 +478,25 @@ impl WgpuShaderPipeline {
                 wgpu::BindGroupEntry {
                     binding: 2,
                     resource: wgpu::BindingResource::TextureView(&prev_view),
+                },
+            ],
+        }));
+
+        let bind_group_swapped = Arc::new(device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("gba_shader_bg_b"),
+            layout: &bind_group_layout,
+            entries: &[
+                wgpu::BindGroupEntry {
+                    binding: 0,
+                    resource: uniform_buf.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 1,
+                    resource: wgpu::BindingResource::TextureView(&prev_view),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 2,
+                    resource: wgpu::BindingResource::TextureView(&curr_view),
                 },
             ],
         }));
@@ -552,11 +607,16 @@ impl WgpuShaderPipeline {
             prev_tex,
             uniform_buf,
             bind_group,
+            bind_group_swapped,
+            active_slot: 0,
+            target_is_srgb,
             pipelines,
             plain_pipeline,
             curr_staging: blank.clone(),
             prev_staging: blank,
             upload_dirty: false,
+            upload_prev_dirty: false,
+            last_lut_key: None,
             has_uploaded_once: false,
             warned_failure: false,
         })
@@ -570,12 +630,56 @@ impl WgpuShaderPipeline {
         !self.has_uploaded_once
     }
 
+    fn active_bind_group(&self) -> &Arc<wgpu::BindGroup> {
+        if self.active_slot == 0 {
+            &self.bind_group
+        } else {
+            &self.bind_group_swapped
+        }
+    }
+
+    /// Ping-pong frame staging with 32K LUT color-profile conversion at 240x160 so steady-state
+    /// frames issue only 1 GPU texture upload (instead of 2) and zero per-fragment `pow()`.
+    pub fn stage_frame_lut(
+        &mut self,
+        curr_fb: &[u16; LCD_WIDTH * LCD_HEIGHT],
+        prev_fb: &[u16; LCD_WIDTH * LCD_HEIGHT],
+        has_prev: bool,
+        color_correction: bool,
+        profile: ColorProfileChoice,
+    ) {
+        let key = (color_correction, profile);
+        let profile_changed = self.last_lut_key != Some(key) || !self.has_uploaded_once;
+        self.last_lut_key = Some(key);
+
+        if profile_changed {
+            self.active_slot = 0;
+            fill_profile_rgba(curr_fb, color_correction, profile, &mut self.curr_staging);
+            if has_prev {
+                fill_profile_rgba(prev_fb, color_correction, profile, &mut self.prev_staging);
+            } else {
+                self.prev_staging.copy_from_slice(&self.curr_staging);
+            }
+            self.upload_dirty = true;
+            self.upload_prev_dirty = true;
+        } else {
+            // Ping-pong: previous GPU texture already holds the prior frame!
+            self.active_slot ^= 1;
+            fill_profile_rgba(curr_fb, color_correction, profile, &mut self.curr_staging);
+            self.upload_dirty = true;
+            self.upload_prev_dirty = false;
+        }
+        self.has_uploaded_once = true;
+    }
+
     pub fn stage_frames(
         &mut self,
         curr_fb: &[u16; LCD_WIDTH * LCD_HEIGHT],
         prev_fb: &[u16; LCD_WIDTH * LCD_HEIGHT],
         has_prev: bool,
     ) {
+        self.active_slot = 0;
+        self.last_lut_key = None;
         fill_linear_rgba(curr_fb, &mut self.curr_staging);
         if has_prev {
             fill_linear_rgba(prev_fb, &mut self.prev_staging);
@@ -583,6 +687,7 @@ impl WgpuShaderPipeline {
             self.prev_staging.copy_from_slice(&self.curr_staging);
         }
         self.upload_dirty = true;
+        self.upload_prev_dirty = true;
         self.has_uploaded_once = true;
     }
 
@@ -603,38 +708,43 @@ impl WgpuShaderPipeline {
             height: LCD_HEIGHT as u32,
             depth_or_array_layers: 1,
         };
+        let layout = wgpu::TexelCopyBufferLayout {
+            offset: 0,
+            bytes_per_row: Some(LCD_WIDTH as u32 * 4),
+            rows_per_image: Some(LCD_HEIGHT as u32),
+        };
+        let (curr_target, prev_target) = if self.active_slot == 0 {
+            (&self.curr_tex, &self.prev_tex)
+        } else {
+            (&self.prev_tex, &self.curr_tex)
+        };
 
         self.queue.write_texture(
             wgpu::TexelCopyTextureInfo {
-                texture: &self.curr_tex,
+                texture: curr_target,
                 mip_level: 0,
                 origin: wgpu::Origin3d::ZERO,
                 aspect: wgpu::TextureAspect::All,
             },
             &self.curr_staging,
-            wgpu::TexelCopyBufferLayout {
-                offset: 0,
-                bytes_per_row: Some(LCD_WIDTH as u32 * 4),
-                rows_per_image: Some(LCD_HEIGHT as u32),
-            },
+            layout,
             extent,
         );
 
-        self.queue.write_texture(
-            wgpu::TexelCopyTextureInfo {
-                texture: &self.prev_tex,
-                mip_level: 0,
-                origin: wgpu::Origin3d::ZERO,
-                aspect: wgpu::TextureAspect::All,
-            },
-            &self.prev_staging,
-            wgpu::TexelCopyBufferLayout {
-                offset: 0,
-                bytes_per_row: Some(LCD_WIDTH as u32 * 4),
-                rows_per_image: Some(LCD_HEIGHT as u32),
-            },
-            extent,
-        );
+        if self.upload_prev_dirty {
+            self.queue.write_texture(
+                wgpu::TexelCopyTextureInfo {
+                    texture: prev_target,
+                    mip_level: 0,
+                    origin: wgpu::Origin3d::ZERO,
+                    aspect: wgpu::TextureAspect::All,
+                },
+                &self.prev_staging,
+                layout,
+                extent,
+            );
+            self.upload_prev_dirty = false;
+        }
 
         self.upload_dirty = false;
     }
@@ -654,9 +764,12 @@ impl WgpuShaderPipeline {
             src_size: [LCD_WIDTH as f32, LCD_HEIGHT as f32],
             dst_size: [dst_width as f32, dst_height as f32],
             ndc_rect: [-1.0, 1.0, 1.0, -1.0],
+            tex_origin: [0.0, 0.0],
             color_profile: color_profile_id,
             frame_blend: 0.0,
             lcd_ghosting: 0.0,
+            lcd_grid_intensity: 0.08,
+            srgb_output: i32::from(self.target_is_srgb),
             _pad: 0.0,
         };
         self.queue
@@ -678,7 +791,7 @@ impl WgpuShaderPipeline {
         });
 
         rpass.set_pipeline(pipeline.as_ref());
-        rpass.set_bind_group(0, self.bind_group.as_ref(), &[]);
+        rpass.set_bind_group(0, self.active_bind_group().as_ref(), &[]);
         rpass.draw(0..6, 0..1);
     }
 
@@ -689,20 +802,26 @@ impl WgpuShaderPipeline {
     ) -> PaintCallback {
         self.flush_uploads();
 
+        // egui_wgpu already sets the render-pass viewport to `rect` in physical pixels,
+        // so the vertex shader fills full clip space [-1..1] inside that viewport.
         let uniforms = Uniforms {
-            src_size: [LCD_WIDTH as f32, LCD_HEIGHT as f32],
-            dst_size: [rect.width(), rect.height()],
-            ndc_rect: [rect.min.x, rect.min.y, rect.max.x, rect.max.y],
+            src_size: params.src_size,
+            dst_size: [rect.width().max(1.0), rect.height().max(1.0)],
+            ndc_rect: [-1.0, 1.0, 1.0, -1.0],
+            tex_origin: params.tex_origin,
             color_profile: params.color_profile_id,
             frame_blend: params.frame_blend,
             lcd_ghosting: params.lcd_ghosting,
+            lcd_grid_intensity: params.lcd_grid_intensity,
+            srgb_output: i32::from(self.target_is_srgb),
             _pad: 0.0,
         };
 
         let cb = WgpuViewportCallback {
             pipeline: self.pipelines[params.preset.index()].clone(),
-            bind_group: self.bind_group.clone(),
+            bind_group: self.active_bind_group().clone(),
             uniform_buf: self.uniform_buf.clone(),
+            rect_points: [rect.width(), rect.height()],
             uniforms,
         };
 
@@ -714,6 +833,7 @@ pub struct WgpuViewportCallback {
     pipeline: Arc<wgpu::RenderPipeline>,
     bind_group: Arc<wgpu::BindGroup>,
     uniform_buf: Arc<wgpu::Buffer>,
+    rect_points: [f32; 2],
     uniforms: Uniforms,
 }
 
@@ -728,27 +848,11 @@ impl egui_wgpu::CallbackTrait for WgpuViewportCallback {
     ) -> Vec<wgpu::CommandBuffer> {
         let mut uniforms = self.uniforms;
         let ppp = screen_descriptor.pixels_per_point;
-        let screen_w = screen_descriptor.size_in_pixels[0] as f32;
-        let screen_h = screen_descriptor.size_in_pixels[1] as f32;
-
-        if screen_w > 0.0 && screen_h > 0.0 {
-            let left_px = uniforms.ndc_rect[0] * ppp;
-            let top_px = uniforms.ndc_rect[1] * ppp;
-            let right_px = uniforms.ndc_rect[2] * ppp;
-            let bottom_px = uniforms.ndc_rect[3] * ppp;
-
-            uniforms.ndc_rect = [
-                (left_px / screen_w) * 2.0 - 1.0,
-                1.0 - (top_px / screen_h) * 2.0,
-                (right_px / screen_w) * 2.0 - 1.0,
-                1.0 - (bottom_px / screen_h) * 2.0,
-            ];
-            uniforms.dst_size = [
-                (right_px - left_px).abs().max(1.0),
-                (bottom_px - top_px).abs().max(1.0),
-            ];
-        }
-
+        uniforms.dst_size = [
+            (self.rect_points[0] * ppp).abs().max(1.0),
+            (self.rect_points[1] * ppp).abs().max(1.0),
+        ];
+        uniforms.ndc_rect = [-1.0, 1.0, 1.0, -1.0];
         queue.write_buffer(&self.uniform_buf, 0, bytemuck::bytes_of(&uniforms));
         Vec::new()
     }
@@ -803,8 +907,9 @@ pub fn find_software_vulkan_icd() -> Option<std::path::PathBuf> {
 }
 
 /// Documented graphics adapter fallback chain from fastest hardware path to no-GPU software:
-/// `Vulkan -> DX12 -> GL -> No-GPU presenter (winit + softbuffer)`.
-pub const ADAPTER_FALLBACK_ORDER: [&str; 4] = [
+/// `Metal -> Vulkan -> DX12 -> GL -> No-GPU presenter (winit + softbuffer)`.
+pub const ADAPTER_FALLBACK_ORDER: [&str; 5] = [
+    "Metal",
     "Vulkan",
     "DX12",
     "GL",
@@ -867,10 +972,11 @@ pub fn enumerate_all_wgpu_adapters_with_sim(
 #[inline]
 pub const fn backend_fallback_rank(backend: wgpu::Backend) -> u8 {
     match backend {
-        wgpu::Backend::Vulkan => 0,
-        wgpu::Backend::Dx12 => 1,
-        wgpu::Backend::Gl => 2,
-        _ => 3,
+        wgpu::Backend::Metal => 0,
+        wgpu::Backend::Vulkan => 1,
+        wgpu::Backend::Dx12 => 2,
+        wgpu::Backend::Gl => 3,
+        _ => 4,
     }
 }
 
@@ -931,10 +1037,12 @@ pub fn discover_software_cpu_adapter_with_backends(
         && std::env::var_os("VK_DRIVER_FILES").is_none()
         && let Some(icd_path) = find_software_vulkan_icd()
     {
-        // SAFETY: Serialized under `VK_ICD_ENV_LOCK` for headless adapter probing.
-        unsafe {
-            std::env::set_var("VK_ADD_DRIVER_FILES", &icd_path);
-        }
+        // Do not call `std::env::set_var` in a multi-threaded process (UB on POSIX);
+        // log the discovered ICD path so callers can export `VK_ADD_DRIVER_FILES` externally if needed.
+        log::info!(
+            "Software Vulkan ICD available at {} (set VK_ADD_DRIVER_FILES externally to force it)",
+            icd_path.display()
+        );
     }
 
     let instance = wgpu::Instance::new(&wgpu::InstanceDescriptor {
@@ -2077,9 +2185,12 @@ impl BenchWgpuContext {
                     src_size: [LCD_WIDTH as f32, LCD_HEIGHT as f32],
                     dst_size: [self.width as f32, self.height as f32],
                     ndc_rect: [-1.0, 1.0, 1.0, -1.0],
+                    tex_origin: [0.0, 0.0],
                     color_profile: 0,
                     frame_blend: 0.0,
                     lcd_ghosting: 0.0,
+                    lcd_grid_intensity: 0.0,
+                    srgb_output: i32::from(self.pipeline.target_is_srgb),
                     _pad: 0.0,
                 };
                 self.queue.write_buffer(
@@ -2459,7 +2570,7 @@ mod tests {
 
     #[test]
     fn test_uniforms_layout_and_size() {
-        assert_eq!(std::mem::size_of::<Uniforms>(), 48);
+        assert_eq!(std::mem::size_of::<Uniforms>(), 64);
         assert_eq!(std::mem::size_of::<Uniforms>() % 16, 0);
     }
 
@@ -2520,7 +2631,11 @@ mod tests {
 
     #[test]
     fn test_adapter_fallback_order_and_missing_adapter_returns_clear_error() {
-        assert_eq!(ADAPTER_FALLBACK_ORDER.len(), 4);
+        assert_eq!(ADAPTER_FALLBACK_ORDER.len(), 5);
+        assert!(
+            backend_fallback_rank(wgpu::Backend::Metal)
+                < backend_fallback_rank(wgpu::Backend::Vulkan)
+        );
         assert!(
             backend_fallback_rank(wgpu::Backend::Vulkan)
                 < backend_fallback_rank(wgpu::Backend::Dx12)

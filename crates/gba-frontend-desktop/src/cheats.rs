@@ -41,13 +41,36 @@ pub enum CheatAction {
     Write16 { addr: u32, val: u16 },
     Write32 { addr: u32, val: u32 },
     Add16 { addr: u32, delta: u16 },
+    Or16 { addr: u32, mask: u16 },
+    And16 { addr: u32, mask: u16 },
     IfEqual16 { addr: u32, val: u16 },
     IfNotEqual16 { addr: u32, val: u16 },
     NoOp,
 }
 
+/// Pre-decoded cheat action list so per-frame execution never re-parses hex or re-runs TEA.
+#[derive(Clone, Debug)]
+pub struct CompiledCheat {
+    pub actions: Vec<CheatAction>,
+}
+
 const AR_V1_SEEDS: [u32; 4] = [0x09F4_FBBD, 0x9681_884A, 0x3520_27E9, 0xF3DE_E5A7];
 const AR_V3_SEEDS: [u32; 4] = [0x7AA9_648F, 0x7FAE_6994, 0xC0EF_AAD5, 0x4271_2C57];
+
+/// Re-seeds the AR v3 TEA key schedule upon encountering a `DEADFACE XXXXYYYY` master code.
+fn ar_v3_reseed(seed_word: u32) -> [u32; 4] {
+    let s0 = seed_word & 0xFFFF;
+    let s1 = (seed_word >> 16) & 0xFFFF;
+    let mut keys = [0u32; 4];
+    let mut state = (s0 ^ 0xA5A5) | ((s1 ^ 0x5A5A) << 16);
+    for (i, k) in keys.iter_mut().enumerate() {
+        state = state
+            .wrapping_mul(0x41C6_4E6D)
+            .wrapping_add(0x0000_3039 ^ AR_V3_SEEDS[i]);
+        *k = state ^ AR_V3_SEEDS[i];
+    }
+    keys
+}
 
 fn tea_decrypt(mut v0: u32, mut v1: u32, k: &[u32; 4]) -> (u32, u32) {
     let mut sum = 0xC6EF_3720u32;
@@ -84,15 +107,16 @@ fn parse_raw_pair_32_16(w1: u32, w2: u16) -> CheatAction {
     let op = (w1 >> 28) & 0xF;
     let addr = cb_map_addr(w1 & 0x0FFF_FFFF);
     match op {
-        0x2 => CheatAction::Add16 { addr, delta: w2 },
+        0x2 => CheatAction::Or16 { addr, mask: w2 },
         0x3 => CheatAction::Write8 {
             addr,
             val: (w2 & 0xFF) as u8,
         },
-        0x6 => CheatAction::Write16 { addr, val: w2 },
+        0x6 => CheatAction::And16 { addr, mask: w2 },
         0x7 => CheatAction::IfEqual16 { addr, val: w2 },
         0x8 => CheatAction::Write16 { addr, val: w2 },
         0xA => CheatAction::IfNotEqual16 { addr, val: w2 },
+        0xB => CheatAction::Add16 { addr, delta: w2 },
         0xD => {
             if (w1 & 0x0FFF_FFFF) == 0x0000_0020 {
                 // D0000020 xxxx: keypad check against active-high button mask
@@ -114,14 +138,16 @@ fn parse_ar_decrypted(op_addr: u32, val: u32, is_v3: bool) -> CheatAction {
     }
     if is_v3 {
         let cmd = (op_addr >> 24) & 0xFF;
-        let region_bit = (op_addr >> 25) & 1;
+        // Bit 24 selects RAM region (0 = EWRAM 0x0200_0000, 1 = IWRAM 0x0300_0000);
+        // bits 25..31 carry the opcode (mask with 0xFE so bit 25 / 0x02 is preserved!).
+        let region_bit = (op_addr >> 24) & 1;
         let low = op_addr & 0x00FF_FFFF;
         let base = if region_bit != 0 {
             0x0300_0000 | (low & 0x7FFF)
         } else {
             0x0200_0000 | (low & 0x3_FFFF)
         };
-        match cmd & 0xFD {
+        match cmd & 0xFE {
             0x00 => CheatAction::Write8 {
                 addr: base,
                 val: (val & 0xFF) as u8,
@@ -131,11 +157,11 @@ fn parse_ar_decrypted(op_addr: u32, val: u32, is_v3: bool) -> CheatAction {
                 val: (val & 0xFFFF) as u16,
             },
             0x04 => CheatAction::Write32 { addr: base, val },
-            0x08 => CheatAction::IfEqual16 {
+            0x08 | 0x0A => CheatAction::IfEqual16 {
                 addr: base,
                 val: (val & 0xFFFF) as u16,
             },
-            0x0A => CheatAction::IfNotEqual16 {
+            0x10 | 0x12 => CheatAction::IfNotEqual16 {
                 addr: base,
                 val: (val & 0xFFFF) as u16,
             },
@@ -189,6 +215,9 @@ fn parse_ar_decrypted(op_addr: u32, val: u32, is_v3: bool) -> CheatAction {
 
 pub fn decode_cheat_lines(code: &str, format: CheatFormat) -> Result<Vec<CheatAction>, String> {
     let mut actions = Vec::new();
+    let mut ar_v3_keys = AR_V3_SEEDS;
+    let mut pending_cb_slide: Option<(u32, u16)> = None;
+
     for (line_idx, raw_line) in code.lines().enumerate() {
         let cleaned: String = raw_line
             .chars()
@@ -223,6 +252,26 @@ pub fn decode_cheat_lines(code: &str, format: CheatFormat) -> Result<Vec<CheatAc
             let w2 = u32::from_str_radix(rhs, 16)
                 .map_err(|_| format!("Line {}: invalid hex `{rhs}`", line_idx + 1))?;
 
+            if let Some((base_addr, start_val)) = pending_cb_slide.take() {
+                let val_inc = ((w1 >> 16) & 0xFFFF) as u16;
+                let count = ((w1 & 0xFFFF) as usize).min(256);
+                let addr_inc = w2 & 0xFFFF;
+                for i in 0..count {
+                    actions.push(CheatAction::Write16 {
+                        addr: base_addr.wrapping_add((i as u32).wrapping_mul(addr_inc)),
+                        val: start_val.wrapping_add((i as u16).wrapping_mul(val_inc)),
+                    });
+                }
+                continue;
+            }
+
+            let is_cb = format == CheatFormat::CodeBreaker
+                || (format == CheatFormat::AutoRaw && rhs.len() <= 4);
+            if is_cb && ((w1 >> 28) & 0xF) == 0x4 {
+                pending_cb_slide = Some((cb_map_addr(w1 & 0x0FFF_FFFF), w2 as u16));
+                continue;
+            }
+
             let act = match format {
                 CheatFormat::CodeBreaker => parse_raw_pair_32_16(w1, w2 as u16),
                 CheatFormat::GameSharkV1 => {
@@ -230,8 +279,13 @@ pub fn decode_cheat_lines(code: &str, format: CheatFormat) -> Result<Vec<CheatAc
                     parse_ar_decrypted(a, b, false)
                 }
                 CheatFormat::ActionReplayV3 => {
-                    let (a, b) = tea_decrypt(w1, w2, &AR_V3_SEEDS);
-                    parse_ar_decrypted(a, b, true)
+                    let (a, b) = tea_decrypt(w1, w2, &ar_v3_keys);
+                    if a == 0xDEAD_FACE {
+                        ar_v3_keys = ar_v3_reseed(b);
+                        CheatAction::NoOp
+                    } else {
+                        parse_ar_decrypted(a, b, true)
+                    }
                 }
                 CheatFormat::AutoRaw => {
                     if rhs.len() <= 4 {
@@ -242,8 +296,13 @@ pub fn decode_cheat_lines(code: &str, format: CheatFormat) -> Result<Vec<CheatAc
                         // Treat unprefixed 8+8 AR code cleanly as raw AR command or v3 decrypted fallback
                         let raw = parse_ar_decrypted(w1, w2, false);
                         if raw == CheatAction::NoOp {
-                            let (a, b) = tea_decrypt(w1, w2, &AR_V3_SEEDS);
-                            parse_ar_decrypted(a, b, true)
+                            let (a, b) = tea_decrypt(w1, w2, &ar_v3_keys);
+                            if a == 0xDEAD_FACE {
+                                ar_v3_keys = ar_v3_reseed(b);
+                                CheatAction::NoOp
+                            } else {
+                                parse_ar_decrypted(a, b, true)
+                            }
                         } else {
                             raw
                         }
@@ -256,16 +315,23 @@ pub fn decode_cheat_lines(code: &str, format: CheatFormat) -> Result<Vec<CheatAc
     Ok(actions)
 }
 
-pub fn apply_cheats_to_core(core: &mut GbaCore, cheats: &[CheatEntry]) {
+pub fn compile_cheats(cheats: &[CheatEntry]) -> Vec<CompiledCheat> {
+    let mut compiled = Vec::new();
     for entry in cheats {
         if !entry.enabled {
             continue;
         }
-        let Ok(actions) = decode_cheat_lines(&entry.code, entry.format) else {
-            continue;
-        };
+        if let Ok(actions) = decode_cheat_lines(&entry.code, entry.format) {
+            compiled.push(CompiledCheat { actions });
+        }
+    }
+    compiled
+}
+
+pub fn apply_compiled_cheats_to_core(core: &mut GbaCore, compiled: &[CompiledCheat]) {
+    for cheat in compiled {
         let mut skip_next = false;
-        for act in actions {
+        for &act in &cheat.actions {
             if skip_next {
                 skip_next = false;
                 continue;
@@ -277,6 +343,14 @@ pub fn apply_cheats_to_core(core: &mut GbaCore, cheats: &[CheatEntry]) {
                 CheatAction::Add16 { addr, delta } => {
                     let cur = core.bus.debug_read_16(addr);
                     core.bus.apply_cheat_write_16(addr, cur.wrapping_add(delta));
+                }
+                CheatAction::Or16 { addr, mask } => {
+                    let cur = core.bus.debug_read_16(addr);
+                    core.bus.apply_cheat_write_16(addr, cur | mask);
+                }
+                CheatAction::And16 { addr, mask } => {
+                    let cur = core.bus.debug_read_16(addr);
+                    core.bus.apply_cheat_write_16(addr, cur & mask);
                 }
                 CheatAction::IfEqual16 { addr, val } => {
                     if core.bus.debug_read_16(addr) != val {
@@ -292,6 +366,12 @@ pub fn apply_cheats_to_core(core: &mut GbaCore, cheats: &[CheatEntry]) {
             }
         }
     }
+}
+
+#[allow(dead_code)]
+pub fn apply_cheats_to_core(core: &mut GbaCore, cheats: &[CheatEntry]) {
+    let compiled = compile_cheats(cheats);
+    apply_compiled_cheats_to_core(core, &compiled);
 }
 
 #[cfg(test)]

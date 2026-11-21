@@ -179,6 +179,20 @@ pub fn fill_linear_rgba(fb_bgr555: &[u16; LCD_WIDTH * LCD_HEIGHT], dst_rgba: &mu
     }
 }
 
+/// Convert raw BGR555 framebuffer pixels directly through the active 32K color-profile LUT.
+pub fn fill_profile_rgba(
+    fb_bgr555: &[u16; LCD_WIDTH * LCD_HEIGHT],
+    color_correction: bool,
+    profile: ColorProfileChoice,
+    dst_rgba: &mut [u8],
+) {
+    let lut = lut_for_profile(color_correction, profile);
+    for (idx, &px) in fb_bgr555.iter().enumerate() {
+        let off = idx * 4;
+        dst_rgba[off..off + 4].copy_from_slice(&lut[(px & 0x7FFF) as usize]);
+    }
+}
+
 #[derive(Clone, Copy)]
 struct FrameComputeOptions {
     color_correction: bool,
@@ -200,9 +214,11 @@ struct SyncCacheKey {
 pub struct VideoPostProcessor {
     pub prev_rgba: Vec<u8>,
     pub curr_rgba: Vec<u8>,
+    #[allow(dead_code)]
     pub grid_rgba: Vec<u8>,
     pub prev_bgr555: Vec<u16>,
     pub has_prev_frame: bool,
+    #[allow(dead_code)]
     pub frame_blending: bool,
     last_sync_key: Option<SyncCacheKey>,
 
@@ -341,6 +357,7 @@ impl VideoPostProcessor {
         }
     }
 
+    #[allow(dead_code)]
     pub fn process_frame(
         &mut self,
         fb_bgr555: &[u16; LCD_WIDTH * LCD_HEIGHT],
@@ -360,7 +377,7 @@ impl VideoPostProcessor {
         )
     }
 
-    #[allow(clippy::too_many_arguments)]
+    #[allow(dead_code, clippy::too_many_arguments)]
     pub fn process_frame_with_blending(
         &mut self,
         fb_bgr555: &[u16; LCD_WIDTH * LCD_HEIGHT],
@@ -505,30 +522,71 @@ impl VideoPostProcessor {
         green_swap: bool,
         grid_intensity: f32,
     ) -> &ColorImage {
+        self.process_display_filter_with_options(
+            fb_bgr555,
+            None,
+            color_correction,
+            ColorProfileChoice::Agb001,
+            false,
+            lcd_ghosting,
+            filter,
+            green_swap,
+            grid_intensity,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn process_display_filter_with_options(
+        &mut self,
+        fb_bgr555: &[u16; LCD_WIDTH * LCD_HEIGHT],
+        prev_fb_bgr555: Option<&[u16; LCD_WIDTH * LCD_HEIGHT]>,
+        color_correction: bool,
+        profile: ColorProfileChoice,
+        frame_blending: bool,
+        lcd_ghosting: bool,
+        filter: DisplayFilter,
+        green_swap: bool,
+        grid_intensity: f32,
+    ) -> &ColorImage {
         self.filter = filter;
         self.lcd_grid_intensity = grid_intensity;
-        let lut = if color_correction {
-            srgb_lut_3()
+        let lut = lut_for_profile(color_correction, profile);
+        let active_prev: Option<&[u16]> = if frame_blending {
+            prev_fb_bgr555
+                .map(|s| s.as_slice())
+                .or_else(|| self.has_prev_frame.then_some(self.prev_bgr555.as_slice()))
         } else {
-            raw_lut_3()
+            None
         };
 
-        // Pass 1: O(1) LUT Color Conversion + Integer LCD Ghosting (~0.05 ms)
+        // Pass 1: O(1) LUT Color Conversion + Frame Blending / Unified LCD Ghosting (~0.05 ms)
         for i in 0..(LCD_WIDTH * LCD_HEIGHT) {
             let mut bgr = (fb_bgr555[i] & 0x7FFF) as usize;
-            if green_swap && (i & 1) == 1 {
+            if green_swap {
                 let neighbor_g = fb_bgr555[i ^ 1] & 0x03E0;
                 bgr = (bgr & !0x03E0) | (neighbor_g as usize);
             }
 
-            let mut rgb = lut[bgr];
-            if lcd_ghosting {
+            let mapped = lut[bgr];
+            let mut rgb = if let Some(prev_buf) = active_prev {
+                let pm = lut[(prev_buf[i] & 0x7FFF) as usize];
+                [
+                    ((mapped[0] as u16 + pm[0] as u16) >> 1) as u8,
+                    ((mapped[1] as u16 + pm[1] as u16) >> 1) as u8,
+                    ((mapped[2] as u16 + pm[2] as u16) >> 1) as u8,
+                ]
+            } else {
+                [mapped[0], mapped[1], mapped[2]]
+            };
+
+            if lcd_ghosting && !frame_blending {
                 let prev = self.prev_rgb[i];
-                rgb[0] = ((rgb[0] as u16 * 3 + prev[0] as u16) >> 2) as u8;
-                rgb[1] = ((rgb[1] as u16 * 3 + prev[1] as u16) >> 2) as u8;
-                rgb[2] = ((rgb[2] as u16 * 3 + prev[2] as u16) >> 2) as u8;
-                self.prev_rgb[i] = rgb;
+                // Match unified ~65% new + ~35% previous TFT persistence weighting
+                rgb[0] = ((rgb[0] as u16 * 166 + prev[0] as u16 * 90) >> 8) as u8;
+                rgb[1] = ((rgb[1] as u16 * 166 + prev[1] as u16 * 90) >> 8) as u8;
+                rgb[2] = ((rgb[2] as u16 * 166 + prev[2] as u16 * 90) >> 8) as u8;
             }
+            self.prev_rgb[i] = rgb;
             self.base_rgb[i] = rgb;
 
             let off = i * 4;
@@ -537,6 +595,8 @@ impl VideoPostProcessor {
             self.curr_rgba[off + 2] = rgb[2];
             self.curr_rgba[off + 3] = 255;
         }
+        self.prev_bgr555.copy_from_slice(fb_bgr555);
+        self.has_prev_frame = true;
 
         // Pass 2: Fast Integer Display Filter (~0.15 - 0.25 ms)
         match filter {
@@ -1913,6 +1973,74 @@ mod tests {
             GOVERNOR_BASE_LOCKOUT_FRAMES * 2
         );
     }
+
+    #[test]
+    fn quality_governor_engages_and_lifts_last_resort_frameskip_only_above_full_budget() {
+        let costs = vec![
+            FilterCost {
+                filter: DisplayFilter::Sharp1x,
+                cost_ms: 0.5,
+            },
+            FilterCost {
+                filter: DisplayFilter::SmoothBilinear,
+                cost_ms: 2.0,
+            },
+        ];
+        let mut gov =
+            QualityGovernor::with_measured_costs(DisplayFilter::SmoothBilinear, true, costs);
+        gov.set_frameskip_support(true);
+        assert!(!gov.is_frameskip_active());
+
+        // 1. Sustained overload at 18 ms steps down filter FIRST (never frameskip before cheapest filter).
+        let step_down = (0..(GOVERNOR_WINDOW_FRAMES + GOVERNOR_DOWN_SUSTAIN_FRAMES))
+            .find_map(|_| gov.record_frame(18.0))
+            .expect("should step down to Sharp1x first");
+        assert_eq!(step_down.kind, GovernorTransitionKind::StepDown);
+        assert_eq!(step_down.to, DisplayFilter::Sharp1x);
+        assert!(!gov.is_frameskip_active());
+
+        // 2. At cheapest filter, 15.0 ms (< 16.743 ms full 60Hz budget) must NOT engage frameskip.
+        for _ in
+            0..(GOVERNOR_COOLDOWN_FRAMES + GOVERNOR_WINDOW_FRAMES + GOVERNOR_DOWN_SUSTAIN_FRAMES)
+        {
+            assert_eq!(gov.record_frame(15.0), None);
+        }
+        assert!(!gov.is_frameskip_active());
+
+        // 3. Sustained >100% budget (19.0 ms > 16.743 ms) at cheapest filter engages last-resort frameskip.
+        let enable_fs = (0..(GOVERNOR_WINDOW_FRAMES + GOVERNOR_DOWN_SUSTAIN_FRAMES))
+            .find_map(|_| gov.record_frame(19.0))
+            .expect("sustained >100% overload at cheapest filter must engage frameskip");
+        assert_eq!(enable_fs.kind, GovernorTransitionKind::EnableFrameskip);
+        assert_eq!(enable_fs.to, DisplayFilter::Sharp1x);
+        assert!(gov.is_frameskip_active());
+
+        // 4. Recovery after lockout lifts frameskip FIRST (before stepping filters back up).
+        for _ in 0..GOVERNOR_BASE_LOCKOUT_FRAMES {
+            assert_eq!(gov.record_frame(3.0), None);
+        }
+        let disable_fs = (0..GOVERNOR_RECOVERY_SUSTAIN_FRAMES)
+            .find_map(|_| gov.record_frame(3.0))
+            .expect("sustained low load after lockout must disable frameskip");
+        assert_eq!(disable_fs.kind, GovernorTransitionKind::DisableFrameskip);
+        assert_eq!(disable_fs.to, DisplayFilter::Sharp1x);
+        assert!(!gov.is_frameskip_active());
+
+        // 5. Re-overload inside flap window re-engages frameskip immediately and doubles lockout.
+        let flap_fs = (0..GOVERNOR_WINDOW_FRAMES)
+            .find_map(|_| gov.record_frame(18.5))
+            .expect("overload inside flap window must re-enable frameskip immediately");
+        assert_eq!(flap_fs.kind, GovernorTransitionKind::EnableFrameskip);
+        assert!(gov.is_frameskip_active());
+        assert_eq!(
+            gov.current_lockout_frames(),
+            GOVERNOR_BASE_LOCKOUT_FRAMES * 2
+        );
+
+        // 6. Disabling governor immediately clears frameskip assist.
+        gov.set_enabled(false);
+        assert!(!gov.is_frameskip_active());
+    }
 }
 
 pub const GOVERNOR_BUDGET_MS: f64 = 1000.0 * 280_896.0 / 16_777_216.0;
@@ -1934,6 +2062,8 @@ pub enum GovernorTransitionKind {
     StepUp,
     CapResolution,
     UncapResolution,
+    EnableFrameskip,
+    DisableFrameskip,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -2027,6 +2157,8 @@ pub struct QualityGovernor {
     capped_costs: Option<Vec<FilterCost>>,
     can_cap_resolution: bool,
     resolution_capped: bool,
+    allow_frameskip: bool,
+    frameskip_active: bool,
     window: VecDeque<f64>,
     scratch: Vec<f64>,
     high_streak: usize,
@@ -2095,6 +2227,8 @@ impl QualityGovernor {
             capped_costs: None,
             can_cap_resolution: false,
             resolution_capped: false,
+            allow_frameskip: false,
+            frameskip_active: false,
             window: VecDeque::with_capacity(GOVERNOR_WINDOW_FRAMES),
             scratch: Vec::with_capacity(GOVERNOR_WINDOW_FRAMES),
             high_streak: 0,
@@ -2139,6 +2273,20 @@ impl QualityGovernor {
 
     pub fn is_resolution_capped(&self) -> bool {
         self.can_cap_resolution && self.resolution_capped
+    }
+
+    /// Opts this governor into engaging last-resort 1-frame auto-frameskip when
+    /// resolution capping and stepping down to the cheapest filter still miss 60 FPS
+    /// (`rolling p95 > 16.743 ms` sustained).
+    pub fn set_frameskip_support(&mut self, allow: bool) {
+        self.allow_frameskip = allow;
+        if !allow {
+            self.frameskip_active = false;
+        }
+    }
+
+    pub fn is_frameskip_active(&self) -> bool {
+        self.enabled && self.allow_frameskip && self.frameskip_active
     }
 
     #[cfg(test)]
@@ -2189,6 +2337,9 @@ impl QualityGovernor {
     pub fn set_enabled(&mut self, enabled: bool) {
         if self.enabled != enabled {
             self.enabled = enabled;
+            if !enabled {
+                self.frameskip_active = false;
+            }
             self.high_streak = 0;
             self.low_streak = 0;
         }
@@ -2204,6 +2355,7 @@ impl QualityGovernor {
         self.user_target = norm;
         self.active = norm;
         self.resolution_capped = false;
+        self.frameskip_active = false;
         self.high_streak = 0;
         self.low_streak = 0;
         self.cooldown = 0;
@@ -2419,13 +2571,56 @@ impl QualityGovernor {
                         rolling_p95_ms: p95,
                     });
                 }
+                // Last resort: only when already capped (or cap unsupported), already on the
+                // cheapest filter, and genuinely missing real-time 60 FPS (>100% of 16.743 ms).
+                if self.allow_frameskip && !self.frameskip_active && p95 > GOVERNOR_BUDGET_MS {
+                    let active_norm = canonical_governor_filter(self.active);
+                    self.frameskip_active = true;
+                    self.high_streak = 0;
+                    self.low_streak = 0;
+                    self.cooldown = GOVERNOR_COOLDOWN_FRAMES;
+                    let next_lockout = if in_flap_probation {
+                        self.current_lockout_frames
+                            .saturating_mul(2)
+                            .max(GOVERNOR_BASE_LOCKOUT_FRAMES * 2)
+                    } else {
+                        GOVERNOR_BASE_LOCKOUT_FRAMES
+                    };
+                    self.current_lockout_frames = next_lockout;
+                    self.up_lockout_remaining = next_lockout;
+                    self.frames_since_step_up = None;
+                    self.window.clear();
+                    return Some(GovernorTransition {
+                        kind: GovernorTransitionKind::EnableFrameskip,
+                        from: active_norm,
+                        to: active_norm,
+                        rolling_p95_ms: p95,
+                    });
+                }
             }
             return None;
         }
 
         self.high_streak = 0;
         if self.up_lockout_remaining == 0 && p95 < low_thresh {
-            if let Some(next_up) = self.select_next_step_up(p95) {
+            if self.is_frameskip_active() {
+                self.low_streak += 1;
+                if self.low_streak >= GOVERNOR_RECOVERY_SUSTAIN_FRAMES {
+                    let active_norm = canonical_governor_filter(self.active);
+                    self.frameskip_active = false;
+                    self.low_streak = 0;
+                    self.high_streak = 0;
+                    self.cooldown = 0;
+                    self.frames_since_step_up = Some(0);
+                    self.window.clear();
+                    return Some(GovernorTransition {
+                        kind: GovernorTransitionKind::DisableFrameskip,
+                        from: active_norm,
+                        to: active_norm,
+                        rolling_p95_ms: p95,
+                    });
+                }
+            } else if let Some(next_up) = self.select_next_step_up(p95) {
                 self.low_streak += 1;
                 if self.low_streak >= GOVERNOR_RECOVERY_SUSTAIN_FRAMES {
                     let prev = self.active;

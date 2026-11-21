@@ -244,7 +244,7 @@ impl OffscreenUiRenderer {
 }
 
 fn make_isolated_app() -> ManuallyDrop<RustboyApp> {
-    let mut app = RustboyApp::new(CliConfig::default());
+    let mut app = RustboyApp::new(CliConfig::default(), AppConfig::default());
     app.library_scanning = false;
     app.library_scan_rx = None;
     app.library_scan_error = None;
@@ -892,6 +892,23 @@ fn capture_b1_ui_screenshots_if_requested() {
                 cart_type_label: "GBA ROM".to_string(),
             },
         ];
+        let _ = ctx.run(
+            egui::RawInput {
+                screen_rect: Some(egui::Rect::from_min_size(
+                    egui::Pos2::ZERO,
+                    egui::vec2(renderer.width as f32, renderer.height as f32),
+                )),
+                ..Default::default()
+            },
+            |c| app.update(c),
+        );
+        for _ in 0..200 {
+            app.poll_cover_downloads(&ctx);
+            if app.pending_cover_downloads.is_empty() {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
         renderer
             .render_app_to_png(
                 &ctx,

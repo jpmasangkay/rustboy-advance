@@ -28,6 +28,11 @@ pub struct GdbPollOutcome {
     pub last_error: Option<String>,
 }
 
+const MAX_READ_BYTES_PER_POLL: usize = 64 * 1024;
+const MAX_EVENTS_PER_POLL: usize = 256;
+const MAX_WRITE_QUEUE_BYTES: usize = 256 * 1024;
+const MAX_DMA_STEP_TICKS: usize = 65_536;
+
 /// Non-blocking TCP GDB Remote Serial Protocol server for [`GbaCore`].
 pub struct GdbStub {
     listener: Option<TcpListener>,
@@ -117,13 +122,16 @@ impl GdbStub {
     }
 
     /// Formats and transmits an asynchronous halt notification (`S05`/`T05...`) to the client.
+    ///
+    /// Ignored when the GDB session is already halted (e.g., after an inline single step already
+    /// transmitted its stop reply) so duplicate `$S05` / `$T05` packets are never sent.
     pub fn notify_stop(&mut self, reason: &StopReason) {
-        if self.client.is_none() {
+        if self.client.is_none() || !self.session.is_running() {
             return;
         }
         let payload = self.session.format_stop_reply(reason);
         self.queue_packet(&payload);
-        self.flush_writes();
+        let _ = self.flush_writes();
     }
 
     /// Polls the listener and active client stream once without advancing free-running frames.
@@ -139,19 +147,29 @@ impl GdbStub {
             return outcome;
         }
 
-        self.flush_writes();
+        if let Some(err) = self.flush_writes() {
+            outcome.last_error = Some(err);
+            outcome.client_disconnected = true;
+            return outcome;
+        }
 
         let mut events = Vec::new();
         let mut disconnect = false;
         let mut buf = [0u8; 4096];
+        let mut bytes_read = 0usize;
 
-        while let Some(stream) = self.client.as_mut() {
-            match stream.read(&mut buf) {
+        while bytes_read < MAX_READ_BYTES_PER_POLL && events.len() < MAX_EVENTS_PER_POLL {
+            let Some(stream) = self.client.as_mut() else {
+                break;
+            };
+            let max_chunk = buf.len().min(MAX_READ_BYTES_PER_POLL - bytes_read);
+            match stream.read(&mut buf[..max_chunk]) {
                 Ok(0) => {
                     disconnect = true;
                     break;
                 }
                 Ok(n) => {
+                    bytes_read += n;
                     self.parser.feed(&buf[..n], &mut events);
                 }
                 Err(e) if e.kind() == ErrorKind::WouldBlock => break,
@@ -165,19 +183,19 @@ impl GdbStub {
         }
 
         for event in events {
-            if self.client.is_none() {
+            if self.client.is_none() || disconnect {
                 break;
             }
             match event {
                 RspEvent::Ack => {}
                 RspEvent::Nack => {
                     if let Some(frame) = self.last_sent.clone() {
-                        self.write_queue.extend_from_slice(frame.as_bytes());
+                        self.push_write_bytes(frame.as_bytes(), &mut disconnect, &mut outcome);
                     }
                 }
                 RspEvent::BadChecksum => {
                     if !self.session.no_ack_mode {
-                        self.write_queue.push(b'-');
+                        self.push_write_bytes(b"-", &mut disconnect, &mut outcome);
                     }
                 }
                 RspEvent::Interrupt => {
@@ -190,7 +208,7 @@ impl GdbStub {
                 RspEvent::Packet(payload) => {
                     let was_no_ack = self.session.no_ack_mode;
                     if !was_no_ack {
-                        self.write_queue.push(b'+');
+                        self.push_write_bytes(b"+", &mut disconnect, &mut outcome);
                     }
                     let pkt = self.session.handle_packet(core, &payload);
                     if let Some(reply) = pkt.reply {
@@ -202,9 +220,22 @@ impl GdbStub {
                             outcome.pause_request = Some(false);
                         }
                         GdbAction::Step => {
+                            // Exclude the current PC from breakpoints so stepping off an active
+                            // breakpoint executes the instruction instead of deadlocking at it.
                             let mut merged = DebugControl::default();
                             self.session.merge_debug_control(user_ctrl, &mut merged);
-                            let hit = core.step_one_debug(&merged);
+                            let cur_pc = core.cpu.current_exec_pc() & !1;
+                            merged.breakpoints.retain(|&bp| (bp & !1) != cur_pc);
+
+                            // Advance past any active DMA ticks so a single-step retires a CPU instruction.
+                            let mut hit = None;
+                            for _ in 0..MAX_DMA_STEP_TICKS {
+                                let was_dma = core.bus.hw.active_dma.is_some();
+                                hit = core.step_one_debug(&merged);
+                                if hit.is_some() || !was_dma {
+                                    break;
+                                }
+                            }
                             let reason = hit.unwrap_or(StopReason::FrameComplete);
                             let reply = self.session.format_stop_reply(&reason);
                             self.queue_packet(&reply);
@@ -226,9 +257,19 @@ impl GdbStub {
                     }
                 }
             }
+            if self.write_queue.len() > MAX_WRITE_QUEUE_BYTES {
+                outcome.last_error = Some(String::from("GDB write queue overflow; disconnecting"));
+                disconnect = true;
+            }
         }
 
-        self.flush_writes();
+        if let Some(err) = self.flush_writes() {
+            if outcome.last_error.is_none() {
+                outcome.last_error = Some(err);
+            }
+            outcome.client_disconnected = true;
+            return outcome;
+        }
         if disconnect {
             self.disconnect_client();
             outcome.client_disconnected = true;
@@ -287,16 +328,30 @@ impl GdbStub {
         }
     }
 
+    fn push_write_bytes(
+        &mut self,
+        bytes: &[u8],
+        disconnect: &mut bool,
+        outcome: &mut GdbPollOutcome,
+    ) {
+        if self.write_queue.len().saturating_add(bytes.len()) > MAX_WRITE_QUEUE_BYTES {
+            outcome.last_error = Some(String::from("GDB write queue overflow; disconnecting"));
+            *disconnect = true;
+            return;
+        }
+        self.write_queue.extend_from_slice(bytes);
+    }
+
     fn queue_packet(&mut self, payload: &str) {
         let frame = encode_rsp_packet(payload);
         self.write_queue.extend_from_slice(frame.as_bytes());
         self.last_sent = Some(frame);
     }
 
-    fn flush_writes(&mut self) {
+    fn flush_writes(&mut self) -> Option<String> {
         let Some(stream) = self.client.as_mut() else {
             self.write_queue.clear();
-            return;
+            return None;
         };
         while !self.write_queue.is_empty() {
             match stream.write(&self.write_queue) {
@@ -306,12 +361,14 @@ impl GdbStub {
                 }
                 Err(e) if e.kind() == ErrorKind::WouldBlock => break,
                 Err(e) if e.kind() == ErrorKind::Interrupted => continue,
-                Err(_) => {
+                Err(e) => {
+                    let msg = std::format!("GDB socket write error: {e}");
                     self.disconnect_client();
-                    break;
+                    return Some(msg);
                 }
             }
         }
+        None
     }
 
     fn disconnect_client(&mut self) {

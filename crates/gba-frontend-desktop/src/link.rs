@@ -1,9 +1,10 @@
 //! GBA Link Cable emulation: Local 2-Player lockstep + TCP Netplay bridge.
 
+use std::collections::VecDeque;
 use std::io::{ErrorKind, Read, Write};
 use std::net::{SocketAddr, TcpListener, TcpStream, ToSocketAddrs};
 use std::path::{Path, PathBuf};
-use std::sync::mpsc::{self, Receiver, Sender};
+use std::sync::mpsc::{self, Receiver, Sender, TryRecvError};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
@@ -12,8 +13,12 @@ use gba_core::hw::{SioMode, SioResponse, SioTransfer};
 use gba_core::{CYCLES_PER_FRAME, GbaCore, HostFrontend, LCD_HEIGHT, LCD_WIDTH};
 
 use crate::app::{ACCENT_TEAL, BG_CARD, BG_PANEL, BORDER_HAIRLINE, RustboyApp, TEXT_MUTED};
+use crate::config::{SaveOverrideChoice, write_atomic};
 use crate::filters::VideoPostProcessor;
-use crate::rom_loader::{RomPlatform, detect_rom_platform, load_rom_bytes};
+use crate::game_settings::load_effective_settings;
+use crate::rom_loader::{
+    RomPlatform, apply_auto_patch_if_present, detect_rom_platform, load_rom_bytes,
+};
 
 /// Default TCP port for GBA Netplay Link Cable sessions.
 pub const DEFAULT_NETPLAY_PORT: u16 = 27888;
@@ -24,7 +29,9 @@ const SUBFRAME_CHUNK_SIO_CYCLES: u64 = 256;
 const NETPLAY_CHUNK_CYCLES: u64 = 35_112; // ~8 lockstep polls per frame
 const LOCAL_SIO_PROBE_TIMEOUT_CYCLES: u64 = CYCLES_PER_FRAME;
 const NETPLAY_SIO_TIMEOUT: Duration = Duration::from_millis(350);
-const MAX_FRAME_PACKET_BYTES: usize = 64 * 1024;
+const MAX_FRAME_PACKET_BYTES: usize = 256;
+const MAX_READ_BUFFER_BYTES: usize = 8 * 1024;
+const MAX_PENDING_NET_QUEUE: usize = 16;
 
 /// Transfer counters displayed in the Link Cable diagnostics UI.
 #[derive(Copy, Clone, Debug, Default, PartialEq, Eq)]
@@ -175,6 +182,8 @@ pub struct LocalLinkSession {
     pub p2_framebuffer: [u16; LCD_WIDTH * LCD_HEIGHT],
     pub(crate) p2_postproc: VideoPostProcessor,
     pub(crate) p2_lcd_tex: Option<egui::TextureHandle>,
+    pub(crate) p2_frame_dirty: bool,
+    pub(crate) p2_last_filter_key: Option<(crate::config::DisplayFilter, bool, bool, u32)>,
     pub p2_rom_title: String,
     pub p2_rom_code: String,
     pub p2_rom_path: Option<PathBuf>,
@@ -202,6 +211,8 @@ impl LocalLinkSession {
             p2_framebuffer: [0; LCD_WIDTH * LCD_HEIGHT],
             p2_postproc: VideoPostProcessor::new(),
             p2_lcd_tex: None,
+            p2_frame_dirty: true,
+            p2_last_filter_key: None,
             p2_rom_title,
             p2_rom_code,
             p2_rom_path,
@@ -226,13 +237,8 @@ impl LocalLinkSession {
             return;
         }
         let data = self.p2_core.bus.cart.export_save_data();
-        if !data.is_empty() {
-            if let Some(parent) = sav_path.parent() {
-                let _ = std::fs::create_dir_all(parent);
-            }
-            if std::fs::write(sav_path, data).is_ok() {
-                self.p2_core.bus.cart.save_dirty = false;
-            }
+        if !data.is_empty() && write_atomic(sav_path, data).is_ok() {
+            self.p2_core.bus.cart.save_dirty = false;
         }
     }
 
@@ -298,6 +304,7 @@ impl LocalLinkSession {
 
         flush_core_to_frontend(p1, p1_fe);
         flush_core_framebuffer_only(&mut self.p2_core, &mut self.p2_framebuffer);
+        self.p2_frame_dirty = true;
     }
 
     fn resolve_pending(&mut self, p1: &mut GbaCore) {
@@ -664,9 +671,19 @@ pub struct NetplayLink {
     frame_counter: u64,
     next_seq: u32,
     local_pending: Option<PendingLocalNet>,
-    remote_pending: Option<PendingRemoteNet>,
+    remote_pending: VecDeque<PendingRemoteNet>,
     remote_multi_state: (bool, u16),
-    latest_remote_resp: Option<(u32, SioResponse)>,
+    remote_responses: VecDeque<(u32, SioResponse)>,
+}
+
+impl Drop for NetplayLink {
+    fn drop(&mut self) {
+        let _ = self.cmd_tx.send(NetWorkerCmd::Send(NetPacket::Disconnect));
+        let _ = self.cmd_tx.send(NetWorkerCmd::Shutdown);
+        if let Some(handle) = self.worker.take() {
+            let _ = handle.join();
+        }
+    }
 }
 
 impl NetplayLink {
@@ -699,9 +716,9 @@ impl NetplayLink {
             frame_counter: 0,
             next_seq: 1,
             local_pending: None,
-            remote_pending: None,
+            remote_pending: VecDeque::new(),
             remote_multi_state: (false, 0xFFFF),
-            latest_remote_resp: None,
+            remote_responses: VecDeque::new(),
         }
     }
 
@@ -735,9 +752,9 @@ impl NetplayLink {
             frame_counter: 0,
             next_seq: 1,
             local_pending: None,
-            remote_pending: None,
+            remote_pending: VecDeque::new(),
             remote_multi_state: (false, 0xFFFF),
-            latest_remote_resp: None,
+            remote_responses: VecDeque::new(),
         }
     }
 
@@ -813,10 +830,17 @@ impl NetplayLink {
                 }
             }
             NetPacket::SioTransfer { seq, transfer } => {
-                self.remote_pending = Some(PendingRemoteNet { seq, transfer });
+                if self.remote_pending.len() >= MAX_PENDING_NET_QUEUE {
+                    self.remote_pending.pop_front();
+                }
+                self.remote_pending
+                    .push_back(PendingRemoteNet { seq, transfer });
             }
             NetPacket::SioResponse { seq, response } => {
-                self.latest_remote_resp = Some((seq, response));
+                if self.remote_responses.len() >= MAX_PENDING_NET_QUEUE {
+                    self.remote_responses.pop_front();
+                }
+                self.remote_responses.push_back((seq, response));
             }
             NetPacket::FrameHeartbeat {
                 frame: _,
@@ -912,7 +936,7 @@ impl NetplayLink {
         match self.role {
             NetplayRole::Host => {
                 if let (Some(loc), Some(rem)) =
-                    (self.local_pending.as_ref(), self.remote_pending.as_ref())
+                    (self.local_pending.as_ref(), self.remote_pending.front())
                     && let Some((resp_host, resp_join, mode)) =
                         pair_responses(loc.transfer, rem.transfer)
                 {
@@ -923,7 +947,7 @@ impl NetplayLink {
                         response: resp_join,
                     }));
                     self.local_pending = None;
-                    self.remote_pending = None;
+                    self.remote_pending.pop_front();
                     self.stats.record_mode(mode);
                     return;
                 }
@@ -931,7 +955,7 @@ impl NetplayLink {
                 // Multi Master -> Join Slave without Join SIOCNT.Start bit.
                 if let Some(loc) = self.local_pending.as_ref()
                     && loc.transfer.mode == SioMode::Multi
-                    && self.remote_pending.is_none()
+                    && self.remote_pending.is_empty()
                     && self.remote_multi_state.0
                 {
                     let peer_send = self.remote_multi_state.1;
@@ -959,7 +983,7 @@ impl NetplayLink {
                 }
             }
             NetplayRole::Join => {
-                if let Some((resp_seq, resp)) = self.latest_remote_resp.take() {
+                while let Some((resp_seq, resp)) = self.remote_responses.pop_front() {
                     if let Some(loc) = self.local_pending.as_ref()
                         && (resp_seq == loc.seq || resp_seq == u32::MAX)
                     {
@@ -1030,10 +1054,10 @@ fn run_host_worker(
     let mut read_buf = Vec::<u8>::with_capacity(1024);
 
     loop {
-        while let Ok(cmd) = cmd_rx.try_recv() {
-            match cmd {
-                NetWorkerCmd::Shutdown => return,
-                NetWorkerCmd::Send(pkt) => {
+        loop {
+            match cmd_rx.try_recv() {
+                Ok(NetWorkerCmd::Shutdown) | Err(TryRecvError::Disconnected) => return,
+                Ok(NetWorkerCmd::Send(pkt)) => {
                     if let Some(s) = &mut stream
                         && let Err(e) = write_packet(s, &pkt)
                     {
@@ -1041,6 +1065,7 @@ fn run_host_worker(
                         return;
                     }
                 }
+                Err(TryRecvError::Empty) => break,
             }
         }
 
@@ -1108,13 +1133,32 @@ fn run_join_worker(
         }
     };
 
-    let mut stream = match TcpStream::connect_timeout(&resolved, Duration::from_secs(4)) {
-        Ok(s) => s,
-        Err(e) => {
+    // Connect in short slices so shutdown/cancel requests never block for 4 full seconds.
+    let connect_deadline = Instant::now() + Duration::from_secs(4);
+    let mut stream = loop {
+        match cmd_rx.try_recv() {
+            Ok(NetWorkerCmd::Shutdown) | Err(TryRecvError::Disconnected) => return,
+            Ok(NetWorkerCmd::Send(_)) | Err(TryRecvError::Empty) => {}
+        }
+        let rem = connect_deadline.saturating_duration_since(Instant::now());
+        if rem.is_zero() {
             let _ = evt_tx.send(NetWorkerEvent::Error(format!(
-                "Connection to {resolved} failed: {e}"
+                "Connection to {resolved} timed out"
             )));
             return;
+        }
+        let slice = rem.min(Duration::from_millis(250));
+        match TcpStream::connect_timeout(&resolved, slice) {
+            Ok(s) => break s,
+            Err(e) if e.kind() == ErrorKind::TimedOut && Instant::now() < connect_deadline => {
+                continue;
+            }
+            Err(e) => {
+                let _ = evt_tx.send(NetWorkerEvent::Error(format!(
+                    "Connection to {resolved} failed: {e}"
+                )));
+                return;
+            }
         }
     };
     configure_stream(&stream);
@@ -1130,15 +1174,16 @@ fn run_join_worker(
 
     let mut read_buf = Vec::<u8>::with_capacity(1024);
     loop {
-        while let Ok(cmd) = cmd_rx.try_recv() {
-            match cmd {
-                NetWorkerCmd::Shutdown => return,
-                NetWorkerCmd::Send(pkt) => {
+        loop {
+            match cmd_rx.try_recv() {
+                Ok(NetWorkerCmd::Shutdown) | Err(TryRecvError::Disconnected) => return,
+                Ok(NetWorkerCmd::Send(pkt)) => {
                     if let Err(e) = write_packet(&mut stream, &pkt) {
                         let _ = evt_tx.send(NetWorkerEvent::Closed(format!("Send failed: {e}")));
                         return;
                     }
                 }
+                Err(TryRecvError::Empty) => break,
             }
         }
 
@@ -1188,6 +1233,9 @@ fn pump_stream_reads(
             Ok(0) => return Err("Peer closed TCP connection".into()),
             Ok(n) => {
                 got_data = true;
+                if buf.len().saturating_add(n) > MAX_READ_BUFFER_BYTES {
+                    return Err("Peer exceeded maximum netplay read buffer".into());
+                }
                 buf.extend_from_slice(&tmp[..n]);
             }
             Err(ref e) if e.kind() == ErrorKind::WouldBlock => break,
@@ -1305,22 +1353,53 @@ impl RustboyApp {
             net.shutdown();
         }
 
-        let loaded = load_rom_bytes(p2_rom_path)?;
+        let mut loaded = load_rom_bytes(p2_rom_path)?;
+        let _ = apply_auto_patch_if_present(p2_rom_path, &mut loaded.bytes)?;
         if detect_rom_platform(p2_rom_path, loaded.inner_name.as_deref(), &loaded.bytes)
             != RomPlatform::Gba
         {
             return Err("Player 2 Link Cable requires a .gba ROM".into());
         }
 
-        let existing_sav = crate::config::AppConfig::find_existing_sav_path_for_rom(p2_rom_path);
-        let sav_path = crate::config::AppConfig::resolve_sav_path_for_rom(p2_rom_path);
         let same_path_as_p1 = self.rom_path.as_ref().is_some_and(|p1p| p1p == p2_rom_path);
+        let p2_sav_path = if same_path_as_p1 {
+            let resolved = crate::config::AppConfig::resolve_sav_path_for_rom(p2_rom_path);
+            resolved.with_extension("p2.sav")
+        } else {
+            crate::config::AppConfig::resolve_sav_path_for_rom(p2_rom_path)
+        };
+        let existing_sav = if same_path_as_p1 {
+            let p2_legacy = p2_rom_path.with_extension("p2.sav");
+            if p2_sav_path.exists() {
+                Some(p2_sav_path.clone())
+            } else if p2_legacy.exists() {
+                Some(p2_legacy)
+            } else {
+                None
+            }
+        } else {
+            crate::config::AppConfig::find_existing_sav_path_for_rom(p2_rom_path)
+        };
 
+        let p2_crc32 = crc32fast::hash(&loaded.bytes);
         let mut p2_core = GbaCore::new(self.bios_bytes.as_deref(), loaded.bytes);
+        let p2_code = p2_core.bus.cart.game_code();
+        let ov = load_effective_settings(&self.config, &p2_code, p2_crc32);
+        if let Some(save_ov) = ov.save_override.and_then(SaveOverrideChoice::to_core) {
+            p2_core.bus.set_save_type_override(Some(save_ov));
+        }
+        p2_core.bus.cart.rtc_override = ov.rtc_override;
+
         if let Some(src_sav) = existing_sav
             && let Ok(sav) = std::fs::read(&src_sav)
         {
             p2_core.bus.cart.load_save_data(&sav);
+        } else if same_path_as_p1
+            && let Some(p1_sav_path) =
+                crate::config::AppConfig::find_existing_sav_path_for_rom(p2_rom_path)
+            && let Ok(p1_sav) = std::fs::read(&p1_sav_path)
+        {
+            p2_core.bus.cart.load_save_data(&p1_sav);
         }
         if let Some(p1_core) = &mut self.core {
             p1_core.set_link_connected(true);
@@ -1329,8 +1408,8 @@ impl RustboyApp {
         let session = LocalLinkSession::new(
             p2_core,
             Some(p2_rom_path.to_path_buf()),
-            Some(sav_path),
-            !same_path_as_p1,
+            Some(p2_sav_path),
+            true,
         );
         let p2_title = session.p2_rom_title.clone();
         self.link.local = Some(session);

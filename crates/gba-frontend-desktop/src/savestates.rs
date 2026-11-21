@@ -78,6 +78,16 @@ impl fmt::Display for SaveStateError {
 }
 
 #[derive(Clone, Debug)]
+pub(crate) enum UndoStateAction {
+    RestoreSlotFile {
+        slot: usize,
+        path: PathBuf,
+        previous_file_bytes: Vec<u8>,
+    },
+    RestoreCoreState(Vec<u8>),
+}
+
+#[derive(Clone, Debug)]
 pub(crate) enum SlotMetaEntry {
     Empty,
     Ready {
@@ -91,8 +101,12 @@ pub(crate) enum SlotMetaEntry {
     Corrupt(String),
 }
 
-pub(crate) fn encode_thumbnail_png(rgba: &[u8]) -> Result<Vec<u8>, String> {
-    let expected = LCD_WIDTH * LCD_HEIGHT * 4;
+pub(crate) fn encode_thumbnail_png_sized(
+    rgba: &[u8],
+    width: usize,
+    height: usize,
+) -> Result<Vec<u8>, String> {
+    let expected = width * height * 4;
     if rgba.len() != expected {
         return Err(format!(
             "Invalid thumbnail RGBA length: got {}, expected {expected}",
@@ -104,12 +118,16 @@ pub(crate) fn encode_thumbnail_png(rgba: &[u8]) -> Result<Vec<u8>, String> {
     encoder
         .write_image(
             rgba,
-            LCD_WIDTH as u32,
-            LCD_HEIGHT as u32,
+            width as u32,
+            height as u32,
             image::ExtendedColorType::Rgba8,
         )
         .map_err(|e| format!("PNG thumbnail encode failed: {e}"))?;
     Ok(out)
+}
+
+pub(crate) fn encode_thumbnail_png(rgba: &[u8]) -> Result<Vec<u8>, String> {
+    encode_thumbnail_png_sized(rgba, LCD_WIDTH, LCD_HEIGHT)
 }
 
 pub(crate) fn encode_container(
@@ -374,17 +392,25 @@ impl RustboyApp {
     }
 
     fn current_thumbnail_png(&mut self) -> Vec<u8> {
-        if self.sink.frame_dirty && self.lcd_tex.is_none() {
-            let color_profile = self.effective_color_profile();
-            self.postproc.process_frame(
-                &self.sink.framebuffer,
-                self.config.color_correction,
-                color_profile,
-                false,
-                false,
-            );
+        let color_profile = self.effective_color_profile();
+        self.postproc.sync_rgba_for_capture(
+            &self.sink.framebuffer,
+            self.sink
+                .has_prev_frame
+                .then_some(&self.sink.prev_framebuffer),
+            self.sink.frame_seq,
+            self.config.color_correction,
+            color_profile,
+            self.config.frame_blending,
+            self.config.lcd_ghosting,
+        );
+        if self.is_gb_active() {
+            let cropped = crate::gb_bridge::crop_gb_rgba_from_240x160(&self.postproc.curr_rgba);
+            encode_thumbnail_png_sized(&cropped, gb_core::LCD_WIDTH, gb_core::LCD_HEIGHT)
+                .unwrap_or_default()
+        } else {
+            encode_thumbnail_png(&self.postproc.curr_rgba).unwrap_or_default()
         }
-        encode_thumbnail_png(&self.postproc.curr_rgba).unwrap_or_default()
     }
 
     fn build_current_state_container(&mut self) -> Result<Vec<u8>, SaveStateError> {
@@ -407,6 +433,10 @@ impl RustboyApp {
     }
 
     pub(crate) fn quick_save(&mut self, slot: usize) {
+        if self.is_ra_hardcore_active() {
+            self.notify_warn("Save states are disabled in RetroAchievements Hardcore Mode");
+            return;
+        }
         let Some(path) = self.slot_path(slot) else {
             return;
         };
@@ -414,31 +444,30 @@ impl RustboyApp {
             return;
         }
 
-        // Backup existing slot state (decoded core bytes) for Ctrl+Z undo
-        if let Some(existing) = self.existing_slot_path(slot)
-            && let Ok(old_bytes) = fs::read(&existing)
-            && let Ok(decoded) = decode_container(
-                &old_bytes,
-                Some(self.rom_crc32),
-                Some(&self.rom_code),
-                &self.rom_title,
-            )
-        {
-            self.undo_state_buffer = Some(decoded.core_bytes);
-        }
+        // Backup existing slot container bytes so Ctrl+Z restores the slot file on disk
+        // without clobbering the live running game!
+        let old_slot_bytes = self
+            .existing_slot_path(slot)
+            .and_then(|existing| fs::read(existing).ok());
 
         let res = self.build_current_state_container().and_then(|container| {
-            if let Some(parent) = path.parent() {
-                fs::create_dir_all(parent).map_err(|e| SaveStateError::Io(e.to_string()))?;
-            }
-            fs::write(&path, container).map_err(|e| SaveStateError::Io(e.to_string()))
+            crate::config::write_atomic(&path, &container)
+                .map_err(|e| SaveStateError::Io(e.to_string()))
         });
 
         match res {
             Ok(()) => {
+                if let Some(prev_bytes) = old_slot_bytes {
+                    self.undo_state_action = Some(UndoStateAction::RestoreSlotFile {
+                        slot,
+                        path: path.clone(),
+                        previous_file_bytes: prev_bytes,
+                    });
+                }
                 if (1..=5).contains(&slot) {
                     self.slot_thumbnails[slot - 1] = None;
                     self.slot_meta[slot - 1] = None;
+                    self.slot_exists_cache[slot - 1] = Some(true);
                 }
                 self.movie.record_state_bookmark(&path);
                 self.state_manager_error = None;
@@ -454,56 +483,106 @@ impl RustboyApp {
     }
 
     pub(crate) fn quick_load(&mut self, slot: usize) {
+        if self.is_ra_hardcore_active() {
+            self.notify_warn("Loading save states is disabled in RetroAchievements Hardcore Mode");
+            return;
+        }
         let Some(path) = self
             .existing_slot_path(slot)
             .or_else(|| self.slot_path(slot))
         else {
             return;
         };
-        // Backup current core state before loading for instant undo
-        if let Ok(cur_bytes) = self.save_active_core_state() {
-            self.undo_state_buffer = Some(cur_bytes);
-            self.movie.record_undo_bookmark();
+        let prev_undo = self.undo_state_action.take();
+        let cur_backup = self.save_active_core_state().ok();
+        if self.load_state_from_path(&path, &format!("Loaded State Slot {slot}")) {
+            if let Some(cur_bytes) = cur_backup {
+                self.undo_state_action = Some(UndoStateAction::RestoreCoreState(cur_bytes));
+                self.movie.record_undo_bookmark();
+            }
+        } else {
+            self.undo_state_action = prev_undo;
         }
-        self.load_state_from_path(&path, &format!("Loaded State Slot {slot}"));
     }
 
     pub(crate) fn undo_last_state_action(&mut self) {
+        if self.is_ra_hardcore_active() {
+            self.notify_warn("Undo state action is disabled in RetroAchievements Hardcore Mode");
+            return;
+        }
         if !self.has_active_game() {
             self.notify("No save/load action to undo");
             return;
         }
-        let Some(prev_bytes) = self.undo_state_buffer.take() else {
+        let Some(action) = self.undo_state_action.take() else {
             self.notify("No save/load action to undo");
             return;
         };
-        let cur = self.save_active_core_state().ok();
-        match self.load_active_core_state(&prev_bytes) {
-            Ok(()) => {
-                self.rewind_buffer.clear();
-                self.rewind_movie_frames.clear();
-                self.rewinding = false;
-                self.undo_state_buffer = cur;
-                self.state_manager_error = None;
-                self.reset_unsaved_progress();
-                if let Some(core) = &self.core {
-                    self.movie.on_undo_state_loaded(core);
-                }
-                if let Some(msg) = self.movie.take_notice() {
-                    self.notify(&msg);
-                } else {
-                    self.notify("Undo: Reverted state to previous checkpoint");
+        match action {
+            UndoStateAction::RestoreSlotFile {
+                slot,
+                path,
+                previous_file_bytes,
+            } => {
+                let cur_file_bytes = fs::read(&path).ok();
+                match crate::config::write_atomic(&path, &previous_file_bytes) {
+                    Ok(()) => {
+                        if let Some(cur) = cur_file_bytes {
+                            self.undo_state_action = Some(UndoStateAction::RestoreSlotFile {
+                                slot,
+                                path,
+                                previous_file_bytes: cur,
+                            });
+                        }
+                        if (1..=5).contains(&slot) {
+                            self.slot_thumbnails[slot - 1] = None;
+                            self.slot_meta[slot - 1] = None;
+                            self.slot_exists_cache[slot - 1] = Some(true);
+                        }
+                        self.state_manager_error = None;
+                        self.reset_unsaved_progress();
+                        self.notify(&format!("Undo: Restored previous Save Slot {slot} file"));
+                    }
+                    Err(e) => {
+                        let msg = format!("Undo slot file restore failed: {e}");
+                        self.state_manager_error = Some(msg.clone());
+                        self.notify_error(&msg);
+                    }
                 }
             }
-            Err(e) => {
-                let msg = format!("Undo state load failed: {e}");
-                self.state_manager_error = Some(msg.clone());
-                self.notify_error(&msg);
+            UndoStateAction::RestoreCoreState(prev_bytes) => {
+                let cur = self.save_active_core_state().ok();
+                match self.load_active_core_state(&prev_bytes) {
+                    Ok(()) => {
+                        self.rewind_buffer.clear();
+                        self.rewind_movie_frames.clear();
+                        self.rewinding = false;
+                        self.undo_state_action = cur.map(UndoStateAction::RestoreCoreState);
+                        self.state_manager_error = None;
+                        if let Some(core) = &self.core {
+                            self.movie.on_undo_state_loaded(core);
+                        }
+                        if let Some(msg) = self.movie.take_notice() {
+                            self.notify(&msg);
+                        } else {
+                            self.notify("Undo: Reverted state to previous checkpoint");
+                        }
+                    }
+                    Err(e) => {
+                        let msg = format!("Undo state load failed: {e}");
+                        self.state_manager_error = Some(msg.clone());
+                        self.notify_error(&msg);
+                    }
+                }
             }
         }
     }
 
     pub(crate) fn save_state_to_file(&mut self) {
+        if self.is_ra_hardcore_active() {
+            self.notify_warn("Save states are disabled in RetroAchievements Hardcore Mode");
+            return;
+        }
         if !self.has_active_game() {
             return;
         }
@@ -514,7 +593,7 @@ impl RustboyApp {
             .save_file()
         {
             match self.build_current_state_container() {
-                Ok(container) => match fs::write(&path, container) {
+                Ok(container) => match crate::config::write_atomic(&path, &container) {
                     Ok(()) => {
                         self.movie.record_state_bookmark(&path);
                         self.reset_unsaved_progress();
@@ -528,18 +607,26 @@ impl RustboyApp {
     }
 
     pub(crate) fn load_state_from_file(&mut self) {
+        if self.is_ra_hardcore_active() {
+            self.notify_warn("Loading save states is disabled in RetroAchievements Hardcore Mode");
+            return;
+        }
         if let Some(path) = rfd::FileDialog::new()
             .set_title("Load Save State")
             .add_filter("Rustboy Save State", &["state", "gbas"])
             .pick_file()
         {
-            self.load_state_from_path(&path, "Loaded State from file");
+            let _ = self.load_state_from_path(&path, "Loaded State from file");
         }
     }
 
-    pub(crate) fn load_state_from_path(&mut self, path: &Path, success_msg: &str) {
+    pub(crate) fn load_state_from_path(&mut self, path: &Path, success_msg: &str) -> bool {
+        if self.is_ra_hardcore_active() {
+            self.notify_warn("Loading save states is disabled in RetroAchievements Hardcore Mode");
+            return false;
+        }
         if !self.has_active_game() {
-            return;
+            return false;
         }
         let bytes = match fs::read(path) {
             Ok(b) => b,
@@ -547,7 +634,7 @@ impl RustboyApp {
                 let msg = SaveStateError::Io(e.to_string()).to_string();
                 self.state_manager_error = Some(msg.clone());
                 self.notify_error(&msg);
-                return;
+                return false;
             }
         };
 
@@ -562,7 +649,7 @@ impl RustboyApp {
                 let msg = e.to_string();
                 self.state_manager_error = Some(msg.clone());
                 self.notify_error(&msg);
-                return;
+                return false;
             }
         };
 
@@ -575,6 +662,7 @@ impl RustboyApp {
                 self.state_manager_error = None;
                 self.reset_unsaved_progress();
                 self.sink.audio.reset_underruns();
+                self.sink.audio.reset_adaptive_target();
                 if let Some(core) = &self.core {
                     self.movie.on_state_loaded_from_path(core, path);
                 }
@@ -583,11 +671,13 @@ impl RustboyApp {
                 } else {
                     self.notify(success_msg);
                 }
+                true
             }
             Err(e) => {
                 let msg = SaveStateError::CoreError(e).to_string();
                 self.state_manager_error = Some(msg.clone());
                 self.notify_error(&msg);
+                false
             }
         }
     }
@@ -665,6 +755,12 @@ impl RustboyApp {
 
     pub(crate) fn draw_visual_state_manager(&mut self, ctx: &egui::Context) {
         if !self.show_state_manager {
+            self.confirm_delete_slot = None;
+            return;
+        }
+        if self.is_ra_hardcore_active() {
+            self.show_state_manager = false;
+            self.confirm_delete_slot = None;
             return;
         }
         let mut open = self.show_state_manager;
@@ -673,8 +769,15 @@ impl RustboyApp {
         let mut load_slot: Option<usize> = None;
         let mut delete_slot: Option<usize> = None;
 
+        // Progressive 1-slot-per-frame loading prevents multi-PNG synchronous UI stalls.
         for slot in 1..=5 {
-            self.ensure_slot_cached(ctx, slot);
+            if self.slot_meta[slot - 1].is_none() {
+                self.ensure_slot_cached(ctx, slot);
+                if self.slot_meta.iter().any(Option::is_none) {
+                    ctx.request_repaint();
+                }
+                break;
+            }
         }
 
         egui::Window::new("Visual Save State Manager")
@@ -702,8 +805,8 @@ impl RustboyApp {
                     ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
                         if ui
                             .add_enabled(
-                                self.undo_state_buffer.is_some(),
-                                egui::Button::new("Undo State Action (Ctrl+Z)"),
+                                self.undo_state_action.is_some(),
+                                egui::Button::new("Undo State Action (Ctrl/Cmd+Z)"),
                             )
                             .clicked()
                         {
@@ -888,12 +991,20 @@ impl RustboyApp {
                                     });
 
                                     ui.add_space(2.0);
+                                    let confirming = self.confirm_delete_slot == Some(slot);
+                                    let del_lbl = if confirming {
+                                        "Confirm Delete?"
+                                    } else {
+                                        "Delete"
+                                    };
                                     if ui
                                         .add_enabled(
                                             is_filled,
                                             egui::Button::new(
-                                                RichText::new("Delete").small().color(
-                                                    if is_filled {
+                                                RichText::new(del_lbl).small().color(
+                                                    if confirming {
+                                                        Color32::from_rgb(255, 90, 90)
+                                                    } else if is_filled {
                                                         Color32::from_rgb(245, 120, 120)
                                                     } else {
                                                         TEXT_MUTED
@@ -904,7 +1015,12 @@ impl RustboyApp {
                                         )
                                         .clicked()
                                     {
-                                        delete_slot = Some(slot);
+                                        if confirming {
+                                            delete_slot = Some(slot);
+                                            self.confirm_delete_slot = None;
+                                        } else {
+                                            self.confirm_delete_slot = Some(slot);
+                                        }
                                     }
                                 });
                             });
@@ -920,25 +1036,41 @@ impl RustboyApp {
             self.undo_last_state_action();
         }
         if let Some(s) = save_slot {
+            self.confirm_delete_slot = None;
             self.quick_save(s);
         }
         if let Some(s) = load_slot {
+            self.confirm_delete_slot = None;
             self.quick_load(s);
         }
         if let Some(s) = delete_slot {
-            if let Some(sp) = self.slot_path(s) {
-                let _ = fs::remove_file(sp);
+            let mut err_msg = None;
+            if let Some(sp) = self.slot_path(s)
+                && sp.exists()
+                && let Err(e) = fs::remove_file(&sp)
+            {
+                err_msg = Some(format!("Failed deleting Slot {s}: {e}"));
             }
-            if let Some(legacy_sp) = self.existing_slot_path(s) {
+            if let Some(legacy_sp) = self.existing_slot_path(s)
+                && legacy_sp != self.slot_path(s).unwrap_or_default()
+            {
                 let _ = fs::remove_file(legacy_sp);
             }
-            if let Some(tp) = self.slot_thumb_path(s) {
+            if let Some(tp) = self.slot_thumb_path(s)
+                && tp.exists()
+            {
                 let _ = fs::remove_file(tp);
             }
-            self.slot_thumbnails[s - 1] = None;
-            self.slot_meta[s - 1] = Some(SlotMetaEntry::Empty);
-            self.state_manager_error = None;
-            self.notify(&format!("Deleted Slot {s}"));
+            if let Some(msg) = err_msg {
+                self.state_manager_error = Some(msg.clone());
+                self.notify_error(&msg);
+            } else {
+                self.slot_thumbnails[s - 1] = None;
+                self.slot_meta[s - 1] = Some(SlotMetaEntry::Empty);
+                self.slot_exists_cache[s - 1] = Some(false);
+                self.state_manager_error = None;
+                self.notify(&format!("Deleted Slot {s}"));
+            }
         }
     }
 }

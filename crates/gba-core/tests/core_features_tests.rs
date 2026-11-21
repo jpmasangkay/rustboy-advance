@@ -206,16 +206,28 @@ fn stop_mode_via_haltcnt_and_swi_wakes_only_on_keypad_cart_serial() {
     assert!(!core_swi.cpu.stopped, "GamePak IRQ must wake STOP");
     assert_eq!(core_swi.cpu.gpr[5], 1);
 
-    // Ensure normal HALT (HALTCNT = 0x00) still wakes on VBlank IRQ.
-    let halt_rom = rom_from_arm_words(&[
+    // Ensure normal HALT (HALTCNT = 0x00) executed from BIOS wakes on VBlank IRQ
+    // (and writes from ROM >= 0x4000 are ignored per hardware).
+    let halt_words = [
         0xE3A0_0301, // mov r0, #0x04000000
         0xE3A0_1000, // mov r1, #0x00 (HALT)
         0xE280_2C03, // add r2, r0, #0x300
         0xE5C2_1001, // strb r1, [r2, #1] -> HALTCNT = 0x00
         0xE285_5001, // add r5, r5, #1
         0xEAFF_FFFE, // b .
-    ]);
+    ];
+    let halt_rom = rom_from_arm_words(&halt_words);
     let mut core_halt = GbaCore::new(None, halt_rom);
+    for (i, &w) in halt_words.iter().enumerate() {
+        core_halt.bus.bios[0x0100 + i * 4..0x0104 + i * 4].copy_from_slice(&w.to_le_bytes());
+    }
+    core_halt.cpu.flush_pipeline(&mut core_halt.bus, 0x0100);
+    // Step through the 4 instructions + 1 tick to latch `halt_requested` into `cpu.halted`.
+    for _ in 0..5 {
+        core_halt.step_one();
+    }
+    assert!(core_halt.cpu.halted, "BIOS HALTCNT write must enter HALT");
+    assert_eq!(core_halt.cpu.gpr[5], 0);
     core_halt
         .bus
         .write_16(0x0400_0200, 1 << 0, AccessType::NonSequential); // IE: VBlank

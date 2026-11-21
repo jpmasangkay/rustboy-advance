@@ -9,6 +9,10 @@ license.workspace = true
 name = "rustboy-advance"
 path = "src/main.rs"
 
+[features]
+default = []
+jit = ["gba-core/jit"]
+
 [dependencies]
 gba-core = { path = "../gba-core" }
 gb-core = { path = "../gb-core" }

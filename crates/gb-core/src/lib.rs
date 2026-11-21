@@ -31,6 +31,10 @@ pub const LCD_WIDTH: usize = 160;
 pub const LCD_HEIGHT: usize = 144;
 /// Default stereo audio output sample rate in Hz.
 pub const DEFAULT_SAMPLE_RATE_HZ: u32 = 48_000;
+/// Magic bytes prepended to serialized [`GbCore`] savestate snapshots.
+pub const GB_STATE_MAGIC: [u8; 4] = *b"RBGB";
+/// Savestate schema version for [`GbCore`].
+pub const GB_STATE_VERSION: u32 = 1;
 
 // Active-high masks matching gba-core's `KEYINPUT` layout for frontend reuse.
 pub const KEY_A: u16 = 1 << 0;
@@ -153,13 +157,22 @@ impl GbCore {
         Self { cpu, bus, config }
     }
 
-    /// Resets the emulated system while preserving ROM, optional boot ROM, battery RAM/RTC,
-    /// and configuration.
+    /// Resets the emulated system while preserving ROM, optional boot ROM, battery-backed RAM/RTC,
+    /// and configuration. Volatile (non-battery) cartridge RAM is cleared to `0xFF`.
     pub fn reset(&mut self) {
         let rom = core::mem::take(&mut self.bus.cart.rom);
-        let saved_ram = self.bus.cart.ram.clone();
-        let saved_rtc = self.bus.cart.rtc.clone();
-        let saved_dirty = self.bus.cart.battery_dirty;
+        let has_battery = self.bus.cart.has_battery;
+        let saved_ram = if has_battery {
+            Some(self.bus.cart.ram.clone())
+        } else {
+            None
+        };
+        let saved_rtc = if has_battery {
+            Some(self.bus.cart.rtc.clone())
+        } else {
+            None
+        };
+        let saved_dirty = has_battery && self.bus.cart.battery_dirty;
         let boot_rom = if self.bus.boot_rom.is_empty() {
             None
         } else {
@@ -167,9 +180,14 @@ impl GbCore {
         };
 
         *self = Self::new_with_config(rom, boot_rom.as_deref(), self.config);
-        self.bus.cart.ram = saved_ram;
-        self.bus.cart.rtc = saved_rtc;
+        if let Some(ram) = saved_ram {
+            self.bus.cart.ram = ram;
+        }
+        if let Some(rtc) = saved_rtc {
+            self.bus.cart.rtc = rtc;
+        }
         self.bus.cart.battery_dirty = saved_dirty;
+        self.bus.cart.rebuild_bank_cache();
     }
 
     /// Steps one CPU instruction (or one M-cycle if halted/stopped/stalled) and returns
@@ -205,7 +223,8 @@ impl GbCore {
         let keypad = frontend.poll_keypad() & 0x03FF;
         self.bus.update_keypad(keypad);
 
-        let target_dots = self.bus.total_normal_dots + CYCLES_PER_FRAME;
+        let frame_budget = CYCLES_PER_FRAME.saturating_sub(self.bus.frame_cycle_debt);
+        let target_dots = self.bus.total_normal_dots + frame_budget;
         let mut presented = false;
 
         while self.bus.total_normal_dots < target_dots {
@@ -230,6 +249,8 @@ impl GbCore {
             }
         }
 
+        self.bus.frame_cycle_debt = self.bus.total_normal_dots.saturating_sub(target_dots);
+
         if !presented {
             frontend.present_frame(&self.bus.ppu.framebuffer);
             self.bus.ppu.frame_ready = false;
@@ -242,21 +263,56 @@ impl GbCore {
         None
     }
 
-    /// Serializes full emulator state (excluding the ROM bytes) using `postcard`.
+    /// Serializes full emulator state (excluding the ROM and boot ROM bytes) with a versioned,
+    /// ROM-CRC32-checked header followed by `postcard` encoding.
     pub fn save_state(&self) -> Result<Vec<u8>, postcard::Error> {
         let payload = SaveStatePayloadRef {
             cpu: &self.cpu,
             bus: &self.bus,
             config: self.config,
         };
-        postcard::to_allocvec(&payload)
+        let encoded = postcard::to_allocvec(&payload)?;
+        let mut out = Vec::with_capacity(12 + encoded.len());
+        out.extend_from_slice(&GB_STATE_MAGIC);
+        out.extend_from_slice(&GB_STATE_VERSION.to_le_bytes());
+        out.extend_from_slice(&self.bus.cart.rom_crc32().to_le_bytes());
+        out.extend_from_slice(&encoded);
+        Ok(out)
     }
 
-    /// Restores emulator state from a `postcard` snapshot while retaining the loaded ROM.
+    /// Restores emulator state from a snapshot while verifying magic/version/ROM CRC32 and
+    /// preserving host-owned ROM, boot ROM, sample rate, and DMG palette settings.
     pub fn load_state(&mut self, bytes: &[u8]) -> Result<(), postcard::Error> {
-        let mut payload: SaveStatePayload = postcard::from_bytes(bytes)?;
+        if bytes.len() < 12 || bytes[0..4] != GB_STATE_MAGIC {
+            return Err(postcard::Error::DeserializeBadEncoding);
+        }
+        let version = u32::from_le_bytes([bytes[4], bytes[5], bytes[6], bytes[7]]);
+        if version != GB_STATE_VERSION {
+            return Err(postcard::Error::DeserializeBadEncoding);
+        }
+        let state_crc = u32::from_le_bytes([bytes[8], bytes[9], bytes[10], bytes[11]]);
+        let current_crc = self.bus.cart.rom_crc32();
+        if state_crc != current_crc {
+            return Err(postcard::Error::DeserializeBadEncoding);
+        }
+
+        let mut payload: SaveStatePayload = postcard::from_bytes(&bytes[12..])?;
         let rom = core::mem::take(&mut self.bus.cart.rom);
+        let boot_rom = core::mem::take(&mut self.bus.boot_rom);
+        let host_sample_rate = self.config.sample_rate_hz;
+        let host_dmg_palette = self.config.dmg_palette;
+
         payload.bus.cart.rom = rom;
+        payload.bus.cart.refresh_rom_crc32();
+        payload.bus.cart.rebuild_bank_cache();
+        payload.bus.boot_rom = boot_rom;
+        payload.bus.apu.set_sample_rate(host_sample_rate);
+        payload.bus.apu.output_buffer.clear();
+        payload.bus.serial.output_buffer.clear();
+        payload.bus.ppu.dmg_palette = host_dmg_palette;
+        payload.config.sample_rate_hz = host_sample_rate;
+        payload.config.dmg_palette = host_dmg_palette;
+
         self.cpu = payload.cpu;
         self.bus = payload.bus;
         self.config = payload.config;

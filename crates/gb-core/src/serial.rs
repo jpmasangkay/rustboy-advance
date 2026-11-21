@@ -1,6 +1,8 @@
 use alloc::vec::Vec;
 use serde::{Deserialize, Serialize};
 
+const MAX_SERIAL_OUTPUT_BYTES: usize = 65_536;
+
 /// Game Boy Link Port / Serial (`SB` `0xFF01`, `SC` `0xFF02`) stub.
 ///
 /// With no link partner connected, transfers using the internal clock shift in `0xFF`,
@@ -14,6 +16,7 @@ pub struct Serial {
     bits_remaining: u8,
     cycle_acc: u16,
     bit_period_cycles: u16,
+    #[serde(skip, default)]
     pub output_buffer: Vec<u8>,
 }
 
@@ -51,8 +54,10 @@ impl Serial {
         self.sc = val & mask;
 
         if (self.sc & 0x81) == 0x81 {
-            // Capture outgoing byte for blargg / debug serial console.
-            self.output_buffer.push(self.sb);
+            // Capture outgoing byte for blargg / debug serial console (bounded to avoid RAM leak).
+            if self.output_buffer.len() < MAX_SERIAL_OUTPUT_BYTES {
+                self.output_buffer.push(self.sb);
+            }
             self.active = true;
             self.bits_remaining = 8;
             self.cycle_acc = 0;
@@ -61,7 +66,8 @@ impl Serial {
             } else {
                 512
             };
-        } else if (self.sc & 0x80) == 0 {
+        } else {
+            // Clearing transfer-enable OR switching to external clock stops internal shifting.
             self.active = false;
         }
     }

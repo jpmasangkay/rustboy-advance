@@ -1,6 +1,7 @@
 [CmdletBinding()]
 param(
-    [switch]$Force
+    [switch]$Force,
+    [switch]$RomsOnly
 )
 
 $ErrorActionPreference = "Stop"
@@ -32,13 +33,13 @@ function Download-File {
     $tmp = "$DestPath.tmp"
     if (Test-Path $tmp) { Remove-Item $tmp -Force }
     if ($CurlExe) {
-        & $CurlExe.Source -fsSL --retry 3 --retry-delay 2 --max-time 60 -o $tmp $Url
+        & $CurlExe.Source -fsSL --retry 3 --retry-delay 2 --connect-timeout 15 --max-time 180 -o $tmp $Url
         if ($LASTEXITCODE -ne 0) {
             throw "curl.exe failed ($LASTEXITCODE) downloading $Url"
         }
     } else {
         [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
-        Invoke-WebRequest -UseBasicParsing -Uri $Url -OutFile $tmp -TimeoutSec 60
+        Invoke-WebRequest -UseBasicParsing -Uri $Url -OutFile $tmp -TimeoutSec 180
     }
     if (-not (Test-Path $tmp) -or (Get-Item $tmp).Length -eq 0) {
         throw "Downloaded empty file from $Url"
@@ -96,30 +97,46 @@ $NbaFiles = @(
     "haltcnt/haltcnt.gba",
     "irq/irq-delay/irq-delay.gba",
     "ppu/bgpd/bgpd.gba",
-    "ppu/bgpd/expected.png",
     "ppu/bgx/bgx.gba",
-    "ppu/bgx/expected.png",
     "ppu/dispcnt-latch/dispcnt-latch.gba",
-    "ppu/dispcnt-latch/expected.png",
     "ppu/greenswap/greenswap.gba",
-    "ppu/greenswap/expected.png",
     "ppu/ram-access-timing/ram-access-timing.gba",
     "ppu/sprite-hmosaic/sprite-hmosaic.gba",
-    "ppu/sprite-hmosaic/expected.png",
     "ppu/status-irq-dma/status-irq-dma.gba",
     "ppu/vram-mirror/vram-mirror.gba",
     "timer/reload/reload.gba",
     "timer/start-stop/start-stop.gba",
     "timer/tick-before-reload/tick-before-reload.gba"
 )
+if (-not $RomsOnly) {
+    $NbaFiles += @(
+        "ppu/bgpd/expected.png",
+        "ppu/bgx/expected.png",
+        "ppu/dispcnt-latch/expected.png",
+        "ppu/greenswap/expected.png",
+        "ppu/sprite-hmosaic/expected.png"
+    )
+}
 foreach ($f in $NbaFiles) {
     Download-File "$NbaBase/$f" (Join-Path $OutRoot "nba-hw-test/$f")
 }
 
 Write-Host "==> Fetching Tonc prebuilt demos (tonc-bin.zip, Copyright (c) Jasper Vijn / cearn, MIT License)"
 $ToncDir = Join-Path $OutRoot "tonc"
-$ToncMarker = Join-Path $ToncDir "win_demo.gba"
-if ((-not (Test-Path $ToncMarker)) -or $Force) {
+$ToncRequired = @(
+    "bm_modes.gba", "mos_demo.gba", "win_demo.gba", "bld_demo.gba",
+    "obj_aff.gba", "obj_demo.gba", "m7_demo.gba", "prio_demo.gba",
+    "tte_demo.gba", "irq_demo.gba", "tmr_demo.gba", "dma_demo.gba"
+)
+$ToncMissing = $false
+foreach ($rom in $ToncRequired) {
+    $p = Join-Path $ToncDir $rom
+    if (-not (Test-Path $p) -or (Get-Item $p).Length -eq 0) {
+        $ToncMissing = $true
+        break
+    }
+}
+if ($ToncMissing -or $Force) {
     if (-not (Test-Path $ToncDir)) {
         New-Item -ItemType Directory -Path $ToncDir -Force | Out-Null
     }
@@ -140,7 +157,31 @@ if ((-not (Test-Path $ToncMarker)) -or $Force) {
     }
     Remove-Item $ToncZip -Force -ErrorAction SilentlyContinue
 } else {
-    Write-Host "  [cached] $ToncDir"
+    Write-Host "  [cached] $ToncDir (all $($ToncRequired.Count) manifest ROMs present)"
+}
+
+$ChecksumFile = Join-Path $PSScriptRoot "test-roms.sha256"
+if (Test-Path $ChecksumFile) {
+    Write-Host "==> Verifying SHA-256 checksums ($ChecksumFile)"
+    $verified = 0
+    foreach ($line in Get-Content $ChecksumFile) {
+        $trimmed = $line.Trim()
+        if (-not $trimmed -or $trimmed.StartsWith("#")) { continue }
+        $parts = $trimmed -split "\s+", 2
+        $expected = $parts[0].ToLowerInvariant()
+        $relPath = $parts[1].Trim()
+        if ($RomsOnly -and $relPath.EndsWith(".png")) { continue }
+        $target = Join-Path $OutRoot $relPath
+        if (-not (Test-Path $target)) {
+            throw "Missing expected file: $target"
+        }
+        $actual = (Get-FileHash -Algorithm SHA256 -Path $target).Hash.ToLowerInvariant()
+        if ($actual -ne $expected) {
+            throw "SHA-256 mismatch for $relPath (expected $expected, got $actual)"
+        }
+        $verified++
+    }
+    Write-Host "  Verified $verified files against SHA-256 manifest."
 }
 
 Write-Host ""

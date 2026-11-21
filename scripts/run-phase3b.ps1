@@ -1,4 +1,4 @@
-# Phase 3B Real Throttle Validation & --slowdown N Sweep (5 runs per condition)
+# Phase 3B Contention & --slowdown N Sweep (5 runs per condition, host-safe without powercfg mutations)
 param(
     [int]$FramesPerRun = 720,
     [int]$Runs = 5
@@ -20,29 +20,6 @@ if (-not (Test-Path $exe)) {
 }
 if (Test-Path "perf/REPORT.md") {
     Copy-Item "perf/REPORT.md" "perf/REPORT.phase3_bak.md" -Force
-}
-
-function Set-CpuPowerState {
-    param(
-        [int]$MinPct,
-        [int]$MaxPct,
-        [int]$BoostMode,
-        [int]$MinEff1 = 5,
-        [int]$MinEff2 = 5
-    )
-    powercfg /setacvalueindex SCHEME_CURRENT SUB_PROCESSOR PROCTHROTTLEMIN $MinPct | Out-Null
-    powercfg /setacvalueindex SCHEME_CURRENT SUB_PROCESSOR PROCTHROTTLEMIN1 $MinEff1 | Out-Null
-    powercfg /setacvalueindex SCHEME_CURRENT SUB_PROCESSOR PROCTHROTTLEMIN2 $MinEff2 | Out-Null
-    powercfg /setacvalueindex SCHEME_CURRENT SUB_PROCESSOR PROCTHROTTLEMAX $MaxPct | Out-Null
-    powercfg /setacvalueindex SCHEME_CURRENT SUB_PROCESSOR PROCTHROTTLEMAX1 $MaxPct | Out-Null
-    powercfg /setacvalueindex SCHEME_CURRENT SUB_PROCESSOR PROCTHROTTLEMAX2 $MaxPct | Out-Null
-    powercfg /setacvalueindex SCHEME_CURRENT SUB_PROCESSOR PERFBOOSTMODE $BoostMode | Out-Null
-    powercfg /setactive SCHEME_CURRENT | Out-Null
-}
-
-function Restore-PowerPlan {
-    Write-Host "Restoring original AC power plan (MIN=80, MIN1=5, MIN2=5, MAX=100, BOOST=2)..."
-    Set-CpuPowerState -MinPct 80 -MaxPct 100 -BoostMode 2 -MinEff1 5 -MinEff2 5
 }
 
 function Kill-Workers($workers) {
@@ -122,24 +99,19 @@ function Get-Sum {
 }
 
 $conditions = @(
-    @{ Group = "powercfg"; Name = "Core0 Baseline (Boost ON, 100%)"; PinCore0 = $true; MinPct = 80; MaxPct = 100; Boost = 2; Workers = 0; Slowdown = 1; ExpectedScale = 1.0 },
-    @{ Group = "powercfg"; Name = "Core0 Boost OFF (MIN=5 MAX=100)"; PinCore0 = $true; MinPct = 5; MaxPct = 100; Boost = 0; Workers = 0; Slowdown = 1; ExpectedScale = 1.0 },
-    @{ Group = "powercfg"; Name = "Core0 Powercfg 25% (MIN=5 MAX=25 BOOST=0)"; PinCore0 = $true; MinPct = 5; MaxPct = 25; Boost = 0; Workers = 0; Slowdown = 1; ExpectedScale = 4.0 },
-    @{ Group = "powercfg"; Name = "Core0 Powercfg 15% (MIN=5 MAX=15 BOOST=0)"; PinCore0 = $true; MinPct = 5; MaxPct = 15; Boost = 0; Workers = 0; Slowdown = 1; ExpectedScale = 6.67 },
-    @{ Group = "powercfg"; Name = "Core0 Powercfg 5% (MIN=5 MAX=5 BOOST=0)"; PinCore0 = $true; MinPct = 5; MaxPct = 5; Boost = 0; Workers = 0; Slowdown = 1; ExpectedScale = 20.0 },
-    @{ Group = "contention"; Name = "Core0 + 2 Busy Workers (Boost ON)"; PinCore0 = $true; MinPct = 80; MaxPct = 100; Boost = 2; Workers = 2; Slowdown = 1; ExpectedScale = 3.0 },
-    @{ Group = "contention"; Name = "Core0 + 4 Busy Workers (Boost ON)"; PinCore0 = $true; MinPct = 80; MaxPct = 100; Boost = 2; Workers = 4; Slowdown = 1; ExpectedScale = 5.0 },
-    @{ Group = "slowdown"; Name = "Slowdown 1x (Baseline)"; PinCore0 = $false; MinPct = 80; MaxPct = 100; Boost = 2; Workers = 0; Slowdown = 1; ExpectedScale = 1.0 },
-    @{ Group = "slowdown"; Name = "Slowdown 5x"; PinCore0 = $false; MinPct = 80; MaxPct = 100; Boost = 2; Workers = 0; Slowdown = 5; ExpectedScale = 5.0 },
-    @{ Group = "slowdown"; Name = "Slowdown 10x"; PinCore0 = $false; MinPct = 80; MaxPct = 100; Boost = 2; Workers = 0; Slowdown = 10; ExpectedScale = 10.0 },
-    @{ Group = "slowdown"; Name = "Slowdown 20x"; PinCore0 = $false; MinPct = 80; MaxPct = 100; Boost = 2; Workers = 0; Slowdown = 20; ExpectedScale = 20.0 },
-    @{ Group = "slowdown"; Name = "Slowdown 30x"; PinCore0 = $false; MinPct = 80; MaxPct = 100; Boost = 2; Workers = 0; Slowdown = 30; ExpectedScale = 30.0 },
-    @{ Group = "slowdown"; Name = "Slowdown 50x"; PinCore0 = $false; MinPct = 80; MaxPct = 100; Boost = 2; Workers = 0; Slowdown = 50; ExpectedScale = 50.0 }
+    @{ Group = "baseline"; Name = "Core0 Baseline"; PinCore0 = $true; Workers = 0; Slowdown = 1; ExpectedScale = 1.0 },
+    @{ Group = "contention"; Name = "Core0 + 2 Busy Workers"; PinCore0 = $true; Workers = 2; Slowdown = 1; ExpectedScale = 3.0 },
+    @{ Group = "contention"; Name = "Core0 + 4 Busy Workers"; PinCore0 = $true; Workers = 4; Slowdown = 1; ExpectedScale = 5.0 },
+    @{ Group = "slowdown"; Name = "Slowdown 1x (Baseline)"; PinCore0 = $false; Workers = 0; Slowdown = 1; ExpectedScale = 1.0 },
+    @{ Group = "slowdown"; Name = "Slowdown 5x"; PinCore0 = $false; Workers = 0; Slowdown = 5; ExpectedScale = 5.0 },
+    @{ Group = "slowdown"; Name = "Slowdown 10x"; PinCore0 = $false; Workers = 0; Slowdown = 10; ExpectedScale = 10.0 },
+    @{ Group = "slowdown"; Name = "Slowdown 20x"; PinCore0 = $false; Workers = 0; Slowdown = 20; ExpectedScale = 20.0 },
+    @{ Group = "slowdown"; Name = "Slowdown 30x"; PinCore0 = $false; Workers = 0; Slowdown = 30; ExpectedScale = 30.0 },
+    @{ Group = "slowdown"; Name = "Slowdown 50x"; PinCore0 = $false; Workers = 0; Slowdown = 50; ExpectedScale = 50.0 }
 )
 
 $results = @()
 $baselineCalibMs = $null
-$boostOff100CalibMs = $null
 
 try {
     foreach ($c in $conditions) {
@@ -147,7 +119,6 @@ try {
         Write-Host "Condition: $($c.Name) ($Runs runs x $FramesPerRun frames)"
         Write-Host "================================================================"
 
-        Set-CpuPowerState -MinPct $c.MinPct -MaxPct $c.MaxPct -BoostMode $c.Boost
         $workerProcs = @()
         for ($i = 0; $i -lt $c.Workers; $i++) {
             $w = Start-Process -FilePath "powershell.exe" -ArgumentList "-NoProfile", "-NonInteractive", "-Command", "while(`$true){}" -PassThru -WindowStyle Hidden
@@ -233,21 +204,10 @@ try {
             $calibMax = Get-Max $calibSamples
             $perfMed = if ($perfPctSamples.Count -gt 0) { Get-Median $perfPctSamples } else { 0.0 }
             if ($null -eq $baselineCalibMs) { $baselineCalibMs = $calibMed }
-            if ($c.Name -like "*Boost OFF (MIN=5 MAX=100)*") { $boostOff100CalibMs = $calibMed }
 
             # Determine whether throttle actually applied proportionally
             $throttleStatus = "APPLIED"
-            if ($c.Group -eq "powercfg" -and $c.MaxPct -lt 100) {
-                $refMs = if ($null -ne $boostOff100CalibMs) { $boostOff100CalibMs } else { $baselineCalibMs }
-                $actualScale = $calibMed / $refMs
-                # Require at least 50% of expected slowdown vs 100% Boost OFF
-                if ($actualScale -lt ($c.ExpectedScale * 0.5)) {
-                    $throttleStatus = "NOT APPLIED"
-                }
-            } elseif ($c.Group -eq "powercfg" -and $c.Boost -eq 0) {
-                $actualScale = $calibMed / $baselineCalibMs
-                $throttleStatus = if ($actualScale -gt 1.25) { "BOOST_OFF_ONLY" } else { "NOT APPLIED" }
-            } elseif ($c.Group -eq "slowdown" -and $c.Slowdown -gt 1) {
+            if ($c.Group -eq "slowdown" -and $c.Slowdown -gt 1) {
                 $throttleStatus = "SYNTHETIC_$($c.Slowdown)X"
             }
 
@@ -317,7 +277,6 @@ try {
         }
     }
 } finally {
-    Restore-PowerPlan
     if (Test-Path "perf/REPORT.phase3_bak.md") {
         Copy-Item "perf/REPORT.phase3_bak.md" "perf/REPORT.md" -Force
     }

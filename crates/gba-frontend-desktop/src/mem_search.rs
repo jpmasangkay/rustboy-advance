@@ -354,6 +354,15 @@ impl MemSearchWindow {
 
         let stride = self.value_type.byte_width();
         self.candidates.clear();
+        let estimated: usize = self
+            .region
+            .ranges()
+            .iter()
+            .map(|&(s, e)| ((e - s) / stride) as usize)
+            .sum();
+        if target.is_none() {
+            self.candidates.reserve(estimated);
+        }
 
         for &(start, end) in self.region.ranges() {
             let mut addr = start;
@@ -401,27 +410,32 @@ impl MemSearchWindow {
 
         let ty = self.value_type;
         let cmp = self.compare;
-        let mut next = Vec::with_capacity(self.candidates.len().min(4096));
-
-        for cand in &self.candidates {
+        let mut write = 0usize;
+        for read in 0..self.candidates.len() {
+            let cand = self.candidates[read];
             let live = read_typed(core, cand.addr, ty);
             if matches_compare(live, cand.cur_raw, target, cmp, ty) {
-                next.push(SearchCandidate {
+                self.candidates[write] = SearchCandidate {
                     addr: cand.addr,
                     cur_raw: live,
                     prev_raw: cand.cur_raw,
                     hit_count: cand.hit_count.saturating_add(1),
-                });
+                };
+                write += 1;
             }
         }
-
-        self.candidates = next;
+        self.candidates.truncate(write);
         self.scan_passes = self.scan_passes.saturating_add(1);
         Ok(self.candidates.len())
     }
 
     /// Renders the floating Memory Search / Cheat Finder window.
-    pub fn show(&mut self, ctx: &egui::Context, core: Option<&GbaCore>) -> MemSearchAction {
+    pub fn show(
+        &mut self,
+        ctx: &egui::Context,
+        core: Option<&GbaCore>,
+        hardcore: bool,
+    ) -> MemSearchAction {
         if !self.open {
             return MemSearchAction::None;
         }
@@ -702,7 +716,7 @@ impl MemSearchWindow {
                                                 egui::Label::new(
                                                     RichText::new(
                                                         self.value_type
-                                                            .format_value(row.prev_raw, self.hex_display),
+                                                            .format_value(row.cur_raw, self.hex_display),
                                                     )
                                                     .monospace(),
                                                 ),
@@ -714,7 +728,15 @@ impl MemSearchWindow {
                                                         .monospace(),
                                                 ),
                                             );
-                                            if ui.small_button("+ Cheat").clicked() {
+                                            let cheat_btn = ui
+                                                .add_enabled(
+                                                    !hardcore,
+                                                    egui::Button::new("+ Cheat").small(),
+                                                )
+                                                .on_disabled_hover_text(
+                                                    "Disabled while RetroAchievements Hardcore mode is active",
+                                                );
+                                            if cheat_btn.clicked() {
                                                 let entry = format_autoraw_cheat(
                                                     row.addr,
                                                     live_val,

@@ -1,6 +1,7 @@
-use egui::{
-    Color32, CornerRadius, FontData, FontDefinitions, FontFamily, FontId, Stroke, TextStyle,
-};
+#[cfg(target_os = "windows")]
+use egui::FontData;
+use egui::{Color32, CornerRadius, FontDefinitions, FontFamily, FontId, Stroke, TextStyle};
+#[cfg(target_os = "windows")]
 use std::sync::Arc;
 
 // DESIGN TOKENS
@@ -16,8 +17,8 @@ pub const COLOR_HOVER_SELECTED: Color32 = Color32::from_rgb(0x2A, 0x2A, 0x2A);
 pub const COLOR_BORDER: Color32 = Color32::from_rgb(0x2A, 0x2A, 0x2A);
 
 pub const COLOR_TEXT: Color32 = Color32::from_rgb(0xE6, 0xE6, 0xE6);
-pub const COLOR_TEXT_SECONDARY: Color32 = Color32::from_rgb(0x8A, 0x8A, 0x8A);
-pub const COLOR_TEXT_DISABLED: Color32 = Color32::from_rgb(0x5A, 0x5A, 0x5A);
+pub const COLOR_TEXT_SECONDARY: Color32 = Color32::from_rgb(0xA0, 0xA0, 0xA0);
+pub const COLOR_TEXT_DISABLED: Color32 = Color32::from_rgb(0x64, 0x64, 0x64);
 
 pub const ACCENT_TEAL: Color32 = Color32::from_rgb(46, 196, 182);
 pub const ACCENT_TEAL_BG: Color32 = Color32::from_rgb(26, 62, 62);
@@ -46,6 +47,7 @@ pub const TEXT_MUTED: Color32 = COLOR_TEXT_SECONDARY;
 /// Configures the unified native desktop theme:
 /// Segoe UI 12px font runtime loading (on Windows), 2px radius, no shadows/glows, 4px grid.
 pub fn configure_theme(ctx: &egui::Context) {
+    #[cfg_attr(not(target_os = "windows"), allow(unused_mut))]
     let mut fonts = FontDefinitions::default();
 
     #[cfg(target_os = "windows")]

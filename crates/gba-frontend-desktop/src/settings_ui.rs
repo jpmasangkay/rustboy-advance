@@ -1369,7 +1369,10 @@ mod tests {
 
     #[test]
     fn esc_closes_top_active_dialog_by_layer_order() {
-        let mut app = ManuallyDrop::new(RustboyApp::new(CliConfig::default()));
+        let mut app = ManuallyDrop::new(RustboyApp::new(
+            CliConfig::default(),
+            crate::config::AppConfig::default(),
+        ));
         let ctx = egui::Context::default();
 
         app.show_settings = true;
@@ -1408,7 +1411,10 @@ mod tests {
     }
 
     fn make_unsaved_prompt_test_app(temp_dir: &std::path::Path) -> ManuallyDrop<RustboyApp> {
-        let mut app = ManuallyDrop::new(RustboyApp::new(CliConfig::default()));
+        let mut app = ManuallyDrop::new(RustboyApp::new(
+            CliConfig::default(),
+            crate::config::AppConfig::default(),
+        ));
         app.core = Some(gba_core::GbaCore::new(None, vec![0u8; 256]));
         app.rom_title = "Summon Night".to_string();
         app.rom_code = "AB4E".to_string();

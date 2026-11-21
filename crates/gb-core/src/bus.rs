@@ -22,6 +22,7 @@ pub struct GbBus {
     pub is_cgb: bool,
     pub gba_mode: bool,
 
+    #[serde(skip)]
     pub boot_rom: Vec<u8>,
     pub boot_rom_enabled: bool,
 
@@ -37,9 +38,13 @@ pub struct GbBus {
     pub hram: [u8; 0x7F],
     pub svbk: u8,
 
-    // CGB speed switch state
+    // CGB speed switch & misc system registers
     pub key1_arm: bool,
     pub double_speed: bool,
+    #[serde(default)]
+    pub key0: u8,
+    #[serde(default)]
+    pub rp: u8,
 
     // Interrupts
     pub if_flag: u8,
@@ -56,6 +61,8 @@ pub struct GbBus {
     pub oam_dma_src: u16,
     pub oam_dma_index: u16,
     pub oam_dma_delay: u8,
+    #[serde(default)]
+    pub oam_dma_locked: bool,
 
     // CGB HDMA / GDMA (`0xFF51..=0xFF55`)
     pub hdma_src: u16,
@@ -70,6 +77,9 @@ pub struct GbBus {
 
     /// Normal-speed T-cycles (dots) elapsed since creation/reset.
     pub total_normal_dots: u64,
+    /// Carry-over dot overshoot from previous frame so frames average exact 70_224 dots.
+    #[serde(default)]
+    pub frame_cycle_debt: u64,
 }
 
 impl GbBus {
@@ -107,6 +117,8 @@ impl GbBus {
             svbk: 1,
             key1_arm: false,
             double_speed: false,
+            key0: if is_cgb { 0x00 } else { 0x04 },
+            rp: 0x00,
             if_flag: if has_boot { 0x00 } else { 0x01 },
             ie_flag: 0x00,
             p1_select: 0x30,
@@ -117,6 +129,7 @@ impl GbBus {
             oam_dma_src: 0,
             oam_dma_index: 0,
             oam_dma_delay: 0,
+            oam_dma_locked: false,
             hdma_src: 0,
             hdma_dst: 0,
             hdma_active: false,
@@ -125,11 +138,12 @@ impl GbBus {
             hdma_stall_m_cycles: 0,
             cpu_halted: false,
             total_normal_dots: 0,
+            frame_cycle_debt: 0,
         };
 
         if !has_boot {
             bus.ppu.init_post_boot(is_cgb);
-            bus.apu.init_post_boot();
+            bus.apu.init_post_boot(is_cgb);
             bus.p1_select = 0x30;
         }
         bus
@@ -147,7 +161,7 @@ impl GbBus {
     }
 
     #[inline]
-    fn compute_p1_low(&self) -> u8 {
+    pub(crate) fn compute_p1_low(&self) -> u8 {
         let mut low = 0x0Fu8;
         let k = self.keypad_active_low;
         // Bit 4 == 0 selects D-pad (Right, Left, Up, Down)
@@ -214,11 +228,13 @@ impl GbBus {
             self.request_irq(IRQ_SERIAL);
         }
 
-        // OAM DMA (1 byte per CPU M-cycle after 1 M-cycle startup delay)
+        // OAM DMA (1 byte per CPU M-cycle after 1 M-cycle startup delay).
+        // OAM stays accessible during the 1-M-cycle startup delay unless an earlier DMA was active.
         if self.oam_dma_active {
             if self.oam_dma_delay > 0 {
                 self.oam_dma_delay -= 1;
             } else {
+                self.oam_dma_locked = true;
                 let addr = self.oam_dma_src.wrapping_add(self.oam_dma_index);
                 let byte = self.dma_read8(addr);
                 self.ppu.oam[self.oam_dma_index as usize] = byte;
@@ -227,6 +243,8 @@ impl GbBus {
                     self.oam_dma_active = false;
                 }
             }
+        } else {
+            self.oam_dma_locked = false;
         }
 
         // PPU & APU & Cartridge RTC (4.194304 MHz normal clock domain)
@@ -245,10 +263,26 @@ impl GbBus {
         self.cart.tick_rtc(normal_dots as u64);
     }
 
+    /// Advances PPU, APU, and RTC during CGB's 2050-M-cycle speed-switch pause while DIV is stopped.
+    pub fn tick_speed_switch_m_cycle(&mut self) {
+        let normal_dots: u32 = if self.double_speed { 2 } else { 4 };
+        self.total_normal_dots += normal_dots as u64;
+        self.timer.reset_div_on_speed_switch();
+        let ppu_res = self.ppu.step(normal_dots, self.is_cgb);
+        if ppu_res.vblank_irq {
+            self.request_irq(IRQ_VBLANK);
+        }
+        if ppu_res.stat_irq {
+            self.request_irq(IRQ_STAT);
+        }
+        self.apu.step(normal_dots);
+        self.cart.tick_rtc(normal_dots as u64);
+    }
+
     fn transfer_hdma_block(&mut self) {
         let vbank = ((self.ppu.vbk & 1) as usize) * 0x2000;
         for _ in 0..16 {
-            let val = self.dma_read8(self.hdma_src);
+            let val = self.hdma_read8(self.hdma_src);
             let vram_off = (self.hdma_dst as usize) & 0x1FFF;
             self.ppu.vram[vbank + vram_off] = val;
             self.hdma_src = self.hdma_src.wrapping_add(1);
@@ -259,6 +293,18 @@ impl GbBus {
         if self.hdma_remaining == 0 {
             self.hdma_active = false;
             self.hdma_cancelled = false;
+        }
+    }
+
+    /// Reads a byte for CGB GDMA/HDMA; only ROM, Cart RAM, and WRAM are valid sources.
+    #[inline]
+    fn hdma_read8(&self, addr: u16) -> u8 {
+        match addr {
+            0x0000..=0x7FFF => self.cart.read_rom(addr),
+            0xA000..=0xBFFF => self.cart.read_ram(addr),
+            0xC000..=0xCFFF => self.wram[(addr as usize) & 0x0FFF],
+            0xD000..=0xDFFF => self.wram[self.wram_bank() * 0x1000 + ((addr as usize) & 0x0FFF)],
+            _ => 0xFF,
         }
     }
 
@@ -345,7 +391,7 @@ impl GbBus {
                 }
             }
             0xFE00..=0xFE9F => {
-                if self.oam_dma_active {
+                if self.oam_dma_locked {
                     return 0xFF;
                 }
                 self.ppu.read_oam(addr)
@@ -383,7 +429,7 @@ impl GbBus {
                 }
             }
             0xFE00..=0xFE9F => {
-                if !self.oam_dma_active {
+                if !self.oam_dma_locked {
                     self.ppu.write_oam(addr, val);
                 }
             }
@@ -414,7 +460,7 @@ impl GbBus {
             0xFF06 => self.timer.read_tma(),
             0xFF07 => self.timer.read_tac(),
             0xFF0F => 0xE0 | (self.if_flag & 0x1F),
-            0xFF10..=0xFF3F => self.apu.read_reg(addr),
+            0xFF10..=0xFF3F => self.apu.read_reg(addr, self.is_cgb),
             0xFF40 => self.ppu.lcdc,
             0xFF41 => self.ppu.read_stat(),
             0xFF42 => self.ppu.scy,
@@ -427,6 +473,7 @@ impl GbBus {
             0xFF49 => self.ppu.obp1,
             0xFF4A => self.ppu.wy,
             0xFF4B => self.ppu.wx,
+            0xFF4C if self.is_cgb && self.boot_rom_enabled => self.key0,
             0xFF4D if self.is_cgb => {
                 0x7E | (if self.double_speed { 0x80 } else { 0 })
                     | (if self.key1_arm { 1 } else { 0 })
@@ -441,11 +488,15 @@ impl GbBus {
                     0xFF
                 }
             }
+            0xFF56 if self.is_cgb => (self.rp & 0xC1) | 0x3E,
             0xFF68 if self.is_cgb => self.ppu.read_bcps(),
             0xFF69 if self.is_cgb => self.ppu.read_bcpd(),
             0xFF6A if self.is_cgb => self.ppu.read_ocps(),
             0xFF6B if self.is_cgb => self.ppu.read_ocpd(),
+            0xFF6C if self.is_cgb => self.ppu.read_opri(),
             0xFF70 if self.is_cgb => 0xF8 | (self.svbk & 0x07),
+            0xFF76 if self.is_cgb => self.apu.read_pcm12(),
+            0xFF77 if self.is_cgb => self.apu.read_pcm34(),
             _ => 0xFF,
         }
     }
@@ -470,12 +521,12 @@ impl GbBus {
             0xFF0F => self.if_flag = val & 0x1F,
             0xFF10..=0xFF3F => self.apu.write_reg(addr, val, self.is_cgb),
             0xFF40 => {
-                if self.ppu.write_lcdc(val) {
+                if self.ppu.write_lcdc(val, self.is_cgb) {
                     self.request_irq(IRQ_STAT);
                 }
             }
             0xFF41 => {
-                if self.ppu.write_stat(val) {
+                if self.ppu.write_stat(val, self.is_cgb) {
                     self.request_irq(IRQ_STAT);
                 }
             }
@@ -497,6 +548,7 @@ impl GbBus {
             0xFF49 => self.ppu.obp1 = val,
             0xFF4A => self.ppu.wy = val,
             0xFF4B => self.ppu.wx = val,
+            0xFF4C if self.is_cgb && self.boot_rom_enabled => self.key0 = val,
             0xFF4D if self.is_cgb => self.key1_arm = (val & 0x01) != 0,
             0xFF4F if self.is_cgb => self.ppu.write_vbk(val),
             0xFF50 => {
@@ -517,10 +569,12 @@ impl GbBus {
                 self.hdma_dst = (self.hdma_dst & 0xFF00) | ((val as u16) & 0xF0);
             }
             0xFF55 if self.is_cgb => self.write_hdma5(val),
+            0xFF56 if self.is_cgb => self.rp = val & 0xC1,
             0xFF68 if self.is_cgb => self.ppu.write_bcps(val),
             0xFF69 if self.is_cgb => self.ppu.write_bcpd(val),
             0xFF6A if self.is_cgb => self.ppu.write_ocps(val),
             0xFF6B if self.is_cgb => self.ppu.write_ocpd(val),
+            0xFF6C if self.is_cgb && self.boot_rom_enabled => self.ppu.write_opri(val),
             0xFF70 if self.is_cgb => self.svbk = val & 0x07,
             _ => {}
         }
@@ -539,7 +593,7 @@ impl GbBus {
             let vbank = ((self.ppu.vbk & 1) as usize) * 0x2000;
             for _ in 0..blocks {
                 for _ in 0..16 {
-                    let b = self.dma_read8(self.hdma_src);
+                    let b = self.hdma_read8(self.hdma_src);
                     let vram_off = (self.hdma_dst as usize) & 0x1FFF;
                     self.ppu.vram[vbank + vram_off] = b;
                     self.hdma_src = self.hdma_src.wrapping_add(1);
@@ -554,6 +608,11 @@ impl GbBus {
             self.hdma_remaining = blocks;
             self.hdma_active = true;
             self.hdma_cancelled = false;
+            // CGB hardware quirk: starting HBlank HDMA while already in Mode 0 or with LCD off
+            // transfers the first 16-byte block immediately.
+            if !self.ppu.lcd_enabled() || self.ppu.mode == 0 {
+                self.transfer_hdma_block();
+            }
         }
     }
 
@@ -601,12 +660,7 @@ impl GbBus {
     /// DMA transfers, or cycle ticks).
     pub fn poke8(&mut self, addr: u16, val: u8) {
         match addr {
-            0x0000..=0x7FFF => {
-                let off = addr as usize;
-                if off < self.cart.rom.len() {
-                    self.cart.rom[off] = val;
-                }
-            }
+            0x0000..=0x7FFF => self.cart.poke_rom_mapped(addr, val),
             0x8000..=0x9FFF => {
                 let bank = if self.is_cgb {
                     (self.ppu.vbk & 1) as usize

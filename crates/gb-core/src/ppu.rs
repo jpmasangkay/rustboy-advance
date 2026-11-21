@@ -81,6 +81,10 @@ pub struct Ppu {
     pub wy_triggered: bool,
     pub stat_irq_line: bool,
     pub ly_eq_lyc: bool,
+    #[serde(default)]
+    pub opri: u8,
+    #[serde(default)]
+    line_153: bool,
 
     pub dmg_palette: DmgPalette,
 }
@@ -114,6 +118,8 @@ impl Ppu {
             wy_triggered: false,
             stat_irq_line: false,
             ly_eq_lyc: false,
+            opri: 0,
+            line_153: false,
             dmg_palette,
         }
     }
@@ -139,6 +145,8 @@ impl Ppu {
         self.wy_triggered = false;
         self.ly_eq_lyc = true;
         self.stat_irq_line = false;
+        self.opri = if is_cgb { 0 } else { 1 };
+        self.line_153 = false;
         if is_cgb {
             self.bg_cram = [0xFF; 64];
             self.obj_cram = [0x00; 64];
@@ -165,7 +173,7 @@ impl Ppu {
         rising
     }
 
-    pub fn write_lcdc(&mut self, val: u8) -> bool {
+    pub fn write_lcdc(&mut self, val: u8, is_cgb: bool) -> bool {
         let was_on = self.lcd_enabled();
         let now_on = (val & 0x80) != 0;
         self.lcdc = val;
@@ -175,24 +183,32 @@ impl Ppu {
             self.ly = 0;
             self.dot = 0;
             self.mode = 0;
+            self.line_153 = false;
             self.win_line = 0;
             self.wy_triggered = false;
             self.stat_irq_line = false;
-            self.framebuffer.fill(0x7FFF);
+            let blank = if is_cgb {
+                0x7FFF
+            } else {
+                self.dmg_palette.colors()[0]
+            };
+            self.framebuffer.fill(blank);
             return false;
         }
 
         if !was_on && now_on {
-            // LCD turned on: begin at LY=0, dot=0, Mode 2, check WY & LY=LYC immediately.
+            // Hardware quirk: turning the LCD on begins LY=0 in Mode 0 (not Mode 2) until dot 80,
+            // while immediately evaluating WY == LY and LY == LYC.
             self.ly = 0;
             self.dot = 0;
-            self.mode = 2;
+            self.mode = 0;
+            self.line_153 = false;
             self.win_line = 0;
-            self.wy_triggered = (self.lcdc & 0x20) != 0 && self.ly == self.wy;
+            self.wy_triggered = self.ly == self.wy;
             return self.update_stat_irq();
         }
 
-        if now_on && (self.lcdc & 0x20) != 0 && self.ly == self.wy {
+        if now_on && !self.line_153 && self.ly < 144 && self.ly == self.wy {
             self.wy_triggered = true;
         }
         false
@@ -209,9 +225,30 @@ impl Ppu {
         0x80 | (self.stat & 0x78) | lyc_bit | mode_bits
     }
 
-    pub fn write_stat(&mut self, val: u8) -> bool {
+    pub fn write_stat(&mut self, val: u8, is_cgb: bool) -> bool {
+        let mut dmg_glitch = false;
+        if !is_cgb && self.lcd_enabled() {
+            // DMG hardware quirk: writing STAT briefly enables all STAT IRQ sources,
+            // firing a spurious rising edge if the STAT line was low during Mode 0/1/2 or LY==LYC.
+            self.ly_eq_lyc = self.ly == self.lyc;
+            let all_sources = self.mode == 0 || self.mode == 1 || self.mode == 2 || self.ly_eq_lyc;
+            if !self.stat_irq_line && all_sources {
+                dmg_glitch = true;
+            }
+        }
         self.stat = val & 0x78;
-        self.update_stat_irq()
+        let normal = self.update_stat_irq();
+        dmg_glitch || normal
+    }
+
+    #[inline]
+    pub fn read_opri(&self) -> u8 {
+        0xFE | (self.opri & 1)
+    }
+
+    #[inline]
+    pub fn write_opri(&mut self, val: u8) {
+        self.opri = val & 1;
     }
 
     pub fn write_lyc(&mut self, val: u8) -> bool {
@@ -322,7 +359,9 @@ impl Ppu {
 
         let mut rem = dots as u16;
         while rem > 0 {
-            let next_boundary = if self.ly < 144 {
+            let next_boundary = if self.line_153 {
+                if self.dot < 4 { 4 } else { 456 }
+            } else if self.ly < 144 {
                 if self.dot < 80 {
                     80
                 } else if self.dot < 252 {
@@ -338,7 +377,25 @@ impl Ppu {
             self.dot += step;
             rem -= step;
 
-            if self.ly < 144 {
+            if self.line_153 {
+                if self.dot == 4 {
+                    // Hardware quirk: scanline 153 wraps LY to 0 after 4 dots while staying in Mode 1.
+                    self.ly = 0;
+                    if self.update_stat_irq() {
+                        res.stat_irq = true;
+                    }
+                } else if self.dot == 456 {
+                    self.dot = 0;
+                    self.line_153 = false;
+                    self.ly = 0;
+                    self.mode = 2;
+                    self.win_line = 0;
+                    self.wy_triggered = self.ly == self.wy;
+                    if self.update_stat_irq() {
+                        res.stat_irq = true;
+                    }
+                }
+            } else if self.ly < 144 {
                 if self.dot == 80 {
                     self.mode = 3;
                     if self.update_stat_irq() {
@@ -362,7 +419,7 @@ impl Ppu {
                         res.vblank_irq = true;
                     } else {
                         self.mode = 2;
-                        if (self.lcdc & 0x20) != 0 && self.ly == self.wy {
+                        if self.ly == self.wy {
                             self.wy_triggered = true;
                         }
                     }
@@ -373,11 +430,14 @@ impl Ppu {
             } else if self.dot == 456 {
                 self.dot = 0;
                 self.ly += 1;
-                if self.ly >= 154 {
+                if self.ly == 153 {
+                    self.line_153 = true;
+                } else if self.ly >= 154 {
                     self.ly = 0;
+                    self.line_153 = false;
                     self.mode = 2;
                     self.win_line = 0;
-                    self.wy_triggered = (self.lcdc & 0x20) != 0 && self.ly == self.wy;
+                    self.wy_triggered = self.ly == self.wy;
                 }
                 if self.update_stat_irq() {
                     res.stat_irq = true;
@@ -424,38 +484,40 @@ impl Ppu {
         let mut window_rendered = false;
 
         if !is_cgb && !bg_enabled_dmg {
-            let blank = dmg_cols[(self.bgp & 0x03) as usize];
-            bg_rgb.fill(blank);
+            // Hardware quirk: when LCDC.0 == 0 on DMG, BG/Window render pure white (shade 0),
+            // independent of BGP.
+            bg_rgb.fill(dmg_cols[0]);
         } else {
-            for x in 0..LCD_WIDTH {
-                let in_win = window_enabled && (x as i16) >= wx_start;
-                let (map_base, map_x, map_y) = if in_win {
-                    window_rendered = true;
-                    (win_map_base, ((x as i16) - wx_start) as u8, self.win_line)
-                } else {
-                    (
-                        bg_map_base,
-                        (x as u8).wrapping_add(self.scx),
-                        ly.wrapping_add(self.scy),
-                    )
-                };
+            let win_x_start = if window_enabled {
+                wx_start.clamp(0, LCD_WIDTH as i16) as usize
+            } else {
+                LCD_WIDTH
+            };
 
+            // Render BG span [0..win_x_start) one 8-pixel tile at a time.
+            let bg_y = ly.wrapping_add(self.scy);
+            let bg_tile_row = ((bg_y >> 3) as usize) * 32;
+            let bg_fine_y = bg_y & 7;
+            let mut x = 0usize;
+            while x < win_x_start {
+                let map_x = (x as u8).wrapping_add(self.scx);
                 let tile_col = (map_x >> 3) as usize;
-                let tile_row = (map_y >> 3) as usize;
-                let map_off = map_base + tile_row * 32 + tile_col;
-                let tile_num = self.vram[map_off];
+                let fine_x0 = (map_x & 7) as usize;
+                let span = (8 - fine_x0).min(win_x_start - x);
 
-                let (attr, vram_bank, x_flip, y_flip, pal_num) = if is_cgb {
+                let map_off = bg_map_base + bg_tile_row + tile_col;
+                let tile_num = self.vram[map_off];
+                let (prio_flag, vram_bank, x_flip, y_flip, pal_num) = if is_cgb {
                     let a = self.vram[0x2000 + map_off];
                     (
-                        a,
+                        (a & 0x80) != 0,
                         ((a >> 3) & 1) as usize,
                         (a & 0x20) != 0,
                         (a & 0x40) != 0,
                         a & 0x07,
                     )
                 } else {
-                    (0, 0, false, false, 0)
+                    (false, 0, false, false, 0)
                 };
 
                 let tile_data_off = if unsigned_tiles {
@@ -463,23 +525,80 @@ impl Ppu {
                 } else {
                     (0x1000isize + ((tile_num as i8 as isize) * 16)) as usize
                 };
+                let ty = if y_flip { 7 - bg_fine_y } else { bg_fine_y } as usize;
+                let data_addr = vram_bank * 0x2000 + tile_data_off + ty * 2;
+                let lo = self.vram[data_addr];
+                let hi = self.vram[data_addr + 1];
 
-                let ty = if y_flip { 7 - (map_y & 7) } else { map_y & 7 } as usize;
-                let tx = if x_flip { 7 - (map_x & 7) } else { map_x & 7 };
+                for i in 0..span {
+                    let tx = fine_x0 + i;
+                    let bit = if x_flip { tx as u8 } else { 7 - (tx as u8) };
+                    let cidx = (((hi >> bit) & 1) << 1) | ((lo >> bit) & 1);
+                    let px = x + i;
+                    bg_color_idx[px] = cidx;
+                    bg_prio[px] = prio_flag;
+                    bg_rgb[px] = if is_cgb {
+                        Self::cgb_color(&self.bg_cram, pal_num, cidx)
+                    } else {
+                        dmg_cols[((self.bgp >> (cidx * 2)) & 0x03) as usize]
+                    };
+                }
+                x += span;
+            }
 
-                let bank_base = vram_bank * 0x2000;
-                let lo = self.vram[bank_base + tile_data_off + ty * 2];
-                let hi = self.vram[bank_base + tile_data_off + ty * 2 + 1];
-                let bit = 7 - tx;
-                let cidx = (((hi >> bit) & 1) << 1) | ((lo >> bit) & 1);
+            // Render Window span [win_x_start..LCD_WIDTH) one 8-pixel tile at a time.
+            if win_x_start < LCD_WIDTH {
+                window_rendered = true;
+                let win_y = self.win_line;
+                let win_tile_row = ((win_y >> 3) as usize) * 32;
+                let win_fine_y = win_y & 7;
+                let mut x = win_x_start;
+                while x < LCD_WIDTH {
+                    let map_x = ((x as i16) - wx_start) as u8;
+                    let tile_col = (map_x >> 3) as usize;
+                    let fine_x0 = (map_x & 7) as usize;
+                    let span = (8 - fine_x0).min(LCD_WIDTH - x);
 
-                bg_color_idx[x] = cidx;
-                bg_prio[x] = is_cgb && (attr & 0x80) != 0;
-                bg_rgb[x] = if is_cgb {
-                    Self::cgb_color(&self.bg_cram, pal_num, cidx)
-                } else {
-                    dmg_cols[((self.bgp >> (cidx * 2)) & 0x03) as usize]
-                };
+                    let map_off = win_map_base + win_tile_row + tile_col;
+                    let tile_num = self.vram[map_off];
+                    let (prio_flag, vram_bank, x_flip, y_flip, pal_num) = if is_cgb {
+                        let a = self.vram[0x2000 + map_off];
+                        (
+                            (a & 0x80) != 0,
+                            ((a >> 3) & 1) as usize,
+                            (a & 0x20) != 0,
+                            (a & 0x40) != 0,
+                            a & 0x07,
+                        )
+                    } else {
+                        (false, 0, false, false, 0)
+                    };
+
+                    let tile_data_off = if unsigned_tiles {
+                        (tile_num as usize) * 16
+                    } else {
+                        (0x1000isize + ((tile_num as i8 as isize) * 16)) as usize
+                    };
+                    let ty = if y_flip { 7 - win_fine_y } else { win_fine_y } as usize;
+                    let data_addr = vram_bank * 0x2000 + tile_data_off + ty * 2;
+                    let lo = self.vram[data_addr];
+                    let hi = self.vram[data_addr + 1];
+
+                    for i in 0..span {
+                        let tx = fine_x0 + i;
+                        let bit = if x_flip { tx as u8 } else { 7 - (tx as u8) };
+                        let cidx = (((hi >> bit) & 1) << 1) | ((lo >> bit) & 1);
+                        let px = x + i;
+                        bg_color_idx[px] = cidx;
+                        bg_prio[px] = prio_flag;
+                        bg_rgb[px] = if is_cgb {
+                            Self::cgb_color(&self.bg_cram, pal_num, cidx)
+                        } else {
+                            dmg_cols[((self.bgp >> (cidx * 2)) & 0x03) as usize]
+                        };
+                    }
+                    x += span;
+                }
             }
         }
 
@@ -520,69 +639,76 @@ impl Ppu {
             return;
         }
 
-        if !is_cgb {
-            // DMG sorts sprites by X coordinate ascending, preserving OAM index order on ties.
+        let dmg_obj_priority = !is_cgb || (self.opri & 1) != 0;
+        if dmg_obj_priority {
+            // DMG (or CGB with OPRI.0 = 1) sorts sprites by X ascending, preserving OAM order on ties.
             sprites[..count].sort_by_key(|entry| entry.unwrap().x);
         }
 
-        for x in 0..LCD_WIDTH {
-            let x_i16 = x as i16;
-            for entry in &sprites[..count] {
-                let s = entry.unwrap();
-                let px = x_i16 - s.x;
-                if !(0..8).contains(&px) {
+        // Inverted sprite loop: decode each sprite row once and plot up to 8 pixels in priority order.
+        let mut obj_drawn = [false; LCD_WIDTH];
+        for entry in &sprites[..count] {
+            let s = entry.unwrap();
+            if s.x <= -8 || s.x >= LCD_WIDTH as i16 {
+                continue;
+            }
+            let py = ly_i16 - s.y;
+            let ty = if (s.flags & 0x40) != 0 {
+                sprite_h - 1 - py
+            } else {
+                py
+            };
+            let tile = if sprite_h == 16 {
+                (s.tile & 0xFE) + if ty >= 8 { 1 } else { 0 }
+            } else {
+                s.tile
+            };
+            let row = (ty & 7) as usize;
+            let vram_bank = if is_cgb && (s.flags & 0x08) != 0 {
+                1
+            } else {
+                0
+            };
+            let addr = vram_bank * 0x2000 + (tile as usize) * 16 + row * 2;
+            let lo = self.vram[addr];
+            let hi = self.vram[addr + 1];
+            let x_flip = (s.flags & 0x20) != 0;
+            let bg_over_obj = (s.flags & 0x80) != 0;
+            let cgb_pal = s.flags & 0x07;
+            let dmg_pal = if (s.flags & 0x10) != 0 {
+                self.obp1
+            } else {
+                self.obp0
+            };
+
+            let px_start = (0 - s.x).max(0);
+            let px_end = (LCD_WIDTH as i16 - s.x).min(8);
+            for px in px_start..px_end {
+                let x = (s.x + px) as usize;
+                if obj_drawn[x] {
                     continue;
                 }
-                let py = ly_i16 - s.y;
-                let ty = if (s.flags & 0x40) != 0 {
-                    sprite_h - 1 - py
-                } else {
-                    py
-                };
-                let tx = if (s.flags & 0x20) != 0 { 7 - px } else { px };
-
-                let tile = if sprite_h == 16 {
-                    (s.tile & 0xFE) + if ty >= 8 { 1 } else { 0 }
-                } else {
-                    s.tile
-                };
-                let row = (ty & 7) as usize;
-                let vram_bank = if is_cgb && (s.flags & 0x08) != 0 {
-                    1
-                } else {
-                    0
-                };
-                let addr = vram_bank * 0x2000 + (tile as usize) * 16 + row * 2;
-                let lo = self.vram[addr];
-                let hi = self.vram[addr + 1];
-                let bit = 7 - (tx as u8);
+                let bit = if x_flip { px as u8 } else { 7 - (px as u8) };
                 let cidx = (((hi >> bit) & 1) << 1) | ((lo >> bit) & 1);
                 if cidx == 0 {
                     continue;
                 }
+                // First non-transparent sprite pixel in priority order owns the OBJ slot at `x`.
+                obj_drawn[x] = true;
 
                 let obj_wins = if is_cgb {
-                    (self.lcdc & 0x01) == 0
-                        || bg_color_idx[x] == 0
-                        || (!bg_prio[x] && (s.flags & 0x80) == 0)
+                    (self.lcdc & 0x01) == 0 || bg_color_idx[x] == 0 || (!bg_prio[x] && !bg_over_obj)
                 } else {
-                    (s.flags & 0x80) == 0 || bg_color_idx[x] == 0
+                    !bg_over_obj || bg_color_idx[x] == 0
                 };
 
                 if obj_wins {
                     self.framebuffer[row_offset + x] = if is_cgb {
-                        Self::cgb_color(&self.obj_cram, s.flags & 0x07, cidx)
+                        Self::cgb_color(&self.obj_cram, cgb_pal, cidx)
                     } else {
-                        let pal = if (s.flags & 0x10) != 0 {
-                            self.obp1
-                        } else {
-                            self.obp0
-                        };
-                        dmg_cols[((pal >> (cidx * 2)) & 0x03) as usize]
+                        dmg_cols[((dmg_pal >> (cidx * 2)) & 0x03) as usize]
                     };
                 }
-                // First non-transparent sprite pixel in priority order determines OBJ winner at `x`.
-                break;
             }
         }
     }

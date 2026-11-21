@@ -31,6 +31,7 @@ fn test_roms_dir() -> PathBuf {
         .join("..")
         .join("..")
         .join("test-roms")
+        .join("jsmolka")
 }
 
 #[test]
@@ -38,19 +39,19 @@ fn jsmolka_gba_tests() {
     let base = test_roms_dir();
     if !base.exists() {
         eprintln!(
-            "Skipping jsmolka_gba_tests: test-roms directory not found at {}",
+            "Skipping jsmolka_gba_tests: test-roms/jsmolka directory not found at {}",
             base.display()
         );
         return;
     }
 
     let roms = [
-        "arm/arm.gba",
-        "thumb/thumb.gba",
-        "memory/memory.gba",
-        "nes/nes.gba",
-        "bios/bios.gba",
-        "unsafe/unsafe.gba",
+        "arm.gba",
+        "thumb.gba",
+        "memory.gba",
+        "nes.gba",
+        "bios.gba",
+        "unsafe.gba",
         "ppu/hello.gba",
         "ppu/shades.gba",
         "ppu/stripes.gba",
@@ -84,15 +85,22 @@ fn jsmolka_gba_tests() {
         core.run_frame(&mut frontend);
         let pc = core.cpu.gpr[15];
 
-        let r12 = core.cpu.gpr[12];
+        // thumb.gba reports failure code in r7 (Thumb low reg); all other jsmolka tests report in r12.
+        let status_reg = if rel == "thumb.gba" {
+            core.cpu.gpr[7]
+        } else {
+            core.cpu.gpr[12]
+        };
         let converged = pc == pc_118 && pc == pc_119;
         println!(
-            "[jsmolka] {rel:<18} -> r12={r12:#010X} ({r12}), pc={pc:#010X}, converged={converged}"
+            "[jsmolka] {rel:<18} -> status={status_reg:#010X} ({status_reg}), pc={pc:#010X}, converged={converged}"
         );
 
-        if r12 != 0 || !converged {
+        // Visual-only PPU demos don't follow the r12=0 / halt convention.
+        let is_ppu_visual = rel.starts_with("ppu/");
+        if !is_ppu_visual && (status_reg != 0 || !converged) {
             failures.push(format!(
-                "{rel}: r12={r12:#x}, converged={converged}, pc={pc:#010x}"
+                "{rel}: status={status_reg:#x}, converged={converged}, pc={pc:#010x}"
             ));
         }
 

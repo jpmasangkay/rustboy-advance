@@ -6,6 +6,7 @@ rust-version.workspace = true
 license.workspace = true
 
 [lib]
+name = "rustboy_advance_libretro"
 crate-type = ["rlib", "cdylib"]
 
 [dependencies]

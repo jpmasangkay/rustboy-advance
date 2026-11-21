@@ -167,9 +167,8 @@ impl RomEmitter {
             self.words[insn_idx] = 0xE59F_0000 | ((rd as u32) << 12) | (off & 0xFFF);
         }
         let mut blob_ptr_words = vec![0usize; self.blobs.len()];
-        #[allow(clippy::needless_range_loop)] // Tracks parallel blob_ptr_words table indices
-        for b_idx in 0..self.blobs.len() {
-            blob_ptr_words[b_idx] = self.words.len();
+        for slot in &mut blob_ptr_words {
+            *slot = self.words.len();
             self.words.push(0);
         }
         let _ = pool_start;
@@ -280,7 +279,7 @@ pub fn build_stress_mode0_4bg_128spr_rom() -> Vec<u8> {
 
     let pal = b.add_blob(build_palette());
     let bg_tiles = b.add_blob(build_4bpp_tiles(64)); // 2 KiB -> 0x0600_0000
-    let obj_tiles = b.add_blob(build_4bpp_tiles(512)); // 16 KiB -> 0x0601_0000
+    let obj_tiles = b.add_blob(build_4bpp_tiles(1024)); // 32 KiB -> 0x0601_0000..0x0601_8000 (covers all OAM tiles 0..1023)
     let map0 = b.add_blob(build_mode0_64x64_map(0));
     let map1 = b.add_blob(build_mode0_64x64_map(3));
     let map2 = b.add_blob(build_mode0_64x64_map(7));

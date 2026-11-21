@@ -145,6 +145,43 @@ pub struct Ppu {
     obj_win_rendered: bool,
     #[serde(skip, default)]
     obj_has_semi: bool,
+    #[serde(skip, default)]
+    mosaic_ref_x: [i32; 2],
+    #[serde(skip, default)]
+    mosaic_ref_y: [i32; 2],
+    #[serde(skip, default)]
+    mosaic_ref_valid: bool,
+
+    // Hardware DISPCNT 3-scanline enable / forced-blank pipeline latches
+    #[serde(default)]
+    dispcnt_pipe_active: bool,
+    #[serde(default)]
+    bg_enable_pipe: [u8; 3],
+    #[serde(default = "default_forced_blank_pipe")]
+    forced_blank_pipe: [bool; 3],
+
+    // Hardware HBlank affine latches (PB/PD sampled ~18 cycles before HBlank end;
+    // BG2X/BG2Y HDraw writes deferred to next scanline; HBlank writes latched at HBlank end)
+    #[serde(default)]
+    latched_bgp_b: [i16; 2],
+    #[serde(default = "default_affine_diag")]
+    latched_bgp_d: [i16; 2],
+    #[serde(default)]
+    hblank_written_ref_x: [Option<i32>; 2],
+    #[serde(default)]
+    hblank_written_ref_y: [Option<i32>; 2],
+    #[serde(default)]
+    hdraw_bgx_dirty: [bool; 2],
+    #[serde(default)]
+    hdraw_bgy_dirty: [bool; 2],
+}
+
+fn default_forced_blank_pipe() -> [bool; 3] {
+    [true; 3]
+}
+
+fn default_affine_diag() -> [i16; 2] {
+    [0x0100; 2]
 }
 
 fn default_layer_enable_mask() -> u8 {
@@ -205,7 +242,80 @@ impl Ppu {
             obj_rendered_this_line: false,
             obj_win_rendered: false,
             obj_has_semi: false,
+            mosaic_ref_x: [0; 2],
+            mosaic_ref_y: [0; 2],
+            mosaic_ref_valid: false,
+            dispcnt_pipe_active: false,
+            bg_enable_pipe: [0; 3],
+            forced_blank_pipe: [true; 3],
+            latched_bgp_b: [0; 2],
+            latched_bgp_d: [0x0100; 2],
+            hblank_written_ref_x: [None; 2],
+            hblank_written_ref_y: [None; 2],
+            hdraw_bgx_dirty: [false; 2],
+            hdraw_bgy_dirty: [false; 2],
         }
+    }
+
+    #[inline(always)]
+    pub fn effective_bg_enable(&self) -> u8 {
+        if self.dispcnt_pipe_active {
+            self.bg_enable_pipe[2]
+        } else {
+            ((self.dispcnt >> 8) & 0x1F) as u8
+        }
+    }
+
+    #[inline(always)]
+    pub fn effective_forced_blank(&self) -> bool {
+        if self.dispcnt_pipe_active {
+            self.forced_blank_pipe[2]
+        } else {
+            (self.dispcnt & 0x0080) != 0
+        }
+    }
+
+    /// Writes `REG_DISPCNT` through the GBA hardware 3-scanline enable/forced-blank latch pipeline:
+    /// - Clearing a BG/OBJ enable bit (1 -> 0) takes effect immediately across all stages.
+    /// - Setting a BG/OBJ enable bit (0 -> 1) takes 2 full scanlines to propagate.
+    /// - Enabling Forced Blank (0 -> 1) takes effect immediately across all stages.
+    /// - Disabling Forced Blank (1 -> 0) takes 2 full scanlines to propagate.
+    /// - Window enable bits (13..15) take effect immediately without pipeline delay.
+    #[inline]
+    pub fn write_dispcnt(&mut self, val: u16) {
+        if !self.dispcnt_pipe_active {
+            let prev_en = ((self.dispcnt >> 8) & 0x1F) as u8;
+            let prev_fb = (self.dispcnt & 0x0080) != 0;
+            self.bg_enable_pipe = [prev_en; 3];
+            self.forced_blank_pipe = [prev_fb; 3];
+            self.dispcnt_pipe_active = true;
+        }
+        let new_val = val & 0xFFF7;
+        let new_en = ((new_val >> 8) & 0x1F) as u8;
+        let new_fb = (new_val & 0x0080) != 0;
+        self.dispcnt = new_val;
+        for stage in &mut self.bg_enable_pipe {
+            *stage &= new_en;
+        }
+        if new_fb {
+            self.forced_blank_pipe = [true; 3];
+        }
+    }
+
+    /// Shifts the DISPCNT enable and forced-blank pipeline by one scanline (called at scanline start).
+    #[inline]
+    pub fn advance_dispcnt_pipeline(&mut self) {
+        if !self.dispcnt_pipe_active {
+            return;
+        }
+        let cur_en = ((self.dispcnt >> 8) & 0x1F) as u8;
+        let cur_fb = (self.dispcnt & 0x0080) != 0;
+        self.bg_enable_pipe[2] = self.bg_enable_pipe[1];
+        self.bg_enable_pipe[1] = self.bg_enable_pipe[0];
+        self.bg_enable_pipe[0] = cur_en;
+        self.forced_blank_pipe[2] = self.forced_blank_pipe[1];
+        self.forced_blank_pipe[1] = self.forced_blank_pipe[0];
+        self.forced_blank_pipe[0] = cur_fb;
     }
 
     #[inline]
@@ -218,6 +328,7 @@ impl Ppu {
         let signed = ((val << 4) as i32) >> 4;
         self.bgx[idx] = signed;
         self.ref_x[idx] = signed;
+        self.mosaic_ref_x[idx] = signed;
     }
 
     #[inline]
@@ -225,6 +336,74 @@ impl Ppu {
         let signed = ((val << 4) as i32) >> 4;
         self.bgy[idx] = signed;
         self.ref_y[idx] = signed;
+        self.mosaic_ref_y[idx] = signed;
+    }
+
+    #[inline]
+    pub fn set_bgx_timed(
+        &mut self,
+        idx: usize,
+        val: u32,
+        in_hblank: bool,
+        before_hblank_latch: bool,
+        in_vblank: bool,
+    ) {
+        let signed = ((val << 4) as i32) >> 4;
+        self.bgx[idx] = signed;
+        if in_vblank || self.effective_forced_blank() {
+            self.ref_x[idx] = signed;
+            self.mosaic_ref_x[idx] = signed;
+            self.hblank_written_ref_x[idx] = None;
+            self.hdraw_bgx_dirty[idx] = false;
+        } else if in_hblank {
+            if before_hblank_latch {
+                self.hblank_written_ref_x[idx] = Some(signed);
+            }
+        } else {
+            // Mid-HDraw writes to BG2X/BG3X do not alter the currently-rendering scanline.
+            self.hdraw_bgx_dirty[idx] = true;
+        }
+    }
+
+    #[inline]
+    pub fn set_bgy_timed(
+        &mut self,
+        idx: usize,
+        val: u32,
+        in_hblank: bool,
+        before_hblank_latch: bool,
+        in_vblank: bool,
+    ) {
+        let signed = ((val << 4) as i32) >> 4;
+        self.bgy[idx] = signed;
+        if in_vblank || self.effective_forced_blank() {
+            self.ref_y[idx] = signed;
+            self.mosaic_ref_y[idx] = signed;
+            self.hblank_written_ref_y[idx] = None;
+            self.hdraw_bgy_dirty[idx] = false;
+        } else if in_hblank {
+            if before_hblank_latch {
+                self.hblank_written_ref_y[idx] = Some(signed);
+            }
+        } else {
+            self.hdraw_bgy_dirty[idx] = true;
+        }
+    }
+
+    #[inline]
+    pub fn set_bgp_b(&mut self, idx: usize, val: i16, allow_hblank_latch: bool) {
+        self.bgp_b[idx] = val;
+        if allow_hblank_latch {
+            self.latched_bgp_b[idx] = val;
+        }
+    }
+
+    #[inline]
+    pub fn set_bgp_d(&mut self, idx: usize, val: i16, allow_hblank_latch: bool) {
+        self.bgp_d[idx] = val;
+        if allow_hblank_latch {
+            self.latched_bgp_d[idx] = val;
+        }
     }
 
     #[inline]
@@ -260,6 +439,15 @@ impl Ppu {
     pub fn reload_affine_refs(&mut self) {
         self.ref_x = self.bgx;
         self.ref_y = self.bgy;
+        self.mosaic_ref_x = self.bgx;
+        self.mosaic_ref_y = self.bgy;
+        self.mosaic_ref_valid = true;
+        self.latched_bgp_b = self.bgp_b;
+        self.latched_bgp_d = self.bgp_d;
+        self.hblank_written_ref_x = [None; 2];
+        self.hblank_written_ref_y = [None; 2];
+        self.hdraw_bgx_dirty = [false; 2];
+        self.hdraw_bgy_dirty = [false; 2];
     }
 
     pub fn step_affine_refs_scanline(&mut self) {
@@ -267,6 +455,48 @@ impl Ppu {
         self.ref_y[0] = self.ref_y[0].wrapping_add(self.bgp_d[0] as i32);
         self.ref_x[1] = self.ref_x[1].wrapping_add(self.bgp_b[1] as i32);
         self.ref_y[1] = self.ref_y[1].wrapping_add(self.bgp_d[1] as i32);
+    }
+
+    /// Commits HBlank affine updates (`ref += PB/PD` or latched HBlank `BG2X/Y` writes) at the end
+    /// of HBlank (`dot 1232`) before the next scanline begins.
+    pub fn finish_hblank_affine(&mut self, was_visible_line: bool) {
+        if was_visible_line {
+            let mode = self.dispcnt & 0x07;
+            // Affine vertical accumulation tracks the unpipelined DISPCNT forced-blank bit so
+            // scanline coordinates stay aligned immediately when leaving forced blank.
+            let step_ok = (self.dispcnt & 0x0080) == 0 && (1..=5).contains(&mode);
+            for i in 0..2 {
+                if let Some(v) = self.hblank_written_ref_x[i].take() {
+                    self.ref_x[i] = v;
+                    self.hdraw_bgx_dirty[i] = false;
+                } else {
+                    if self.hdraw_bgx_dirty[i] {
+                        self.ref_x[i] = self.bgx[i];
+                        self.hdraw_bgx_dirty[i] = false;
+                    }
+                    if step_ok {
+                        self.ref_x[i] = self.ref_x[i].wrapping_add(self.latched_bgp_b[i] as i32);
+                    }
+                }
+                if let Some(v) = self.hblank_written_ref_y[i].take() {
+                    self.ref_y[i] = v;
+                    self.hdraw_bgy_dirty[i] = false;
+                } else {
+                    if self.hdraw_bgy_dirty[i] {
+                        self.ref_y[i] = self.bgy[i];
+                        self.hdraw_bgy_dirty[i] = false;
+                    }
+                    if step_ok {
+                        self.ref_y[i] = self.ref_y[i].wrapping_add(self.latched_bgp_d[i] as i32);
+                    }
+                }
+            }
+        } else {
+            self.hblank_written_ref_x = [None; 2];
+            self.hblank_written_ref_y = [None; 2];
+        }
+        self.latched_bgp_b = self.bgp_b;
+        self.latched_bgp_d = self.bgp_d;
     }
 
     #[inline]
@@ -288,12 +518,21 @@ impl Ppu {
         self.obj_rendered_this_line = false;
         self.obj_win_rendered = false;
         self.obj_has_semi = false;
+        let mos_v = (((self.mosaic >> 4) & 0x0F) as usize) + 1;
+        if y == 0 || !self.mosaic_ref_valid || y.is_multiple_of(mos_v) {
+            self.mosaic_ref_x = self.ref_x;
+            self.mosaic_ref_y = self.ref_y;
+            self.mosaic_ref_valid = true;
+        }
         if self.skip_rendering {
+            if y == 159 {
+                self.skipped_frames = self.skipped_frames.saturating_add(1);
+            }
             return;
         }
 
         let mode = self.dispcnt & 0x07;
-        if (self.dispcnt & 0x0080) == 0 && (self.dispcnt & 0x1000) != 0 {
+        if !self.effective_forced_blank() && (self.effective_bg_enable() & 0x10) != 0 {
             if self.obj_line_dirty {
                 self.obj_line.fill(ObjPixel::empty());
                 self.obj_line_dirty = false;
@@ -315,14 +554,14 @@ impl Ppu {
         let row_start = y * LCD_WIDTH;
 
         // Forced Blank -> pure white
-        if (self.dispcnt & 0x0080) != 0 {
+        if self.effective_forced_blank() {
             self.framebuffer[row_start + x0..row_start + x1].fill(0x7FFF);
             return;
         }
 
         let mode = self.dispcnt & 0x07;
         let active_bg_mask =
-            ((self.dispcnt >> 8) as u8) & Self::mode_bg_mask(mode) & self.layer_enable_mask;
+            self.effective_bg_enable() & Self::mode_bg_mask(mode) & self.layer_enable_mask;
 
         for bg in 0..4 {
             if (active_bg_mask & (1 << bg)) != 0 {
@@ -377,10 +616,8 @@ impl Ppu {
     }
 
     pub fn end_scanline(&mut self) {
-        let mode = self.dispcnt & 0x07;
-        if (self.dispcnt & 0x0080) == 0 && (1..=5).contains(&mode) {
-            self.step_affine_refs_scanline();
-        }
+        // Affine vertical accumulation (ref += PB/PD) is committed at HBlank end in
+        // `finish_hblank_affine` to match real GBA HBlank latch timing.
     }
 
     pub fn render_scanline(&mut self, y: usize) {
@@ -398,18 +635,19 @@ impl Ppu {
         // Mode 4 Fast Path:
         // Active only when ALL of the following conditions hold:
         // 1. Mode 4 (bitmap 240x160 8bpp)
-        // 2. BG2 enabled in DISPCNT and layer_enable_mask
-        // 3. Forced blank is OFF
+        // 2. BG2 enabled in effective DISPCNT pipeline and layer_enable_mask
+        // 3. Forced blank is OFF (effective pipeline)
         // 4. Sprites and windows disabled: (dispcnt & 0xF000) == 0
         // 5. Special color effects disabled: (bldcnt & 0x00C0) == 0
         // 6. Mosaic disabled for BG2: (bgcnt[2] & 0x0040) == 0
         // 7. BG2 affine transform is identity: PA=0x0100, PB=0, PC=0, PD=0x0100, RefX=0, RefY/256 == y
         let mode = self.dispcnt & 0x07;
         let mode4_fast_path = mode == 4
-            && (self.dispcnt & 0x0400) != 0
+            && (self.effective_bg_enable() & 0x04) != 0
             && (self.layer_enable_mask & 0x04) != 0
-            && (self.dispcnt & 0x0080) == 0
-            && (self.dispcnt & 0xF000) == 0
+            && !self.effective_forced_blank()
+            && (self.effective_bg_enable() & 0x10) == 0
+            && (self.dispcnt & 0xE000) == 0
             && (self.bldcnt & 0x00C0) == 0
             && (self.bgcnt[2] & 0x0040) == 0
             && self.bgp_a[0] == 0x0100
@@ -448,14 +686,17 @@ impl Ppu {
         self.end_scanline();
     }
 
+    /// BG tilemap addresses wrap within the 64 KiB BG VRAM region (`0x0000..=0xFFFF`).
     #[inline(always)]
-    fn bg_vram_off(byte_off: usize) -> usize {
-        let masked = byte_off & 0x1FFFF;
-        if masked >= 0x18000 {
-            masked - 0x8000
-        } else {
-            masked
-        }
+    fn bg_map_off(byte_off: usize) -> usize {
+        byte_off & 0xFFFF
+    }
+
+    /// BG tile data reads strictly from BG VRAM (`0x0000..0x10000`); accesses into OBJ VRAM return transparent.
+    #[inline(always)]
+    fn bg_tile_off(byte_off: usize) -> Option<usize> {
+        let off = byte_off & 0x1FFFF;
+        if off < 0x10000 { Some(off) } else { None }
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -480,7 +721,7 @@ impl Ppu {
 
             let block_x_offset = if tile_x >= 32 { 1024 } else { 0 };
             let entry_idx = y_entry_offset + block_x_offset + (tile_x & 31);
-            let entry_off = Self::bg_vram_off(screen_base + entry_idx * 2) & !1;
+            let entry_off = Self::bg_map_off(screen_base + entry_idx * 2) & !1;
             let entry = u16::from_le_bytes([self.vram[entry_off], self.vram[entry_off + 1]]);
             let tile_num = (entry & 0x03FF) as usize;
             let h_flip = (entry & 0x0400) != 0;
@@ -488,7 +729,10 @@ impl Ppu {
             let ty = if v_flip { 7 - fine_y } else { fine_y };
 
             let (mut bits, pal_base, shift, mask): (u64, usize, u32, u64) = if BPP8 {
-                let row_off = Self::bg_vram_off(char_base + tile_num * 64 + ty * 8);
+                let Some(row_off) = Self::bg_tile_off(char_base + tile_num * 64 + ty * 8) else {
+                    x += run;
+                    continue;
+                };
                 let mut raw = u64::from_le_bytes([
                     self.vram[row_off],
                     self.vram[row_off + 1],
@@ -505,7 +749,10 @@ impl Ppu {
                 (raw >> (fine_x * 8), 0, 8, 0xFF)
             } else {
                 let pal_bank = ((entry >> 12) & 0x0F) as usize;
-                let row_off = Self::bg_vram_off(char_base + tile_num * 32 + ty * 4);
+                let Some(row_off) = Self::bg_tile_off(char_base + tile_num * 32 + ty * 4) else {
+                    x += run;
+                    continue;
+                };
                 let mut raw = u32::from_le_bytes([
                     self.vram[row_off],
                     self.vram[row_off + 1],
@@ -567,7 +814,7 @@ impl Ppu {
 
             if entry_idx != cached_entry_idx {
                 cached_entry_idx = entry_idx;
-                let entry_off = Self::bg_vram_off(screen_base + entry_idx * 2) & !1;
+                let entry_off = Self::bg_map_off(screen_base + entry_idx * 2) & !1;
                 let entry = u16::from_le_bytes([self.vram[entry_off], self.vram[entry_off + 1]]);
                 tile_num = (entry & 0x03FF) as usize;
                 h_flip = (entry & 0x0400) != 0;
@@ -579,11 +826,16 @@ impl Ppu {
             let ty = if v_flip { 7 - fine_y } else { fine_y };
 
             let (col_idx, pram_idx) = if BPP8 {
-                let off = Self::bg_vram_off(char_base + tile_num * 64 + ty * 8 + tx);
+                let Some(off) = Self::bg_tile_off(char_base + tile_num * 64 + ty * 8 + tx) else {
+                    continue;
+                };
                 let idx = self.vram[off] as usize;
                 (idx, idx)
             } else {
-                let off = Self::bg_vram_off(char_base + tile_num * 32 + ty * 4 + (tx >> 1));
+                let Some(off) = Self::bg_tile_off(char_base + tile_num * 32 + ty * 4 + (tx >> 1))
+                else {
+                    continue;
+                };
                 let byte = self.vram[off];
                 let idx = ((byte >> ((tx & 1) * 4)) & 0x0F) as usize;
                 (idx, pal_base + idx)
@@ -694,36 +946,76 @@ impl Ppu {
         tiles_per_row: usize,
         pa: i32,
         pc: i32,
-        mut cx: i32,
-        mut cy: i32,
+        ref_x: i32,
+        ref_y: i32,
+        mos_h: usize,
     ) {
         let map_mask = map_px - 1;
         let map_u32 = map_px as u32;
-        for x in x_start..x_end {
-            let mut px = cx >> 8;
-            let mut py = cy >> 8;
-            cx = cx.wrapping_add(pa);
-            cy = cy.wrapping_add(pc);
+        if mos_h <= 1 {
+            let mut cx = ref_x.wrapping_add(pa.wrapping_mul(x_start as i32));
+            let mut cy = ref_y.wrapping_add(pc.wrapping_mul(x_start as i32));
+            for x in x_start..x_end {
+                let mut px = cx >> 8;
+                let mut py = cy >> 8;
+                cx = cx.wrapping_add(pa);
+                cy = cy.wrapping_add(pc);
 
-            if WRAP {
-                px &= map_mask;
-                py &= map_mask;
-            } else if (px as u32) >= map_u32 || (py as u32) >= map_u32 {
-                continue;
+                if WRAP {
+                    px &= map_mask;
+                    py &= map_mask;
+                } else if (px as u32) >= map_u32 || (py as u32) >= map_u32 {
+                    continue;
+                }
+
+                let tile_x = (px >> 3) as usize;
+                let tile_y = (py >> 3) as usize;
+                let fine_x = (px & 7) as usize;
+                let fine_y = (py & 7) as usize;
+
+                let map_off = Self::bg_map_off(screen_base + tile_y * tiles_per_row + tile_x);
+                let tile_num = self.vram[map_off] as usize;
+                let Some(pixel_off) =
+                    Self::bg_tile_off(char_base + tile_num * 64 + fine_y * 8 + fine_x)
+                else {
+                    continue;
+                };
+                let col_idx = self.vram[pixel_off] as usize;
+
+                if col_idx != 0 {
+                    self.bg_lines[bg][x] = self.read_pram_u16(col_idx) | 0x8000;
+                }
             }
+        } else {
+            for x in x_start..x_end {
+                let eff_x = (x - (x % mos_h)) as i32;
+                let mut px = ref_x.wrapping_add(pa.wrapping_mul(eff_x)) >> 8;
+                let mut py = ref_y.wrapping_add(pc.wrapping_mul(eff_x)) >> 8;
 
-            let tile_x = (px >> 3) as usize;
-            let tile_y = (py >> 3) as usize;
-            let fine_x = (px & 7) as usize;
-            let fine_y = (py & 7) as usize;
+                if WRAP {
+                    px &= map_mask;
+                    py &= map_mask;
+                } else if (px as u32) >= map_u32 || (py as u32) >= map_u32 {
+                    continue;
+                }
 
-            let map_off = Self::bg_vram_off(screen_base + tile_y * tiles_per_row + tile_x);
-            let tile_num = self.vram[map_off] as usize;
-            let pixel_off = Self::bg_vram_off(char_base + tile_num * 64 + fine_y * 8 + fine_x);
-            let col_idx = self.vram[pixel_off] as usize;
+                let tile_x = (px >> 3) as usize;
+                let tile_y = (py >> 3) as usize;
+                let fine_x = (px & 7) as usize;
+                let fine_y = (py & 7) as usize;
 
-            if col_idx != 0 {
-                self.bg_lines[bg][x] = self.read_pram_u16(col_idx) | 0x8000;
+                let map_off = Self::bg_map_off(screen_base + tile_y * tiles_per_row + tile_x);
+                let tile_num = self.vram[map_off] as usize;
+                let Some(pixel_off) =
+                    Self::bg_tile_off(char_base + tile_num * 64 + fine_y * 8 + fine_x)
+                else {
+                    continue;
+                };
+                let col_idx = self.vram[pixel_off] as usize;
+
+                if col_idx != 0 {
+                    self.bg_lines[bg][x] = self.read_pram_u16(col_idx) | 0x8000;
+                }
             }
         }
     }
@@ -733,6 +1025,7 @@ impl Ppu {
         let cnt = self.bgcnt[bg];
         let char_base = (((cnt >> 2) & 0x03) as usize) * 0x4000;
         let screen_base = (((cnt >> 8) & 0x1F) as usize) * 0x0800;
+        let mosaic_en = (cnt & 0x0040) != 0;
         let wraparound = (cnt & 0x2000) != 0;
         let size_mode = ((cnt >> 14) & 0x03) as usize;
         let map_px = 128i32 << size_mode;
@@ -740,8 +1033,15 @@ impl Ppu {
 
         let pa = self.bgp_a[aff_idx] as i32;
         let pc = self.bgp_c[aff_idx] as i32;
-        let cx = self.ref_x[aff_idx].wrapping_add(pa.wrapping_mul(x_start as i32));
-        let cy = self.ref_y[aff_idx].wrapping_add(pc.wrapping_mul(x_start as i32));
+        let (rx, ry, mos_h) = if mosaic_en {
+            (
+                self.mosaic_ref_x[aff_idx],
+                self.mosaic_ref_y[aff_idx],
+                ((self.mosaic & 0x0F) as usize) + 1,
+            )
+        } else {
+            (self.ref_x[aff_idx], self.ref_y[aff_idx], 1)
+        };
 
         if wraparound {
             self.render_affine_bg_inner::<true>(
@@ -754,8 +1054,9 @@ impl Ppu {
                 tiles_per_row,
                 pa,
                 pc,
-                cx,
-                cy,
+                rx,
+                ry,
+                mos_h,
             );
         } else {
             self.render_affine_bg_inner::<false>(
@@ -768,35 +1069,58 @@ impl Ppu {
                 tiles_per_row,
                 pa,
                 pc,
-                cx,
-                cy,
+                rx,
+                ry,
+                mos_h,
             );
         }
     }
 
     fn render_mode3_bg(&mut self, x_start: usize, x_end: usize) {
+        let mosaic_en = (self.bgcnt[2] & 0x0040) != 0;
         let pa = self.bgp_a[0] as i32;
         let pc = self.bgp_c[0] as i32;
-        let mut cx = self.ref_x[0].wrapping_add(pa.wrapping_mul(x_start as i32));
-        let mut cy = self.ref_y[0].wrapping_add(pc.wrapping_mul(x_start as i32));
-        let wrap = (self.bgcnt[2] & 0x2000) != 0;
+        let (rx, ry, mos_h) = if mosaic_en {
+            (
+                self.mosaic_ref_x[0],
+                self.mosaic_ref_y[0],
+                ((self.mosaic & 0x0F) as usize) + 1,
+            )
+        } else {
+            (self.ref_x[0], self.ref_y[0], 1)
+        };
 
-        for x in x_start..x_end {
-            let mut px = cx >> 8;
-            let mut py = cy >> 8;
-            cx = cx.wrapping_add(pa);
-            cy = cy.wrapping_add(pc);
+        if mos_h <= 1 {
+            let mut cx = rx.wrapping_add(pa.wrapping_mul(x_start as i32));
+            let mut cy = ry.wrapping_add(pc.wrapping_mul(x_start as i32));
+            for x in x_start..x_end {
+                let px = cx >> 8;
+                let py = cy >> 8;
+                cx = cx.wrapping_add(pa);
+                cy = cy.wrapping_add(pc);
 
-            if wrap {
-                px = px.rem_euclid(LCD_WIDTH as i32);
-                py = py.rem_euclid(LCD_HEIGHT as i32);
-            } else if (px as u32) >= LCD_WIDTH as u32 || (py as u32) >= LCD_HEIGHT as u32 {
-                continue;
+                if (px as u32) >= LCD_WIDTH as u32 || (py as u32) >= LCD_HEIGHT as u32 {
+                    continue;
+                }
+
+                let offset = ((py as usize) * LCD_WIDTH + (px as usize)) * 2;
+                self.bg_lines[2][x] =
+                    u16::from_le_bytes([self.vram[offset], self.vram[offset + 1]]) | 0x8000;
             }
+        } else {
+            for x in x_start..x_end {
+                let eff_x = (x - (x % mos_h)) as i32;
+                let px = rx.wrapping_add(pa.wrapping_mul(eff_x)) >> 8;
+                let py = ry.wrapping_add(pc.wrapping_mul(eff_x)) >> 8;
 
-            let offset = ((py as usize) * LCD_WIDTH + (px as usize)) * 2;
-            self.bg_lines[2][x] =
-                u16::from_le_bytes([self.vram[offset], self.vram[offset + 1]]) | 0x8000;
+                if (px as u32) >= LCD_WIDTH as u32 || (py as u32) >= LCD_HEIGHT as u32 {
+                    continue;
+                }
+
+                let offset = ((py as usize) * LCD_WIDTH + (px as usize)) * 2;
+                self.bg_lines[2][x] =
+                    u16::from_le_bytes([self.vram[offset], self.vram[offset + 1]]) | 0x8000;
+            }
         }
     }
 
@@ -806,25 +1130,53 @@ impl Ppu {
         } else {
             0
         };
+        let mosaic_en = (self.bgcnt[2] & 0x0040) != 0;
         let pa = self.bgp_a[0] as i32;
         let pc = self.bgp_c[0] as i32;
-        let mut cx = self.ref_x[0].wrapping_add(pa.wrapping_mul(x_start as i32));
-        let mut cy = self.ref_y[0].wrapping_add(pc.wrapping_mul(x_start as i32));
+        let (rx, ry, mos_h) = if mosaic_en {
+            (
+                self.mosaic_ref_x[0],
+                self.mosaic_ref_y[0],
+                ((self.mosaic & 0x0F) as usize) + 1,
+            )
+        } else {
+            (self.ref_x[0], self.ref_y[0], 1)
+        };
 
-        for x in x_start..x_end {
-            let px = cx >> 8;
-            let py = cy >> 8;
-            cx = cx.wrapping_add(pa);
-            cy = cy.wrapping_add(pc);
+        if mos_h <= 1 {
+            let mut cx = rx.wrapping_add(pa.wrapping_mul(x_start as i32));
+            let mut cy = ry.wrapping_add(pc.wrapping_mul(x_start as i32));
+            for x in x_start..x_end {
+                let px = cx >> 8;
+                let py = cy >> 8;
+                cx = cx.wrapping_add(pa);
+                cy = cy.wrapping_add(pc);
 
-            if (px as u32) >= LCD_WIDTH as u32 || (py as u32) >= LCD_HEIGHT as u32 {
-                continue;
+                if (px as u32) >= LCD_WIDTH as u32 || (py as u32) >= LCD_HEIGHT as u32 {
+                    continue;
+                }
+
+                let offset = page_base + (py as usize) * LCD_WIDTH + (px as usize);
+                let col_idx = self.vram[offset] as usize;
+                if col_idx != 0 {
+                    self.bg_lines[2][x] = self.read_pram_u16(col_idx) | 0x8000;
+                }
             }
+        } else {
+            for x in x_start..x_end {
+                let eff_x = (x - (x % mos_h)) as i32;
+                let px = rx.wrapping_add(pa.wrapping_mul(eff_x)) >> 8;
+                let py = ry.wrapping_add(pc.wrapping_mul(eff_x)) >> 8;
 
-            let offset = page_base + (py as usize) * LCD_WIDTH + (px as usize);
-            let col_idx = self.vram[offset] as usize;
-            if col_idx != 0 {
-                self.bg_lines[2][x] = self.read_pram_u16(col_idx) | 0x8000;
+                if (px as u32) >= LCD_WIDTH as u32 || (py as u32) >= LCD_HEIGHT as u32 {
+                    continue;
+                }
+
+                let offset = page_base + (py as usize) * LCD_WIDTH + (px as usize);
+                let col_idx = self.vram[offset] as usize;
+                if col_idx != 0 {
+                    self.bg_lines[2][x] = self.read_pram_u16(col_idx) | 0x8000;
+                }
             }
         }
     }
@@ -835,24 +1187,50 @@ impl Ppu {
         } else {
             0
         };
+        let mosaic_en = (self.bgcnt[2] & 0x0040) != 0;
         let pa = self.bgp_a[0] as i32;
         let pc = self.bgp_c[0] as i32;
-        let mut cx = self.ref_x[0].wrapping_add(pa.wrapping_mul(x_start as i32));
-        let mut cy = self.ref_y[0].wrapping_add(pc.wrapping_mul(x_start as i32));
+        let (rx, ry, mos_h) = if mosaic_en {
+            (
+                self.mosaic_ref_x[0],
+                self.mosaic_ref_y[0],
+                ((self.mosaic & 0x0F) as usize) + 1,
+            )
+        } else {
+            (self.ref_x[0], self.ref_y[0], 1)
+        };
 
-        for x in x_start..x_end {
-            let px = cx >> 8;
-            let py = cy >> 8;
-            cx = cx.wrapping_add(pa);
-            cy = cy.wrapping_add(pc);
+        if mos_h <= 1 {
+            let mut cx = rx.wrapping_add(pa.wrapping_mul(x_start as i32));
+            let mut cy = ry.wrapping_add(pc.wrapping_mul(x_start as i32));
+            for x in x_start..x_end {
+                let px = cx >> 8;
+                let py = cy >> 8;
+                cx = cx.wrapping_add(pa);
+                cy = cy.wrapping_add(pc);
 
-            if (px as u32) >= 160 || (py as u32) >= 128 {
-                continue;
+                if (px as u32) >= 160 || (py as u32) >= 128 {
+                    continue;
+                }
+
+                let offset = page_base + ((py as usize) * 160 + (px as usize)) * 2;
+                self.bg_lines[2][x] =
+                    u16::from_le_bytes([self.vram[offset], self.vram[offset + 1]]) | 0x8000;
             }
+        } else {
+            for x in x_start..x_end {
+                let eff_x = (x - (x % mos_h)) as i32;
+                let px = rx.wrapping_add(pa.wrapping_mul(eff_x)) >> 8;
+                let py = ry.wrapping_add(pc.wrapping_mul(eff_x)) >> 8;
 
-            let offset = page_base + ((py as usize) * 160 + (px as usize)) * 2;
-            self.bg_lines[2][x] =
-                u16::from_le_bytes([self.vram[offset], self.vram[offset + 1]]) | 0x8000;
+                if (px as u32) >= 160 || (py as u32) >= 128 {
+                    continue;
+                }
+
+                let offset = page_base + ((py as usize) * 160 + (px as usize)) * 2;
+                self.bg_lines[2][x] =
+                    u16::from_le_bytes([self.vram[offset], self.vram[offset + 1]]) | 0x8000;
+            }
         }
     }
 
@@ -871,7 +1249,7 @@ impl Ppu {
         if col_idx == 0 {
             if !OBJ_WIN {
                 let cur = self.obj_line[sx];
-                if !cur.is_present() && prio < cur.prio() {
+                if prio < cur.prio() {
                     self.obj_line[sx] = cur.with_transparent_prio(prio, mosaic_en);
                     self.obj_line_dirty = true;
                 }
@@ -1111,11 +1489,9 @@ impl Ppu {
             let box_w = if is_double { spr_w * 2 } else { spr_w };
             let box_h = if is_double { spr_h * 2 } else { spr_h };
 
-            let mut spr_y = (attr0 & 0xFF) as i32;
-            if spr_y >= 160 {
-                spr_y -= 256;
-            }
-            if (y as i32) < spr_y || (y as i32) >= spr_y + box_h {
+            let raw_y = (attr0 & 0xFF) as i32;
+            let local_y = ((y as i32) - raw_y) & 0xFF;
+            if local_y >= box_h {
                 continue;
             }
 
@@ -1141,7 +1517,7 @@ impl Ppu {
             let mosaic_en = (attr0 & 0x1000) != 0;
             let is_8bpp = (attr0 & 0x2000) != 0;
             let mut tile_base = (attr2 & 0x03FF) as usize;
-            if is_8bpp {
+            if is_8bpp && !mapping_1d {
                 tile_base &= !1;
             }
             let prio = ((attr2 >> 10) & 0x03) as u8;
@@ -1150,11 +1526,12 @@ impl Ppu {
             let semi_transparent = obj_mode == 1;
             let is_obj_win = obj_mode == 2;
 
-            let eff_y = if mosaic_en {
-                let my = y - (y % mos_v);
-                (my as i32).max(spr_y) - spr_y
+            let eff_y = if mosaic_en && mos_v > 1 {
+                let my = (y - (y % mos_v)) as i32;
+                let m_local = (my - raw_y) & 0xFF;
+                if m_local < box_h { m_local } else { 0 }
             } else {
-                (y as i32) - spr_y
+                local_y
             };
 
             if is_affine {
@@ -1551,7 +1928,7 @@ impl Ppu {
             }
         }
 
-        let obj_layer_en = (self.dispcnt & 0x1000) != 0
+        let obj_layer_en = (self.effective_bg_enable() & 0x10) != 0
             && (self.layer_enable_mask & 0x10) != 0
             && self.obj_rendered_this_line
             && self.obj_line_dirty

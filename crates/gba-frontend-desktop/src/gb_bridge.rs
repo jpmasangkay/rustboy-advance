@@ -213,7 +213,7 @@ impl RustboyApp {
             core.bus.ppu.dot_accurate_mode = self.config.dot_accurate_ppu;
             core.bus.ppu.layer_enable_mask = self.config.layer_mask;
             core.bus.apu.channel_enable_mask = self.config.audio_channel_mask;
-            core.bus.apu.master_volume_pct = self.config.master_volume;
+            core.bus.apu.master_volume_pct = 100;
             self.sink
                 .framebuffer
                 .copy_from_slice(&*core.bus.ppu.framebuffer);
@@ -241,7 +241,7 @@ impl RustboyApp {
             core.bus.ppu.dot_accurate_mode = self.config.dot_accurate_ppu;
             core.bus.ppu.layer_enable_mask = self.config.layer_mask;
             core.bus.apu.channel_enable_mask = self.config.audio_channel_mask;
-            core.bus.apu.master_volume_pct = self.config.master_volume;
+            core.bus.apu.master_volume_pct = 100;
             if refresh_fb {
                 self.sink
                     .framebuffer
@@ -295,11 +295,12 @@ impl RustboyApp {
         self.flush_gb_battery_save_mode(force_rtc_update, true);
     }
 
-    pub(crate) fn flush_gb_battery_save_mode(&mut self, force_rtc_update: bool, sync: bool) {
+    pub(crate) fn flush_gb_battery_save_mode(&mut self, force_write: bool, sync: bool) {
         #[allow(clippy::if_same_then_else)]
         // Keep periodic vs shutdown/reset save-flush conditions explicit.
         if sync {
             self.join_pending_save_flush();
+            self.drain_battery_save_worker();
         } else if self
             .pending_save_flush
             .as_ref()
@@ -307,15 +308,14 @@ impl RustboyApp {
         {
             self.join_pending_save_flush();
         }
-
         let (Some(gb), Some(sav_path)) = (&mut self.gb, &self.sav_path) else {
             return;
         };
         if !gb.core.has_battery() {
             return;
         }
-        let rtc_needs_flush = force_rtc_update && gb.has_rtc() && sav_path.exists();
-        if !gb.core.battery_dirty() && !rtc_needs_flush {
+        let rtc_needs_flush = force_write && gb.has_rtc() && sav_path.exists();
+        if !gb.core.battery_dirty() && !rtc_needs_flush && !force_write {
             return;
         }
         let data = gb.export_sav_with_rtc();
@@ -328,13 +328,7 @@ impl RustboyApp {
             }
         } else if self.pending_save_flush.is_none() {
             gb.core.clear_battery_dirty();
-            let path = sav_path.clone();
-            self.pending_save_flush = Some(std::thread::spawn(move || {
-                if let Some(parent) = path.parent() {
-                    let _ = fs::create_dir_all(parent);
-                }
-                let _ = fs::write(path, data);
-            }));
+            self.enqueue_battery_save_write(sav_path.clone(), data);
         }
     }
 
@@ -399,6 +393,9 @@ impl RustboyApp {
         ctx: Option<&egui::Context>,
     ) {
         self.link.disconnect_all();
+        self.ra.on_rom_closed();
+        self.lua.on_rom_changed("", "");
+        self.debugger.mem_search.reset_scan();
         self.core = None;
 
         let rom_crc32 = crc32fast::hash(&rom_bytes);

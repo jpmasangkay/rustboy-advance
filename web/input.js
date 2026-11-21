@@ -66,12 +66,20 @@ export class InputManager {
 
     this.heldCodes = new Set();
     this.touchMask = 0;
+    this.faceTouchMask = 0;
     this.dpadTouchMask = 0;
     this.activeGamepadName = "";
     this.rebindingButton = null;
     this.onRebindComplete = null;
     this.onGamepadChange = null;
     this.onShortcut = null;
+  }
+
+  clearAllInputs() {
+    this.heldCodes.clear();
+    this.touchMask = 0;
+    this.faceTouchMask = 0;
+    this.dpadTouchMask = 0;
   }
 
   loadBindings() {
@@ -118,6 +126,13 @@ export class InputManager {
 
   setBinding(buttonName, code) {
     if (!(buttonName in GBA_KEYS)) return;
+    // Prevent duplicate bindings: if another button already used `code`, swap with previous code.
+    const prevCode = this.bindings[buttonName];
+    for (const [otherBtn, otherCode] of Object.entries(this.bindings)) {
+      if (otherBtn !== buttonName && otherCode === code) {
+        this.bindings[otherBtn] = prevCode || "";
+      }
+    }
     this.bindings[buttonName] = code;
     this.rebuildLookup();
     this.saveBindings();
@@ -136,9 +151,12 @@ export class InputManager {
     window.addEventListener("keydown", (e) => this.handleKeyDown(e));
     window.addEventListener("keyup", (e) => this.handleKeyUp(e));
     window.addEventListener("blur", () => {
-      this.heldCodes.clear();
-      this.touchMask = 0;
-      this.dpadTouchMask = 0;
+      this.clearAllInputs();
+    });
+    document.addEventListener("visibilitychange", () => {
+      if (document.visibilityState === "hidden") {
+        this.clearAllInputs();
+      }
     });
 
     window.addEventListener("gamepadconnected", (e) => {
@@ -189,7 +207,17 @@ export class InputManager {
     const mappedBit = this.codeToBit.get(e.code);
     const uiFocused = this.isUiInteractiveFocused();
 
-    // Prevent Enter/Space/Backspace from clicking focused toolbar controls while playing unless a button is explicitly focused.
+    // User-configured game bindings always take precedence over built-in shortcuts
+    // (e.g. if the player maps Space, P, F, or M to a GBA button).
+    if (mappedBit !== undefined) {
+      if (uiFocused && (e.code === "Enter" || e.code === "Space" || e.code === "Backspace")) {
+        return;
+      }
+      e.preventDefault();
+      this.heldCodes.add(e.code);
+      return;
+    }
+
     if (!uiFocused) {
       if (e.code === "KeyP" || e.code === "Space") {
         e.preventDefault();
@@ -207,16 +235,6 @@ export class InputManager {
         return;
       }
     }
-
-    if (mappedBit !== undefined) {
-      // Allow keyboard navigation inside UI controls when a button/input is focused,
-      // except Arrow keys when canvas/body has focus.
-      if (uiFocused && (e.code === "Enter" || e.code === "Space" || e.code === "Backspace")) {
-        return;
-      }
-      e.preventDefault();
-      this.heldCodes.add(e.code);
-    }
   }
 
   handleKeyUp(e) {
@@ -226,6 +244,16 @@ export class InputManager {
   }
 
   bindTouchDeck(deckEl, dpadEl, buttonEls) {
+    const faceButtons = [];
+    const standardButtons = [];
+    for (const btn of buttonEls) {
+      if (btn.classList.contains("touch-circle")) {
+        faceButtons.push(btn);
+      } else {
+        standardButtons.push(btn);
+      }
+    }
+
     const updateButtonPress = (el, pressed) => {
       const key = el.dataset.key;
       const bit = GBA_KEYS[key];
@@ -240,7 +268,7 @@ export class InputManager {
       }
     };
 
-    for (const btn of buttonEls) {
+    for (const btn of standardButtons) {
       const activePointers = new Set();
       btn.addEventListener("pointerdown", (e) => {
         e.preventDefault();
@@ -249,13 +277,70 @@ export class InputManager {
         updateButtonPress(btn, true);
       });
       const release = (e) => {
-        activePointers.delete(e.pointerId);
-        if (activePointers.size === 0) {
+        if (activePointers.delete(e.pointerId) && activePointers.size === 0) {
           updateButtonPress(btn, false);
         }
       };
       btn.addEventListener("pointerup", release);
       btn.addEventListener("pointercancel", release);
+      btn.addEventListener("lostpointercapture", release);
+    }
+
+    // Face buttons (B & A): track pointer sliding across the face pad so thumb rolls
+    // from B to A smoothly transfer or press both buttons without lifting.
+    const faceContainer = faceButtons[0]?.parentElement;
+    if (faceContainer && faceButtons.length > 0) {
+      const facePointers = new Map();
+      const recomputeFace = () => {
+        let mask = 0;
+        for (const m of facePointers.values()) mask |= m;
+        this.faceTouchMask = mask;
+        for (const btn of faceButtons) {
+          const bit = GBA_KEYS[btn.dataset.key];
+          if (bit && (mask & bit)) {
+            btn.setAttribute("data-pressed", "true");
+          } else {
+            btn.removeAttribute("data-pressed");
+          }
+        }
+      };
+      const faceMaskAt = (clientX, clientY) => {
+        let mask = 0;
+        const pad = 10;
+        for (const btn of faceButtons) {
+          const r = btn.getBoundingClientRect();
+          if (
+            clientX >= r.left - pad &&
+            clientX <= r.right + pad &&
+            clientY >= r.top - pad &&
+            clientY <= r.bottom + pad
+          ) {
+            const bit = GBA_KEYS[btn.dataset.key];
+            if (bit) mask |= bit;
+          }
+        }
+        return mask;
+      };
+      faceContainer.addEventListener("pointerdown", (e) => {
+        e.preventDefault();
+        faceContainer.setPointerCapture?.(e.pointerId);
+        facePointers.set(e.pointerId, faceMaskAt(e.clientX, e.clientY));
+        recomputeFace();
+        if (navigator.vibrate) navigator.vibrate(6);
+      });
+      faceContainer.addEventListener("pointermove", (e) => {
+        if (!facePointers.has(e.pointerId)) return;
+        facePointers.set(e.pointerId, faceMaskAt(e.clientX, e.clientY));
+        recomputeFace();
+      });
+      const releaseFace = (e) => {
+        if (facePointers.delete(e.pointerId)) {
+          recomputeFace();
+        }
+      };
+      faceContainer.addEventListener("pointerup", releaseFace);
+      faceContainer.addEventListener("pointercancel", releaseFace);
+      faceContainer.addEventListener("lostpointercapture", releaseFace);
     }
 
     if (dpadEl) {
@@ -303,6 +388,7 @@ export class InputManager {
       };
       dpadEl.addEventListener("pointerup", releaseDpad);
       dpadEl.addEventListener("pointercancel", releaseDpad);
+      dpadEl.addEventListener("lostpointercapture", releaseDpad);
     }
 
     if (deckEl) {
@@ -357,7 +443,7 @@ export class InputManager {
   }
 
   getCombinedMask() {
-    let mask = this.touchMask | this.dpadTouchMask | this.pollGamepadMask();
+    let mask = this.touchMask | this.faceTouchMask | this.dpadTouchMask | this.pollGamepadMask();
     for (const code of this.heldCodes) {
       const bit = this.codeToBit.get(code);
       if (bit !== undefined) mask |= bit;

@@ -40,8 +40,19 @@ function txRequest(db, storeName, mode, op) {
     const tx = db.transaction(storeName, mode);
     const store = tx.objectStore(storeName);
     const req = op(store);
-    req.onsuccess = () => resolve(req.result);
+    let result;
+    req.onsuccess = () => {
+      result = req.result;
+      if (mode === "readonly") {
+        resolve(result);
+      }
+    };
     req.onerror = () => reject(req.error ?? new Error("IndexedDB request failed."));
+    if (mode !== "readonly") {
+      tx.oncomplete = () => resolve(result);
+      tx.onerror = () => reject(tx.error ?? new Error("IndexedDB transaction failed."));
+      tx.onabort = () => reject(tx.error ?? new Error("IndexedDB transaction aborted."));
+    }
   });
 }
 

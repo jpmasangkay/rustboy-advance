@@ -431,6 +431,7 @@ impl RustboyApp {
             rom_crc32,
             ctx,
         );
+        self.begin_playtest_session_for_active_rom();
 
         let patch_tag = match patch_applied {
             Some(fmt) => format!(" ({} Patched)", fmt.label()),

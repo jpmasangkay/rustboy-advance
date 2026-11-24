@@ -1010,6 +1010,10 @@ impl RustboyApp {
             self.start_performance_check();
             ui.close_menu();
         }
+        if ui.button("Open Playtest Results Folder").clicked() {
+            self.open_playtest_results_folder();
+            ui.close_menu();
+        }
         if ui.button("Open Config & Logs Folder").clicked() {
             self.open_config_and_logs_folder();
             ui.close_menu();

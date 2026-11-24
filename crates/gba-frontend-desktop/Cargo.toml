@@ -4,10 +4,15 @@ version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
+default-run = "rustboy-advance"
 
 [[bin]]
 name = "rustboy-advance"
 path = "src/main.rs"
+
+[[bin]]
+name = "uninstall"
+path = "src/bin/uninstall.rs"
 
 [features]
 default = []

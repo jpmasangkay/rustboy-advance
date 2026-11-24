@@ -26,6 +26,7 @@ mod mem_search;
 mod menus;
 mod movies;
 mod no_gpu;
+mod playtest_report;
 mod retroachievements;
 mod rewind;
 mod rom_loader;

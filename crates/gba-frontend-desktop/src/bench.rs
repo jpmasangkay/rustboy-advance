@@ -2700,7 +2700,7 @@ pub struct SelftestReportJson {
     pub filter_timings: Vec<FilterBenchRow>,
 }
 
-fn collect_host_system_info() -> HostSystemInfo {
+pub(crate) fn collect_host_system_info() -> HostSystemInfo {
     let logical_threads = std::thread::available_parallelism()
         .map(|n| n.get())
         .unwrap_or(1);

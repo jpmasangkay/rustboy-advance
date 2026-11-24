@@ -1239,6 +1239,8 @@ struct NoGpuApp {
     fullscreen_on_start: bool,
     is_fullscreen: bool,
     sync_60hz: bool,
+    display_refresh_hz: Option<f64>,
+    host_audio_rate: u32,
     slowdown: usize,
     drc_pacer: crate::emu_thread::DrcPacer,
     phase_lock: crate::display_timing::VblankPhaseLock,
@@ -1256,6 +1258,8 @@ struct NoGpuApp {
     total_emu_frames: u64,
     capture_done: bool,
     startup_err: Option<String>,
+    rom_crc32: u32,
+    playtest: crate::playtest_report::PlaytestTracker,
 }
 
 impl NoGpuApp {
@@ -1276,6 +1280,7 @@ impl NoGpuApp {
         let audio = AudioOutput::start();
         audio.set_muted(config.muted);
         audio.set_master_volume(config.master_volume);
+        let host_audio_rate = audio.host_sample_rate();
         let audio_cap = audio.capacity();
         let sync_decision =
             crate::display_timing::resolve_sync_decision(cli.sync_60hz, cli.simulate_refresh_hz);
@@ -1369,10 +1374,12 @@ impl NoGpuApp {
         let mut gb = None;
         let mut sav_path = cli.sav_path.clone();
         let mut rom_name = String::from("No ROM loaded (press Ctrl+O or drop .gba/.gb/.gbc)");
+        let mut rom_crc32 = 0u32;
         if let Some(path) = &cli.rom_path {
             match crate::rom_loader::load_rom_bytes(path) {
                 Ok(mut loaded) => {
                     let _ = crate::rom_loader::apply_auto_patch_if_present(path, &mut loaded.bytes);
+                    rom_crc32 = crc32fast::hash(&loaded.bytes);
                     let platform = crate::rom_loader::detect_rom_platform(
                         path,
                         loaded.inner_name.as_deref(),
@@ -1438,7 +1445,8 @@ impl NoGpuApp {
             crate::shaders::ADAPTER_FALLBACK_ORDER.join(" -> ")
         );
 
-        Self {
+        let playtest_enabled = cli.perf_seconds.is_none() && cli.capture_png.is_none();
+        let mut app = Self {
             title,
             window: None,
             context: None,
@@ -1472,6 +1480,8 @@ impl NoGpuApp {
             fullscreen_on_start: cli.fullscreen,
             is_fullscreen: cli.fullscreen,
             sync_60hz,
+            display_refresh_hz,
+            host_audio_rate,
             slowdown: cli.slowdown.max(1),
             drc_pacer,
             phase_lock,
@@ -1488,7 +1498,68 @@ impl NoGpuApp {
             total_emu_frames: 0,
             capture_done: false,
             startup_err: None,
+            rom_crc32,
+            playtest: crate::playtest_report::PlaytestTracker::new(playtest_enabled),
+        };
+        app.sync_playtest_environment();
+        if app.has_active_game() {
+            app.begin_playtest_session();
         }
+        app
+    }
+
+    fn begin_playtest_session(&mut self) {
+        let renderer = "No-GPU (winit + softbuffer)".to_string();
+        let filter = self.config.display_filter.label().to_string();
+        let meta = if let Some(core) = &self.core {
+            Some(crate::playtest_report::GameSessionMeta::from_gba_core(
+                &core.bus.cart,
+                self.rom_crc32,
+                self.bios_bytes.is_some(),
+                core.recommends_real_bios().map(str::to_string),
+                renderer,
+                filter,
+            ))
+        } else if let Some(gb) = &self.gb {
+            Some(crate::playtest_report::GameSessionMeta::from_gb_session(
+                gb,
+                &self.rom_name,
+                self.rom_crc32,
+                renderer,
+                filter,
+            ))
+        } else {
+            None
+        };
+        if let Some(meta) = meta {
+            self.playtest
+                .begin_session(meta, self.sink.audio.underruns());
+        }
+    }
+
+    fn sync_playtest_environment(&mut self) {
+        let filter = self.config.display_filter.label();
+        let save_type = if let Some(core) = &self.core {
+            Some(crate::playtest_report::format_gba_save_type(
+                core.bus.cart.effective_save_type(),
+            ))
+        } else {
+            self.gb.as_ref().map(|g| g.cart_type_label.as_str())
+        };
+        self.playtest
+            .update_device_specs(crate::playtest_report::RuntimeDeviceUpdate {
+                gpu_name: "Software Presenter (winit + softbuffer)",
+                gpu_backend: "No-GPU CPU",
+                gpu_device_type: "Cpu",
+                gpu_driver: "",
+                display_width: self.size.0,
+                display_height: self.size.1,
+                display_refresh_hz: self.display_refresh_hz,
+                sync_60hz: self.sync_60hz,
+                audio_sample_rate_hz: self.host_audio_rate,
+            });
+        self.playtest
+            .update_environment("No-GPU (winit + softbuffer)", filter, save_type);
     }
 
     fn has_active_game(&self) -> bool {
@@ -1496,11 +1567,14 @@ impl NoGpuApp {
     }
 
     fn load_rom(&mut self, path: &Path) {
+        self.sync_playtest_environment();
+        self.playtest.end_session();
         self.flush_save();
         let Ok(mut loaded) = crate::rom_loader::load_rom_bytes(path) else {
             return;
         };
         let _ = crate::rom_loader::apply_auto_patch_if_present(path, &mut loaded.bytes);
+        self.rom_crc32 = crc32fast::hash(&loaded.bytes);
         let platform = crate::rom_loader::detect_rom_platform(
             path,
             loaded.inner_name.as_deref(),
@@ -1544,6 +1618,7 @@ impl NoGpuApp {
         self.next_frame_due = Instant::now();
         self.phase_lock.reset_schedule();
         self.sink.frame_dirty = true;
+        self.begin_playtest_session();
     }
 
     fn save_config_preserving_target(&mut self) {
@@ -1578,6 +1653,8 @@ impl NoGpuApp {
     }
 
     fn quit_with_save_flush(&mut self) {
+        self.sync_playtest_environment();
+        self.playtest.end_session();
         self.flush_save();
         if let Some(ref mut logger) = self.perf_logger {
             logger.finish_and_print();
@@ -1597,10 +1674,13 @@ impl NoGpuApp {
                 self.paused = !self.paused;
                 self.sink.audio.set_paused(self.paused);
                 if self.paused {
+                    self.sync_playtest_environment();
+                    self.playtest.on_pause();
                     self.flush_save();
                 } else {
                     self.next_frame_due = Instant::now();
                     self.phase_lock.reset_schedule();
+                    self.playtest.on_resume(self.sink.audio.underruns());
                 }
                 false
             }
@@ -2075,6 +2155,10 @@ impl ApplicationHandler for NoGpuApp {
             self.flush_save();
             self.last_save_flush = Instant::now();
         }
+        if self.playtest.is_periodic_flush_due() {
+            self.sync_playtest_environment();
+            self.playtest.maybe_flush_periodic();
+        }
 
         if self.capture_done && self.perf_seconds.is_none() {
             self.flush_save();
@@ -2176,6 +2260,19 @@ impl ApplicationHandler for NoGpuApp {
                 self.pending_emu_ms += scaled_core_ms;
                 self.frames_stepped_since_present += 1;
                 self.frames_in_window += 1;
+                let save_dirty_now = self.core.as_ref().is_some_and(|c| c.bus.cart.save_dirty)
+                    || self.gb.as_ref().is_some_and(|g| g.core.battery_dirty());
+                self.playtest.record_frame(
+                    crate::playtest_report::FrameSample {
+                        emu_ms: core_ms as f32,
+                        present_ms: self.last_present_ms as f32,
+                        normal_speed: self.slowdown <= 1,
+                        frameskipped: gov_skip_this_frame,
+                        save_dirty: save_dirty_now,
+                        audio_underruns_now: self.sink.audio.underruns(),
+                    },
+                    &self.sink.framebuffer,
+                );
 
                 if !gov_skip_this_frame {
                     let work_ms = scaled_core_ms + scaled_present_ms;

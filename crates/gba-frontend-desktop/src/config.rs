@@ -1895,6 +1895,7 @@ impl AppConfig {
             data_dir.join("rustboy_library.cfg"),
             data_dir.join("rustboy-advance-crash.log"),
             data_dir.join("rustboy-advance-startup-error.log"),
+            data_dir.join(crate::playtest_report::PLAYTEST_LEDGER_FILENAME),
         ];
         let managed_dirs = [
             data_dir.join("saves"),

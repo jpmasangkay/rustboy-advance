@@ -494,6 +494,14 @@ impl RustboyApp {
         }
     }
 
+    /// Flushes and opens the folder containing `PLAYTEST_RESULTS.md` in the OS file manager.
+    pub(crate) fn open_playtest_results_folder(&mut self) {
+        self.sync_playtest_environment();
+        self.playtest.flush_now();
+        let dir = self.playtest.report_dir();
+        self.open_directory_in_file_manager(&dir);
+    }
+
     /// Opens the configuration, saves, states, and crash/perf logs directory in the file manager.
     pub(crate) fn open_config_and_logs_folder(&mut self) {
         let dir = AppConfig::app_data_dir();

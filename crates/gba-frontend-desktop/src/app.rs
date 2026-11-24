@@ -220,6 +220,8 @@ pub(crate) struct RustboyApp {
     pub(crate) quality_governor: QualityGovernor,
     pub(crate) governor_adapter_name: String,
     pub(crate) governor_adapter_backend: String,
+    pub(crate) governor_adapter_device_type: String,
+    pub(crate) governor_adapter_driver: String,
     pub(crate) governor_viewport_px: (u32, u32),
     pub(crate) governor_user_target: DisplayFilter,
     pub(crate) governor_cli_filter: bool,
@@ -277,6 +279,7 @@ pub(crate) struct RustboyApp {
     pub(crate) pacing_deadline: Option<Instant>,
     pub(crate) last_step_frames: u32,
     pub(crate) last_step_emu_ms: f64,
+    pub(crate) playtest: crate::playtest_report::PlaytestTracker,
 }
 
 impl RustboyApp {
@@ -303,6 +306,7 @@ impl RustboyApp {
         let cli_perf_log_path = cli.perf_log;
         let cli_perf_seconds = cli.perf_seconds;
         let cli_loop_replay = cli.loop_replay;
+        let playtest_enabled = cli_perf_seconds.is_none() && cli.capture_png.is_none();
         let sync_decision =
             crate::display_timing::resolve_sync_decision(cli.sync_60hz, cli.simulate_refresh_hz);
         println!("[sync] {}", sync_decision.reason);
@@ -437,6 +441,8 @@ impl RustboyApp {
             quality_governor,
             governor_adapter_name: String::from("Unknown"),
             governor_adapter_backend: String::from("Unknown"),
+            governor_adapter_device_type: String::new(),
+            governor_adapter_driver: String::new(),
             governor_viewport_px: (LCD_WIDTH as u32 * scale_u32, LCD_HEIGHT as u32 * scale_u32),
             governor_user_target,
             governor_cli_filter: cli_filter_set,
@@ -486,6 +492,7 @@ impl RustboyApp {
             pacing_deadline: None,
             last_step_frames: 0,
             last_step_emu_ms: 0.0,
+            playtest: crate::playtest_report::PlaytestTracker::new(playtest_enabled),
         };
 
         app.load_persistent_config();
@@ -499,6 +506,74 @@ impl RustboyApp {
             app.notify_error(&format!("Failed to load CLI ROM: {e}"));
         }
         app
+    }
+
+    pub(crate) fn current_playtest_renderer_label(&self) -> String {
+        if self.governor_adapter_backend != "Unknown" && self.governor_adapter_name != "Unknown" {
+            format!(
+                "{} ({})",
+                self.governor_adapter_backend, self.governor_adapter_name
+            )
+        } else if self.governor_adapter_backend != "Unknown" {
+            self.governor_adapter_backend.clone()
+        } else {
+            "Desktop GPU".to_string()
+        }
+    }
+
+    pub(crate) fn sync_playtest_environment(&mut self) {
+        let renderer = self.current_playtest_renderer_label();
+        let filter = self.config.display_filter.label();
+        let save_type = if let Some(core) = &self.core {
+            Some(crate::playtest_report::format_gba_save_type(
+                core.bus.cart.effective_save_type(),
+            ))
+        } else {
+            self.gb.as_ref().map(|g| g.cart_type_label.as_str())
+        };
+        self.playtest
+            .update_device_specs(crate::playtest_report::RuntimeDeviceUpdate {
+                gpu_name: &self.governor_adapter_name,
+                gpu_backend: &self.governor_adapter_backend,
+                gpu_device_type: &self.governor_adapter_device_type,
+                gpu_driver: &self.governor_adapter_driver,
+                display_width: self.governor_viewport_px.0,
+                display_height: self.governor_viewport_px.1,
+                display_refresh_hz: self.display_refresh_hz,
+                sync_60hz: self.sync_60hz,
+                audio_sample_rate_hz: self.host_audio_rate,
+            });
+        self.playtest
+            .update_environment(&renderer, filter, save_type);
+    }
+
+    pub(crate) fn begin_playtest_session_for_active_rom(&mut self) {
+        let renderer = self.current_playtest_renderer_label();
+        let filter = self.config.display_filter.label().to_string();
+        let meta = if let Some(core) = &self.core {
+            Some(crate::playtest_report::GameSessionMeta::from_gba_core(
+                &core.bus.cart,
+                self.rom_crc32,
+                self.bios_bytes.is_some(),
+                core.recommends_real_bios().map(str::to_string),
+                renderer,
+                filter,
+            ))
+        } else if let Some(gb) = &self.gb {
+            Some(crate::playtest_report::GameSessionMeta::from_gb_session(
+                gb,
+                &self.rom_title,
+                self.rom_crc32,
+                renderer,
+                filter,
+            ))
+        } else {
+            None
+        };
+        if let Some(meta) = meta {
+            self.playtest
+                .begin_session(meta, self.sink.audio.underruns());
+        }
     }
 
     pub(crate) fn is_ra_hardcore_active(&self) -> bool {
@@ -729,6 +804,8 @@ impl RustboyApp {
         explicit_patch: Option<&Path>,
         ctx: Option<&egui::Context>,
     ) -> Result<(), String> {
+        self.sync_playtest_environment();
+        self.playtest.end_session();
         self.flush_gb_battery_save_sync(true);
         self.flush_battery_save_sync();
         self.save_rom_specific_settings();
@@ -799,6 +876,7 @@ impl RustboyApp {
             ctx,
         );
         self.apply_active_game_settings_to_core();
+        self.begin_playtest_session_for_active_rom();
         if let Some(core) = &self.core {
             self.ra
                 .on_rom_loaded(&self.config, &core.bus.cart.rom, &title);
@@ -897,6 +975,8 @@ impl RustboyApp {
     }
 
     pub(crate) fn close_rom(&mut self, ctx: &egui::Context) {
+        self.sync_playtest_environment();
+        self.playtest.end_session();
         self.flush_gb_battery_save_sync(true);
         self.flush_battery_save_sync();
         self.save_rom_specific_settings();
@@ -1422,7 +1502,10 @@ impl RustboyApp {
         self.pacing_deadline = None;
         self.playtime_timer = Instant::now();
         self.autofire_state.clear_latches();
-        if !self.paused {
+        if self.paused {
+            self.sync_playtest_environment();
+            self.playtest.on_pause();
+        } else {
             self.temp_step_bp = None;
             self.temp_step_target_depth = None;
             let ctrl = self.build_debug_control();
@@ -1438,6 +1521,7 @@ impl RustboyApp {
             self.next_frame_due = Instant::now();
             self.sink.audio.reset_adaptive_target();
             self.sink.audio.reset_underruns();
+            self.playtest.on_resume(self.sink.audio.underruns());
         }
     }
 
@@ -2028,6 +2112,19 @@ impl RustboyApp {
             self.frames_in_window += 1;
             self.frame_counter += 1;
             self.track_frame_unsaved_progress(live_keypad, had_save_dirty);
+            let save_dirty_now = self.is_battery_save_dirty();
+            let audio_underruns_now = self.sink.audio.underruns();
+            self.playtest.record_frame(
+                crate::playtest_report::FrameSample {
+                    emu_ms: self.last_core_ms,
+                    present_ms: self.last_present_ms,
+                    normal_speed: is_normal_speed && !turbo,
+                    frameskipped: should_skip_render,
+                    save_dirty: save_dirty_now,
+                    audio_underruns_now,
+                },
+                &self.sink.framebuffer,
+            );
 
             let frame_complete = matches!(stop_reason, gba_core::StopReason::FrameComplete);
             self.flush_frame_captures(
@@ -2072,6 +2169,10 @@ impl RustboyApp {
         if self.last_save_flush.elapsed() >= Duration::from_secs(3) {
             self.flush_battery_save();
             self.last_save_flush = Instant::now();
+        }
+        if self.playtest.is_periodic_flush_due() {
+            self.sync_playtest_environment();
+            self.playtest.maybe_flush_periodic();
         }
 
         // Track per-game active gameplay time
@@ -2473,6 +2574,15 @@ impl RustboyApp {
         let info = rs.adapter.get_info();
         self.governor_adapter_name = info.name.clone();
         self.governor_adapter_backend = format!("{:?}", info.backend);
+        self.governor_adapter_device_type = format!("{:?}", info.device_type);
+        self.governor_adapter_driver = if !info.driver.is_empty() && !info.driver_info.is_empty() {
+            format!("{} ({})", info.driver, info.driver_info)
+        } else if !info.driver_info.is_empty() {
+            info.driver_info.clone()
+        } else {
+            info.driver.clone()
+        };
+        self.sync_playtest_environment();
         if let Some(path) = self.perf_log_path.take() {
             let tag = format!(
                 "eframe-wgpu-{:?}{}{}",
@@ -2571,6 +2681,8 @@ impl RustboyApp {
             self.link.disconnect_all();
             return;
         }
+        self.sync_playtest_environment();
+        self.playtest.end_session();
         self.stop_all_captures(false);
         self.ra.on_rom_closed();
         self.lua.on_rom_changed("", "");

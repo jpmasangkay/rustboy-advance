@@ -469,7 +469,10 @@ impl ActiveSession {
 
         let now = Instant::now();
         let tick_dt = match self.last_active_tick {
-            Some(prev) => now.saturating_duration_since(prev).as_secs_f64().min(MAX_ACTIVE_TICK_SECS),
+            Some(prev) => now
+                .saturating_duration_since(prev)
+                .as_secs_f64()
+                .min(MAX_ACTIVE_TICK_SECS),
             None => 0.0,
         };
         self.last_active_tick = Some(now);
@@ -690,13 +693,12 @@ impl PlaytestTracker {
 
     /// Directory where `PLAYTEST_RESULTS.md` is written (for "Open Playtest Results Folder").
     pub(crate) fn report_dir(&self) -> PathBuf {
-        let target = if self.report_path.is_file()
-            || self.report_path.parent().is_some_and(Path::is_dir)
-        {
-            &self.report_path
-        } else {
-            &self.fallback_report_path
-        };
+        let target =
+            if self.report_path.is_file() || self.report_path.parent().is_some_and(Path::is_dir) {
+                &self.report_path
+            } else {
+                &self.fallback_report_path
+            };
         target
             .parent()
             .map(Path::to_path_buf)
@@ -713,7 +715,12 @@ impl PlaytestTracker {
     }
 
     /// Updates live renderer/filter metadata (e.g. after wgpu init or filter switch).
-    pub(crate) fn update_environment(&mut self, renderer: &str, filter: &str, save_type: Option<&str>) {
+    pub(crate) fn update_environment(
+        &mut self,
+        renderer: &str,
+        filter: &str,
+        save_type: Option<&str>,
+    ) {
         let Some(active) = &mut self.active else {
             return;
         };
@@ -1005,9 +1012,11 @@ fn merge_session_into_ledger(
     }
 
     // Most recently played games appear first in the table.
-    ledger
-        .records
-        .sort_by(|a, b| b.last_played_unix.cmp(&a.last_played_unix).then_with(|| a.title.cmp(&b.title)));
+    ledger.records.sort_by(|a, b| {
+        b.last_played_unix
+            .cmp(&a.last_played_unix)
+            .then_with(|| a.title.cmp(&b.title))
+    });
 }
 
 #[inline]
@@ -1094,7 +1103,10 @@ pub(crate) fn render_markdown_report(
         "> No personal folders, hostnames, or usernames are recorded — safe to share back."
     );
     let _ = writeln!(out);
-    let _ = writeln!(out, "- **Emulator:** Rustboy Advance v{version} (`{os}` / `{arch}`)");
+    let _ = writeln!(
+        out,
+        "- **Emulator:** Rustboy Advance v{version} (`{os}` / `{arch}`)"
+    );
     if generated_unix > 0 {
         let _ = writeln!(
             out,
@@ -1117,8 +1129,16 @@ pub(crate) fn render_markdown_report(
         let _ = writeln!(out, "| Component | Details |");
         let _ = writeln!(out, "| :--- | :--- |");
         let _ = writeln!(out, "| **OS** | {} |", escape_md_cell(&os_display));
-        let _ = writeln!(out, "| **CPU** | {} |", escape_md_cell(&device.cpu_summary()));
-        let _ = writeln!(out, "| **Memory** | {} |", escape_md_cell(&device.ram_summary()));
+        let _ = writeln!(
+            out,
+            "| **CPU** | {} |",
+            escape_md_cell(&device.cpu_summary())
+        );
+        let _ = writeln!(
+            out,
+            "| **Memory** | {} |",
+            escape_md_cell(&device.ram_summary())
+        );
         let _ = writeln!(
             out,
             "| **GPU / Backend** | {} |",
@@ -1250,7 +1270,11 @@ pub(crate) fn render_markdown_report(
             "- **Stability:** `{}` audio underrun(s) · `{}` frameskipped frame(s) · Video active: {}",
             r.audio_underruns,
             r.frameskip_frames,
-            if r.video_active { "Yes" } else { "No (uniform/blank screen)" }
+            if r.video_active {
+                "Yes"
+            } else {
+                "No (uniform/blank screen)"
+            }
         );
         let _ = writeln!(
             out,
@@ -1341,13 +1365,7 @@ fn format_duration_short(total_secs: u64) -> String {
 
 fn sanitize_display_text(s: &str) -> String {
     s.chars()
-        .map(|c| {
-            if c.is_control() {
-                ' '
-            } else {
-                c
-            }
-        })
+        .map(|c| if c.is_control() { ' ' } else { c })
         .collect::<String>()
         .split_whitespace()
         .collect::<Vec<_>>()
@@ -1521,8 +1539,12 @@ mod tests {
 
         // Reload in a fresh tracker and run a tiny <3s brief launch: should keep Smooth verdict
         // while incrementing session count to 2.
-        let mut tracker2 =
-            PlaytestTracker::with_paths(true, ledger_path.clone(), report_path.clone(), fallback_path);
+        let mut tracker2 = PlaytestTracker::with_paths(
+            true,
+            ledger_path.clone(),
+            report_path.clone(),
+            fallback_path,
+        );
         tracker2.begin_session(meta, 0);
         for _ in 0..10 {
             tracker2.record_frame(

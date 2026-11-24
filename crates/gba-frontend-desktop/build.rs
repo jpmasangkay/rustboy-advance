@@ -295,10 +295,7 @@ fn main() {
                     "cargo:rustc-link-arg-bin=rustboy-advance={}",
                     obj_path.display()
                 );
-                println!(
-                    "cargo:rustc-link-arg-bin=uninstall={}",
-                    obj_path.display()
-                );
+                println!("cargo:rustc-link-arg-bin=uninstall={}", obj_path.display());
             }
         }
     }

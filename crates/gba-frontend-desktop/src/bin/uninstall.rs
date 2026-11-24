@@ -119,11 +119,7 @@ fn main() {
     };
 
     let Some(emu_exe) = sibling_emulator_exe(&current_exe) else {
-        show_message(
-            title,
-            "Could not determine the installation folder.",
-            true,
-        );
+        show_message(title, "Could not determine the installation folder.", true);
         std::process::exit(1);
     };
 
